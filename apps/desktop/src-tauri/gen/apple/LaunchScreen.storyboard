@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="17150" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="Y6W-OH-hqX">
+    <dependencies>
+        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="17122"/>
+        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        <capability name="Named colors" minToolsVersion="9.0"/>
+        <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+    </dependencies>
+    <scenes>
+        <!--View Controller-->
+        <scene sceneID="s0d-6b-0kx">
+            <objects>
+                <viewController id="Y6W-OH-hqX" sceneMemberID="viewController">
+                    <view key="view" contentMode="scaleToFill" id="5EZ-qb-Rvc">
+                        <rect key="frame" x="0.0" y="0.0" width="414" height="896"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                        <subviews>
+                            <imageView userInteractionEnabled="NO" contentMode="scaleAspectFit" image="LaunchStar" translatesAutoresizingMaskIntoConstraints="NO" id="elo-launch-star">
+                                <rect key="frame" x="63" y="304" width="288" height="288"/>
+                                <color key="tintColor" name="LaunchStarColor"/>
+                                <constraints>
+                                    <constraint firstAttribute="width" constant="288" id="elo-star-width"/>
+                                    <constraint firstAttribute="height" constant="288" id="elo-star-height"/>
+                                </constraints>
+                            </imageView>
+                        </subviews>
+                        <viewLayoutGuide key="safeArea" id="vDu-zF-Fre"/>
+                        <color key="backgroundColor" name="LaunchBackground"/>
+                        <constraints>
+                            <constraint firstItem="elo-launch-star" firstAttribute="centerX" secondItem="5EZ-qb-Rvc" secondAttribute="centerX" id="elo-star-center-x"/>
+                            <constraint firstItem="elo-launch-star" firstAttribute="centerY" secondItem="5EZ-qb-Rvc" secondAttribute="centerY" id="elo-star-center-y"/>
+                        </constraints>
+                    </view>
+                </viewController>
+                <placeholder placeholderIdentifier="IBFirstResponder" id="Ief-a0-LHa" userLabel="First Responder" customClass="UIResponder" sceneMemberID="firstResponder"/>
+            </objects>
+        </scene>
+    </scenes>
+    <resources>
+        <image name="LaunchStar" width="288" height="288"/>
+        <namedColor name="LaunchBackground">
+            <color red="0.968627451" green="0.976470588" blue="0.964705882" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+        </namedColor>
+        <namedColor name="LaunchStarColor">
+            <color red="0.435294118" green="0.560784314" blue="0.482352941" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+        </namedColor>
+    </resources>
+</document>

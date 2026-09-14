@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prepare-profile"
+description = "Enables the prepare_profile command without any pre-configured scope."
+commands.allow = ["prepare_profile"]
+
+[[permission]]
+identifier = "deny-prepare-profile"
+description = "Denies the prepare_profile command without any pre-configured scope."
+commands.deny = ["prepare_profile"]

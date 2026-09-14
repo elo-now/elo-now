@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-operate"
+description = "Enables the operate command without any pre-configured scope."
+commands.allow = ["operate"]
+
+[[permission]]
+identifier = "deny-operate"
+description = "Denies the operate command without any pre-configured scope."
+commands.deny = ["operate"]

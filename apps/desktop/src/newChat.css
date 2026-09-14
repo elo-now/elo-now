@@ -1,0 +1,151 @@
+.dialog.new-chat-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(640px, calc(100vw - 32px));
+  height: min(760px, calc(var(--app-viewport-height, 100dvh) - 32px));
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+  background: var(--elo-background);
+}
+.new-chat-dialog > .screen-header {
+  padding-inline: 0;
+  margin: 0 var(--elo-page-inset);
+}
+.new-chat-dialog > form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  margin: 0;
+}
+.new-chat-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.new-chat-switch {
+  margin: 12px var(--elo-page-inset);
+  flex-shrink: 0;
+}
+.new-chat-fields {
+  padding: 0 var(--elo-page-inset);
+  overflow-y: auto;
+  flex-shrink: 0;
+  max-height: 35%;
+}
+.new-chat-dialog:has(.floating-search[data-expanded="true"]) .new-chat-fields {
+  display: none;
+}
+.dm-selection {
+  display: flex;
+  gap: 6px;
+  padding: 2px var(--elo-page-inset) 8px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+.dm-selection button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: calc(32px * var(--elo-content-density));
+  font-size: var(--elo-type-label);
+  padding: 4px 8px;
+  border: 1px solid var(--elo-line);
+  background: var(--elo-surface);
+  color: var(--elo-text);
+  border-radius: 18px;
+}
+.dm-selection .ui-icon {
+  width: var(--elo-type-label);
+  height: var(--elo-type-label);
+}
+.dm-people-viewport {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin-inline: var(--elo-page-inset);
+}
+.dm-people-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: var(--elo-search-clearance);
+}
+.dm-people {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.dm-person {
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  gap: calc(12px * var(--elo-content-density));
+  margin: 0;
+  padding: calc(10px * var(--elo-content-density)) 0;
+  min-height: calc(62px * var(--elo-content-density));
+  border-bottom: 1px solid var(--elo-line);
+  cursor: pointer;
+}
+.dm-person-copy {
+  min-width: 0;
+  flex: 1;
+}
+.new-chat-dialog .dm-person {
+  /* Form-label spacing must not add a second gap around each person. */
+  margin: 0;
+}
+.dm-person-name {
+  display: block;
+  font-size: var(--elo-type-body);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dm-person-context {
+  display: block;
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+  color: var(--elo-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dm-person .avatar {
+  width: calc(2 * var(--elo-type-body));
+  height: calc(2 * var(--elo-type-body));
+  flex-shrink: 0;
+  font-size: var(--elo-type-label);
+}
+.new-chat-footer {
+  flex-shrink: 0;
+  margin-inline: var(--elo-page-inset);
+  padding: 12px 0;
+  border-top: 1px solid var(--elo-line);
+}
+.new-chat-footer > button {
+  width: 100%;
+  min-height: var(--elo-control-height);
+}
+@media (max-width: 760px) {
+  .dialog.new-chat-dialog {
+    width: 100%;
+    height: var(--app-viewport-height, 100dvh);
+    max-width: none;
+    inset: var(--app-viewport-top, 0px) 0 auto;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+      var(--app-content-bottom-inset, env(safe-area-inset-bottom))
+      env(safe-area-inset-left);
+  }
+}

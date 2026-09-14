@@ -1,0 +1,73 @@
+{
+  "identifier": "main",
+  "description": "Bundled local application commands only. Native file dialogs are mediated by Rust; no generic filesystem, HTTP, shell or opener access.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "allow-profile-environment",
+    "allow-profile-task",
+    "allow-open-demo",
+    "allow-prepare-profile",
+    "allow-cancel-profile",
+    "allow-create-profile",
+    "allow-unlock",
+    "allow-lock",
+    "allow-verify-password",
+    "biometry:default",
+    {
+      "identifier": "biometry:allow-has-data",
+      "allow": [
+        {
+          "domain": "now.elo.profile",
+          "name": "vault-password-v1"
+        }
+      ]
+    },
+    {
+      "identifier": "biometry:allow-get-data",
+      "allow": [
+        {
+          "domain": "now.elo.profile",
+          "name": "vault-password-v1"
+        }
+      ]
+    },
+    {
+      "identifier": "biometry:allow-set-data",
+      "allow": [
+        {
+          "domain": "now.elo.profile",
+          "name": "vault-password-v1"
+        }
+      ]
+    },
+    {
+      "identifier": "biometry:allow-remove-data",
+      "allow": [
+        {
+          "domain": "now.elo.profile",
+          "name": "vault-password-v1"
+        }
+      ]
+    },
+    "allow-operate",
+    "allow-push-task",
+    "allow-choose-import",
+    "allow-prepare-export",
+    "allow-save-export",
+    "allow-invitation-qr",
+    "deep-link:allow-get-current",
+    "core:app:allow-version",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "notification:allow-notify",
+    "notification:allow-register-listener",
+    "notification:allow-pending-action",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-cancel",
+    "notification:allow-get-pending",
+    "notification:allow-get-active",
+    "notification:allow-remove-active"
+  ]
+}

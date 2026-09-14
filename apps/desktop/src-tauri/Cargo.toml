@@ -1,0 +1,47 @@
+[package]
+name = "elo-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+[lib]
+name = "elo_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+team-test-replica = []
+mobile-push = ["dep:tauri-plugin-elo-push"]
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+serde_json.workspace = true
+[dependencies]
+tauri = { version = "2", features = [] }
+elo-core.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+age.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+getrandom.workspace = true
+tauri-plugin-elo-push = { path = "../../../crates/tauri-plugin-elo-push", optional = true }
+base64.workspace = true
+zeroize.workspace = true
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+rqrr = "=0.10.1"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-biometry = "=0.3.0-rc.3"
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-sharekit = "0.3"
+tauri-plugin-barcode-scanner = "2"
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "=0.22.4"
+rustls-platform-verifier = "=0.7.0"
+[dev-dependencies]
+tempfile.workspace = true
+[lints]
+workspace = true

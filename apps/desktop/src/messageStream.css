@@ -1,0 +1,295 @@
+.message-stream[hidden] {
+  display: none;
+}
+.message-stream {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  padding: 0 var(--elo-page-inset);
+  overflow: hidden;
+  background: var(--elo-background);
+}
+.shell[data-stream="true"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.shell[data-stream="true"] > aside,
+.shell[data-stream="true"] > .conversation,
+.shell[data-stream="true"] > .details {
+  display: none;
+}
+.stream-sidebar-link {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.stream-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.stream-list-host {
+  height: 100%;
+}
+.stream-list {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 8px 12px;
+  scrollbar-width: none;
+  overscroll-behavior: contain;
+}
+.stream-list::-webkit-scrollbar {
+  display: none;
+}
+.stream-card-slot {
+  position: relative;
+  margin-bottom: calc(8px * var(--elo-content-density));
+  border-radius: 12px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--elo-accent) 12%, var(--elo-background));
+}
+.stream-card-slot:last-child {
+  margin-bottom: 0;
+}
+.stream-read-hint {
+  position: absolute;
+  inset: 0 16px 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--elo-type-label);
+  color: var(--elo-text);
+}
+.stream-read-hint .ui-icon {
+  width: 18px;
+}
+.stream-card {
+  position: relative;
+  margin: 0;
+  border: 1px solid
+    color-mix(in srgb, var(--elo-line) 65%, var(--elo-background));
+  border-radius: 12px;
+  background: var(--elo-background);
+  touch-action: pan-y;
+  overflow: hidden;
+  transition: transform 180ms ease-out;
+}
+.stream-card.message {
+  padding: calc(10px * var(--elo-content-density));
+}
+.stream-card[data-dragging="true"] {
+  transition: none;
+}
+.stream-card[data-lifted="true"] {
+  opacity: 0;
+}
+.stream-preview {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  padding: 0;
+  margin: 4px 0 0;
+  min-height: 0;
+  background: transparent;
+  color: var(--elo-text);
+  text-align: left;
+  font-weight: 400;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+  transform: none;
+}
+.stream-preview:hover:not(:disabled) {
+  filter: none;
+}
+.stream-preview:focus-visible {
+  outline-offset: -2px;
+}
+.stream-preview p {
+  margin: 0;
+}
+.stream-preview .stream-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.message-meta[data-context="true"] {
+  display: flex;
+}
+.message-meta[data-context="true"] strong {
+  flex: 0 1 auto;
+  max-width: 30%;
+}
+.message-meta[data-context="true"] time {
+  flex: none;
+}
+.message-meta[data-context="true"][data-full-date="true"] {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+.message-meta[data-context="true"][data-full-date="true"] > strong {
+  grid-column: 1 / -1;
+  max-width: none;
+}
+.message-meta[data-context="true"][data-full-date="true"] > .message-time {
+  grid-column: 1;
+}
+.message-meta[data-context="true"][data-full-date="true"] > .stream-chat-name {
+  grid-row: 2;
+  grid-column: 2;
+}
+.stream-chat-name {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stream-file .ui-icon {
+  vertical-align: middle;
+  width: 18px;
+  margin-right: 8px;
+}
+.stream-load {
+  width: 100%;
+  margin: 8px 0;
+}
+.stream-lift-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  overflow: hidden;
+}
+.stream-lift-scrim {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--elo-background) 94%, transparent);
+}
+.stream-lift {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  padding: calc(10px * var(--elo-content-density));
+  box-shadow: 0 8px 28px color-mix(in srgb, var(--elo-text) 6%, transparent);
+  transition:
+    top 220ms ease-out,
+    left 220ms ease-out,
+    width 220ms ease-out,
+    height 220ms ease-out,
+    border-color 120ms ease-out;
+}
+.stream-lift[data-phase="drag"] {
+  transition: border-color 120ms ease-out;
+}
+.stream-lift[data-phase="drag"][data-ready="true"] {
+  border-color: var(--elo-accent);
+}
+.stream-lift[data-phase="open"] {
+  pointer-events: auto;
+}
+.stream-reading-message.message {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  overflow: hidden;
+}
+.stream-reading-message .message-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+.stream-reading-message .message-meta {
+  flex-shrink: 0;
+}
+.stream-card-body {
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.stream-card-body p {
+  margin: 4px 0 0;
+}
+.stream-lift[data-phase="open"] .stream-card-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  touch-action: pan-y;
+}
+.stream-card-actions {
+  display: grid;
+  grid-template-columns: var(--elo-control-height) minmax(0, 1.6fr) minmax(
+      0,
+      1fr
+    );
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding-top: 10px;
+  margin-top: 10px;
+  border-top: 1px solid var(--elo-line);
+}
+.stream-card-actions button {
+  min-width: 0;
+  min-height: var(--elo-control-height);
+  padding: calc(8px * var(--elo-control-density)) 12px;
+  font-size: var(--elo-type-label);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.stream-card-actions .stream-collapse {
+  width: var(--elo-control-height);
+  padding: 0;
+  background: transparent;
+  color: var(--elo-muted);
+}
+.stream-card-actions .ui-icon {
+  width: 18px;
+  height: 18px;
+}
+.message[data-target="true"] {
+  border-radius: 10px;
+  outline: 1px solid var(--elo-accent);
+  outline-offset: 4px;
+}
+.message:focus {
+  scroll-margin-block: 12px;
+}
+@media (min-width: 761px) {
+  .stream-sidebar-link {
+    display: flex;
+  }
+  .message-stream {
+    max-width: 900px;
+    width: 100%;
+    justify-self: center;
+    padding-top: 16px;
+  }
+}
+@media (max-width: 760px) {
+  .mobile-tabbar {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .stream-viewport {
+    margin-inline: -8px;
+  }
+  .stream-card-actions {
+    padding-bottom: 4px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stream-card,
+  .stream-lift {
+    transition: none;
+  }
+}

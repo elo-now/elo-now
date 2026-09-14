@@ -1,0 +1,4 @@
+.back-fading #root,
+.back-fading dialog[open] {
+  pointer-events: none;
+}

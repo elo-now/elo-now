@@ -1,0 +1,352 @@
+[
+  {
+    "name": "Team",
+    "messages": [
+      {
+        "sender": "Alex",
+        "text": "Morning! What is everyone working on today?",
+        "created_at": "2026-09-07T09:00:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "I am simplifying the mobile headers. More room for the conversation.",
+        "created_at": "2026-09-07T09:04:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "I will try the new build on my phone after lunch.",
+        "created_at": "2026-09-07T09:08:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "I can check the light and dark themes.",
+        "created_at": "2026-09-07T09:12:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Perfect. Let us keep notes here as we go.",
+        "created_at": "2026-09-07T09:16:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "The title now stays in the same place across screens.",
+        "created_at": "2026-09-07T09:20:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "That already feels calmer.",
+        "created_at": "2026-09-07T09:24:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Small suggestion: keep the common actions close to the conversation.",
+        "created_at": "2026-09-07T09:28:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "New build is ready for a quick look.",
+        "created_at": "2026-09-08T09:00:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "The message spacing looks good in dark mode.",
+        "created_at": "2026-09-08T09:04:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Long messages wrap nicely too. I tried a paragraph with enough text to take several lines, because a chat should stay comfortable to read without making every message feel like a separate card.",
+        "created_at": "2026-09-08T09:08:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Agreed. We should also test a busy conversation, not just two short messages.",
+        "created_at": "2026-09-08T09:12:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "I added a few longer replies for that.",
+        "created_at": "2026-09-08T09:16:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "And some very short ones.",
+        "created_at": "2026-09-08T09:20:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Nice 👍",
+        "created_at": "2026-09-08T09:24:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Thanks everyone. I will check the keyboard next.",
+        "created_at": "2026-09-08T09:28:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "Good morning! The compact layout feels much better.",
+        "created_at": "2026-09-09T09:00:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "I can get to the conversation in one tap now.",
+        "created_at": "2026-09-09T09:04:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Try pulling down from the top to refresh.",
+        "created_at": "2026-09-09T09:08:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "That works here.",
+        "created_at": "2026-09-09T09:12:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "Could we separate the conversation by day?",
+        "created_at": "2026-09-09T09:16:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Yes. A date divider, then only the time next to each message.",
+        "created_at": "2026-09-09T09:20:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "That will make older conversations much easier to scan.",
+        "created_at": "2026-09-09T09:24:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Let us try it with these demo chats.",
+        "created_at": "2026-09-09T09:28:00Z"
+      }
+    ]
+  },
+  {
+    "name": "Design",
+    "messages": [
+      {
+        "sender": "Maya",
+        "text": "I put together a few ideas for the navigation.",
+        "created_at": "2026-09-07T10:00:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "The quieter version is my favourite.",
+        "created_at": "2026-09-07T10:04:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "Same. The mint accent is enough for the selected tab.",
+        "created_at": "2026-09-07T10:08:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Can we keep the labels available when holding an icon?",
+        "created_at": "2026-09-08T10:00:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Yes, the label can stay until you release it.",
+        "created_at": "2026-09-08T10:04:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Let us keep the animation short and smooth.",
+        "created_at": "2026-09-08T10:08:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "The shared header spacing looks consistent now.",
+        "created_at": "2026-09-09T10:00:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "I like the three-dot menu on each message.",
+        "created_at": "2026-09-09T10:04:00Z"
+      }
+    ]
+  },
+  {
+    "name": "Weekend plans",
+    "messages": [
+      {
+        "sender": "Jules",
+        "text": "Anyone up for a walk this weekend?",
+        "created_at": "2026-09-07T11:00:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "Saturday morning works for me.",
+        "created_at": "2026-09-07T11:04:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Count me in. Coffee afterwards?",
+        "created_at": "2026-09-07T11:08:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Absolutely ☕",
+        "created_at": "2026-09-08T11:00:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Let us meet near the park entrance at ten.",
+        "created_at": "2026-09-08T11:04:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "I will bring snacks.",
+        "created_at": "2026-09-08T11:08:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Perfect. I will check the weather in the morning.",
+        "created_at": "2026-09-09T11:00:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "See you there!",
+        "created_at": "2026-09-09T11:04:00Z"
+      }
+    ]
+  },
+  {
+    "name": "Music",
+    "messages": [
+      {
+        "sender": "Sam",
+        "text": "What is on your playlist today?",
+        "created_at": "2026-09-07T12:00:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Something quiet while I work.",
+        "created_at": "2026-09-07T12:04:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "I have had the same instrumental album on repeat all morning.",
+        "created_at": "2026-09-07T12:08:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "I need something with a bit more energy for the commute.",
+        "created_at": "2026-09-08T12:00:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "We should make a shared list for the next trip.",
+        "created_at": "2026-09-08T12:04:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Good idea. A few picks from each of us.",
+        "created_at": "2026-09-08T12:08:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "I am adding my favourites tonight.",
+        "created_at": "2026-09-09T12:00:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Looking forward to it 🎧",
+        "created_at": "2026-09-09T12:04:00Z"
+      }
+    ]
+  },
+  {
+    "name": "Food",
+    "messages": [
+      {
+        "sender": "Alex",
+        "text": "Any ideas for lunch?",
+        "created_at": "2026-09-07T13:00:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "There is a new place around the corner.",
+        "created_at": "2026-09-07T13:04:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Does it have vegetarian options?",
+        "created_at": "2026-09-07T13:08:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "Yes, I tried the roasted vegetable bowl yesterday.",
+        "created_at": "2026-09-08T13:00:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Sold.",
+        "created_at": "2026-09-08T13:04:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "Meet downstairs in ten?",
+        "created_at": "2026-09-08T13:08:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "On my way.",
+        "created_at": "2026-09-09T13:00:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "I will catch up with you there.",
+        "created_at": "2026-09-09T13:04:00Z"
+      }
+    ]
+  },
+  {
+    "name": "Random",
+    "messages": [
+      {
+        "sender": "Jules",
+        "text": "Tiny win: I finally organised my desk.",
+        "created_at": "2026-09-07T14:00:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "How long do you think it will stay that way?",
+        "created_at": "2026-09-07T14:04:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "At least until tomorrow 😄",
+        "created_at": "2026-09-07T14:08:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "That is still progress.",
+        "created_at": "2026-09-08T14:00:00Z"
+      },
+      {
+        "sender": "Alex",
+        "text": "Mine currently has three notebooks and no working pen.",
+        "created_at": "2026-09-08T14:04:00Z"
+      },
+      {
+        "sender": "Maya",
+        "text": "A very relatable setup.",
+        "created_at": "2026-09-08T14:08:00Z"
+      },
+      {
+        "sender": "Sam",
+        "text": "I found a pen. Now I need to remember what I wanted to write.",
+        "created_at": "2026-09-09T14:00:00Z"
+      },
+      {
+        "sender": "Jules",
+        "text": "Put it in the chat. We will remember together.",
+        "created_at": "2026-09-09T14:04:00Z"
+      }
+    ]
+  }
+]

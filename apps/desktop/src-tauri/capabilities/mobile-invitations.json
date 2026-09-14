@@ -1,0 +1,14 @@
+{
+  "identifier": "mobile-invitations",
+  "description": "User-initiated QR scanning and sharing invitation text only.",
+  "windows": ["main"],
+  "platforms": ["iOS", "android"],
+  "local": true,
+  "permissions": [
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions",
+    "sharekit:allow-share-text"
+  ]
+}

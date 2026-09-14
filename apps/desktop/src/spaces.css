@@ -1,0 +1,186 @@
+.current-space {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: auto;
+  column-gap: 0.25rem;
+  align-items: center;
+}
+.current-space > p {
+  grid-column: 2;
+  margin: 0;
+  text-align: center;
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.current-space > .icon {
+  grid-column: 3;
+  min-width: 44px;
+  min-height: 44px;
+  position: relative;
+  color: var(--elo-muted);
+}
+.space-setup {
+  width: 100%;
+  max-width: 42rem;
+  margin-inline: auto;
+  padding: max(0px, env(safe-area-inset-top)) var(--elo-page-inset)
+    max(12px, var(--app-content-bottom-inset, env(safe-area-inset-bottom)));
+}
+.space-setup-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.space-setup-choices > .quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--elo-muted);
+}
+.spaces-page {
+  min-width: 0;
+}
+.spaces-page .settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.space-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(10px * var(--elo-content-density));
+}
+.space-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: calc(12px * var(--elo-content-density));
+  border: 1px solid var(--elo-line);
+  border-radius: var(--elo-radius-panel);
+  background: var(--elo-surface);
+}
+.space-row-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.space-symbol {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: calc(36px * var(--elo-content-density));
+  height: calc(36px * var(--elo-content-density));
+  border-radius: var(--elo-radius-button);
+  color: var(--elo-muted);
+  background: var(--elo-background);
+}
+.space-symbol .ui-icon {
+  width: calc(20px * var(--elo-content-density));
+  height: calc(20px * var(--elo-content-density));
+}
+.space-row[aria-current="true"] .space-symbol {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+}
+.space-switch {
+  display: grid;
+  grid-template-columns: 1em minmax(0, 1fr) 1em;
+  align-items: center;
+  gap: 0.5em;
+  width: 100%;
+}
+.space-switch-label {
+  grid-column: 2;
+  grid-row: 1;
+}
+.space-switch-loader {
+  grid-column: 1;
+  grid-row: 1;
+  width: 1em;
+  height: 1em;
+  border-top-color: currentColor;
+}
+.space-row-name {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  overflow-wrap: anywhere;
+}
+.space-row-name > span {
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+}
+.space-row .icon {
+  position: relative;
+  flex-shrink: 0;
+}
+.space-row small,
+.space-offer small {
+  font-size: var(--elo-type-caption);
+}
+.space-paste-label {
+  text-align: center;
+}
+.space-scan {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+}
+.space-choice {
+  display: flex;
+  gap: 0.5rem;
+}
+.space-choice button {
+  flex: 1;
+  min-width: 0;
+}
+.space-request,
+.space-offer {
+  padding-block: 0.75rem;
+  border-bottom: 1px solid var(--elo-line);
+}
+.space-requests-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.space-request > p {
+  margin: 0 0 0.5rem;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.space-request[aria-busy="true"] {
+  opacity: 0.6;
+}
+.space-join-requests > button {
+  width: 100%;
+}
+.invitation-scroll.has-join-requests {
+  padding-bottom: 76px;
+}
+.invitation-search-layer {
+  position: absolute;
+  bottom: max(
+    12px,
+    var(--app-content-bottom-inset, env(safe-area-inset-bottom))
+  );
+  inset-inline: var(--elo-page-inset);
+  height: 56px;
+  pointer-events: none;
+  z-index: 5;
+}
+.spaces-page section > h3 {
+  text-align: center;
+}
+.spaces-page section > select,
+.spaces-page section > button {
+  width: 100%;
+}
+.spaces-page .check {
+  margin-block: 1rem;
+}

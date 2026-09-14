@@ -1,0 +1,34 @@
+{
+  "name": "elo-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "test": "vitest run",
+    "format": "prettier --write src package.json tsconfig.json src-tauri/tauri.conf.json src-tauri/capabilities/main.json"
+  },
+  "dependencies": {
+    "@choochmeque/tauri-plugin-biometry-api": "0.3.0-rc.3",
+    "@choochmeque/tauri-plugin-sharekit-api": "0.3.1",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-barcode-scanner": "2.4.6",
+    "@tauri-apps/plugin-deep-link": "2.4.10",
+    "@tauri-apps/plugin-notification": "2.4.0",
+    "lucide-react": "1.44.0",
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "prettier": "3.9.6",
+    "typescript": "^5",
+    "vite": "^7",
+    "vitest": "4.1.11"
+  },
+  "license": "AGPL-3.0-only"
+}

@@ -1,0 +1,58 @@
+.shell[data-contacts="true"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.shell[data-contacts="true"] > aside,
+.shell[data-contacts="true"] > .conversation,
+.shell[data-contacts="true"] > .details {
+  display: none;
+}
+.contacts-page {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 var(--elo-page-inset);
+  overflow: hidden;
+}
+.contacts-viewport {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+}
+.contacts-list {
+  height: 100%;
+  overflow-y: auto;
+  padding-bottom: calc(var(--elo-search-clearance) + 54px);
+}
+.contact-row {
+  width: 100%;
+  border-radius: 0;
+  border-inline: 0;
+  border-top: 0;
+  background: transparent;
+  color: var(--elo-text);
+  text-align: left;
+  cursor: default;
+}
+.contact-row .contact-message {
+  color: var(--elo-muted);
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.contact-row .contact-message .ui-icon {
+  width: calc(var(--elo-type-label) * 1.4);
+  height: calc(var(--elo-type-label) * 1.4);
+}
+.contacts-viewport .contact-add {
+  bottom: calc(var(--elo-search-bottom) + 54px);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .contacts-viewport {
+    animation: page-appear 150ms ease-out;
+  }
+}

@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="288dp"
+    android:height="288dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+    <!-- Star geometry from brandbook/svg/elo-app-icon-light.svg, without its background. -->
+    <path
+        android:pathData="M32,14v36M14,32h36M19,19l26,26M19,45l26,-26"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@color/elo_launch_star"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+</vector>

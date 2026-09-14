@@ -1,0 +1,241 @@
+.message-more,
+.message-reaction-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: calc(32px * var(--elo-content-density));
+  min-height: calc(32px * var(--elo-content-density));
+  padding: 0;
+  margin: -6px 0;
+  background: transparent;
+  color: var(--elo-muted);
+  border: 0;
+}
+.message-more .ui-icon,
+.message-reaction-button .ui-icon {
+  width: var(--elo-type-caption);
+  height: var(--elo-type-caption);
+  stroke-width: 1.5;
+}
+.message-more:only-child {
+  margin-left: auto;
+}
+.message-meta > .message-context + .message-more {
+  margin-left: auto;
+}
+.dialog.anchored-dialog {
+  outline: none;
+  position: fixed;
+  margin: 0;
+  inset: auto;
+  padding: 6px;
+  width: max-content;
+  min-width: 190px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(var(--app-viewport-height, 100dvh) - 16px);
+  border-radius: 14px;
+  box-shadow: 0 8px 30px #0002;
+}
+.dialog.anchored-dialog::backdrop {
+  background: transparent;
+  backdrop-filter: none;
+}
+.dialog.message-action-menu button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  min-height: var(--elo-control-height);
+  background: transparent;
+  color: var(--elo-text);
+  border: 0;
+  font-weight: 400;
+  font-size: var(--elo-type-label);
+}
+.dialog.message-action-menu button:hover:not(:disabled),
+.dialog.message-action-menu button:focus-visible {
+  background: var(--elo-surface);
+}
+.dialog.message-action-dialog {
+  width: min(360px, calc(100vw - 32px));
+}
+.reaction-picker {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 2px;
+  max-height: min(300px, calc(var(--app-viewport-height, 100dvh) - 32px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.dialog.reaction-popover {
+  width: min(300px, calc(100vw - 16px));
+}
+.reaction-picker button {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 6px 0;
+  min-width: 0;
+  font-size: calc(22px * var(--elo-content-density));
+}
+.reaction-picker button[aria-pressed="true"] {
+  border-color: var(--elo-accent);
+}
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.message-reactions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  min-height: calc(28px * var(--elo-content-density));
+  border: 1px solid var(--elo-line);
+  border-radius: 12px;
+  background: var(--elo-surface);
+  color: var(--elo-text);
+  font-size: var(--elo-type-caption);
+}
+.message-reactions button[aria-pressed="true"] {
+  border-color: var(--elo-accent);
+  background: color-mix(in srgb, var(--elo-accent) 12%, var(--elo-surface));
+}
+.message-reactions button:disabled {
+  opacity: 1;
+}
+.reminder-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.reminder-picker label {
+  margin-top: 8px;
+}
+.reminder-picker input[type="datetime-local"] {
+  width: 100%;
+  max-width: 100%;
+}
+.reminder-picker button[aria-pressed="true"] {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+  border-color: var(--elo-accent);
+}
+.dialog.message-collection {
+  position: fixed;
+  margin: auto;
+  inset: 0;
+  width: min(640px, calc(100vw - 32px));
+  height: min(800px, calc(var(--app-viewport-height, 100dvh) - 32px));
+  max-height: none;
+  padding: 0 var(--elo-page-inset);
+  background: var(--elo-background);
+  overflow: hidden;
+}
+.dialog.message-collection[open] {
+  display: flex;
+  flex-direction: column;
+}
+.message-collection-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+.message-collection-list > .stream-card {
+  margin-bottom: calc(8px * var(--elo-content-density));
+}
+.reminder-time {
+  font-size: var(--elo-type-caption);
+  color: var(--elo-muted);
+  margin: 4px 0;
+}
+.reminder-time[data-due="true"] {
+  color: var(--elo-text);
+}
+.reminder-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.reminder-actions button {
+  flex: 1;
+  min-height: var(--elo-control-height);
+}
+@media (max-width: 760px) {
+  .dialog.message-collection {
+    width: 100%;
+    height: var(--app-viewport-height, 100dvh);
+    max-width: none;
+    margin: 0;
+    inset: var(--app-viewport-top, 0px) 0 auto;
+    border: 0;
+    border-radius: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: var(
+      --app-content-bottom-inset,
+      env(safe-area-inset-bottom)
+    );
+  }
+}
+
+.message-controls {
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.message-controls .message-status {
+  width: calc(32px * var(--elo-content-density));
+  min-height: calc(32px * var(--elo-content-density));
+  justify-items: center;
+  padding: 0;
+  margin: -6px 0;
+}
+.message-context {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dialog.message-collection[open] {
+  animation: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .dialog.anchored-dialog[open] {
+    animation: page-appear 120ms ease-out;
+  }
+  .message-collection-list {
+    animation: page-appear 150ms ease-out;
+  }
+}
+.dialog.status-popover {
+  padding: 8px 12px;
+}
+.status-popover .status-legend {
+  margin: 0;
+}
+.status-popover .status-legend li {
+  font-size: var(--elo-type-label);
+  padding: 8px 0;
+}
+.status-popover .status-actions:empty {
+  display: none;
+}
+.reminder-picker .reminder-notification {
+  margin: 0;
+}
+.reminder-overdue {
+  display: inline-block;
+  margin-inline-start: 8px;
+  padding: 2px 6px;
+  border: 1px solid var(--elo-line);
+  border-radius: 6px;
+  font-size: var(--elo-type-caption);
+  color: var(--elo-text);
+}
