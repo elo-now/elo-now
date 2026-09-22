@@ -1,0 +1,50 @@
+.dialog.message-debug {
+  width: min(600px, calc(100vw - 32px));
+  max-height: calc(var(--app-viewport-height, 100dvh) - 32px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  text-align: left;
+}
+.message-debug h3,
+.message-debug-facts dt {
+  font-size: var(--elo-type-label);
+  color: var(--elo-muted);
+  line-height: 1.5;
+  font-weight: 400;
+  text-align: left;
+  margin: calc(18px * var(--elo-content-density)) 0 6px;
+}
+.message-debug p,
+.message-debug-facts dd {
+  font-size: var(--elo-type-label);
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+.message-debug code,
+.message-debug time {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: var(--elo-type-caption);
+  color: var(--elo-muted);
+}
+.message-debug-card {
+  padding: calc(12px * var(--elo-content-density));
+  margin: 8px 0;
+  border: 1px solid var(--elo-line);
+  border-radius: 12px;
+}
+.message-debug-timeline {
+  padding: 0;
+  list-style: none;
+}
+.message-debug-timeline li {
+  border-left: 1px solid var(--elo-line);
+  margin-left: 4px;
+  padding: 4px 0 calc(16px * var(--elo-content-density)) 12px;
+  font-size: var(--elo-type-label);
+}
+.message-debug > div > .secondary {
+  margin-top: 16px;
+  width: 100%;
+}

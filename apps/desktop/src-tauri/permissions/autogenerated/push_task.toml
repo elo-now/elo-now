@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-push-task"
+description = "Enables the push_task command without any pre-configured scope."
+commands.allow = ["push_task"]
+
+[[permission]]
+identifier = "deny-push-task"
+description = "Denies the push_task command without any pre-configured scope."
+commands.deny = ["push_task"]

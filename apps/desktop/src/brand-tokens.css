@@ -1,0 +1,59 @@
+:root {
+  --elo-cloud: #f7f9f6;
+  --elo-mint: #c3e3cf;
+  --elo-ink: #2f493d;
+  --elo-green: #6f8f7b;
+  --elo-muted: #617468;
+  --elo-line: #dce5dc;
+  --elo-white: #ffffff;
+  --elo-night: #15231d;
+  --elo-forest: #1e3027;
+  --elo-sage: #9ab5a1;
+  --elo-mist: #a9bab0;
+  --elo-darkLine: #344b3e;
+  --elo-font: Manrope, system-ui, sans-serif;
+  --elo-ui-scale: 1;
+  --elo-control-height: 44px;
+  --elo-control-density: 1;
+  --elo-content-density: 1;
+  --elo-chat-row-height: 60px;
+  --elo-input-inset: 18px;
+  --elo-type-caption: calc(12px * var(--elo-ui-scale));
+  --elo-type-label: calc(14px * var(--elo-ui-scale));
+  --elo-type-body: calc(16px * var(--elo-ui-scale));
+  --elo-type-message: var(--elo-type-body);
+  --elo-type-input: var(--elo-type-body);
+  --elo-type-title: calc(20px * var(--elo-ui-scale));
+  --elo-type-display: calc(24px * var(--elo-ui-scale));
+  --elo-radius-button: 6px;
+  --elo-radius-panel: 16px;
+  --elo-space-unit: 8px;
+}
+:root[data-ui-scale="compact"] {
+  --elo-type-message: var(--elo-type-label);
+  --elo-type-input: var(--elo-type-label);
+  --elo-control-height: 40px;
+  --elo-control-density: 0.8;
+  --elo-content-density: 0.875;
+  --elo-chat-row-height: 54px;
+}
+[data-theme="light"] {
+  --elo-background: #f7f9f6;
+  --elo-surface: #ffffff;
+  --elo-text: #2f493d;
+  --elo-muted: #617468;
+  --elo-accent: #6f8f7b;
+  --elo-button: #c3e3cf;
+  --elo-onButton: #2f493d;
+  --elo-line: #dce5dc;
+}
+[data-theme="dark"] {
+  --elo-background: #15231d;
+  --elo-surface: #1e3027;
+  --elo-text: #f7f9f6;
+  --elo-muted: #a9bab0;
+  --elo-accent: #9ab5a1;
+  --elo-button: #c3e3cf;
+  --elo-onButton: #2f493d;
+  --elo-line: #344b3e;
+}

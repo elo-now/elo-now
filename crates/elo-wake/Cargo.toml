@@ -1,0 +1,31 @@
+[package]
+name = "elo-wake"
+description = "Private, request-driven FCM wake relay for elo.now"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+elo-core = { path = "../elo-core" }
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+reqwest = { workspace = true, features = ["form", "http2"] }
+ring = "=0.17.14"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

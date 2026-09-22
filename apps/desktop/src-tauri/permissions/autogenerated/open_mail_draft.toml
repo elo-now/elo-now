@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-mail-draft"
+description = "Enables the open_mail_draft command without any pre-configured scope."
+commands.allow = ["open_mail_draft"]
+
+[[permission]]
+identifier = "deny-open-mail-draft"
+description = "Denies the open_mail_draft command without any pre-configured scope."
+commands.deny = ["open_mail_draft"]

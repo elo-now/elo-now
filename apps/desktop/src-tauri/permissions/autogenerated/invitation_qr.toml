@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-invitation-qr"
+description = "Enables the invitation_qr command without any pre-configured scope."
+commands.allow = ["invitation_qr"]
+
+[[permission]]
+identifier = "deny-invitation-qr"
+description = "Denies the invitation_qr command without any pre-configured scope."
+commands.deny = ["invitation_qr"]

@@ -1,0 +1,514 @@
+.current-space {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: auto;
+  column-gap: 0.25rem;
+  align-items: center;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--elo-muted);
+}
+.current-space-label {
+  grid-column: 2;
+  margin: 0;
+  text-align: center;
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.current-space > .icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  grid-column: 3;
+  min-width: 44px;
+  min-height: 44px;
+  position: relative;
+  color: var(--elo-muted);
+}
+.space-setup {
+  display: flex;
+  flex-direction: column;
+  height: var(--app-viewport-height, 100dvh);
+  overflow: hidden;
+  width: 100%;
+  max-width: 42rem;
+  margin-inline: auto;
+  padding: max(0px, env(safe-area-inset-top)) var(--elo-page-inset)
+    max(12px, var(--app-content-bottom-inset, env(safe-area-inset-bottom)));
+}
+.space-setup > .settings-page,
+.space-setup > .spaces-page {
+  flex: 1;
+  min-height: 0;
+}
+.space-setup > .spaces-page {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.space-setup > .spaces-page > .settings-page {
+  flex: 1;
+}
+.space-setup-legal-link {
+  min-width: 44px;
+  padding-inline: 0;
+}
+.space-setup-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.space-setup-choices > .quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--elo-muted);
+}
+.spaces-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.spaces-page > .settings-page {
+  flex: 1;
+}
+.spaces-page .settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.space-join-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding-block: 1.5rem;
+  text-align: center;
+}
+.space-join-preview > h2 {
+  margin: 0;
+  font: 600 var(--elo-type-title)/1.25 var(--elo-font);
+  letter-spacing: -0.025em;
+}
+.space-join-preview > p {
+  margin: 0;
+  line-height: 1.5;
+}
+.space-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(10px * var(--elo-content-density));
+}
+.space-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: calc(12px * var(--elo-content-density));
+  border: 1px solid var(--elo-line);
+  border-radius: var(--elo-radius-panel);
+  background: var(--elo-surface);
+}
+.space-row-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.space-symbol {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: calc(36px * var(--elo-content-density));
+  height: calc(36px * var(--elo-content-density));
+  border-radius: var(--elo-radius-button);
+  color: var(--elo-muted);
+  background: var(--elo-background);
+}
+.space-symbol .ui-icon {
+  width: calc(20px * var(--elo-content-density));
+  height: calc(20px * var(--elo-content-density));
+}
+.space-row[aria-current="true"] .space-symbol {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+}
+.space-switch {
+  display: grid;
+  grid-template-columns: 1em minmax(0, 1fr) 1em;
+  align-items: center;
+  gap: 0.5em;
+  width: 100%;
+}
+.space-switch-label {
+  grid-column: 2;
+  grid-row: 1;
+}
+.space-switch-loader {
+  grid-column: 1;
+  grid-row: 1;
+  width: 1em;
+  height: 1em;
+  border-top-color: currentColor;
+}
+.space-row-name {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  overflow-wrap: anywhere;
+}
+.space-row-name > span {
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+}
+.space-row .icon {
+  position: relative;
+  flex-shrink: 0;
+}
+.space-row small,
+.space-offer small {
+  font-size: var(--elo-type-caption);
+}
+.space-paste-label {
+  text-align: center;
+}
+.space-scan {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+}
+.space-choice {
+  display: flex;
+  gap: 0.5rem;
+}
+.space-choice button {
+  flex: 1;
+  min-width: 0;
+}
+.space-request,
+.space-offer {
+  padding-block: 0.75rem;
+  border-bottom: 1px solid var(--elo-line);
+}
+.space-requests-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.space-request > p {
+  margin: 0 0 0.5rem;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.invitation-scroll .space-role-requests > h3 {
+  color: var(--elo-text);
+  font-size: var(--elo-type-body);
+  font-weight: 600;
+}
+.space-role-requests .space-request {
+  border-bottom: 0;
+}
+.space-role-requests .space-request > p {
+  margin-bottom: 1rem;
+  font-weight: 400;
+}
+.space-role-dialog .space-choice {
+  margin-top: 1rem;
+}
+.space-request[aria-busy="true"] {
+  opacity: 0.6;
+}
+.space-join-requests > button {
+  width: 100%;
+}
+.space-join-requests > h3 {
+  text-align: center;
+}
+.invitation-scroll.has-join-requests {
+  padding-bottom: 76px;
+}
+.invitation-search-layer {
+  position: absolute;
+  bottom: max(
+    12px,
+    var(--app-content-bottom-inset, env(safe-area-inset-bottom))
+  );
+  inset-inline: var(--elo-page-inset);
+  height: 56px;
+  pointer-events: none;
+  z-index: 5;
+}
+.spaces-page section > h3 {
+  text-align: center;
+}
+.spaces-page section > select,
+.spaces-page section > button {
+  width: 100%;
+}
+.spaces-page .check {
+  margin-block: 1rem;
+}
+
+.space-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.space-create-form .space-hosting-limits {
+  margin: 0;
+  font-size: var(--elo-type-caption);
+  line-height: 1.5;
+}
+.space-request p small {
+  display: block;
+  margin-top: 0.25rem;
+}
+.space-setup-choices .space-paste-label {
+  margin: 0;
+}
+
+.spaces-page .settings-page h3 {
+  text-align: left;
+}
+.space-delete-dialog input {
+  width: 100%;
+  min-width: 0;
+  margin: 8px 0 16px;
+}
+
+.space-maintenance form,
+.space-storage-usage,
+.space-storage-preview {
+  display: grid;
+  gap: 0.75rem;
+}
+.space-maintenance form {
+  gap: 16px;
+}
+.space-maintenance input,
+.space-storage progress {
+  width: 100%;
+}
+.space-storage progress {
+  appearance: none;
+  accent-color: var(--elo-accent);
+  background: var(--elo-line);
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  height: 0.5rem;
+}
+.space-storage-usage p {
+  margin: 0;
+}
+.space-storage-preview {
+  margin-top: 1rem;
+}
+
+.space-storage progress::-webkit-progress-bar {
+  background: var(--elo-line);
+}
+.space-storage progress::-webkit-progress-value {
+  background: var(--elo-accent);
+}
+.space-storage progress::-moz-progress-bar {
+  background: var(--elo-accent);
+}
+.space-maintenance form label {
+  margin: 0;
+}
+
+.space-form-field,
+.space-join-note,
+.space-contact-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: left;
+  min-width: 0;
+}
+:is(.space-form-field, .space-join-note, .space-contact-field) > label,
+.dialog :is(.space-form-field, .space-join-note, .space-contact-field) > label,
+:is(.space-form-field, .space-join-note, .space-contact-field) > p {
+  margin: 0;
+}
+.space-contact-form {
+  margin: 0;
+}
+.space-contact-form > button {
+  width: 100%;
+  margin-top: 16px;
+}
+.spaces-page .space-management-page {
+  overflow: hidden;
+  padding-bottom: 0;
+}
+.space-management-tabs {
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+.space-management-tabs button {
+  min-width: 0;
+  padding-inline: 6px;
+}
+.space-management-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.space-management-content {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: none;
+  padding-bottom: 20px;
+}
+.space-management-list {
+  padding-bottom: var(--elo-search-clearance);
+}
+.space-details-section {
+  padding: 20px 0;
+}
+.space-details-section:first-child {
+  padding-top: 4px;
+}
+.space-details-section + .space-details-section {
+  border-top: 1px solid var(--elo-line);
+}
+.spaces-page .space-details h3 {
+  margin: 0 0 12px;
+  text-align: center;
+}
+.space-details-section > p {
+  font-size: var(--elo-type-label);
+  overflow-wrap: anywhere;
+}
+.space-details-section > .space-primary-owner {
+  margin: 0 0 16px;
+  text-align: center;
+}
+.space-storage > p {
+  margin: 12px 0 0;
+}
+.space-attachment-controls {
+  display: grid;
+  gap: calc(24px * var(--elo-content-density, 1));
+  margin-top: calc(24px * var(--elo-content-density, 1));
+}
+.space-attachment-cleanup {
+  display: grid;
+  gap: 12px;
+}
+.space-attachment-cleanup > p {
+  margin: 0;
+  font-size: var(--elo-type-label);
+  color: var(--status-error-text);
+}
+.space-attachment-cleanup > button {
+  width: 100%;
+}
+.space-storage-usage {
+  text-align: center;
+}
+.space-offers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.space-offer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.space-offer-copy {
+  min-width: 0;
+  flex: 1;
+  font-size: var(--elo-type-label);
+  overflow-wrap: anywhere;
+}
+.space-offer-copy small {
+  display: block;
+  margin-top: 4px;
+}
+.space-offer-validity {
+  white-space: pre-line;
+}
+.space-square-action {
+  display: grid;
+  place-items: center;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+}
+.space-square-action .ui-icon {
+  width: 20px;
+  height: 20px;
+}
+.space-members .dm-person-name {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.space-members > button {
+  margin-top: 16px;
+}
+.space-invitation-dialog .space-form-field select {
+  width: 100%;
+}
+.space-invitation-dialog .check {
+  margin-block: 16px 0;
+  font-weight: 400;
+}
+.dialog:is(
+  .space-invitation-dialog,
+  .space-revoke-dialog,
+  .space-delete-dialog,
+  .space-member-dialog
+) {
+  max-height: calc(
+    var(--app-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top)) -
+      max(12px, env(safe-area-inset-bottom)) - 24px
+  );
+  top: var(--app-viewport-top, 0px);
+}
+.space-member-dialog .space-choice,
+.space-revoke-dialog .space-choice {
+  margin-top: 16px;
+}
+.space-applicant-note {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.blocked-user-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.blocked-user-list li {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding-block: 12px;
+  border-bottom: 1px solid var(--elo-line);
+}
+.blocked-user-list li > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.blocked-user-list li > button {
+  flex-shrink: 0;
+}
+.blocking-dialog h2 {
+  overflow-wrap: anywhere;
+}

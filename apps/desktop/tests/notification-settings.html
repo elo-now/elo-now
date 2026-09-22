@@ -1,0 +1,33 @@
+<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Notification settings fixture</title></head><body><div id="root"></div><script type="module">
+import React from 'react';
+import {createRoot} from 'react-dom/client';
+import {usePushNotifications} from '/src/usePushNotifications.tsx';
+import '/src/style.css';
+import '/src/mobile.css';
+let status = {available:true, enabled:false, pending:false, callsEnabled:false, callsPending:false};
+const qa=window.notificationSettingsQA={operations:[], hold:false, release:null, ready:()=>{status={...status,pending:false};}};
+window.__TAURI_INTERNALS__={invoke:async(command,{op})=>{
+  if(command!=='push_task')throw Error('Unexpected command');
+  qa.operations.push(op);
+  if(op==='hint')return {};
+  if(op==='status'&&qa.hold){
+    qa.hold=false;
+    const before={...status};
+    return new Promise(resolve=>{qa.release=()=>{qa.release=null;resolve(before);};});
+  }
+  if(op==='enable')status={...status,enabled:true,pending:true};
+  if(op==='disable')status={...status,enabled:false,pending:false,callsEnabled:false};
+  if(op==='calls_enable'||op==='calls_disable'){
+    if(!status.enabled||status.pending)throw Error('Notification registration is not ready');
+    status={...status,callsEnabled:op==='calls_enable'};
+  }
+  return {...status};
+}};
+const view={identity:'synthetic',streams:[]};
+const noop=()=>{};
+function App(){
+  const push=usePushNotifications(view,false,noop,noop,()=>true,error=>{throw error;});
+  return React.createElement('main',{className:'shell','data-mode':'default'},push.settings);
+}
+createRoot(document.getElementById('root')).render(React.createElement(App));
+</script></body></html>

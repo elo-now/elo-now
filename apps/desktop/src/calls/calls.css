@@ -1,0 +1,415 @@
+.call-choice {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+}
+.call-choice button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+}
+.call-dock {
+  position: fixed;
+  z-index: 35;
+  left: 12px;
+  right: 12px;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 82px);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--elo-line);
+  border-radius: 18px;
+  background: var(--elo-surface);
+  box-shadow: 0 4px 20px #0002;
+}
+.call-dock-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  font-size: var(--elo-type-label);
+  padding: 4px;
+  border: 0;
+}
+.call-dock-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.call-dock-title small {
+  display: block;
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+}
+.call-leave {
+  color: #b33333 !important;
+}
+.call-controls {
+  display: flex;
+  justify-content: center;
+  gap: clamp(8px, 2vw, 14px);
+  flex-shrink: 0;
+  padding: 12px 72px max(12px, env(safe-area-inset-bottom)) 12px;
+  background: #101412;
+}
+.call-controls .icon,
+.call-featured-actions .icon {
+  color: white;
+  background: #ffffff1a;
+  border-color: #ffffff40;
+}
+.call-controls .call-leave {
+  color: white !important;
+  background: #b33333;
+  border-color: #b33333;
+}
+.call-controls .call-media-control:active {
+  color: white;
+  background: #ffffff30;
+}
+.dialog.message-action-dialog.call-dialog {
+  position: fixed;
+  inset: var(--app-viewport-top, 0px) 0 auto;
+  width: 100vw;
+  max-width: none;
+  height: var(--app-viewport-height, 100dvh);
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  color: white;
+  background: #101412;
+  border: 0;
+  border-radius: 0;
+}
+.dialog.message-action-dialog.call-dialog > h2 {
+  display: none;
+}
+.dialog.message-action-dialog.call-dialog > div {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+.dialog.message-action-dialog.call-dialog .close {
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  padding: 10px;
+  line-height: 1;
+  top: auto;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: calc(max(12px, env(safe-area-inset-bottom)) + 2px);
+  color: white;
+  background: #0008;
+  border-color: #ffffff40;
+  border-radius: 50%;
+}
+.dialog.message-action-dialog.call-dialog .close .ui-icon {
+  width: 24px;
+  height: 24px;
+}
+.dialog.message-action-dialog.call-dialog::backdrop {
+  background: #101412;
+  backdrop-filter: none;
+}
+.call-stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  gap: 8px;
+  padding: max(8px, env(safe-area-inset-top)) 8px 0;
+  overflow: hidden;
+}
+.call-participant {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: white;
+  background: #1c2420;
+  border: 2px solid transparent;
+  border-radius: 14px;
+}
+.call-participant[data-main] {
+  flex: 1;
+}
+.call-participant[data-selected],
+.call-participant[data-speaking] {
+  border-color: var(--elo-accent);
+}
+.call-participant .call-tile,
+.call-participant .call-tile video {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  border-radius: 0;
+}
+.call-participant .call-tile video {
+  object-fit: cover;
+}
+.call-participant .call-tile[data-source="screen"] video {
+  object-fit: contain;
+}
+.call-participant .call-tile span,
+.call-initials span {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 1;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  color: white;
+  background: #0009;
+  padding: 3px 8px;
+  border-radius: 7px;
+  font-size: var(--elo-type-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.call-initials {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-height: 100px;
+  place-items: center;
+  background: linear-gradient(145deg, #26352e, #141a17);
+}
+.call-initials strong {
+  font: 600 clamp(2rem, 12vw, 7rem) / 1 var(--elo-font);
+  letter-spacing: 0.04em;
+}
+.call-participant-muted {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  left: 8px;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  color: white;
+  background: #0009;
+  border-radius: 50%;
+}
+.call-self-preview {
+  position: absolute;
+  z-index: 3;
+  top: max(8px, env(safe-area-inset-top));
+  right: max(8px, env(safe-area-inset-right));
+  width: 25vw;
+  aspect-ratio: 3 / 4;
+  max-height: 34vh;
+  filter: drop-shadow(0 5px 16px #0008);
+}
+.call-self-preview .call-participant {
+  width: 100%;
+  height: 100%;
+}
+.call-self-preview .call-initials strong {
+  font-size: clamp(1.2rem, 7vw, 3rem);
+}
+.call-participant-strip {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  width: 100%;
+  padding-right: max(8px, env(safe-area-inset-right));
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+}
+.call-participant-strip::-webkit-scrollbar {
+  display: none;
+}
+.call-participant-strip > button {
+  flex: 0 0 25vw;
+  width: 25vw;
+  max-width: none;
+  min-width: 0;
+  aspect-ratio: 4 / 3;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+  border: 0;
+  border-radius: 14px;
+  scroll-snap-align: start;
+}
+.call-participant-strip .call-participant,
+.call-participant-strip .call-initials {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+.call-participant-strip .call-initials strong {
+  font-size: clamp(1rem, 6vw, 2.6rem);
+}
+.call-featured-actions {
+  position: absolute;
+  z-index: 4;
+  right: 20px;
+  bottom: 52px;
+  display: flex;
+  gap: 8px;
+}
+.call-connection-status {
+  position: absolute;
+  z-index: 4;
+  right: 8px;
+  bottom: 8px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  padding: 3px 8px;
+  color: var(--elo-onButton);
+  background: var(--elo-accent);
+  border-radius: 7px;
+  font-size: var(--elo-type-caption);
+  line-height: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.call-tile {
+  position: relative;
+  overflow: hidden;
+  border-radius: 12px;
+  background: #151a18;
+  min-height: 100px;
+}
+.call-tile video {
+  display: block;
+  width: 100%;
+  max-height: 30vh;
+  object-fit: contain;
+}
+.call-audio video {
+  display: none;
+}
+.call-media {
+  position: fixed;
+  z-index: 1001;
+  right: 16px;
+  top: calc(env(safe-area-inset-top, 0px) + 70px);
+  width: min(200px, 40vw);
+  display: grid;
+  gap: 6px;
+  max-height: 45vh;
+  overflow: auto;
+}
+.call-media-collapsed {
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+.call-indicator {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ce3636;
+  position: absolute;
+  top: 4px;
+  right: 4px;
+}
+@media (min-width: 800px) {
+  .call-dock {
+    left: auto;
+    width: 400px;
+    bottom: 20px;
+  }
+  .call-participant-strip > button {
+    flex-basis: 25vw;
+    width: 25vw;
+  }
+  .call-self-preview {
+    width: min(25vw, 320px);
+  }
+}
+
+.call-trigger {
+  position: relative;
+  flex-shrink: 0;
+}
+.floating-call {
+  position: absolute;
+  z-index: 5;
+  inset-inline-end: var(--elo-page-inset);
+  bottom: calc(var(--elo-search-bottom) + 54px);
+}
+.floating-call .call-trigger {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  place-items: center;
+  color: var(--elo-accent);
+  background: color-mix(in srgb, var(--elo-surface) 78%, transparent);
+  border: 0;
+  border-radius: 50%;
+  box-shadow:
+    inset 0 0 0 1px var(--elo-line),
+    0 3px 12px color-mix(in srgb, var(--elo-text) 9%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+  backdrop-filter: blur(16px) saturate(1.15);
+}
+
+.call-share[aria-pressed="true"] {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+}
+
+.call-controls > .icon,
+.call-dock > .icon {
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 10px;
+}
+
+/* Native iOS media renders beneath WebView. Only the call's HTML overlay is
+   visible while its video rectangles are attached; no pixel buffers cross IPC. */
+html.native-call-video,
+html.native-call-video body,
+html.native-call-video #root {
+  background: transparent !important;
+}
+html.native-call-video #root {
+  visibility: hidden;
+}
+html.native-call-video dialog[open] {
+  visibility: visible;
+}
+html.native-call-video .call-dialog,
+html.native-call-video .call-dialog::backdrop,
+html.native-call-video .call-participant:has(.call-native-video),
+html.native-call-video .call-native-video {
+  background: transparent !important;
+}
+.call-native-video,
+.native-video-frame {
+  width: 100%;
+  height: 100%;
+}

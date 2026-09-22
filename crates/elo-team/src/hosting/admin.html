@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>elo.now · Hosting</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        background: #f6f8f5;
+        color: #2e473c;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: auto;
+        max-width: 1180px;
+        padding: 32px 24px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+      h1 {
+        font-size: 28px;
+        letter-spacing: -1px;
+      }
+      h2 {
+        font-size: 20px;
+        margin-top: 36px;
+      }
+      p,
+      small {
+        color: #65756c;
+        line-height: 1.5;
+      }
+      button {
+        font: inherit;
+        border: 1px solid #ccd8ce;
+        background: #fff;
+        border-radius: 12px;
+        padding: 10px 16px;
+        color: inherit;
+        cursor: pointer;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 14px;
+        margin: 28px 0;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid #dfe5df;
+        padding: 20px;
+        border-radius: 18px;
+      }
+      .card strong {
+        font-size: 30px;
+        display: block;
+        margin-top: 8px;
+      }
+      .table {
+        overflow: auto;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        text-align: left;
+      }
+      td,
+      th {
+        padding: 14px 10px;
+        border-bottom: 1px solid #dfe5df;
+        white-space: nowrap;
+      }
+      th {
+        font-size: 13px;
+        font-weight: 600;
+        color: #65756c;
+      }
+      .status {
+        min-height: 24px;
+      }
+      pre {
+        white-space: pre-wrap;
+        font: inherit;
+      }
+      a {
+        color: inherit;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          background: #16251d;
+          color: #deebe2;
+        }
+        button,
+        .card {
+          background: #203328;
+          border-color: #354d3e;
+        }
+        p,
+        small,
+        th {
+          color: #abc0b1;
+        }
+        td,
+        th {
+          border-color: #354d3e;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>elo.now <span aria-hidden="true">✳</span> <small>Hosting</small></h1>
+      <button id="refresh">Refresh</button>
+    </header>
+    <p>
+      Operational metadata only. Encrypted objects include messages, attachments
+      and configuration; their count is not a message count.
+    </p>
+    <p class="status" role="status" id="status">Loading statistics…</p>
+    <div class="cards" id="cards"></div>
+    <h2>Spaces</h2>
+    <div class="table">
+      <table>
+        <thead>
+          <tr>
+            <th>Space</th>
+            <th>Members</th>
+            <th>Pending joins</th>
+            <th>Encrypted objects</th>
+            <th>Stored data</th>
+            <th>Mailbox capacity</th>
+          </tr>
+        </thead>
+        <tbody id="spaces"></tbody>
+      </table>
+    </div>
+    <h2>Server</h2>
+    <pre id="system"></pre>
+    <p id="capacity"></p>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const number = (v) =>
+        typeof v === "number" ? v.toLocaleString() : "Unavailable";
+      const bytes = (v) =>
+        typeof v === "number"
+          ? (v / 1048576).toLocaleString(undefined, {
+              maximumFractionDigits: 1,
+            }) + " MiB"
+          : "Unavailable";
+      function cell(row, value) {
+        const td = document.createElement("td");
+        td.textContent = value;
+        row.append(td);
+      }
+      function card(label, value) {
+        const node = document.createElement("div");
+        node.className = "card";
+        const small = document.createElement("small");
+        small.textContent = label;
+        const strong = document.createElement("strong");
+        strong.textContent = value;
+        node.append(small, strong);
+        $("cards").append(node);
+      }
+      async function refresh() {
+        $("refresh").disabled = true;
+        try {
+          const response = await fetch("stats", {
+            cache: "no-store",
+            redirect: "error",
+          });
+          if (!response.ok) throw Error();
+          const data = await response.json();
+          const snapshot = data.operator_snapshot;
+          const legacy = snapshot?.legacy_spaces ?? [];
+          const spaces = [
+            ...data.spaces.map((s) => ({
+              ...s,
+              storage: data.storage?.mailboxes.find((m) => m.id === s.mailbox),
+            })),
+            ...legacy,
+          ];
+          $("cards").replaceChildren();
+          card("Spaces", number(spaces.length));
+          card(
+            "Memberships",
+            spaces.every((s) => s.membership)
+              ? number(spaces.reduce((n, s) => n + s.membership.members, 0))
+              : "Updating",
+          );
+          card(
+            "Encrypted objects",
+            spaces.every((s) => s.storage)
+              ? number(spaces.reduce((n, s) => n + s.storage.objects, 0))
+              : "Updating",
+          );
+          card(
+            "Stored ciphertext",
+            spaces.every((s) => s.storage)
+              ? bytes(spaces.reduce((n, s) => n + s.storage.bytes, 0))
+              : "Updating",
+          );
+          $("spaces").replaceChildren();
+          for (const space of spaces) {
+            const row = document.createElement("tr");
+            cell(row, space.name);
+            cell(
+              row,
+              space.membership ? number(space.membership.members) : "Updating",
+            );
+            cell(
+              row,
+              space.membership ? number(space.membership.pending) : "Updating",
+            );
+            cell(row, number(space.storage?.objects));
+            cell(row, bytes(space.storage?.bytes));
+            cell(row, bytes(space.storage?.quota_bytes));
+            $("spaces").append(row);
+          }
+          $("system").textContent =
+            "Service uptime: " +
+            Math.floor(data.uptime_seconds / 60) +
+            " minutes\nLoad average (1 / 5 / 15 minutes): " +
+            (data.system.load_average?.join(" / ") ?? "Unavailable") +
+            "\n" +
+            (data.system.memory?.join("\n") ?? "Memory unavailable") +
+            "\nAvailable disk: " +
+            bytes(snapshot?.disk?.available_bytes);
+          const requests = snapshot?.requests;
+          if (requests)
+            $("system").textContent +=
+              "\nRecent HTTP sample (last 5 minutes, up to 1,000 requests per service log): " +
+              number(requests.requests) +
+              " requests; " +
+              number(requests.server_errors) +
+              " server errors\nMean / p95 response time: " +
+              number(requests.mean_ms) +
+              " / " +
+              number(requests.p95_ms) +
+              " ms\nResponse transfer in sample: " +
+              bytes(requests.response_bytes);
+          $("capacity").textContent =
+            "Self-service hosting capacity: " +
+            data.capacity.per_identity +
+            " Spaces per creator, " +
+            bytes(data.capacity.bytes_per_space) +
+            " per Space. Memberships count a person once in each Space.";
+          $("status").textContent =
+            "Updated " +
+            new Date().toLocaleTimeString() +
+            (snapshot
+              ? " · Legacy/HTTP sample: " +
+                new Date(snapshot.collected_at).toLocaleTimeString()
+              : " · Legacy/HTTP statistics unavailable");
+        } catch {
+          $("status").textContent = "Could not refresh statistics. Try again.";
+        } finally {
+          $("refresh").disabled = false;
+        }
+      }
+      $("refresh").addEventListener("click", refresh);
+      refresh();
+      setInterval(() => {
+        if (!document.hidden) refresh();
+      }, 30000);
+    </script>
+  </body>
+</html>

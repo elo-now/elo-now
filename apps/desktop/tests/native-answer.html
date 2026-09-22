@@ -1,0 +1,35 @@
+<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Native Answer handoff fixture</title></head><body><div id="root"></div><script type="module">
+import React, { useLayoutEffect } from 'react';
+import { createRoot } from 'react-dom/client';
+import { CallSurface, useCalls } from '/src/calls/CallUI.tsx';
+import { ToastProvider } from '/src/Toast.tsx';
+import '/src/style.css';
+import '/src/mobile.css';
+const reads = [];
+window.__TAURI_INTERNALS__ = { invoke: async (command, args = {}) => {
+  if (command === 'push_task' && args.op === 'calls_status') return new Promise(resolve => reads.push(resolve));
+  return {};
+} };
+const view = { identity: 'me', credential: 'my-device', name: 'Synthetic user', streams: [], contacts: [], spaces: [] };
+const chat = { space: 'space', stream: 'chat', name: 'Synthetic call' };
+const call = { call_id: 'call', kind: 'direct', ringing: true, participants: {} };
+const native = { id: 'call', action: 'answer', expires: Date.now() / 1000 + 60, target: { identity: 'me', space: 'space', stream: 'chat' } };
+function App() {
+  const calls = useCalls(view, 'silent');
+  useLayoutEffect(() => {
+    calls.start = async () => calls.change({ phase: 'connecting', nativeAnswer: undefined, incoming: undefined });
+    window.nativeAnswerQA = {
+      reads,
+      ring: () => calls.change({ incoming: { chat, call }, phase: 'idle' }),
+      resolve: answer => reads.shift()?.({ incoming: answer ? native : null }),
+      visibility: visible => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: visible ? 'visible' : 'hidden' });
+        Object.defineProperty(document, 'hidden', { configurable: true, value: !visible });
+        document.dispatchEvent(new Event('visibilitychange'));
+      },
+    };
+  }, [calls]);
+  return React.createElement(ToastProvider, null, React.createElement(CallSurface, { calls, view }));
+}
+createRoot(document.getElementById('root')).render(React.createElement(App));
+</script></body></html>

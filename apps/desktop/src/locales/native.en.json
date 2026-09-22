@@ -1,0 +1,9 @@
+{
+  "calls.background": "Incoming calls in the background",
+  "calls.backgroundHelp": "Ring when elo is closed. Unlock your profile to answer. Muted chats and blocked users stay silent.",
+  "calls.unlockToAnswer": "Unlock your profile to answer.",
+  "calls.nativeIncoming": "Incoming call",
+  "calls.nativeAnswer": "Answer",
+  "calls.nativeDecline": "Decline",
+  "calls.nativeConnected": "Connected"
+}

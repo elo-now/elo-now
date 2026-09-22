@@ -1,0 +1,13 @@
+{
+  "identifier": "desktop-window",
+  "description": "Move and control the local desktop app window through its integrated header.",
+  "windows": ["main"],
+  "local": true,
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-minimize",
+    "core:window:allow-close"
+  ]
+}

@@ -1,0 +1,71 @@
+name: Desktop release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - name: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      # Public service endpoints only. Provider credentials never belong in a client.
+      TAURI_ELO_SPACE_HOST_URL: ${{ vars.ELO_RELEASE_SPACE_HOST_URL }}
+      TAURI_ELO_WAKE_URL: ${{ vars.ELO_RELEASE_WAKE_URL }}
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Require publisher endpoint configuration
+        shell: bash
+        run: test -n "$TAURI_ELO_SPACE_HOST_URL" && test -n "$TAURI_ELO_WAKE_URL"
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+          targets: ${{ matrix.target }}
+      - name: Install frontend dependencies
+        run: npm --prefix apps/desktop ci
+      - name: Check frontend
+        run: npm --prefix apps/desktop test
+      - name: Build desktop installer
+        run: npm --prefix apps/desktop run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elo-now-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/**/*.dmg
+            target/${{ matrix.target }}/release/bundle/**/*.exe
+            target/${{ matrix.target }}/release/bundle/**/*.deb
+            target/${{ matrix.target }}/release/bundle/**/*.AppImage
+          if-no-files-found: error

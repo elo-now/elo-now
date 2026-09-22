@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Call controls fixture</title></head>
+<body><div id="root"></div><script type="module">
+import React, { useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { CallSurface, useCalls } from '/src/calls/CallUI.tsx';
+import { RingtonePicker } from '/src/calls/RingtonePicker.tsx';
+import { ToastProvider } from '/src/Toast.tsx';
+import { defaultPreferences, applyVisualPreferences, savePreferences, readPreferences } from '/src/preferences.ts';
+import '/src/style.css';
+import '/src/mobile.css';
+import '/src/desktop.css';
+const h = React.createElement;
+const view = { identity: 'local', credential: 'local-device', name: 'Local participant', contacts: [] };
+const chat = { name: 'Call test', member_names: { remote: 'Remote participant' } };
+const participant = (identity) => ({ identity_id: identity, credential_id: identity + '-device', media: { audio_muted: false, video_published: false, screen_published: false } });
+const active = { call_id: 'test-call', participants: { local: participant('local'), remote: participant('remote') } };
+function App() {
+  const [preferences, setPreferences] = useState(readPreferences);
+  const [showPicker, setShowPicker] = useState(true);
+  const calls = useCalls(null, preferences.callRingtone);
+  useEffect(() => { applyVisualPreferences(preferences, 'light'); }, [preferences]);
+  useEffect(() => {
+    let toggles = 0;
+    calls.toggle = async (kind) => {
+      toggles++;
+      if (kind === 'audio') calls.change({ media: { ...calls.snapshot.media, audio_muted: !calls.snapshot.media.audio_muted } });
+    };
+    window.callQA = {
+      calls,
+      toggleCount: () => toggles,
+      picker: (visible) => setShowPicker(visible),
+      start: (id = 'test-call') => calls.change({
+        incoming: undefined, phase: 'connected', active: { ...active, call_id: id }, chat,
+        media: { audio_muted: false, video_published: true, screen_published: false },
+        tiles: ['remote', 'third'].map((credential) => ({ id: credential + '-audio', credential: credential + '-device', source: 'audio', local: false, stream: new MediaStream() })),
+      }),
+      reconnect: () => calls.change({ phase: 'reconnecting', tiles: [{ id: 'reconnected-audio', credential: 'remote-device', source: 'audio', local: false, stream: new MediaStream() }] }),
+      ring: () => calls.change({ incoming: { call: { ...active, call_id: 'incoming-test' }, chat }, active: undefined, phase: 'idle' }),
+      clear: () => calls.change({ incoming: undefined, active: undefined, phase: 'idle', tiles: [] }),
+      compact: () => setPreferences((p) => ({ ...p, uiScale: 'compact' })),
+    };
+    return () => { delete window.callQA; };
+  }, [calls]);
+  return h(ToastProvider, null, h('main', { className: 'shell', 'data-mobile': String(innerWidth < 768) },
+    showPicker && h('div', { className: 'settings-page appearance-page', style: { padding: '16px' } },
+      h(RingtonePicker, { value: preferences.callRingtone, onChange: (callRingtone) => { const next = { ...preferences, callRingtone }; savePreferences(next); setPreferences(next); } })),
+    h(CallSurface, { calls, view })));
+}
+createRoot(document.getElementById('root')).render(h(App));
+</script></body></html>

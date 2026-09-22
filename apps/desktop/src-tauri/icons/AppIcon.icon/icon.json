@@ -1,0 +1,32 @@
+{
+  "fill": {
+    "solid": "extended-srgb:0.76471,0.89020,0.81176,1.00000"
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "glass": false,
+          "image-name": "elo-icon-star.svg",
+          "name": "elo-icon-star"
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.5
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "name": "Elo star"
+    }
+  ],
+  "supported-platforms": {
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
+  }
+}

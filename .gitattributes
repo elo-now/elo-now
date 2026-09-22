@@ -1,0 +1,7 @@
+* text=auto
+*.md text eol=lf
+*.sql text eol=lf
+*.py text eol=lf
+*.bin binary
+/.private export-ignore
+/.private/** export-ignore

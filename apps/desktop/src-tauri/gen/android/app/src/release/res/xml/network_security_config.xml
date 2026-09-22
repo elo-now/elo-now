@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <!-- Android's PKIX verifier downloads signed Let's Encrypt revocation lists.
+         These public CRLs use HTTP; keep all application endpoints HTTPS-only.
+         The CA rotates issuer subdomains under c.lencr.org on renewal. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">c.lencr.org</domain>
+    </domain-config>
+</network-security-config>

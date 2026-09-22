@@ -1,0 +1,7 @@
+<resources>
+    <style name="EloIncomingCallTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#101512</item>
+        <item name="android:colorAccent">#A3CAB5</item>
+    </style>
+</resources>

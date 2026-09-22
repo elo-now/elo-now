@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-attachment-transfer"
+description = "Enables the attachment_transfer command without any pre-configured scope."
+commands.allow = ["attachment_transfer"]
+
+[[permission]]
+identifier = "deny-attachment-transfer"
+description = "Denies the attachment_transfer command without any pre-configured scope."
+commands.deny = ["attachment_transfer"]

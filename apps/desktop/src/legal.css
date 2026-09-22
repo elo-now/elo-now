@@ -1,0 +1,61 @@
+.dialog.message-action-dialog.legal-dialog {
+  width: min(38rem, calc(100vw - 32px));
+}
+.legal-embedded {
+  text-align: left;
+}
+.legal-notice,
+.unlock .legal-notice,
+.recovery-page .legal-notice {
+  margin: 12px 0;
+  font-size: var(--elo-type-caption);
+  line-height: 1.5;
+  color: var(--elo-muted);
+  text-align: center;
+}
+.legal-notice .legal-inline-link {
+  display: inline;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.service-request-list {
+  list-style: none;
+  padding: 0;
+  text-align: left;
+}
+.account-deletion-button {
+  width: 100%;
+  margin-top: 24px;
+}
+.account-deletion-dialog .space-choice {
+  margin-top: 24px;
+}
+.account-deletion-error {
+  color: #b42318;
+}
+.service-request-list li {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--elo-line);
+}
+.service-request-list small {
+  display: block;
+}
+.request-identifier {
+  overflow-wrap: anywhere;
+  font-size: var(--elo-type-caption);
+  margin: 6px 0;
+}
+.request-evidence {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: left;
+  font-size: var(--elo-type-label);
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=elo.now call control
+After=network-online.target elo-host.service elo-media.service
+Wants=network-online.target
+Requires=elo-host.service elo-media.service
+
+[Service]
+User=elo-call
+Group=elo-call
+UMask=0077
+ExecStart=/opt/elo/bin/elo-call-service --config /etc/elo/call/config.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/elo/call
+
+[Install]
+WantedBy=multi-user.target

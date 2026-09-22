@@ -1,0 +1,6 @@
+{
+  "desktop.tray.open": "Open elo.now",
+  "desktop.tray.quit": "Quit elo.now",
+  "desktop.tray.idle": "elo.now",
+  "desktop.tray.unread": "elo.now — {count} unread messages"
+}

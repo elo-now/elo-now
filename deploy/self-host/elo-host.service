@@ -1,0 +1,20 @@
+[Unit]
+Description=elo.now hosted Spaces
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=elo-host
+Group=elo-host
+UMask=0077
+ExecStart=/opt/elo/bin/elo-team host --config /etc/elo/host/config.json --bind 127.0.0.1:18900
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/elo/host /var/lib/elo/attachments
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=elo.now LiveKit media
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=elo-media
+Group=elo-media
+UMask=0077
+ExecStart=/opt/elo/bin/livekit-server --config /etc/elo/media/livekit.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/elo/media
+
+[Install]
+WantedBy=multi-user.target

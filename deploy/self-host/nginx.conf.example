@@ -1,0 +1,97 @@
+# Example for one VPS. Replace the two domains before installing.
+# Put this file under an Nginx http{} include such as conf.d/.
+# First issue certificates using the HTTP challenge server alone; then enable
+# the TLS server. The TURN certificate is used by coturn, not this TLS server.
+
+log_format elo_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';
+
+server {
+    listen 80;
+    server_name chat.example.org turn.example.org;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+    location / { return 301 https://chat.example.org$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    server_name chat.example.org;
+    if ($host != chat.example.org) { return 444; }
+    ssl_certificate /etc/letsencrypt/live/chat.example.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/chat.example.org/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    access_log /var/log/nginx/elo-api-access.log elo_minimal;
+    error_log /var/log/nginx/elo-api-error.log warn;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Connection "";
+    proxy_cache off;
+    proxy_buffering off;
+    proxy_next_upstream off;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 35s;
+    client_max_body_size 1m;
+
+    location = /spaces/v1/create {
+        client_max_body_size 64k;
+        proxy_read_timeout 65s;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location = /spaces/v1/health { proxy_pass http://127.0.0.1:18900; }
+    location ~ "^/accounts/v1/deletion(/status)?$" {
+        client_max_body_size 32k;
+        access_log off;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location ~ "^/spaces/[0-9a-f]{64}/team/v1/spaces$" {
+        client_max_body_size 64k;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location ~ "^/spaces/[0-9a-f]{64}/attachments/v1/(upload|download)$" {
+        client_max_body_size 6m;
+        proxy_request_buffering off;
+        proxy_send_timeout 125s;
+        proxy_read_timeout 125s;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location ~ "^/spaces/[0-9a-f]{64}/replica/" {
+        proxy_request_buffering off;
+        proxy_pass http://127.0.0.1:18900;
+    }
+
+    location ^~ /v1/routes/ {
+        client_max_body_size 1m;
+        access_log off;
+        proxy_pass http://127.0.0.1:8788;
+    }
+    location = /wake/v1/account-deletion {
+        client_max_body_size 32k;
+        access_log off;
+        proxy_pass http://127.0.0.1:8788;
+    }
+    location = /wake/health { proxy_pass http://127.0.0.1:8788; }
+
+    location = /calls/v1/connect {
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_pass http://127.0.0.1:18920;
+    }
+    location = /calls/v1/health { proxy_pass http://127.0.0.1:18920; }
+
+    # The trailing slash strips exactly /media/ and preserves the remainder.
+    location ^~ /media/ {
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_pass http://127.0.0.1:7880/;
+    }
+
+    # In particular, never expose /internal/calls/admission or /internal/calls/event.
+    location / { return 404; }
+}

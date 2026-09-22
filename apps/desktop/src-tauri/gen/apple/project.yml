@@ -1,0 +1,136 @@
+name: elo-desktop
+options:
+  bundleIdPrefix: now.elo
+  deploymentTarget:
+    iOS: 15.0
+fileGroups: [../../src]
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: 153.0.0
+configs:
+  debug: debug
+  release: release
+settingGroups:
+  app:
+    base:
+      PRODUCT_NAME: elo.now
+      PRODUCT_BUNDLE_IDENTIFIER: now.elo
+      DEVELOPMENT_TEAM: F3HJA47BQU
+targetTemplates:
+  app:
+    type: application
+    sources:
+      - path: Sources
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      groups: [app]
+targets:
+  elo-desktop_iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+      - path: AppIcon.icon
+        type: file
+        buildPhase: resources
+      - path: elo-desktop_iOS
+      - path: assets
+        buildPhase: resources
+        type: folder
+      - path: ../../call-ringtones
+        buildPhase: resources
+      - path: LaunchScreen.storyboard
+    info:
+      path: elo-desktop_iOS/Info.plist
+      properties:
+        FirebaseMessagingAutoInitEnabled: false
+        FirebaseAnalyticsCollectionEnabled: false
+        UIBackgroundModes: [remote-notification, voip, audio]
+        NSFaceIDUsageDescription: Use Face ID to unlock your encrypted elo profile on this device.
+        NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.
+        NSPhotoLibraryAddUsageDescription: Save your password-protected recovery QR image to Photos.
+        NSCameraUsageDescription: Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
+        NSMicrophoneUsageDescription: Use your microphone during audio and video calls.
+        LSRequiresIPhoneOS: true
+        UILaunchStoryboardName: LaunchScreen
+        UIRequiredDeviceCapabilities: [arm64, metal]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+        CFBundleShortVersionString: 1.0.0
+        CFBundleVersion: "1082"
+        CFBundleURLTypes:
+          - CFBundleURLName: now.elo
+            CFBundleURLSchemes: [elo]
+    entitlements:
+      path: elo-desktop_iOS/elo-desktop_iOS.entitlements
+      properties:
+        application-identifier: $(DEVELOPMENT_TEAM).$(PRODUCT_BUNDLE_IDENTIFIER)
+        aps-environment: development
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_BITCODE: false
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64 
+        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+      groups: [app]
+    dependencies:
+      - package: WebRTC
+      - framework: libapp.a
+        embed: false
+      - sdk: CoreGraphics.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: Security.framework
+      - sdk: UIKit.framework
+      - sdk: WebKit.framework
+    preBuildScripts:
+      - script: |
+          if [ -n "${TAURI_ELO_FIREBASE_IOS:-}" ]; then
+            /usr/bin/plutil -lint "$TAURI_ELO_FIREBASE_IOS" >/dev/null || exit 1
+            bundle=$(/usr/libexec/PlistBuddy -c 'Print :BUNDLE_ID' "$TAURI_ELO_FIREBASE_IOS")
+            [ "$bundle" = "$PRODUCT_BUNDLE_IDENTIFIER" ] || exit 1
+            /bin/mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+            /bin/cp "$TAURI_ELO_FIREBASE_IOS" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/GoogleService-Info.plist"
+          else
+            /bin/rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/GoogleService-Info.plist"
+          fi
+        name: Stage Firebase client configuration
+        basedOnDependencyAnalysis: false
+      - script: npm run -- tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
+        name: Build Rust Code
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
+          - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+    postBuildScripts:
+      - name: Embed SDK privacy manifests
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          resources="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          /bin/mkdir -p "$resources"
+          /bin/cp "$SRCROOT/../../PrivacyInfo.xcprivacy" "$resources/PrivacyInfo.xcprivacy"
+          # These resource-only bundles belong to elo's optional push plugin.
+          for bundle in "$resources"/Firebase_*.bundle "$resources"/GoogleUtilities_*.bundle "$resources"/GoogleDataTransport_*.bundle "$resources"/Promises_*.bundle "$resources"/nanopb_*.bundle; do
+            [ ! -d "$bundle" ] || /bin/rm -r "$bundle"
+          done
+          test -d "$SRCROOT/PrivacyResources"
+          for bundle in "$SRCROOT"/PrivacyResources/*.bundle; do
+            [ ! -d "$bundle" ] || /bin/cp -R "$bundle" "$resources/"
+          done

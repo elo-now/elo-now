@@ -1,0 +1,84 @@
+# Replace HOST and certificate paths. API backends remain loopback-only.
+limit_req_zone $binary_remote_addr zone=elo_create:1m rate=2r/m;
+limit_req_zone $binary_remote_addr zone=elo_spaces:1m rate=3r/s;
+limit_req_zone $binary_remote_addr zone=elo_operator:1m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=elo_hosted_replica:1m rate=20r/s;
+limit_req_zone $binary_remote_addr zone=elo_attachments:1m rate=5r/s;
+limit_req_zone $binary_remote_addr zone=elo_accounts:1m rate=2r/s;
+log_format elo_hosting_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';
+server {
+    listen 8444 ssl;
+    listen [::]:8444 ssl;
+    server_name HOST;
+    ssl_certificate /etc/letsencrypt/live/HOST/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/HOST/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 16m;
+    client_body_timeout 30s;
+    access_log /var/log/nginx/elo-hosting-access.log elo_hosting_minimal;
+    error_log /var/log/nginx/elo-hosting-error.log warn;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_next_upstream off;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 35s;
+    location ~ "^/accounts/v1/deletion(/status)?$" {
+        client_max_body_size 32k;
+        limit_req zone=elo_accounts burst=8 nodelay;
+        limit_req_status 429;
+        access_log off;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location = /spaces/v1/create {
+        client_max_body_size 64k;
+        limit_req zone=elo_create burst=2 nodelay;
+        limit_req_status 429;
+        proxy_read_timeout 65s;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location ~ "^/spaces/[0-9a-f]{64}/team/v1/spaces$" {
+        client_max_body_size 64k;
+        limit_req zone=elo_spaces burst=20 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location ~ "^/spaces/[0-9a-f]{64}/attachments/v1/(upload|download)$" {
+        client_max_body_size 6m;
+        limit_req zone=elo_attachments burst=12 nodelay;
+        limit_req_status 429;
+        proxy_request_buffering off;
+        proxy_send_timeout 125s;
+        proxy_read_timeout 125s;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    # Preserve the complete stable Space path, including signed access proofs.
+    location ~ "^/spaces/[0-9a-f]{64}/replica/" {
+        limit_req zone=elo_hosted_replica burst=80 nodelay;
+        limit_req_status 429;
+        proxy_request_buffering off;
+        proxy_pass http://127.0.0.1:18900;
+    }
+    location = /spaces/v1/health { proxy_pass http://127.0.0.1:18900; }
+    location / { return 404; }
+}
+
+# Include this block inside the existing port 443 server, replacing PRIVATE_PATH.
+# Do not expose port 18901 or merge operator routes into the public API.
+# location ^~ /PRIVATE_PATH/ {
+#     auth_basic "elo.now administration";
+#     auth_basic_user_file /etc/elo-hosting/admin.htpasswd;
+#     limit_req zone=elo_operator burst=8 nodelay;
+#     access_log off;
+#     add_header Cache-Control "no-store" always;
+#     add_header X-Robots-Tag "noindex, nofollow" always;
+#     add_header X-Frame-Options "DENY" always;
+#     add_header X-Content-Type-Options "nosniff" always;
+#     proxy_pass http://127.0.0.1:18901/;
+#     proxy_cache off;
+#     proxy_next_upstream off;
+# }

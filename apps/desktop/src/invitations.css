@@ -1,0 +1,274 @@
+.invitation-page {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  height: var(--app-viewport-height, 100dvh);
+  background: var(--elo-background);
+  color: var(--elo-text);
+  display: flex;
+  flex-direction: column;
+  padding: max(0px, env(safe-area-inset-top)) var(--elo-page-inset)
+    max(12px, var(--app-content-bottom-inset, env(safe-area-inset-bottom)));
+  overflow: hidden;
+  outline: none;
+}
+.invitation-page > .screen-header {
+  flex-shrink: 0;
+}
+.invitation-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 12px 0 24px;
+}
+.invitation-scroll > *,
+.invitation-scroll form > * {
+  margin-bottom: 16px;
+}
+.invitation-scroll label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: var(--elo-type-label);
+}
+.invitation-scroll label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--elo-type-label);
+  line-height: 1.5;
+}
+.invitation-paste-label {
+  text-align: center;
+}
+
+.invitation-scroll input,
+.invitation-scroll select,
+.invitation-scroll textarea {
+  width: 100%;
+  font-size: var(--elo-type-input);
+  min-height: var(--elo-control-height);
+}
+.invitation-scroll textarea {
+  resize: vertical;
+  overflow-wrap: anywhere;
+}
+.invitation-scroll button:not(.refresh-accessible) {
+  min-height: var(--elo-control-height);
+}
+.invitation-scroll > button:not(.refresh-accessible),
+.invitation-scroll form > button {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  align-items: center;
+}
+.invitation-scroll h3 {
+  font-size: var(--elo-type-label);
+  font-weight: 400;
+  color: var(--elo-muted);
+  line-height: 1.5;
+  margin-top: 24px;
+}
+.invitation-hint {
+  text-align: center;
+  white-space: pre-line;
+  font-size: var(--elo-type-label);
+  line-height: 1.5;
+  color: var(--elo-muted);
+}
+.invitation-context {
+  margin: 0 0 16px;
+  padding: 12px;
+  border-radius: var(--elo-radius-panel);
+  background: var(--elo-surface);
+  text-align: center;
+  overflow-wrap: anywhere;
+  font-size: var(--elo-type-body);
+  font-weight: 600;
+}
+.invitation-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  outline: none;
+}
+.invitation-panel .invitation-scroll {
+  padding-top: 0;
+}
+.invitation-person {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+.invitation-person strong {
+  font-size: var(--elo-type-body);
+}
+.invitation-person code {
+  font-size: var(--elo-type-caption);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.invitation-person details {
+  max-width: 100%;
+}
+.invitation-permissions > .check {
+  margin: 12px 0;
+}
+.invitation-buttons {
+  display: flex;
+  gap: 12px;
+}
+.invitation-buttons button {
+  flex: 1;
+}
+.invitation-scroll .quiet {
+  background: transparent;
+  color: var(--elo-text);
+  border: 1px solid var(--elo-line);
+  box-shadow: none;
+}
+.invitation-scroll .danger {
+  color: var(--status-error-text);
+}
+.invitation-code {
+  display: flex;
+  align-items: stretch;
+  flex-direction: column;
+  gap: 12px;
+}
+.invitation-code > img,
+.invitation-qr-placeholder {
+  width: min(100%, 336px);
+  height: auto;
+  aspect-ratio: 1;
+  align-self: center;
+  background: white;
+  border-radius: 12px;
+}
+.invitation-qr-placeholder {
+  display: grid;
+  place-items: center;
+  background: var(--elo-surface);
+  color: var(--elo-muted);
+  text-align: center;
+  padding: 16px;
+}
+.invitation-code-alternative {
+  margin: 0;
+  color: var(--elo-muted);
+  text-align: center;
+}
+.invitation-qr-loader {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--elo-line);
+  border-top-color: var(--elo-muted);
+  border-radius: 50%;
+  animation: invitation-qr-spin 0.9s linear infinite;
+}
+@keyframes invitation-qr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .invitation-qr-loader {
+    animation: none;
+  }
+}
+.invitation-code > button {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+}
+.invitation-code p,
+.qr-controls {
+  font-size: var(--elo-type-label);
+  text-align: center;
+}
+.qr-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+}
+.invitation-link-row {
+  border-bottom: 1px solid var(--elo-line);
+  padding: 8px 0 12px;
+}
+.invitation-link-row .action-link {
+  width: 100%;
+}
+.invitation-link-row small {
+  display: block;
+  font-weight: 400;
+  font-size: var(--elo-type-caption);
+}
+.invitation-confirm {
+  margin-top: 12px;
+  font-size: var(--elo-type-label);
+}
+.invitation-confirm button {
+  margin-right: 8px;
+}
+.shell[data-mobile="true"][data-invitations="true"] > :not(.invitation-page) {
+  visibility: hidden;
+  pointer-events: none;
+}
+html.elo-scanning,
+.elo-scanning body,
+.elo-scanning #root,
+.elo-scanning .shell,
+.elo-scanning .invitation-scanner {
+  background: transparent !important;
+}
+/* The scanner can be nested inside opaque Settings or onboarding panels. Hide
+   their paint while keeping the scanner and its controls visible above camera. */
+.elo-scanning #root {
+  visibility: hidden;
+}
+.elo-scanning .invitation-scanner {
+  visibility: visible;
+}
+.invitation-scanner .screen-header,
+.scan-controls {
+  background: var(--elo-background);
+}
+.scan-window {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+}
+.scan-window > span {
+  width: min(80vw, 280px);
+  aspect-ratio: 1;
+  border: 2px solid white;
+  border-radius: 16px;
+}
+.scan-controls {
+  padding: 16px;
+  text-align: center;
+  font-size: var(--elo-type-label);
+}
+.scan-controls button {
+  width: 100%;
+  min-height: var(--elo-control-height);
+}
+@media (min-width: 761px) {
+  .invitation-page {
+    max-width: 620px;
+    left: auto;
+    border-left: 1px solid var(--elo-line);
+  }
+}
