@@ -6,6 +6,8 @@ The examples use `chat.example.org` for the app API and media WebSocket, and `tu
 
 Debian 13 is the deployment path exercised by this project. Oracle Linux 10 follows the same service layout, but still requires its own end-to-end acceptance run, especially package availability, SELinux policy and media ports. Do not present an untested OEL10 installation as verified.
 
+For upgrades, see [API compatibility and application updates](API_COMPATIBILITY.md). That document describes next-release work; the published 1.0.0 server does not support its `client_policy` setting. Do not copy future configuration into an older server or replace services with an incompatible build while older clients are in use.
+
 ## 1. What runs where
 
 | Component | Install on the VPS | Public route / port | Private configuration |

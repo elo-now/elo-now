@@ -20,6 +20,7 @@
 /docs/*
 !docs/BUILDING.md
 !docs/SELF_HOSTING.md
+!docs/API_COMPATIBILITY.md
 *.p8
 *.p12
 *.pfx

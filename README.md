@@ -155,6 +155,12 @@ The default source build does not include a hosted Demo's access credentials, li
 
 This repository contains application source and build resources. The marketing website, brandbook, internal decisions, development conversations, private notes, operational configurations, user profiles, signing credentials and compiled packages are not part of it. Deterministic test fixtures and test-only passwords are public test data; never use them for real accounts.
 
+### Server and app updates
+
+Application releases and API versions are separate. Future compatible server releases should preserve existing client contracts; incompatible security changes require a coordinated rollout. A startup update check with separate minimum versions for each platform is being prepared for a future release. It opens the official download page and does not silently install software. Published version 1.0.0 does not contain this gate.
+
+See [API compatibility and application updates](docs/API_COMPATIBILITY.md) for the planned configuration, rollout order, rollback and current implementation boundaries. Keep existing endpoints available while users update; a release still waiting for store review must not become the required minimum.
+
 ## License
 
 Project code is licensed under **AGPL-3.0-only**. See the full [LICENSE](LICENSE). Third-party components retain their own licenses, including the notices under `apps/desktop/public/licenses`, `apps/desktop/public/brand` and `vendor/tauri-plugin-notification`.

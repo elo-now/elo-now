@@ -15,6 +15,8 @@ npm ci
 
 ## Desktop development
 
+Before upgrading a running service, read [API compatibility and application updates](API_COMPATIBILITY.md). It distinguishes published 1.0.0 behavior from mechanisms being prepared for the next release; do not assume that a newer server build supports every older client.
+
 From `apps/desktop`:
 
 ```sh
