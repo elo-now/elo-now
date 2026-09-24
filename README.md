@@ -159,7 +159,7 @@ This repository contains application source and build resources. The marketing w
 
 Application releases and API versions are separate. Future compatible server releases should preserve existing client contracts; incompatible security changes require a coordinated rollout. A startup update check with separate minimum versions for each platform is being prepared for a future release. It opens the official download page and does not silently install software. Published version 1.0.0 does not contain this gate.
 
-See [API compatibility and application updates](docs/API_COMPATIBILITY.md) for the planned configuration, rollout order, rollback and current implementation boundaries. Keep existing endpoints available while users update; a release still waiting for store review must not become the required minimum.
+See [API compatibility and application updates](docs/API_COMPATIBILITY.md) for the planned configuration, rollout order, rollback and current implementation boundaries. The next security baseline is a clean cutover without older-client support or existing-data migration. Later compatible upgrades should preserve supported endpoints while users update; a release still waiting for store review must not become the required minimum.
 
 ## License
 

@@ -4,8 +4,9 @@
 and client gate described here have been implemented and tested in the development
 workspace; their source and binaries are not yet part of the published release.
 Treat the configuration below as preparation for that rollout, not as a setting
-supported by the current published server. The security transition still has the
-compatibility limits listed at the end of this document.
+supported by the current published server. The current transition establishes a
+new security baseline; older clients and existing runtime data are not supported
+through that cutover.
 
 Application versions, HTTP API versions and signed-record versions are separate.
 A new app release must not silently redefine an existing server contract. Keep
@@ -64,7 +65,27 @@ client version. Google Play's optional in-app-update SDK is not integrated; the
 button opens the app listing. Older installed releases do not contain this gate
 and cannot acquire it without an app update.
 
-## Safe rollout
+## Current security baseline: clean cutover
+
+This transition does not include a compatibility bridge or migration of existing
+profiles, Spaces, notification routes or stored objects. Prepare matching app and
+server builds, verify them together on fresh test data, and switch the services
+as a coordinated release. Retire old clients rather than accepting their old
+proof formats. Existing runtime data can be reset as part of the operator's
+explicitly scheduled cutover; an app update itself must not silently erase the
+local profile.
+
+Prepare the new clients before resetting the services. Recreate test/reviewer
+accounts and invitations against the new baseline, and replace their access
+instructions when switching it on. Preserve signing credentials, service secrets
+and original cryptographic test fixtures: none of these are obsolete runtime
+data. A reset does not replace authorization, replay-protection or device tests.
+
+Older installed apps without the update gate cannot display a new update screen
+remotely. They must be replaced by the new app. Minimum-version policy governs
+subsequent releases that already contain that mechanism.
+
+## Later compatible releases
 
 1. Deploy an additive discovery endpoint with all minimums disabled.
 2. Publish and verify clients containing the update gate. Keep the previous
@@ -88,11 +109,13 @@ of the existing 1.0.0 store builds. The security work changes mailbox request
 proofs to v2, retention authorization, linked-device keys and iOS VoIP registration.
 Those changes are **not compatible with the previous installed clients** merely
 because several resource URLs still contain `/v1`. Discovery exposes their
-separate security capabilities. Do not deploy this security server build over
-the current services while old clients are still expected to work. A complete
-compatibility bridge for that transition is not implemented yet.
+separate security capabilities. This incompatibility is deliberate for the clean
+cutover above; support for those previous clients is outside its scope, rather
+than an unfinished release requirement. Native signing, physical-device tests
+and coordinated deployment remain necessary.
 
 For future releases, retain a versioned contract test fixture from each supported
 client release. Tests of a new client against its own new server do not prove
-backward compatibility. Keep data/schema changes reversible until the rollback
-window closes; do not reset existing Spaces as an upgrade strategy.
+backward compatibility. After establishing this baseline, keep data/schema
+changes reversible until the rollback window closes; the present clean cutover
+is not an automatic reset policy for future upgrades.
