@@ -92,7 +92,7 @@ pub async fn approve(
     store: &ClientStore,
     approval: CandidateApproval,
     key: &SigningKey,
-    own_identity: &age::x25519::Identity,
+    own_identity: &dyn crate::crypto::DecryptionIdentity,
     now: LocalTime,
 ) -> std::result::Result<ConfigAdmission, StoreError> {
     let invalid =

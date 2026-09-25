@@ -1,3 +1,4 @@
+import { UpdateBanner } from "./UpdateGate";
 import { PageContent } from "./PageContent";
 import { PageSurface, useDesktopLayout } from "./PageSurface";
 import { ScreenHeader } from "./ScreenHeader";
@@ -113,6 +114,7 @@ function ModalActionDialog({
             {closeIcon ?? <Icon name="close" />}
           </button>
           <h2>{title}</h2>
+          <UpdateBanner />
         </>
       )}
       <div

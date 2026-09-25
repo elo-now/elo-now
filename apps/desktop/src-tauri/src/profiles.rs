@@ -19,6 +19,23 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::{FsExt, OpenOptions};
 use zeroize::Zeroizing;
 type Result<T> = elo_core::app::Result<T>;
+fn device_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "Mac",
+        "ios" => "iPhone or iPad",
+        "android" => "Android",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        _ => "Computer",
+    }
+}
+
+fn confirm_device_removal(request: &Value) -> Result<()> {
+    if request["confirmed"] != true {
+        return Err("device_revocation_confirmation_required".into());
+    }
+    Ok(())
+}
 
 fn base(app: &tauri::AppHandle) -> Result<PathBuf> {
     Ok(app.path().app_data_dir()?)
@@ -61,6 +78,32 @@ pub fn active(app: &tauri::AppHandle) -> Result<PathBuf> {
             .as_str()
             .ok_or("Invalid profile selection")?,
     ))
+}
+fn biometric_profile(app: &tauri::AppHandle, id: &str, identity: &str) -> Result<PathBuf> {
+    let path = active(app)?;
+    if path.file_name().and_then(|name| name.to_str()) != Some(id)
+        || !saved(app)?.iter().any(|entry| {
+            entry["id"] == id && entry["identity"] == identity && entry["active"] == true
+        })
+    {
+        return Err("dataNeedsReenrollment".into());
+    }
+    Ok(path)
+}
+pub(super) fn biometric_password(
+    app: &tauri::AppHandle,
+    id: &str,
+    identity: &str,
+    key: SecretString,
+) -> Result<SecretString> {
+    let path = biometric_profile(app, id, identity)?;
+    vault::biometric::open(
+        &vault::read_private(&path.join("biometric-unlock.age"))?,
+        key,
+        identity.parse()?,
+        id,
+    )
+    .map_err(|_| "dataNeedsReenrollment".into())
 }
 pub fn saved(app: &tauri::AppHandle) -> Result<Vec<Value>> {
     let mut entries = Vec::new();
@@ -202,12 +245,15 @@ fn check_removable(path: &Path) -> Result<()> {
                 || !(matches!(
                     name,
                     "profile.json"
+                        | "biometric-unlock.age"
                         | "vault.age"
                         | "workspace.age"
                         | "profile-details.age"
                         | "read-state.age"
                         | "blocked.age"
                         | "invitations.age"
+                        | "device-names.age"
+                        | "device-revocations.age"
                         | "client.sqlite"
                         | "client.sqlite-wal"
                         | "client.sqlite-shm"
@@ -350,7 +396,7 @@ async fn pick(app: &tauri::AppHandle) -> Result<Option<Zeroizing<Vec<u8>>>> {
     }
     Ok(Some(bytes))
 }
-async fn save(app: &tauri::AppHandle, bytes: &[u8], filename: &str) -> Result<bool> {
+pub(crate) async fn save(app: &tauri::AppHandle, bytes: &[u8], filename: &str) -> Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -380,34 +426,60 @@ pub async fn profile_task(
     state: tauri::State<'_, State>,
     request: Value,
 ) -> std::result::Result<Value, String> {
-    let linking = request["op"] == "pair_start";
-    let result = run(&app, state, request).await;
-    if linking && option_env!("TAURI_ELO_PROFILE_DIAGNOSTICS") == Some("1") {
-        // This records only a transport/QR error category, never profile or code bytes.
-        if let Err(error) = &result {
-            let category = if let Some(error) = error.downcast_ref::<elo_core::sync::SyncError>() {
-                error.to_string()
-            } else if let Some(error) = error.downcast_ref::<qrcode::types::QrError>() {
-                error.to_string()
-            } else {
-                "Device linking failed before QR presentation".to_string()
-            };
-            if let Ok(directory) = app.path().app_cache_dir()
-                && std::fs::create_dir_all(&directory).is_ok()
-            {
-                let _ = std::fs::write(directory.join("device-link-diagnostic.txt"), category);
-            }
-        }
-    }
-    result.map_err(|e| e.to_string())
+    run(&app, state, request).await.map_err(|e| e.to_string())
 }
 async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -> Result<Value> {
+    let v = crate::sensitive_request::SensitiveRequest(v);
     let op = text(&v, "op")?;
     if op == "pause_recovery" {
         return Ok(json!({"paused":crate::recovery_progress::pause(app, text(&v,"request_id")?)}));
     }
     let mut state = state.lock().await;
+    if !matches!(
+        op,
+        "biometric_enroll"
+            | "biometric_forget"
+            | "account_deletion_status"
+            | "cancel"
+            | "select"
+            | "check_recovery"
+            | "read_recovery_qr"
+            | "recovery_material"
+            | "recovery_qr"
+            | "save_recovery_qr"
+            | "share_recovery_qr"
+            | "read_qr_image"
+            | "choose_backup"
+            | "clear_qr"
+            | "clear_backup"
+            | "backup"
+    ) {
+        crate::release_policy::require_online(app)?;
+    }
     match op {
+        "biometric_enroll" => {
+            use age::secrecy::ExposeSecret;
+            let id = text(&v, "id")?;
+            let identity = text(&v, "identity")?;
+            let path = biometric_profile(app, id, identity)?;
+            let client = state.client.as_ref().ok_or("The profile is locked")?;
+            let password: SecretString = text(&v, "password")?.to_owned().into();
+            if client.identity_id().to_string() != identity || !client.password_matches(&password) {
+                return Err("The password is incorrect".into());
+            }
+            let (bytes, key) = vault::biometric::seal(password, identity.parse()?, id)?;
+            let destination = path.join("biometric-unlock.age");
+            vault::write_private(&destination, &bytes, destination.try_exists()?)?;
+            return Ok(json!({"key":key.expose_secret()}));
+        }
+        "biometric_forget" => {
+            let path = biometric_profile(app, text(&v, "id")?, text(&v, "identity")?)?
+                .join("biometric-unlock.age");
+            if path.try_exists()? {
+                std::fs::remove_file(path)?;
+            }
+            return Ok(json!({}));
+        }
         "account_deletion_status" => {
             let path = base(app)?.join("account-deletion-receipts.json");
             if !path.try_exists()? {
@@ -421,6 +493,9 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
                 serde_json::from_value(saved["receipts"].clone())?;
             if receipts.len() > 2048 {
                 return Err("Invalid deletion receipts.".into());
+            }
+            if crate::release_policy::required(app) {
+                return Ok(json!({"status":"pending"}));
             }
             for receipt in receipts {
                 if !receipt.completed(false).await.unwrap_or(false) {
@@ -436,6 +511,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             state.pair_source = None;
             state.pair_target = None;
             state.recovery_qr = None;
+            state.control_recovery = None;
         }
         "select" => {
             if state.client.is_some() {
@@ -545,6 +621,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
         }
         "clear_qr" => {
             state.recovery_qr = None;
+            state.control_recovery = None;
         }
         "clear_backup" => {
             state.backup = None;
@@ -616,6 +693,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             state.recovery = None;
             state.backup = None;
             state.recovery_qr = None;
+            state.control_recovery = None;
             state.client = Some(client);
             app.state::<crate::background_history::BackgroundHistory>()
                 .resume();
@@ -647,7 +725,22 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
                 json!({"saved":save(app, &bytes, "elo-profile.elo-backup").await?,"omitted_messages":omitted_messages}),
             );
         }
+        "device_list" => {
+            return state
+                .client
+                .as_ref()
+                .ok_or("The profile is locked")?
+                .linked_devices()
+                .await;
+        }
+        "device_revoke" => {
+            let client = state.client.as_ref().ok_or("The profile is locked")?;
+            confirm_device_removal(&v)?;
+            return client.revoke_linked_device(text(&v, "credential")?).await;
+        }
         "pair_start" => {
+            let client = state.client.as_ref().ok_or("The profile is locked")?;
+            client.name_current_device(device_name())?;
             let source =
                 PairSource::new(state.client.as_ref().ok_or("The profile is locked")?).await?;
             let link = source.link()?;
@@ -671,22 +764,26 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
                 ..
             } = &mut *state;
             let client = client.as_ref().ok_or("The profile is locked")?;
-            if !client.password_matches(&text(&v, "password")?.to_string().into())
-                || v["confirmed"] != true
-            {
-                return Err("Confirm the device and enter your profile password".into());
-            }
             pair_source
                 .as_mut()
                 .ok_or("Create a device code first")?
-                .approve(client, text(&v, "id")?, text(&v, "code")?)
+                .accept(client, text(&v, "id")?)
                 .await?;
+        }
+        "pair_reject" => {
+            state
+                .pair_source
+                .as_mut()
+                .ok_or("Create a device code first")?
+                .reject(text(&v, "id")?)
+                .await?;
+            state.pair_source = None;
         }
         "pair_request" => {
             if state.client.is_some() {
                 return Err("Log out before linking this device".into());
             }
-            let target = PairTarget::new(text(&v, "code")?, text(&v, "name")?, false)?;
+            let target = PairTarget::new(text(&v, "code")?, device_name(), false)?;
             target.send().await?;
             let summary = target.summary()?;
             state.pair_target = Some(target);
@@ -704,21 +801,12 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             if state.client.is_some() {
                 return Err("Log out before linking this device".into());
             }
-            if v["confirmed"] != true {
-                return Err("Compare and confirm the code on both devices".into());
-            }
             let path = new_profile(app)?;
             let target = state
                 .pair_target
                 .as_mut()
                 .ok_or("Scan a device code first")?;
-            let mut client = target
-                .finish(
-                    path.clone(),
-                    text(&v, "password")?.to_string().into(),
-                    text(&v, "code")?,
-                )
-                .await?;
+            let mut client = target.finish_linked(path.clone()).await?;
             crate::team_replica::configure(&mut client)?;
             crate::push::configure_client(&mut client)?;
             client.enable_spaces().await?;
@@ -871,6 +959,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             state.pair_source = None;
             state.pair_target = None;
             state.recovery_qr = None;
+            state.control_recovery = None;
             crate::exchange::clear(app)?;
             if op == "delete_account" {
                 let path = base(app)?.join("account-deletion-receipts.json");
@@ -889,6 +978,20 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_removal_requires_explicit_confirmation_without_recovery_material() {
+        for request in [
+            json!({}),
+            json!({"confirmed":false}),
+            json!({"confirmed":"true"}),
+        ] {
+            assert_eq!(
+                confirm_device_removal(&request).unwrap_err().to_string(),
+                "device_revocation_confirmation_required"
+            );
+        }
+        confirm_device_removal(&json!({"confirmed":true})).unwrap();
+    }
     #[test]
     fn hosted_device_codes_fit_both_qr_exports_without_truncation() {
         let code = format!("elo-pair:1:{}", "a".repeat(2600));

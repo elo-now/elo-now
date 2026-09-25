@@ -112,6 +112,8 @@ struct RequestEntry {
 #[serde(deny_unknown_fields)]
 struct Invitations {
     v: u8,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    seed_metadata: BTreeMap<StreamId, RecordId>,
     #[serde(default)]
     additions: BTreeMap<String, membership::Addition>,
     #[serde(default)]
@@ -342,6 +344,7 @@ impl ClientApp {
             || state.additions.len() > MAX_ITEMS
             || state.removals.len() > MAX_ITEMS
             || state.contact_chats.len() > MAX_ITEMS
+            || state.seed_metadata.len() > MAX_ITEMS
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
@@ -407,6 +410,7 @@ impl ClientApp {
             || state.additions.len() > MAX_ITEMS
             || state.removals.len() > MAX_ITEMS
             || state.contact_chats.len() > MAX_ITEMS
+            || state.seed_metadata.len() > MAX_ITEMS
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
@@ -427,7 +431,7 @@ impl ClientApp {
         self.require_controller(a)?;
         let p = &self.pins[index];
         let time = now()?.as_millis() as u64;
-        let signed = shared::create(
+        let mut signed = shared::create(
             a,
             self.session.signing_key(),
             &p.name,
@@ -435,6 +439,11 @@ impl ClientApp {
             v["reusable"] != false,
             time + duration_ms,
         )?;
+        if self.is_personal_seed(p, a)? {
+            let mut body = signed.body().clone();
+            body["personal_seed"] = json!(true);
+            signed = SignedRecord::sign(&serde_json::to_vec(&body)?, self.session.signing_key())?;
+        }
         Ok(Bundle {
             space: p.space,
             stream: p.stream,
@@ -840,7 +849,9 @@ impl ClientApp {
                         stream: p.stream,
                         root: p.root.clone(),
                         name: p.name.clone(),
-                        ciphertext: STANDARD.encode(a.seal_snapshot(&c.recipient())?),
+                        ciphertext: STANDARD.encode(
+                            a.seal_snapshot_signed(&c.recipient(), self.session.signing_key())?,
+                        ),
                     };
                     let link = encode(&grant)?;
                     let automatic = self.queue_response(&mut state, &id, &entry.packet, &grant)?;
@@ -1063,6 +1074,7 @@ impl ClientApp {
             self.authorities.0[i] = a;
         } else {
             self.pins.push(Pin {
+                personal_seed: Some(false),
                 chat_kind: Some(chats::imported_kind(&a, self.session.identity_id())?),
                 name,
                 space,

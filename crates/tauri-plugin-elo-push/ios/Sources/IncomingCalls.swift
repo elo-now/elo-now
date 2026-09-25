@@ -4,6 +4,7 @@ import PushKit
 import CallKit
 import AVFAudio
 import WebRTC
+import Tauri
 
 /// No profile key or message plaintext is accessible from this native ring path.
 final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate, URLSessionTaskDelegate {
@@ -14,6 +15,11 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
     private var timer: Timer?
     private var answer: CXAnswerCallAction?
     private var checking = false
+    var answerListener: Channel?
+    private var answerTask: UIBackgroundTaskIdentifier = .invalid
+    private func finishAnswerTask() {
+        if answerTask != .invalid { UIApplication.shared.endBackgroundTask(answerTask); answerTask = .invalid }
+    }
     private(set) var audioActive = false
     var ownsAudio: Bool { pending != nil }
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
@@ -110,6 +116,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         update.hasVideo = data["elo_video"] as? String == "1"
         update.supportsHolding=false;update.supportsGrouping=false;update.supportsUngrouping=false;update.supportsDTMF=false
         if valid {
+            prefs.removeObject(forKey: "elo.call.event")
             pending = ["id":id,"uuid":uuid.uuidString,"expires":expires,"target":target,"ticket":ticket,
                 "registration":data["elo_registration"] as? String ?? "","action":"ring","connected":false]
         }
@@ -125,6 +132,13 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         }
     }
     func status() -> [String:Any]? { prefs.dictionary(forKey:"elo.call.event") ?? pending }
+    func isAnswering(_ id: String) -> Bool {
+        pending?["id"] as? String == id && pending?["action"] as? String == "answer"
+    }
+    func requestUnlock(_ id: String) {
+        guard isAnswering(id) else { return }
+        UIApplication.shared.open(URL(string: "elo://incoming-call")!, options: [:])
+    }
     func acknowledge(_ id:String, event:String?) {
         guard let value=prefs.dictionary(forKey:"elo.call.event"),value["id"] as? String == id,value["event"] as? String == event else { return }
         prefs.removeObject(forKey:"elo.call.event")
@@ -140,10 +154,26 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         }
         end(id)
     }
+    func answerFromApp(_ id: String) -> Bool {
+        guard let call = pending, call["id"] as? String == id,
+            let raw = call["uuid"] as? String, let uuid = UUID(uuidString: raw) else { return false }
+        if call["action"] as? String != "ring" { return true }
+        // Use the same Answer delegate as the system banner. Rust remains the
+        // only owner of admission until the foreground UI adopts the peer.
+        CXCallController().request(CXTransaction(action: CXAnswerCallAction(call: uuid))) { [weak self] error in
+            if error != nil { DispatchQueue.main.async { self?.end(id, reason: .failed) } }
+        }
+        return true
+    }
+    func declineFromApp(_ id: String) -> Bool {
+        guard pending?["id"] as? String == id else { return false }
+        reject(id)
+        return true
+    }
     func answering(_ id:String) {
         guard var call=pending,call["id"] as? String == id,call["action"] as? String == "ring",
             let raw=call["uuid"] as? String,let uuid=UUID(uuidString:raw) else { return }
-        call["action"]="answer";pending=call
+        call["action"]="answer";call["ui_owned"]=true;pending=call
         CXCallController().request(CXTransaction(action:CXAnswerCallAction(call:uuid))) { [weak self] error in
             if error != nil { DispatchQueue.main.async { self?.end(id,reason:.failed) } }
         }
@@ -153,6 +183,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         call["connected"]=true;call["action"]="connected";pending=call
         answer?.fulfill();answer=nil
         timer?.invalidate();timer=nil
+        finishAnswerTask()
     }
     func end(_ id:String, reason:CXCallEndedReason = .remoteEnded) {
         guard let call=pending,call["id"] as? String == id,let raw=call["uuid"] as? String,let uuid=UUID(uuidString:raw) else { return }
@@ -160,6 +191,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         answer?.fail();answer=nil
         provider.reportCall(with:uuid,endedAt:Date(),reason:reason)
         timer?.invalidate();timer=nil;pending=nil
+        finishAnswerTask()
     }
     func providerDidReset(_ provider:CXProvider) {
         // Rebuilding an idle provider after changing ringtone/background-call
@@ -169,6 +201,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
             event(call,action:"decline")
         }
         timer?.invalidate();timer=nil;answer?.fail();answer=nil;pending=nil
+        finishAnswerTask()
     }
     func provider(_ provider:CXProvider,perform action:CXSetMutedCallAction) {
         guard let call=pending,call["uuid"] as? String == action.callUUID.uuidString,call["connected"] as? Bool == true else { action.fail();return }
@@ -182,9 +215,17 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         do { try AVAudioSession.sharedInstance().setCategory(.playAndRecord,mode:.voiceChat,options:[.allowBluetooth,.defaultToSpeaker]) }
         catch { action.fail();return }
         call["action"]="answer";pending=call;answer=action
-        // This explicit user action requests the app UI. Media stays stopped until
-        // the ordinary profile-unlock flow and signed call admission both succeed.
-        UIApplication.shared.open(URL(string:"elo://incoming-call")!,options:[:])
+        // Rust can join using the in-memory unlocked session while WebKit is
+        // suspended. A cold/locked profile still requires the normal unlock UI.
+        if answerTask == .invalid {
+            answerTask = UIApplication.shared.beginBackgroundTask(withName: "Answer call") { [weak self] in
+                guard let self = self, let id = self.pending?["id"] as? String else { return }
+                self.end(id, reason: .failed)
+            }
+        }
+        if call["ui_owned"] as? Bool != true {
+            try? answerListener?.send(["answer": true] as [String: Bool])
+        }
     }
     func provider(_ provider:CXProvider,perform action:CXEndCallAction) {
         if let id=pending?["id"] as? String { reject(id) }

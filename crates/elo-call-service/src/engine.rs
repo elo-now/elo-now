@@ -25,6 +25,58 @@ pub struct Request {
     pub proof: Option<CallAuthorityProof>,
 }
 
+pub struct Preparation {
+    request: Request,
+    signed: SignedRecord,
+    scope: Scope,
+    audience: String,
+    cached: Option<Arc<Authority>>,
+}
+impl Preparation {
+    pub fn authenticate(&self, now: u64) -> Result<(Command, IdentityId)> {
+        let command: Command = self.signed.decode().map_err(|_| CallError::Invalid)?;
+        let credential = match &self.request.proof {
+            Some(proof) => proof.credential(command.credential_id),
+            None => self
+                .cached
+                .as_ref()
+                .ok_or(CallError::Unauthorized)?
+                .credential(command.credential_id)
+                .cloned(),
+        }
+        .map_err(|_| CallError::Unauthorized)?;
+        let command =
+            calls::verify_command_authorship(&credential, &self.signed, &self.audience, now)
+                .map_err(|_| CallError::Unauthorized)?;
+        Ok((command, credential.identity()))
+    }
+    /// CPU-bound proof verification runs without the shared engine lock.
+    pub fn verify(self, now: u64) -> Result<Prepared> {
+        let authority = match &self.request.proof {
+            Some(proof) => Arc::new(
+                proof
+                    .verify(
+                        self.scope.conversation.space_id,
+                        self.scope.conversation.stream_id,
+                    )
+                    .map_err(|_| CallError::Unauthorized)?,
+            ),
+            None => self.cached.ok_or(CallError::Unauthorized)?,
+        };
+        let command = calls::verify_command(&authority, &self.signed, &self.audience, now)
+            .map_err(|_| CallError::Unauthorized)?;
+        let identity = calls::require_member(&authority, command.credential_id)
+            .map_err(|_| CallError::Unauthorized)?;
+        Ok(Prepared {
+            command,
+            identity,
+            request_id: self.signed.id(),
+            authority,
+            proof: self.request.proof,
+        })
+    }
+}
+
 pub struct Prepared {
     pub command: Command,
     pub identity: IdentityId,
@@ -41,6 +93,7 @@ pub struct Applied {
 }
 struct Fence {
     head: RecordId,
+    recovery: Option<RecordId>,
     sequence: u64,
     authority: Option<Arc<Authority>>,
     proof_bytes: usize,
@@ -90,47 +143,12 @@ impl Engine {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             PRAGMA max_page_count=65536;
-            CREATE TABLE IF NOT EXISTS fences(scope TEXT PRIMARY KEY, head TEXT NOT NULL, sequence INTEGER NOT NULL, blocked INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS fences(scope TEXT PRIMARY KEY, head TEXT NOT NULL, sequence INTEGER NOT NULL, blocked INTEGER NOT NULL DEFAULT 0, recovery TEXT);
             CREATE TABLE IF NOT EXISTS receipts(credential TEXT NOT NULL, nonce TEXT NOT NULL, request_id TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(credential, nonce));
             CREATE INDEX IF NOT EXISTS receipt_expiry ON receipts(expires);")?;
-        let mut fences = BTreeMap::new();
-        {
-            let mut statement = db.prepare("SELECT scope, head, sequence, blocked FROM fences")?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                if fences.len() >= MAX_SCOPES {
-                    return Err("Call authorization capacity exceeded.".into());
-                }
-                let key: String = row.get(0)?;
-                let parts = key.split(':').collect::<Vec<_>>();
-                if parts.len() != 3 {
-                    return Err("Invalid call authorization database.".into());
-                }
-                let scope = Scope {
-                    hosting_space_id: parts[0].parse()?,
-                    conversation: calls::CallScope {
-                        space_id: parts[1].parse()?,
-                        stream_id: parts[2].parse()?,
-                    },
-                };
-                let head: RecordId = row.get::<_, String>(1)?.parse()?;
-                let sequence = u64::try_from(row.get::<_, i64>(2)?)?;
-                if sequence == 0 {
-                    return Err("Invalid call authorization fence.".into());
-                }
-                fences.insert(
-                    scope,
-                    Fence {
-                        head,
-                        sequence,
-                        authority: None,
-                        proof_bytes: 0,
-                        last_used: 0,
-                        blocked: row.get::<_, bool>(3)?,
-                    },
-                );
-            }
-        }
+        // Load rollback floors on demand. Historic chats do not consume the
+        // bounded live proof cache, and their persisted fences are never erased.
+        let fences = BTreeMap::new();
         Ok(Self {
             _lock: lock,
             db,
@@ -149,6 +167,45 @@ impl Engine {
         device: Option<RecordId>,
         now: u64,
     ) -> Result<Prepared> {
+        self.preparation(request, device)?.verify(now)
+    }
+    fn stored_fence(&self, scope: Scope) -> Result<Option<Fence>> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT head, sequence, blocked, recovery FROM fences WHERE scope=?1",
+                [scope_key(scope)],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| CallError::Unavailable)?;
+        row.map(|(head, sequence, blocked, recovery)| {
+            if sequence <= 0 {
+                return Err(CallError::Unavailable);
+            }
+            Ok(Fence {
+                head: head.parse().map_err(|_| CallError::Unavailable)?,
+                recovery: recovery
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|_| CallError::Unavailable)?,
+                sequence: sequence as u64,
+                blocked,
+                authority: None,
+                proof_bytes: 0,
+                last_used: 0,
+            })
+        })
+        .transpose()
+    }
+    pub fn preparation(&self, request: Request, device: Option<RecordId>) -> Result<Preparation> {
         if request.command.len() > 192 * 1024 {
             return Err(CallError::Invalid);
         }
@@ -158,36 +215,21 @@ impl Engine {
         let signed = SignedRecord::parse(&bytes).map_err(|_| CallError::Invalid)?;
         let unverified: Command = signed.decode().map_err(|_| CallError::Invalid)?;
         if device.is_some_and(|device| device != unverified.credential_id) {
-
             return Err(CallError::Unauthorized);
         }
         let scope = Scope::from(&unverified);
         if self.fences.get(&scope).is_some_and(|fence| fence.blocked) {
-
             return Err(CallError::Unauthorized);
         }
-        let authority = match &request.proof {
-            Some(proof) => Arc::new(
-                proof
-                    .verify(scope.conversation.space_id, scope.conversation.stream_id)
-                    .map_err(|_| CallError::Unauthorized)?,
-            ),
-            None => self
-                .fences
-                .get(&scope)
-                .and_then(|fence| fence.authority.clone())
-                .ok_or(CallError::Unauthorized)?,
-        };
-        let command =
-            calls::verify_command(&authority, &signed, &self.audience, now).map_err(|_| CallError::Unauthorized)?;
-        let identity = calls::require_member(&authority, command.credential_id)
-            .map_err(|_| CallError::Unauthorized)?;
-        Ok(Prepared {
-            command,
-            identity,
-            request_id: signed.id(),
-            authority,
-            proof: request.proof,
+        if self.stored_fence(scope)?.is_some_and(|f| f.blocked) {
+            return Err(CallError::Unauthorized);
+        }
+        Ok(Preparation {
+            request,
+            signed,
+            scope,
+            audience: self.audience.clone(),
+            cached: self.fences.get(&scope).and_then(|f| f.authority.clone()),
         })
     }
 
@@ -200,14 +242,35 @@ impl Engine {
             proof,
         } = prepared;
         if command.expires_at <= now {
-
             return Err(CallError::Unauthorized);
         }
         let scope = Scope::from(&command);
+        if !self.fences.contains_key(&scope) {
+            if self.fences.len() >= MAX_SCOPES {
+                let idle = self
+                    .fences
+                    .iter()
+                    .filter(|(key, fence)| {
+                        self.registry.presence(key).is_none()
+                            && now.saturating_sub(fence.last_used) >= 120
+                    })
+                    .min_by_key(|(_, fence)| fence.last_used)
+                    .map(|(key, _)| *key);
+                if let Some(idle) = idle {
+                    self.fences.remove(&idle);
+                } else {
+                    return Err(CallError::Unavailable);
+                }
+            }
+            if let Some(fence) = self.stored_fence(scope)? {
+                self.fences.insert(scope, fence);
+            }
+        }
         let proof_bytes = proof
             .as_ref()
             .map(|proof| {
                 proof.genesis.len()
+                    + proof.checkpoint.as_ref().map_or(0, String::len)
                     + proof
                         .credentials
                         .iter()
@@ -230,13 +293,15 @@ impl Engine {
         let changed = match self.fences.get(&scope) {
             Some(old) => {
                 if old.blocked {
-
+                    return Err(CallError::Unauthorized);
+                }
+                if !authority.proves_recovery_ancestor(old.recovery) {
                     return Err(CallError::Unauthorized);
                 }
                 let old_id = old.head;
                 if old_id == command.config_id {
                     false
-                } else if authority.config(old_id).is_ok() {
+                } else if authority.proves_config_at(old_id, old.sequence) {
                     true
                 } else if authority
                     .head()
@@ -244,10 +309,8 @@ impl Engine {
                     .sequence
                     < old.sequence
                 {
-
                     return Err(CallError::Unauthorized);
                 } else {
-
                     self.db
                         .execute(
                             "UPDATE fences SET blocked=1 WHERE scope=?1",
@@ -306,12 +369,13 @@ impl Engine {
                 .head()
                 .map_err(|_| CallError::Unauthorized)?
                 .sequence;
-            self.db.execute("INSERT INTO fences(scope,head,sequence) VALUES(?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET head=excluded.head, sequence=excluded.sequence",
-                params![scope_key(scope), command.config_id.to_string(), i64::try_from(sequence).map_err(|_| CallError::Invalid)?]).map_err(|_| CallError::Unavailable)?;
+            self.db.execute("INSERT INTO fences(scope,head,sequence,recovery) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET head=excluded.head, sequence=excluded.sequence, recovery=excluded.recovery",
+                params![scope_key(scope), command.config_id.to_string(), i64::try_from(sequence).map_err(|_| CallError::Invalid)?, authority.recovery_id().map(|id|id.to_string())]).map_err(|_| CallError::Unavailable)?;
             self.fences.insert(
                 scope,
                 Fence {
                     head: command.config_id,
+                    recovery: authority.recovery_id(),
                     sequence,
                     authority: Some(authority.clone()),
                     proof_bytes,

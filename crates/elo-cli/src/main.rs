@@ -135,6 +135,9 @@ enum ReplicaCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: std::net::SocketAddr,
+        /// Public HTTPS origin used by clients, configured by the operator.
+        #[arg(long)]
+        public_origin: Option<String>,
         #[arg(long)]
         allow_insecure_loopback: bool,
     },
@@ -431,8 +434,9 @@ async fn run(cli: Cli) -> Result<()> {
             ),
             ReplicaCommand::Serve {
                 bind,
+                public_origin,
                 allow_insecure_loopback,
-            } => elo_core::http::serve(store, bind, allow_insecure_loopback).await?,
+            } => elo_core::http::serve(store, bind, allow_insecure_loopback, public_origin).await?,
         }
         return Ok(());
     }

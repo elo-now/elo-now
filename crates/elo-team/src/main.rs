@@ -103,6 +103,9 @@ async fn enroll(
     headers: HeaderMap,
     Json(request): Json<EnrollmentRequest>,
 ) -> std::result::Result<Json<EnrollmentReply>, StatusCode> {
+    if state.spaces.is_some() {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let supplied = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
@@ -385,9 +388,12 @@ mod tests {
             write_token: Some(mailbox.write_token),
         };
         let replica_task = tokio::spawn(async move {
-            axum::serve(replica_listener, elo_core::http::router(replica))
-                .await
-                .unwrap()
+            {
+                let origin = format!("http://{}", replica_listener.local_addr().unwrap());
+                axum::serve(replica_listener, elo_core::http::router(replica, &origin))
+            }
+            .await
+            .unwrap()
         });
         for client in [&mut alex, &mut maya] {
             client.ensure_peer(peer.clone()).unwrap();
@@ -406,21 +412,23 @@ mod tests {
             scope: owner.team_scope().unwrap(),
             message_lifetime_seconds: 86_400,
         };
+        let managed_space = ServiceConfig {
+            name: "Demo".into(),
+            address: elo_core::app::space_service::SpaceAddress {
+                url: descriptor.url.replace("/enroll", "/spaces"),
+                scope: descriptor.scope.clone(),
+                message_lifetime_seconds: descriptor.message_lifetime_seconds,
+            },
+            owners: vec![alex.identity_id()],
+            contact_email: None,
+            peer,
+        };
         let state = Arc::new(Server {
             client: Mutex::new(owner),
             token: Zeroizing::new(descriptor.token.clone()),
-            spaces: Some(ServiceConfig {
-                name: "Demo".into(),
-                address: elo_core::app::space_service::SpaceAddress {
-                    url: descriptor.url.replace("/enroll", "/spaces"),
-                    scope: descriptor.scope.clone(),
-                    message_lifetime_seconds: descriptor.message_lifetime_seconds,
-                },
-                owners: vec![alex.identity_id()],
-                contact_email: None,
-                peer,
-            }),
+            spaces: None,
         });
+        let listen_address = listener.local_addr().unwrap();
         let router = app(state.clone());
         let service_task =
             tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -537,10 +545,33 @@ mod tests {
         maya.close().await.unwrap();
         // Exercise the actual Space HTTP endpoint, including migration of the
         // existing owner and approval of a freshly registered profile.
+        service_task.abort();
+        let _ = service_task.await;
+        drop(http);
+        let mut upgraded = Arc::try_unwrap(state).ok().unwrap();
+        upgraded.spaces = Some(managed_space);
+        let state = Arc::new(upgraded);
+        let listener = tokio::net::TcpListener::bind(listen_address).await.unwrap();
+        let router = app(state.clone());
+        let service_task =
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let mut alex = ClientApp::open(dir.path().join("Alex"), PASSWORD.into(), true)
             .await
             .unwrap();
         alex.configure_team(descriptor.clone()).unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert_eq!(
+            http.post(&descriptor.url)
+                .bearer_auth(&descriptor.token)
+                .json(&alex.team_enrollment_request(&descriptor.scope).unwrap())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "the static enrollment token cannot bypass managed Space approval"
+        );
+        drop(http);
         alex.enable_spaces().await.unwrap();
         let space_id = descriptor.scope.space.to_string();
         let offer = alex

@@ -1,5 +1,12 @@
 /* Desktop shell follows the approved two-column concept. Mobile keeps its
    dedicated navigation and page transitions in mobile.css. */
+:root {
+  --desktop-sidebar-width: 286px;
+}
+body:has(.shell[data-mobile="false"]) .toast {
+  left: calc(50% + var(--desktop-sidebar-width) / 2);
+  width: min(480px, calc(100vw - var(--desktop-sidebar-width) - 24px));
+}
 .desktop-window-drag {
   position: fixed;
   z-index: 30;
@@ -161,15 +168,6 @@
   background: var(--elo-surface);
   box-shadow: 0 18px 50px color-mix(in srgb, var(--elo-text) 14%, transparent);
 }
-.desktop-workspace-menu > p {
-  margin: 7px 9px 4px;
-  color: var(--elo-muted);
-  font-size: var(--elo-type-caption);
-  font-weight: 600;
-  letter-spacing: 0.07em;
-  line-height: 1.4;
-  text-transform: uppercase;
-}
 .desktop-current-space,
 .desktop-workspace-profile,
 .desktop-workspace-menu-item {
@@ -276,17 +274,20 @@
   padding: calc(12px * var(--desktop-density))
     calc(12px * var(--desktop-density)) calc(7px * var(--desktop-density));
 }
-.desktop-sidebar-search .search-field {
+.desktop-sidebar-search .search-field,
+.desktop-header-search .search-field {
   margin: 0;
 }
-.desktop-sidebar-search .search-input {
+.desktop-sidebar-search .search-input,
+.desktop-header-search .search-input {
   min-height: var(--desktop-nav-row-height);
   padding-block: calc(7px * var(--desktop-density));
   border-radius: 10px;
   background: var(--elo-surface);
   font-size: var(--elo-type-label);
 }
-.desktop-sidebar-search .search-clear {
+.desktop-sidebar-search .search-clear,
+.desktop-header-search .search-clear {
   width: var(--desktop-nav-row-height);
   min-height: var(--desktop-nav-row-height);
 }
@@ -514,10 +515,6 @@
   padding: 0;
   overflow: visible;
 }
-.shell[data-mobile="false"] .contacts-desktop-toolbar {
-  padding: 0;
-  margin: 0 0 calc(16px * var(--desktop-density));
-}
 .shell[data-mobile="false"] .contacts-list > .empty-state {
   margin: var(--desktop-content-inset) 0;
 }
@@ -646,18 +643,8 @@
 .shell[data-mobile="false"] .contacts-viewport > .floating-search {
   display: none;
 }
-.contacts-desktop-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0;
-}
-.contacts-desktop-toolbar .search-field {
-  flex: 1;
-  margin: 0;
-}
 @media (max-width: 1040px) {
-  .shell[data-mobile="false"] {
+  :root {
     --desktop-sidebar-width: 250px;
   }
   .desktop-workspace-menu {
@@ -973,20 +960,12 @@
     width: 100%;
   }
 }
-.desktop-message-search {
-  flex: 0 0 auto;
-  width: 100%;
-  max-width: var(--desktop-content-width);
-  margin-inline: auto;
-  padding: var(--desktop-content-inset) var(--desktop-content-inset) 0;
-}
-.desktop-message-search .search-field {
-  margin: 0;
-}
-.desktop-message-search .search-input {
-  min-height: var(--desktop-control-height);
-  font-size: var(--elo-type-label);
-  padding-block: calc(7px * var(--desktop-density));
+.desktop-header-search {
+  width: calc(
+    var(--desktop-sidebar-width, 286px) - 24px * var(--desktop-density)
+  );
+  min-width: 0;
+  margin-inline-end: calc(8px * var(--desktop-density));
 }
 .shell[data-mobile="false"] .call-dock {
   left: 12px;

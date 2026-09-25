@@ -20,6 +20,9 @@ impl Projection {
                 continue;
             }
             let Ok(chat) = record.chat() else { continue };
+            if !record::current_message_time_is_valid(chat.logical_time) {
+                continue;
+            }
             let version = (chat.logical_time, record.id());
             match chat.payload.action {
                 Some(MessageAction::Reaction {
@@ -153,10 +156,7 @@ impl ClientApp {
                 config_id: authority.head_id().ok_or("Missing configuration.")?,
                 audience: vec![],
                 recipient_credentials: vec![],
-                logical_time: highest
-                    .checked_add(1)
-                    .ok_or("logical time overflow")?
-                    .max(u64::try_from(time.as_millis())?),
+                logical_time: record::next_message_time(highest, u64::try_from(time.as_millis())?),
                 created_at: field(v, "created_at")?.into(),
                 parents: vec![],
                 payload: TextPayload {
@@ -166,6 +166,7 @@ impl ClientApp {
                     action: Some(action),
                 },
                 locator: None,
+                access: None,
             },
             self.session.signing_key(),
         )?;
@@ -175,6 +176,7 @@ impl ClientApp {
             .iter()
             .map(|id| authority.credential(*id).cloned())
             .collect::<record::Result<Vec<_>>>()?;
+        self.require_fresh_membership(authority).await?;
         let cipher = crypto::seal_chat(&signed, &recipients)?;
         let cipher = crate::erasure::wrap(
             cipher,

@@ -1,3 +1,4 @@
+import { UpdateBanner } from "./UpdateGate";
 import { PasswordInput } from "./PasswordInput";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -157,7 +158,17 @@ export function ProfileGate({
         });
         onOpen(view, environment.mobile, undefined, credential.demoProfile);
       } else {
-        await open(credential.password, false);
+        const view = await invoke<View>("unlock", {
+          directory: environment.directory,
+          password: "",
+          allowInsecureLoopback: false,
+          biometricKey: credential.key,
+          biometricProfile: biometric.profile.id,
+          biometricIdentity: biometric.profile.identity,
+        });
+        acceptLegal(view.identity);
+        setPassword("");
+        onOpen(view, environment.mobile);
       }
     } catch (error) {
       if (!biometricCancelled(error)) reportError(error);
@@ -204,6 +215,7 @@ export function ProfileGate({
         {card && <Brand />}
         {!pinAppearance && (card ? appearance : menu)}
       </div>
+      <UpdateBanner />
       <div
         className="unlock-content"
         data-credentials={!card}

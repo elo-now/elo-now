@@ -6,6 +6,7 @@
   "permissions": [
     "allow-profile-environment",
     "allow-profile-task",
+    "allow-control-task",
     "allow-open-demo",
     "allow-prepare-profile",
     "allow-cancel-profile",
@@ -58,6 +59,10 @@
     "allow-save-export",
     "allow-open-mail-draft",
     "allow-invitation-qr",
+    "allow-copy-recovery-code",
+    "allow-release-policy",
+    "allow-check-release-policy",
+    "allow-open-update",
     "deep-link:allow-get-current",
     "core:app:allow-version",
     "core:event:allow-listen",

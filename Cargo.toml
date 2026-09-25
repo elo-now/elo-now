@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/elo-core", "crates/elo-cli", "crates/elo-wake", "crates/elo-team", "crates/elo-call-service", "crates/tauri-plugin-elo-push", "apps/desktop/src-tauri"]
+members = ["crates/elo-core", "crates/elo-cli", "crates/elo-wake", "crates/elo-team", "crates/elo-call-service", "crates/tauri-plugin-elo-push", "crates/tauri-plugin-elo-privacy", "apps/desktop/src-tauri"]
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-only"
@@ -64,3 +64,13 @@ tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
 # Xcode 27 internalizes Swift package C exports. Keep the build bridge
 # reproducible and promote the shared SwiftRs helpers from Tauri exactly once.
 swift-rs = { path = "vendor/swift-rs" }
+
+# Require reenrollment when the enrolled Apple biometrics change.
+tauri-plugin-biometry = { path = "vendor/tauri-plugin-biometry" }
+# Backport the upstream VariantStrIter fix while Tauri still requires GTK3/glib 0.18.
+glib = { path = "vendor/glib" }
+
+# Adopt single-window UIScene lifecycle and fix scene-config ownership on iOS 27.
+tao = { path = "vendor/tao" }
+# Keep Android share files inside the app's declared, private FileProvider path.
+tauri-plugin-sharekit = { path = "vendor/tauri-plugin-sharekit" }

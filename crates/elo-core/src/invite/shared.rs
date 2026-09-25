@@ -66,6 +66,9 @@ pub struct WakeRoute {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Offer {
+    /// Signed presentation metadata for the profile's internal setup stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_seed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeRoute>,
     pub v: u64,
@@ -168,6 +171,7 @@ pub fn create(
         return Err(RecordError::Authority);
     }
     let offer = Offer {
+        personal_seed: None,
         wake: None,
         v: 1,
         kind: "space.invitation.shared".into(),
@@ -321,7 +325,7 @@ pub async fn approve(
     store: &ClientStore,
     approval: Approval,
     key: &SigningKey,
-    own: &age::x25519::Identity,
+    own: &dyn crate::crypto::DecryptionIdentity,
     now: LocalTime,
 ) -> std::result::Result<ConfigAdmission, StoreError> {
     let invalid = || StoreError::InvalidInput("invalid shared invitation or request");
@@ -385,7 +389,7 @@ pub(crate) async fn enroll(
     store: &ClientStore,
     enrollment: Enrollment,
     key: &SigningKey,
-    own: &age::x25519::Identity,
+    own: &dyn crate::crypto::DecryptionIdentity,
     now: LocalTime,
 ) -> std::result::Result<ConfigAdmission, StoreError> {
     let invalid = || StoreError::InvalidInput("invalid membership approval");

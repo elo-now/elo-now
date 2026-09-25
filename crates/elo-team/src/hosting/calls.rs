@@ -49,6 +49,16 @@ pub(super) async fn admit(
     if !bool::from(key.as_slice().ct_eq(presented.as_bytes())) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if let Some((credential, _, _)) = request.device {
+        if host
+            .revocations
+            .get(credential)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .is_some()
+        {
+            return Ok(Json(json!({"allowed":false})));
+        }
+    }
     let entry = host
         .spaces
         .read()
@@ -113,9 +123,12 @@ mod tests {
                 root: directory.path().join("host"),
                 public_url: "http://127.0.0.1:18000".into(),
                 max_spaces_per_identity: 3,
+                max_spaces: default_max_spaces(),
+                max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
                 operator_snapshot: None,
                 call_admission_key: Some(key_path),
+                client_policy: Default::default(),
                 attachment_storage: None,
             },
             true,
@@ -172,9 +185,12 @@ mod tests {
                 root: directory.path().join("host"),
                 public_url: base.clone(),
                 max_spaces_per_identity: 3,
+                max_spaces: default_max_spaces(),
+                max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
                 operator_snapshot: None,
                 call_admission_key: Some(key_path),
+                client_policy: Default::default(),
                 attachment_storage: None,
             },
             true,
@@ -380,6 +396,7 @@ mod tests {
             .await
             .unwrap();
         owner.operate(json!({"op":"contact_add", "link":card["link"], "trusted":true,"confirmed_contact":preview["id"]})).await.unwrap();
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
         owner.operate(json!({"op":"contact_add_members", "space":private["space"],"stream":private["stream"],
             "request_id":"41".repeat(16),"people":[guest.identity_id()]})).await.unwrap();
         let updated = owner.operate(authorize_private).await.unwrap();

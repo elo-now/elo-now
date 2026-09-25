@@ -306,7 +306,9 @@ impl ClientApp {
                     let recipient = next.credential(*credential)?.recipient();
                     let packet = Packet::Members {
                         bundle: bundle.clone(),
-                        ciphertext: STANDARD.encode(next.seal_snapshot(&recipient)?),
+                        ciphertext: STANDARD.encode(
+                            next.seal_snapshot_signed(&recipient, self.session.signing_key())?,
+                        ),
                     };
                     let id = format!(
                         "members:{}:{credential}:{}:{}",
@@ -350,10 +352,10 @@ impl ClientApp {
                     people: people.clone(),
                     proof: proof.id(),
                     base,
-                    snapshot: Some(
-                        STANDARD
-                            .encode(next.seal_snapshot(&self.session.age_identity().to_public())?),
-                    ),
+                    snapshot: Some(STANDARD.encode(next.seal_snapshot_signed(
+                        &self.session.age_identity().to_public(),
+                        self.session.signing_key(),
+                    )?)),
                     jobs: prepared.jobs,
                 },
             );
@@ -516,6 +518,7 @@ impl ClientApp {
                 unreachable!()
             };
             self.pins.push(Pin {
+                personal_seed: Some(false),
                 chat_kind: incoming.head()?.chat_kind,
                 name: offer.name,
                 space: incoming.space(),

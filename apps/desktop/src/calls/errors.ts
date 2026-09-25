@@ -1,6 +1,8 @@
 /** Service decisions must not be presented as generic connectivity failures. */
 export function callErrorCopy(code: string) {
   switch (code) {
+    case "updateRequired":
+      return { title: "update.title", message: "update.banner" } as const;
     case "already_joined":
       return {
         title: "calls.alreadyJoinedTitle",

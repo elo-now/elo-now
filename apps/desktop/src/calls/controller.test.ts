@@ -18,6 +18,7 @@ vi.mock("./control", async (importOriginal) => ({
   },
 }));
 import { Calls } from "./controller";
+import { setUpdateRequired } from "../releasePolicy";
 import { callErrorCopy } from "./errors";
 const chat = {
   space_context: "host",
@@ -51,10 +52,51 @@ function pendingCapture() {
   return { resolve: () => resolve(stream), stop };
 }
 afterEach(() => {
+  setUpdateRequired(false);
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 describe("call subscriptions", () => {
+  it("subscribes beyond 32 chats in bounded batches and cancels queued work on logout", async () => {
+    vi.useFakeTimers();
+    const calls = new Calls();
+    const command = vi.fn(async () => ({ type: "result" }));
+    Object.assign(calls, { command });
+    const streams = Array.from({ length: 70 }, (_, i) => ({
+      ...chat,
+      stream: `chat-${i}`,
+    }));
+    calls.update({ ...view, streams });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(command).toHaveBeenCalledTimes(16);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(command).toHaveBeenCalledTimes(32);
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(command).toHaveBeenCalledTimes(70);
+    expect(
+      new Set(
+        command.mock.calls.map(
+          (entry) => (entry as unknown as [Stream])[0].stream,
+        ),
+      ).size,
+    ).toBe(70);
+    calls.update({
+      ...view,
+      streams: [
+        ...streams,
+        ...Array.from({ length: 30 }, (_, i) => ({
+          ...chat,
+          stream: `extra-${i}`,
+        })),
+      ],
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(command).toHaveBeenCalledTimes(86);
+    calls.update(null);
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(command).toHaveBeenCalledTimes(86);
+    calls.dispose();
+  });
   it("resubscribes after server eviction without clearing a different incoming call", async () => {
     const calls = new Calls();
     const other = { ...chat, stream: "other" };
@@ -492,4 +534,44 @@ it("silences muted chats and immediately dismisses a ringing call when muted or 
   });
   expect(calls.snapshot.incoming).toBeUndefined();
   calls.dispose();
+});
+
+it("required updates stop subscriptions and new calls without stopping active media", async () => {
+  vi.useFakeTimers();
+  setUpdateRequired(true);
+  const calls = new Calls();
+  const command = vi.fn(async () => ({ type: "result" }));
+  Object.assign(calls, { command });
+  calls.activate();
+  calls.update(view);
+  await calls.start(chat);
+  expect(calls.snapshot.error).toBe("updateRequired");
+  await vi.advanceTimersByTimeAsync(20000);
+  expect(command).not.toHaveBeenCalled();
+  calls.dispose();
+
+  setUpdateRequired(false);
+  const connected = new Calls();
+  connected.activate();
+  const close = vi.fn();
+  const unrelatedClose = vi.fn();
+  const active = { call_id: "ongoing" } as ActiveCall;
+  connected.snapshot = {
+    ...connected.snapshot,
+    active,
+    chat,
+    phase: "connected",
+  };
+  Object.assign(connected, {
+    endpoints: new Map([["host", "https://active.example"]]),
+    connections: new Map([
+      ["https://active.example", { close }],
+      ["https://other.example", { close: unrelatedClose }],
+    ]),
+  });
+  setUpdateRequired(true);
+  expect(close).not.toHaveBeenCalled();
+  expect(unrelatedClose).toHaveBeenCalledOnce();
+  expect(connected.snapshot.active).toBe(active);
+  connected.dispose();
 });

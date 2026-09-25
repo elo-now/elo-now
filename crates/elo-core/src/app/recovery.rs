@@ -2,8 +2,9 @@ use super::*;
 use crate::ids::ObjectId;
 
 impl ClientApp {
-    fn recovery_input(&self, v: &Value) -> Result<(Vec<u8>, Authority, Pin)> {
+    pub(super) fn recovery_input(&self, v: &Value) -> Result<(Vec<u8>, Authority, Pin)> {
         let mut p = Pin {
+            personal_seed: Some(false),
             chat_kind: None,
             space: field(v, "space")?.parse()?,
             stream: field(v, "stream")?.parse()?,
@@ -15,7 +16,17 @@ impl ClientApp {
         if p.name.is_empty() || p.name.len() > 120 {
             return Err("invalid channel name".into());
         }
-        let bytes = read_exchange(Path::new(field(v, "path")?), MAX_EXCHANGE)?;
+        let bytes = if let Some(ciphertext) = v.get("ciphertext") {
+            let text = ciphertext
+                .as_str()
+                .ok_or("Invalid management recovery file.")?;
+            if text.len() > super::control_recovery::MAX_CONTROL_PACKAGE {
+                return Err("Management recovery file is too large.".into());
+            }
+            STANDARD.decode(text)?
+        } else {
+            read_exchange(Path::new(field(v, "path")?), MAX_EXCHANGE)?
+        };
         let a = Authority::open_snapshot(
             &bytes,
             self.session.age_identity(),
@@ -39,7 +50,7 @@ impl ClientApp {
         }
         Ok(())
     }
-    pub(super) async fn recovery_operation(&mut self, v: Value) -> Result<Value> {
+    pub(super) async fn recovery_operation(&mut self, mut v: Value) -> Result<Value> {
         match field(&v, "op")? {
             "device_export" => {
                 write_export(
@@ -94,7 +105,7 @@ impl ClientApp {
                     .iter()
                     .find(|p| p.space() == a.space() && p.stream() == a.stream());
                 return Ok(
-                    json!({"expected_proof":ObjectId::of_ciphertext(&bytes),"expected_config":a.head_id(),"expected_recovery":a.recovery_id(),"controller":a.controller().id(),"new_device":self.session.credential().id(),"members":a.head()?.members,"forked":a.is_forked(),"local_head":local.and_then(Authority::head_id),"warning_code":"recovery_requires_review","warning":"Check the members and permissions with surviving participants. This file does not prove global freshness. Recovery replaces all devices of the controlling owner; old keys and history are not recovered. Offline clients may not know about the change."}),
+                    json!({"expected_proof":ObjectId::of_ciphertext(&bytes),"expected_config":a.head_id(),"expected_recovery":a.recovery_id(),"controller":a.controller().id(),"new_device":self.session.credential().id(),"members":a.head()?.members,"names":self.presentation.member_names(&a),"forked":a.is_forked(),"local_head":local.and_then(Authority::head_id),"warning_code":"recovery_requires_review","warning":"Check the members and permissions with surviving participants. This file does not prove global freshness. Recovery replaces all devices of the controlling owner; old keys and history are not recovered. Offline clients may not know about the change."}),
                 );
             }
             "controller_recover" => {
@@ -105,10 +116,19 @@ impl ClientApp {
                 {
                     return Err("conflicting proof or wrong recovery owner".into());
                 }
-                let card_bytes =
-                    Zeroizing::new(vault::read_private(Path::new(field(&v, "recovery_card")?))?);
-                let card: RecoveryCard = serde_json::from_slice(&card_bytes)?;
-                let root = card.recover_root(self.session.identity_id())?;
+                let root = if let Value::String(words) = v["recovery_words"].take() {
+                    let words = Zeroizing::new(words);
+                    let draft =
+                        ProfileDraft::recover(&words, &self.session.identity_id().to_string())?;
+                    draft.card().recover_root(self.session.identity_id())?
+                } else {
+                    let bytes = Zeroizing::new(vault::read_private(Path::new(field(
+                        &v,
+                        "recovery_card",
+                    )?))?);
+                    let card: RecoveryCard = serde_json::from_slice(&bytes)?;
+                    card.recover_root(self.session.identity_id())?
+                };
                 let existing = if let Some(cipher) =
                     self.store.authority_snapshot(pin.space, pin.stream).await?
                 {
@@ -210,6 +230,15 @@ impl ClientApp {
                 }
                 self.persist_workspace()?;
                 let i = self.authority_index(&v)?;
+                // The durable local certificate makes a failed host publication
+                // retryable with the same head, never a second recovery branch.
+                let recovered = &self.authorities.0[i];
+                self.publish_call_update(
+                    recovered,
+                    recovered.config_record(recovered.head_id().ok_or("head")?)?,
+                )
+                .await?;
+                self.invalidate_membership_checks().await;
                 let before = self.session.controller_mode;
                 let previous_spaces = self.session.controller_spaces.clone();
                 self.session

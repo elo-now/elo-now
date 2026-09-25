@@ -11,6 +11,24 @@ use sha2::{Digest, Sha256};
 const RESERVATION_TTL_MS: u64 = 15 * 60 * 1000;
 const ACCESS_TTL_MS: u64 = 5 * 60 * 1000;
 const UNLINKED_UPLOAD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_ATTACHMENT_ENTRIES: usize = 4096;
+const MAX_PENDING_UPLOADS_PER_IDENTITY: usize = 16;
+
+fn require_upload_capacity(state: &ServiceState, identity: IdentityId) -> Result<()> {
+    if state.attachments.len() >= MAX_ATTACHMENT_ENTRIES {
+        return Err("Attachment file limit reached. Remove old files.".into());
+    }
+    if state
+        .attachments
+        .values()
+        .filter(|entry| entry.issuer == identity && entry.counts_as_reserved())
+        .count()
+        >= MAX_PENDING_UPLOADS_PER_IDENTITY
+    {
+        return Err("Too many pending attachments. Finish or cancel an upload.".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +41,124 @@ enum HostedAttachmentState {
     Expired,
     Deleted,
     Missing,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_slots_are_bounded_without_blocking_other_members() {
+        let owner: IdentityId = "11".repeat(32).parse().unwrap();
+        let other: IdentityId = "22".repeat(32).parse().unwrap();
+        let mut state = ServiceState::default();
+        let attachment = HostedAttachment {
+            object_id: AttachmentObjectId::from_bytes([1; 16]),
+            issuer: owner,
+            plaintext_size: 1,
+            encrypted_size: 100,
+            ciphertext_sha256: "11".repeat(32),
+            created_at_ms: 1,
+            expires_at_ms: None,
+            reservation_expires_at_ms: 100,
+            state: HostedAttachmentState::Reserved,
+            message_id: None,
+            terminal_at_ms: 0,
+        };
+        for i in 0..MAX_PENDING_UPLOADS_PER_IDENTITY {
+            state.attachments.insert(
+                AttachmentId::from_bytes((i as u128).to_be_bytes()),
+                attachment.clone(),
+            );
+        }
+        assert!(require_upload_capacity(&state, owner).is_err());
+        require_upload_capacity(&state, other).unwrap();
+        state.attachments.values_mut().next().unwrap().state = HostedAttachmentState::Uploaded;
+        assert!(require_upload_capacity(&state, owner).is_err());
+        state.attachments.values_mut().next().unwrap().state = HostedAttachmentState::Available;
+        require_upload_capacity(&state, owner).unwrap();
+        for i in 0..MAX_ATTACHMENT_ENTRIES {
+            state.attachments.insert(
+                AttachmentId::from_bytes((i as u128).to_be_bytes()),
+                attachment.clone(),
+            );
+        }
+        assert_eq!(
+            require_upload_capacity(&state, other)
+                .unwrap_err()
+                .to_string(),
+            "Attachment file limit reached. Remove old files."
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_bounds_terminal_metadata_and_keeps_expired_uploads_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = ProfileDraft::new()
+            .unwrap()
+            .save_named(
+                dir.path().join("profile"),
+                "synthetic attachment cleanup password".into(),
+                "General",
+                "Owner",
+            )
+            .await
+            .unwrap();
+        let current = time().unwrap();
+        let attachment = |state, terminal_at_ms| HostedAttachment {
+            object_id: AttachmentObjectId::from_bytes([1; 16]),
+            issuer: app.identity_id(),
+            plaintext_size: 1,
+            encrypted_size: 100,
+            ciphertext_sha256: "11".repeat(32),
+            created_at_ms: current - 100,
+            expires_at_ms: None,
+            reservation_expires_at_ms: current - 1,
+            state,
+            message_id: None,
+            terminal_at_ms,
+        };
+        let mut state = app.service_state().unwrap();
+        for i in 0u128..550 {
+            state.attachments.insert(
+                AttachmentId::from_bytes(i.to_be_bytes()),
+                attachment(HostedAttachmentState::Deleted, current - 1),
+            );
+        }
+        let pending = AttachmentId::from_bytes([254; 16]);
+        state
+            .attachments
+            .insert(pending, attachment(HostedAttachmentState::Reserved, 0));
+        let old = AttachmentId::from_bytes([253; 16]);
+        state
+            .attachments
+            .insert(old, attachment(HostedAttachmentState::Missing, 0));
+        state.attachment_access.insert(
+            "old-access".into(),
+            AttachmentAccess {
+                attachment: old,
+                credential: None,
+                kind: "download".into(),
+                expires_at_ms: current + 1000,
+            },
+        );
+        app.save_service_state(&state).unwrap();
+        let targets = app.attachment_cleanup_targets(current, 16).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].attachment_id, pending);
+        let state = app.service_state().unwrap();
+        assert_eq!(state.attachments.len(), 513);
+        assert!(!state.attachments.contains_key(&old));
+        assert!(!state.attachment_access.contains_key("old-access"));
+        assert_eq!(
+            app.attachment_storage_usage().unwrap().used_bytes,
+            100,
+            "expired uploads still occupy quota until provider deletion succeeds"
+        );
+        app.attachment_cleanup_complete(pending).unwrap();
+        assert_eq!(app.attachment_storage_usage().unwrap().used_bytes, 0);
+        app.close().await.unwrap();
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -39,6 +175,8 @@ pub(super) struct HostedAttachment {
     state: HostedAttachmentState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_id: Option<RecordId>,
+    #[serde(default)]
+    terminal_at_ms: u64,
 }
 
 impl HostedAttachment {
@@ -78,11 +216,14 @@ impl HostedAttachment {
 pub(super) struct AttachmentAccess {
     attachment: AttachmentId,
     kind: String,
+    #[serde(default)]
+    pub(super) credential: Option<RecordId>,
     expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct AttachmentTransferGrant {
+    pub credential: Option<RecordId>,
     pub attachment_id: AttachmentId,
     pub object_id: AttachmentObjectId,
     pub encrypted_size: u64,
@@ -216,6 +357,9 @@ impl ClientApp {
                 {
                     return Some(Err("Attachment identifiers must be unique.".into()));
                 }
+                if let Err(error) = require_upload_capacity(state, credential.identity()) {
+                    return Some(Err(error));
+                }
                 let (used, reserved) = bytes_in_state(state);
                 if used
                     .checked_add(reserved)
@@ -223,8 +367,9 @@ impl ClientApp {
                     .is_none_or(|value| value > MAX_SPACE_ATTACHMENT_STORAGE)
                 {
                     return Some(Err(format!(
-                        "Attachment storage is full. {} MB of 200 MB is currently used.",
-                        used.div_ceil(1024 * 1024)
+                        "Attachment storage is full. {} MB of {} MB is currently used.",
+                        used.div_ceil(1_000_000),
+                        MAX_SPACE_ATTACHMENT_STORAGE / 1_000_000
                     )
                     .into()));
                 }
@@ -246,12 +391,14 @@ impl ClientApp {
                         reservation_expires_at_ms: current + RESERVATION_TTL_MS,
                         state: HostedAttachmentState::Reserved,
                         message_id: None,
+                        terminal_at_ms: 0,
                     },
                 );
                 state.attachment_access.insert(
                     token_hash(&raw_token),
                     AttachmentAccess {
                         attachment,
+                        credential: Some(credential.id()),
                         kind: "upload".into(),
                         expires_at_ms: current + RESERVATION_TTL_MS,
                     },
@@ -368,6 +515,7 @@ impl ClientApp {
                     token_hash(&raw_token),
                     AttachmentAccess {
                         attachment,
+                        credential: Some(credential.id()),
                         kind: "download".into(),
                         expires_at_ms: current + ACCESS_TTL_MS,
                     },
@@ -496,6 +644,7 @@ impl ClientApp {
             return Err("Attachment upload is no longer pending.".into());
         }
         Ok(AttachmentTransferGrant {
+            credential: access.credential,
             attachment_id: access.attachment,
             object_id: attachment.object_id,
             encrypted_size: attachment.encrypted_size,
@@ -541,6 +690,7 @@ impl ClientApp {
             return Err("Attachment is no longer available.".into());
         }
         Ok(AttachmentTransferGrant {
+            credential: access.credential,
             attachment_id: access.attachment,
             object_id: attachment.object_id,
             encrypted_size: attachment.encrypted_size,
@@ -557,12 +707,36 @@ impl ClientApp {
         state
             .attachment_access
             .retain(|_, access| access.expires_at_ms >= current);
-        let mut remove = Vec::new();
-        for (id, attachment) in &mut state.attachments {
+        let mut terminal = state
+            .attachments
+            .iter()
+            .filter(|(_, a)| {
+                matches!(
+                    a.state,
+                    HostedAttachmentState::Deleted
+                        | HostedAttachmentState::Expired
+                        | HostedAttachmentState::Missing
+                )
+            })
+            .map(|(id, a)| (*id, a.terminal_at_ms))
+            .collect::<Vec<_>>();
+        terminal.sort_by_key(|(_, time)| *time);
+        let excess = terminal.len().saturating_sub(512);
+        let remove = terminal
+            .into_iter()
+            .enumerate()
+            .filter(|(index, (_, at))| {
+                *index < excess || current.saturating_sub(*at) > 30 * 86400 * 1000
+            })
+            .map(|(_, (id, _))| id)
+            .collect::<Vec<_>>();
+        for attachment in state.attachments.values_mut() {
             if matches!(attachment.state, HostedAttachmentState::Reserved)
                 && attachment.reservation_expires_at_ms < current
             {
-                remove.push(*id);
+                // Upload may have reached the provider before the commit response.
+                // Keep tracking it until provider deletion succeeds.
+                attachment.state = HostedAttachmentState::DeletingDeleted;
             } else if matches!(attachment.state, HostedAttachmentState::Uploaded)
                 && attachment.reservation_expires_at_ms < current
             {
@@ -646,6 +820,7 @@ impl ClientApp {
             .attachments
             .get_mut(&id)
             .ok_or("Attachment was not found.")?;
+        attachment.terminal_at_ms = time()?;
         attachment.state = match attachment.state {
             HostedAttachmentState::DeletingExpired => HostedAttachmentState::Expired,
             HostedAttachmentState::DeletingDeleted => HostedAttachmentState::Deleted,
@@ -661,6 +836,7 @@ impl ClientApp {
             .get_mut(&id)
             .ok_or("Attachment was not found.")?;
         attachment.state = HostedAttachmentState::Missing;
+        attachment.terminal_at_ms = time()?;
         self.save_service_state(&state)
     }
 }

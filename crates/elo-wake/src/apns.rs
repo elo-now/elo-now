@@ -19,6 +19,9 @@ pub struct Config {
     pub key_file: PathBuf,
     pub key_id: String,
     pub team_id: String,
+    /// Older Apple accounts can have an App ID prefix different from Team ID.
+    #[serde(default)]
+    pub app_id_prefix: Option<String>,
     pub bundle_id: String,
     pub sandbox: bool,
 }
@@ -36,6 +39,10 @@ pub enum Error {
     Configuration,
     #[error("APNs authentication failed")]
     Authentication,
+    #[error("APNs provider token expired")]
+    TokenExpired,
+    #[error("APNs rate limit reached")]
+    Throttled,
     #[error("APNs call delivery failed")]
     Delivery,
     #[error("The VoIP device registration is no longer valid")]
@@ -49,7 +56,22 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
+#[derive(Deserialize)]
+struct Rejection {
+    reason: String,
+}
+
 impl Apns {
+    pub(crate) fn app_id(&self) -> String {
+        format!(
+            "{}.{}",
+            self.config
+                .app_id_prefix
+                .as_deref()
+                .unwrap_or(&self.config.team_id),
+            self.config.bundle_id
+        )
+    }
     pub fn load(path: &Path) -> Result<Self, Error> {
         let config: Config = serde_json::from_slice(&Zeroizing::new(
             elo_core::vault::read_private(path).map_err(|_| Error::Configuration)?,
@@ -61,6 +83,10 @@ impl Apns {
     pub fn new(config: Config) -> Result<Self, Error> {
         if !valid_id(&config.key_id)
             || !valid_id(&config.team_id)
+            || config
+                .app_id_prefix
+                .as_ref()
+                .is_some_and(|prefix| !valid_id(prefix))
             || config.bundle_id.is_empty()
             || config.bundle_id.len() > 200
             || !config
@@ -154,7 +180,7 @@ impl Apns {
             "api.push.apple.com"
         };
         let authorization = self.authorization(now).await?;
-        let response = self
+        let mut response = self
             .client
             .post(format!("https://{host}/3/device/{token}"))
             .bearer_auth(authorization.as_str())
@@ -166,13 +192,51 @@ impl Apns {
             .send()
             .await
             .map_err(|_| Error::Delivery)?;
-        match response.status().as_u16() {
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        if status == 403 {
+            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Delivery)? {
+                if body.len() + chunk.len() > 1024 {
+                    return Err(Error::Authentication);
+                }
+                body.extend_from_slice(&chunk);
+            }
+        }
+        let reason = serde_json::from_slice::<Rejection>(&body).ok();
+        self.outcome(
+            status,
+            reason.as_ref().map(|value| value.reason.as_str()),
+            &authorization,
+            now,
+        )
+        .await
+    }
+
+    async fn outcome(
+        &self,
+        status: u16,
+        reason: Option<&str>,
+        used: &str,
+        now: u64,
+    ) -> Result<(), Error> {
+        match status {
             200 => Ok(()),
             403 => {
-                *self.authorization.lock().await = None;
+                // A bad key/environment is not token expiry. Also ignore stale
+                // responses to an older token after another request renewed it.
+                if reason == Some("ExpiredProviderToken") {
+                    let mut cached = self.authorization.lock().await;
+                    if cached.as_ref().is_some_and(|(token, issued)| {
+                        token.as_str() == used && now >= *issued && now - issued >= 20 * 60
+                    }) {
+                        *cached = None;
+                        return Err(Error::TokenExpired);
+                    }
+                }
                 Err(Error::Authentication)
             }
             410 => Err(Error::Unregistered),
+            429 => Err(Error::Throttled),
             _ => Err(Error::Delivery),
         }
     }
@@ -181,9 +245,7 @@ impl Apns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn provider_token_is_signed_cached_and_never_survives_clock_rollback() {
-        use ring::signature::{ECDSA_P256_SHA256_FIXED, KeyPair, UnparsedPublicKey};
+    fn provider() -> Apns {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("auth.p8");
         let key =
@@ -194,14 +256,20 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(key.as_ref())
         );
         elo_core::vault::write_private(&path, pem.as_bytes(), false).unwrap();
-        let provider = Apns::new(Config {
+        Apns::new(Config {
             key_file: path,
             key_id: "ABCDEFGHIJ".into(),
             team_id: "1234567890".into(),
+            app_id_prefix: None,
             bundle_id: "now.elo".into(),
             sandbox: true,
         })
-        .unwrap();
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn provider_token_is_signed_cached_and_never_survives_clock_rollback() {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED, KeyPair, UnparsedPublicKey};
+        let provider = provider();
         let token = provider.authorization(10000).await.unwrap();
         assert_eq!(
             token.as_str(),
@@ -215,5 +283,67 @@ mod tests {
         let previous = provider.authorization(9999).await.unwrap();
         assert_ne!(previous.as_str(), token.as_str());
         assert!(provider.incoming("not-a-token", &json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn permanent_rejection_and_rate_limit_do_not_rotate_provider_tokens() {
+        let provider = provider();
+        let token = provider.authorization(10000).await.unwrap();
+        for reason in [
+            "BadEnvironmentKeyInToken",
+            "BadEnvironmentKeyIdInToken",
+            "InvalidProviderToken",
+            "Forbidden",
+            "MissingProviderToken",
+        ] {
+            assert!(matches!(
+                provider.outcome(403, Some(reason), &token, 10001).await,
+                Err(Error::Authentication)
+            ));
+            assert_eq!(
+                provider.authorization(10002).await.unwrap().as_str(),
+                token.as_str()
+            );
+        }
+        assert!(matches!(
+            provider.outcome(429, None, &token, 10003).await,
+            Err(Error::Throttled)
+        ));
+        assert_eq!(
+            provider.authorization(10004).await.unwrap().as_str(),
+            token.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_renews_only_the_rejected_token_and_respects_minimum_age() {
+        let provider = provider();
+        let old = provider.authorization(10000).await.unwrap();
+        assert!(matches!(
+            provider
+                .outcome(403, Some("ExpiredProviderToken"), &old, 10001)
+                .await,
+            Err(Error::Authentication)
+        ));
+        assert_eq!(
+            provider.authorization(10002).await.unwrap().as_str(),
+            old.as_str()
+        );
+        assert!(matches!(
+            provider
+                .outcome(403, Some("ExpiredProviderToken"), &old, 11200)
+                .await,
+            Err(Error::TokenExpired)
+        ));
+        let fresh = provider.authorization(11201).await.unwrap();
+        assert_ne!(fresh.as_str(), old.as_str());
+        provider
+            .outcome(403, Some("ExpiredProviderToken"), &old, 12402)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider.authorization(12403).await.unwrap().as_str(),
+            fresh.as_str()
+        );
     }
 }

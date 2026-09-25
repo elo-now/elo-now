@@ -15,6 +15,7 @@ export function callErrorCode(error: unknown): string {
   if (
     typeof message === "string" &&
     [
+      "updateRequired",
       "ended",
       "unavailable",
       "unauthorized",

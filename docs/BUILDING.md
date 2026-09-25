@@ -15,8 +15,6 @@ npm ci
 
 ## Desktop development
 
-Before upgrading a running service, read [API compatibility and application updates](API_COMPATIBILITY.md). It distinguishes published 1.0.0 behavior from mechanisms being prepared for the next release; do not assume that a newer server build supports every older client.
-
 From `apps/desktop`:
 
 ```sh
@@ -34,6 +32,21 @@ npm run tauri -- build
 The Tauri configuration creates native desktop packages for the current host.
 The Desktop release workflow packages macOS (`.dmg` for Apple Silicon and Intel), Windows (x64 NSIS installer) and Linux (x64 `.deb` and AppImage) builds as workflow artifacts. Only successful builds are attached to a release. Distribution signing and notarization still require the publisher's
 platform credentials and must stay outside the repository.
+
+The download workflow applies an ad hoc signature to the complete macOS app
+bundle and verifies its resource seal before packaging. This is an integrity
+check, not Developer ID signing or notarization. A local equivalent is
+`npm run tauri -- build --bundles app,dmg --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'`.
+Use the appropriate distribution identity instead when preparing a signed release.
+
+Future runs of the Desktop release workflow stage only final installers, generate
+SHA256SUMS, and attest their provenance in a separate job with no build scripts.
+To verify a downloaded installer, use `gh attestation verify PATH --repo OWNER/REPO`
+with the actual publisher repository, then check its release checksum. This binds
+the file to the GitHub workflow and source revision; it does not replace Apple
+notarization or Windows Authenticode. Previously published packages have no
+retroactive attestation. The workflow must complete successfully before publishing
+its resulting installers.
 
 ## iOS and Android projects
 
@@ -57,6 +70,28 @@ npm run tauri -- android dev
 
 A simulator build is not a device-signed or app-store-ready package. Mobile initialization and signing must be validated on the contributor's toolchain.
 
+### iOS startup and delivery checks
+
+Keep the nonempty `UIApplicationSceneManifest` in both `project.yml` and the
+generated `Info.plist`. This app uses one `TaoScene` with `TaoSceneDelegate` and
+`UIApplicationSupportsMultipleScenes = false`. iPhone-only targeting does not
+remove the scene-lifecycle requirement. The local Tao patch is documented in
+[vendor/tao/ELO_PATCH.md](../vendor/tao/ELO_PATCH.md); keep its Cargo override.
+
+Before delivery, check the actual archive **and exported IPA**:
+
+```sh
+python3 tools/check_ios_startup.py /path/to/elo.xcarchive
+python3 tools/check_ios_startup.py /path/to/elo.ipa
+python3 tools/check_ios_privacy.py /path/to/elo.xcarchive --push
+```
+
+Launch the release build on iOS/iPadOS 27, including iPhone compatibility mode
+on an iPad, before resubmitting the startup-crash rejection. Check cold launch,
+background/foreground transitions and cold/warm `elo:` links. Static checks and
+an iOS 26 launch are not evidence of successful operation on iOS 27. Preserve
+the matching archive/dSYM UUID for each delivered build.
+
 ## Optional services and mobile push
 
 The workspace also builds the service executables:
@@ -77,7 +112,7 @@ The optional Tauri `mobile-push` feature enables the native push plugin. Its bui
 | Variable | Purpose |
 | --- | --- |
 | `TAURI_ELO_API_URL` | Single HTTPS origin; forwarded by Tauri to Xcode/Gradle. Plain `ELO_API_URL` also works with direct Cargo builds. |
-| `TAURI_ELO_SPACE_HOST_URL`, `TAURI_ELO_WAKE_URL` | Explicit separate hosting/wake overrides for QA; cannot be combined with the API-origin setting. `ELO_SPACE_HOST_URL` is the direct Cargo alias. |
+| `TAURI_ELO_SPACE_HOST_URL`, `TAURI_ELO_WAKE_URL` | Explicit separate overrides; the host value must include `/spaces/v1/create`, while wake is an HTTPS origin. Cannot be combined with the API-origin setting. `ELO_SPACE_HOST_URL` is the direct Cargo alias. |
 | `TAURI_ELO_FIREBASE_IOS` | Absolute path to your Firebase iOS client plist |
 | `TAURI_ELO_FIREBASE_ANDROID` | Path to your Firebase Android client JSON |
 | `TAURI_ELO_ANDROID_SIGNING` | Absolute path to a private Android signing configuration |
@@ -87,7 +122,19 @@ The `team-test-replica` feature embeds the selected client access capabilities i
 
 A Firebase service-account key belongs only on the wake-service host. APNs keys belong in your notification-provider configuration. Neither belongs in the application, repository or release resources. Do not commit environment files, `.p8`, `.p12`, keystores, provisioning profiles or personal test profiles.
 
+iOS VoIP registration additionally requires the App Attest capability and the
+`com.apple.developer.devicecheck.appattest-environment = production` entitlement
+in the signed app. Regenerate provisioning profiles after enabling the capability.
+The relay verifies Apple's production attestation root; a simulator or a development
+App Attest environment cannot register incoming calls. This setting is independent
+of the APNs sandbox/production delivery setting. Test on a physical supported device
+before deploying the matching relay. See [wake setup](SELF_HOSTING.md#6-firebase-apns-and-the-wake-service).
+
 ## Single-VPS setup
+
+See [API compatibility and required updates](API_COMPATIBILITY.md) before changing
+server contracts or setting a minimum application version. Release discovery is
+additive; cryptographic protocol changes need a separately verified rollout.
 
 For a fresh installation on Debian 13 or Oracle Linux 10, follow the [complete self-hosting guide](SELF_HOSTING.md). It identifies each service, private configuration file, public endpoint, storage choice, TLS route and acceptance check. The publisher's credentials and infrastructure are not included.
 

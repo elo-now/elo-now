@@ -54,8 +54,7 @@ impl<T: Serialize> Serialize for Shared<T> {
 
 struct HistoryContext {
     identity: IdentityId,
-    credential: RecordId,
-    age: age::x25519::Identity,
+    age: crate::crypto::DecryptionKeys,
     store: ClientStore,
     authorities: Authorities,
     read: Shared<ReadState>,
@@ -66,7 +65,6 @@ impl HistoryContext {
     fn new(client: &ClientApp) -> Self {
         Self {
             identity: client.identity_id(),
-            credential: client.session.credential().id(),
             age: client.session.age_identity().clone(),
             store: client.store.clone(),
             authorities: client.authorities.clone(),
@@ -78,7 +76,6 @@ impl HistoryContext {
     fn view(&self) -> HistoryView<'_> {
         HistoryView {
             identity: self.identity,
-            credential: self.credential,
             age: &self.age,
             store: &self.store,
             authorities: &self.authorities,
@@ -125,7 +122,6 @@ impl ClientApp {
     pub(super) fn history_view(&self) -> HistoryView<'_> {
         HistoryView {
             identity: self.identity_id(),
-            credential: self.session.credential().id(),
             age: self.session.age_identity(),
             store: &self.store,
             authorities: &self.authorities,
@@ -165,8 +161,7 @@ impl HistorySnapshot {
 
 pub(super) struct HistoryView<'a> {
     identity: IdentityId,
-    credential: RecordId,
-    age: &'a age::x25519::Identity,
+    age: &'a dyn crate::crypto::DecryptionIdentity,
     store: &'a ClientStore,
     authorities: &'a Authorities,
     read: &'a ReadState,
@@ -275,7 +270,8 @@ impl HistoryView<'_> {
             ) {
                 a.verify_historical(&r)?;
             } else {
-                crate::files::VerifiedFileShare::verify(&r, a, self.credential, true)?;
+                let recipient = crypto::history_recipient(&r, a, self.identity, self.age)?;
+                crate::files::VerifiedFileShare::verify(&r, a, recipient, true)?;
             }
             self.presentation.remember(a, &source, &r);
             unique.insert(r.id(), (r, source.status));

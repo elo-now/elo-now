@@ -19,6 +19,13 @@ pub struct InboxItem {
     pub epoch: i64,
 }
 impl ClientStore {
+    pub(crate) async fn waiting_objects(&self, after: String) -> Result<Vec<(ObjectId, Vec<u8>)>> {
+        self.call(move |c| {
+            let mut q = c.prepare("SELECT object_id,ciphertext FROM objects WHERE object_id=(SELECT DISTINCT object_id FROM inbox WHERE state='WAITING_FOR_PROOF' AND object_id>?1 ORDER BY object_id LIMIT 1)")?;
+            let values = q.query_map([after], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            values.into_iter().map(|(id, bytes)| Ok((id.parse().map_err(|_| StoreError::ObjectIntegrity)?,bytes))).collect()
+        }).await
+    }
     pub async fn confirm_stored(
         &self,
         attempt: DeliveryAttempt,

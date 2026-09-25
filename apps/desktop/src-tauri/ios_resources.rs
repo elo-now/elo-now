@@ -40,9 +40,15 @@ pub fn stage() -> io::Result<()> {
             }
         }
     }
-    // Xcode 27 uses the native Swift build layout instead:
-    // out/Products/{Debug,Release}-iphoneos. Restrict discovery to device
-    // products in this exact plugin build tree.
+    // Xcode 27 uses out/Products/{Debug,Release}-<platform>. Select the
+    // current target's products in this exact plugin build tree.
+    let simulator = env::var("TARGET")
+        .is_ok_and(|target| target.ends_with("-sim") || target.starts_with("x86_64-"));
+    let product_suffix = if simulator {
+        "-iphonesimulator"
+    } else {
+        "-iphoneos"
+    };
     let xcode_products = Path::new(&root).join("out/Products");
     if xcode_products.is_dir() {
         for products in fs::read_dir(xcode_products)? {
@@ -51,7 +57,7 @@ pub fn stage() -> io::Result<()> {
                 && products
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.ends_with("-iphoneos"))
+                    .is_some_and(|name| name.ends_with(product_suffix))
             {
                 product_directories.push(products.path());
             }

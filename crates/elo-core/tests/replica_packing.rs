@@ -240,7 +240,7 @@ async fn legacy_schema_migrates_without_rewriting_objects_or_rotating_node_ident
             bytes
         );
         let raw = Connection::open(dir.path().join("replica.sqlite")).unwrap();
-        assert_eq!(scalar(&raw, "PRAGMA user_version"), 7);
+        assert_eq!(scalar(&raw, "PRAGMA user_version"), 9);
         assert_eq!(scalar(&raw, "PRAGMA auto_vacuum"), 2);
         assert_eq!(scalar(&raw, "SELECT COUNT(*) FROM object_credentials"), 0);
         assert_eq!(

@@ -32,12 +32,17 @@ pub enum RetentionClaim {
         record_id: RecordId,
         lifetime_seconds: u64,
         direct_peer: Option<IdentityId>,
+        #[serde(default)]
+        request_key: String,
+        accept_key: Option<String>,
     },
     MessageLocator {
         locator_nonce: String,
         body_object_id: ObjectId,
         record_id: RecordId,
         lifetime_seconds: u64,
+        #[serde(default)]
+        request_key: String,
     },
 }
 pub struct Content<'a> {
@@ -169,16 +174,27 @@ fn valid_retention(
             locator_nonce,
             lifetime_seconds,
             direct_peer,
+            request_key,
+            accept_key,
             ..
         }) => {
             valid_common(locator_nonce, *lifetime_seconds)
+                && (request_key.is_empty() || crate::retention_access::valid_key(request_key))
+                && accept_key
+                    .as_ref()
+                    .is_none_or(|key| crate::retention_access::valid_key(key) && key != request_key)
+                && (request_key.is_empty() || direct_peer.is_some() == accept_key.is_some())
                 && direct_peer.is_none_or(|peer| peer != issuer && subjects.contains(&issuer))
         }
         Some(RetentionClaim::MessageLocator {
             locator_nonce,
             lifetime_seconds,
+            request_key,
             ..
-        }) => valid_common(locator_nonce, *lifetime_seconds),
+        }) => {
+            valid_common(locator_nonce, *lifetime_seconds)
+                && (request_key.is_empty() || crate::retention_access::valid_key(request_key))
+        }
     }
 }
 pub fn owner(bytes: &[u8]) -> crypto::Result<Option<IdentityId>> {
@@ -195,6 +211,61 @@ pub fn verify_original(bytes: &[u8], original: &SignedRecord) -> crypto::Result<
         original
             .verify_signature(content.credential.key())
             .map_err(|_| crypto::CryptoError::Decrypt)?;
+        if let Some(retention) = content.retention {
+            let invalid = || crypto::CryptoError::Decrypt;
+            let chat = original.chat().map_err(|_| invalid())?;
+            let valid = match retention {
+                RetentionClaim::MessageBody {
+                    record_id,
+                    locator_nonce,
+                    request_key,
+                    accept_key,
+                    direct_peer,
+                    ..
+                } => {
+                    chat.kind == "chat.message"
+                        && record_id == original.id()
+                        && (request_key.is_empty() && chat.access.is_none() && accept_key.is_none()
+                            || locator_nonce == chat.nonce
+                                && chat.access.as_ref().is_some_and(|access| {
+                                    access.request_key == request_key
+                                        && access
+                                            .accept_secret
+                                            .as_deref()
+                                            .map(crate::retention_access::public_key)
+                                            .transpose()
+                                            .ok()
+                                            == Some(accept_key)
+                                }))
+                        && direct_peer.is_none_or(|peer| {
+                            chat.audience.len() == 2
+                                && peer != chat.issuer_identity
+                                && chat.audience.contains(&peer)
+                        })
+                }
+                RetentionClaim::MessageLocator {
+                    body_object_id,
+                    record_id,
+                    locator_nonce,
+                    request_key,
+                    ..
+                } => {
+                    chat.kind == "chat.locator"
+                        && chat.locator.as_ref().is_some_and(|locator| {
+                            locator.message_record_id == record_id
+                                && locator.body_object_id == body_object_id
+                                && locator.locator_nonce == locator_nonce
+                                && (request_key.is_empty() && locator.request_secret.is_empty()
+                                    || crate::retention_access::public_key(&locator.request_secret)
+                                        .ok()
+                                        == Some(request_key))
+                        })
+                }
+            };
+            if !valid {
+                return Err(invalid());
+            }
+        }
     }
     Ok(())
 }

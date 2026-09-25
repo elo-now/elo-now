@@ -21,6 +21,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 mod calls;
+mod voip_ownership;
 
 type Result<T> = std::result::Result<T, StatusCode>;
 pub trait Provider: Send + Sync {
@@ -44,6 +45,7 @@ pub struct Relay {
     db: Mutex<Connection>,
     provider: Arc<dyn Provider>,
     delivery_gate: tokio::sync::Mutex<()>,
+    registrations: tokio::sync::Semaphore,
     endpoint: String,
     call_key: Option<zeroize::Zeroizing<String>>,
     apns: Option<crate::apns::Apns>,
@@ -100,6 +102,8 @@ struct Policy {
     authenticated_senders: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     blocked_senders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notify_key: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +112,9 @@ struct Scope {
     enabled: bool,
     #[serde(default = "default_alert_once", skip_serializing_if = "is_true")]
     alert_once: bool,
+    senders: Vec<String>,
+    #[serde(default)]
+    allow_unknown: bool,
 }
 fn default_alert_once() -> bool {
     true
@@ -236,11 +243,46 @@ impl Relay {
             db.execute("ALTER TABLE queue ADD COLUMN sender TEXT", [])
                 .map_err(|_| "Cannot migrate notification queue")?;
         }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS scope_senders(route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, scope TEXT NOT NULL, credential TEXT NOT NULL, PRIMARY KEY(route,scope,credential));
+            CREATE TABLE IF NOT EXISTS open_scopes(route TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE, scope TEXT NOT NULL, PRIMARY KEY(route,scope));
+            CREATE TABLE IF NOT EXISTS untrusted_wakes(route TEXT PRIMARY KEY REFERENCES routes(id) ON DELETE CASCADE, next INTEGER NOT NULL);")
+            .map_err(|_| "Cannot initialize notification authorization")?;
+        let has_credential = db
+            .prepare("PRAGMA table_info(queue)")
+            .and_then(|mut q| {
+                q.query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|_| "Cannot read notification queue")?
+            .iter()
+            .any(|c| c == "credential");
+        if !has_credential {
+            db.execute("ALTER TABLE queue ADD COLUMN credential TEXT", [])
+                .map_err(|_| "Cannot initialize notification credentials")?;
+        }
+        // Counters keep admission independent of the total ledger size. Each
+        // proved route retains reserved capacity even when shared capacity is full.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS event_totals(id INTEGER PRIMARY KEY CHECK(id=1), count INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS route_event_totals(route TEXT PRIMARY KEY REFERENCES routes(id) ON DELETE CASCADE, count INTEGER NOT NULL);
+            INSERT INTO event_totals VALUES(1,(SELECT count(*) FROM events)) ON CONFLICT(id) DO UPDATE SET count=excluded.count;
+            DELETE FROM route_event_totals;
+            INSERT INTO route_event_totals SELECT route,count(*) FROM events GROUP BY route;
+            CREATE TRIGGER IF NOT EXISTS event_added AFTER INSERT ON events BEGIN
+                UPDATE event_totals SET count=count+1 WHERE id=1;
+                INSERT INTO route_event_totals VALUES(NEW.route,1) ON CONFLICT(route) DO UPDATE SET count=count+1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS event_removed AFTER DELETE ON events BEGIN
+                UPDATE event_totals SET count=count-1 WHERE id=1;
+                UPDATE route_event_totals SET count=count-1 WHERE route=OLD.route;
+            END;")
+            .map_err(|_| "Cannot initialize notification capacity")?;
         calls::schema(&db).map_err(|_| "Cannot initialize call delivery")?;
+        voip_ownership::schema(&db).map_err(|_| "Cannot initialize VoIP ownership")?;
         Ok(Arc::new(Self {
             db: Mutex::new(db),
             provider,
             delivery_gate: tokio::sync::Mutex::new(()),
+            registrations: tokio::sync::Semaphore::new(4),
             endpoint: "https://api.elo.now".into(),
             call_key: None,
             apns: None,
@@ -258,6 +300,11 @@ impl Relay {
             .route("/v1/routes/{id}/policy", put(policy))
             .route("/v1/routes/{id}/read", post(read))
             .route("/v1/routes/{id}/calls", put(calls::register))
+            .route(
+                "/v1/routes/{id}/voip/challenge",
+                post(voip_ownership::challenge),
+            )
+            .route("/v1/routes/{id}/voip/proof", post(voip_ownership::prove))
             .route(
                 "/v1/routes/{id}/calls/{call_id}",
                 get(calls::status).delete(calls::decline),
@@ -404,7 +451,10 @@ async fn register(
     headers: HeaderMap,
     Json(input): Json<Registration>,
 ) -> Result<Json<Value>> {
-    let _gate = relay.delivery_gate.lock().await;
+    let _permit = relay
+        .registrations
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let identity = elo_core::app::account_deletion::verify_route_binding(
         &input.binding,
         &relay.endpoint,
@@ -488,7 +538,19 @@ async fn register(
                     |r| r.get(0),
                 )
                 .map_err(db_error)?;
-            if total >= 10000 || same >= 8 {
+            let pending: i64 = db
+                .query_row("SELECT count(*) FROM routes WHERE active=0", [], |r| {
+                    r.get(0)
+                })
+                .map_err(db_error)?;
+            let owned: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM route_accounts WHERE identity=?1",
+                    [&identity],
+                    |r| r.get(0),
+                )
+                .map_err(db_error)?;
+            if total >= 10000 || pending >= 64 || owned >= 16 || same >= 8 {
                 return Err(StatusCode::TOO_MANY_REQUESTS);
             }
             let challenge = secret()?;
@@ -502,17 +564,28 @@ async fn register(
             challenge
         }
     };
-    relay
-        .provider
-        .send(
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        relay.provider.send(
             input.token,
             Notice::Challenge {
-                registration: id,
-                challenge,
+                registration: id.clone(),
+                challenge: challenge.clone(),
             },
-        )
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        ),
+    )
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        // Failed or arbitrary tokens must not occupy the active-route budget.
+        relay
+            .database()?
+            .execute(
+                "DELETE FROM routes WHERE id=?1 AND challenge=?2 AND active=0",
+                params![id, challenge],
+            )
+            .map_err(db_error)?;
+        return Err(StatusCode::BAD_GATEWAY);
+    }
     Ok(Json(json!({"active":false})))
 }
 async fn confirm(
@@ -566,11 +639,18 @@ async fn policy(
 ) -> Result<StatusCode> {
     let owner = auth(&headers)?;
     if input.revision < 1
+        || !input.authenticated_senders
         || input.scopes.len() > 4096
         || input.blocked_senders.len() > 4096
         || input.blocked_senders.iter().any(|s| !hex(s, 32))
         || (!input.blocked_senders.is_empty() && !input.authenticated_senders)
         || input.scopes.iter().any(|s| !hex(&s.scope, 32))
+        || input.notify_key.as_ref().is_some_and(|key| !hex(key, 32))
+        || input.scopes.iter().map(|s| s.senders.len()).sum::<usize>() > 8192
+        || input
+            .scopes
+            .iter()
+            .any(|s| s.senders.iter().any(|c| !hex(c, 32)))
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -616,6 +696,13 @@ async fn policy(
         };
     }
     let tx = db.transaction().map_err(db_error)?;
+    if let Some(key) = &input.notify_key {
+        tx.execute(
+            "UPDATE routes SET notify=? WHERE id=?",
+            params![hash(key), id],
+        )
+        .map_err(db_error)?;
+    }
     tx.execute("INSERT INTO sender_policy VALUES(?,?) ON CONFLICT(route) DO UPDATE SET authenticated=excluded.authenticated", params![id,input.authenticated_senders]).map_err(db_error)?;
     tx.execute("DELETE FROM blocked_senders WHERE route=?", [&id])
         .map_err(db_error)?;
@@ -631,7 +718,25 @@ async fn policy(
         .map_err(db_error)?;
     tx.execute("DELETE FROM repeat_alerts WHERE route=?", [&id])
         .map_err(db_error)?;
+    tx.execute("DELETE FROM scope_senders WHERE route=?", [&id])
+        .map_err(db_error)?;
+    tx.execute("DELETE FROM open_scopes WHERE route=?", [&id])
+        .map_err(db_error)?;
     for scope in input.scopes {
+        for credential in &scope.senders {
+            tx.execute(
+                "INSERT OR IGNORE INTO scope_senders VALUES(?,?,?)",
+                params![id, scope.scope, credential],
+            )
+            .map_err(db_error)?;
+        }
+        if scope.allow_unknown {
+            tx.execute(
+                "INSERT INTO open_scopes VALUES(?,?)",
+                params![id, scope.scope],
+            )
+            .map_err(db_error)?;
+        }
         if !scope.alert_once {
             tx.execute(
                 "INSERT OR IGNORE INTO repeat_alerts VALUES(?,?)",
@@ -648,11 +753,26 @@ async fn policy(
     }
     tx.execute("INSERT INTO policy_versions VALUES(?,?,?,?) ON CONFLICT(route) DO UPDATE SET revision=excluded.revision,introductions=excluded.introductions,digest=excluded.digest",params![id,input.revision,input.introductions,digest]).map_err(db_error)?;
     tx.execute("DELETE FROM queue WHERE route=? AND (EXISTS(SELECT 1 FROM scopes s WHERE s.route=queue.route AND s.scope=queue.scope AND s.enabled=0) OR (NOT EXISTS(SELECT 1 FROM scopes s WHERE s.route=queue.route AND s.scope=queue.scope) AND NOT EXISTS(SELECT 1 FROM policy_versions p WHERE p.route=queue.route AND p.introductions=1)))",[&id]).map_err(db_error)?;
+    // Revalidate already queued work atomically with the new recipient policy.
+    tx.execute("DELETE FROM queue WHERE route=? AND (credential IS NULL OR (EXISTS(SELECT 1 FROM scopes s WHERE s.route=queue.route AND s.scope=queue.scope) AND NOT EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=queue.route AND o.scope=queue.scope) AND NOT EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=queue.route AND a.scope=queue.scope AND a.credential=queue.credential)))",[&id]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 // Only the device owner can re-arm a conversation. Reading an older alert must
 // not re-arm a newer, still unread one; retries and delayed senders are harmless.
+// 64 reserved events per route plus the 250k shared pool; with the 10k
+// registration cap this is bounded by 890k rows, never an unbounded ledger.
+// One identity cannot multiply its allowance by registering extra devices.
+fn event_capacity(db: &Connection, route: &str) -> Result<bool> {
+    let (count, total, identity): (i64, i64, i64) = db.query_row(
+        "SELECT COALESCE((SELECT count FROM route_event_totals WHERE route=?1),0),
+            (SELECT count FROM event_totals WHERE id=1),
+            COALESCE((SELECT SUM(t.count) FROM route_accounts a JOIN route_event_totals t ON t.route=a.route
+                WHERE a.identity=(SELECT identity FROM route_accounts WHERE route=?1)),0)",
+        [route], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db_error)?;
+    Ok(count < 4096 && identity < 8192 && (count < 64 || total < 250_000))
+}
+
 async fn read(
     State(relay): State<Arc<Relay>>,
     Path(id): Path<String>,
@@ -682,15 +802,7 @@ async fn read(
     for receipt in input.events {
         // A read can arrive before its sender's delayed wake. Remember it using
         // the same bounded dedup ledger, with no message or identity information.
-        let count: i64 = tx
-            .query_row("SELECT count(*) FROM events WHERE route=?", [&id], |r| {
-                r.get(0)
-            })
-            .map_err(db_error)?;
-        let total: i64 = tx
-            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
-            .map_err(db_error)?;
-        if count < 4096 && total < 250_000 {
+        if event_capacity(&tx, &id)? {
             tx.execute(
                 "INSERT OR IGNORE INTO events VALUES(?,?,?)",
                 params![id, receipt.event, time + 86400],
@@ -741,11 +853,11 @@ async fn wake(
         .optional()
         .map_err(db_error)?
         .unwrap_or(false);
-    let sender_identity = input
+    let verified_sender = input
         .sender
         .as_ref()
         .map(|_| {
-            elo_core::app::push_sender::verify_identity(
+            elo_core::app::push_sender::verify_sender(
                 &id,
                 &serde_json::to_value(&input).map_err(|_| StatusCode::BAD_REQUEST)?,
                 time as u64,
@@ -753,20 +865,24 @@ async fn wake(
             .map_err(|_| StatusCode::FORBIDDEN)
         })
         .transpose()?;
-    if let Some(identity) = sender_identity
+    if let Some(sender) = &verified_sender
         && db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM erased_accounts WHERE identity=?1)",
-                [identity.to_string()],
+                [sender.identity.to_string()],
                 |r| r.get::<_, bool>(0),
             )
             .map_err(db_error)?
     {
         return Ok(StatusCode::ACCEPTED);
     }
-    let sender =
-        sender_identity.map(|identity| elo_core::app::push_sender::sender_tag(&id, identity));
-    if authenticated && sender.is_none() {
+    let sender = verified_sender
+        .as_ref()
+        .map(|s| elo_core::app::push_sender::sender_tag(&id, s.identity));
+    let credential = verified_sender
+        .as_ref()
+        .map(|s| elo_core::app::push_sender::credential_tag(&id, s.credential));
+    if !authenticated || sender.is_none() {
         return Ok(StatusCode::ACCEPTED);
     }
     if let Some(sender) = &sender {
@@ -802,6 +918,43 @@ async fn wake(
     if enabled == Some(false) || (enabled.is_none() && !introductions) {
         return Ok(StatusCode::ACCEPTED);
     }
+    let authorized: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM scope_senders WHERE route=? AND scope=? AND credential=?)",
+            params![id, input.scope, credential],
+            |r| r.get(0),
+        )
+        .map_err(db_error)?;
+    let open: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM open_scopes WHERE route=? AND scope=?)",
+            params![id, input.scope],
+            |r| r.get(0),
+        )
+        .map_err(db_error)?;
+    if enabled.is_some() && !authorized && !open {
+        return Ok(StatusCode::ACCEPTED);
+    }
+    // Untrusted introductions share one durable budget across identities and
+    // made-up scopes. They never consume the recipient's audible alert budget.
+    if !authorized {
+        let trusted_pending: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM queue q JOIN scope_senders a ON a.route=q.route AND a.scope=q.scope AND a.credential=q.credential WHERE q.route=? AND q.scope=?)",params![id,input.scope],|r|r.get(0)).map_err(db_error)?;
+        if trusted_pending {
+            return Ok(StatusCode::ACCEPTED);
+        }
+        let next: i64 = db
+            .query_row(
+                "SELECT next FROM untrusted_wakes WHERE route=?",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .unwrap_or(0);
+        if next > time {
+            return Ok(StatusCode::ACCEPTED);
+        }
+    }
     let existing: bool = db
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE route=? AND event=?)",
@@ -824,15 +977,7 @@ async fn wake(
     let tx = db.transaction().map_err(db_error)?;
     tx.execute("DELETE FROM events WHERE expires<=?", [time])
         .map_err(db_error)?;
-    let count: i64 = tx
-        .query_row("SELECT count(*) FROM events WHERE route=?", [&id], |r| {
-            r.get(0)
-        })
-        .map_err(db_error)?;
-    let total: i64 = tx
-        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
-        .map_err(db_error)?;
-    if count >= 4096 || total >= 250_000 {
+    if !event_capacity(&tx, &id)? {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     if tx
@@ -846,12 +991,19 @@ async fn wake(
         return Ok(StatusCode::ACCEPTED);
     }
     // A burst replaces the pending preview, but the dedup ledger remembers all events.
-    tx.execute("INSERT INTO queue(route,scope,event,target,next,expires,sender) VALUES(?,?,?,?,?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event,target=excluded.target,expires=excluded.expires,sender=excluded.sender",params![id,input.scope,input.event,input.target,time+2,time+86400,sender]).map_err(db_error)?;
+    if !authorized {
+        // Keep at most one untrusted hint per recipient, rather than letting
+        // arbitrary scopes consume all queue slots reserved for real chats.
+        tx.execute("DELETE FROM queue WHERE route=? AND NOT EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=queue.route AND a.scope=queue.scope AND a.credential=queue.credential)", [&id]).map_err(db_error)?;
+        tx.execute("INSERT INTO untrusted_wakes VALUES(?,?) ON CONFLICT(route) DO UPDATE SET next=excluded.next", params![id,time+300]).map_err(db_error)?;
+    }
+    tx.execute("INSERT INTO queue(route,scope,event,target,next,expires,sender,credential) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event,target=excluded.target,expires=excluded.expires,sender=excluded.sender,credential=excluded.credential",params![id,input.scope,input.event,input.target,time+2,time+86400,sender,credential]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 impl Relay {
-    /// One bounded delivery; no mutex guard is held over a provider network call.
+    /// One bounded delivery; the SQLite mutex is released during provider I/O.
+    /// The delivery gate serializes acknowledgement of recipient policy changes.
     pub async fn deliver_due(&self) -> Result<bool> {
         let _gate = self.delivery_gate.lock().await;
         let time = now()?;
@@ -861,17 +1013,17 @@ impl Relay {
                 .map_err(db_error)?;
             db.execute("DELETE FROM queue WHERE expires<=?", [time])
                 .map_err(db_error)?;
-            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?))).optional().map_err(db_error)?
+            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.credential IS NOT NULL AND (s.scope IS NULL OR EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=q.route AND o.scope=q.scope) OR EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=q.route AND a.scope=q.scope AND a.credential=q.credential)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?))).optional().map_err(db_error)?
         };
         let Some((route, scope, event, target, token, failures)) = item else {
             return Ok(false);
         };
-        // Updated clients declare a repeatable introduction scope and acknowledge
-        // reads. Legacy policies cannot re-arm alerts, so keep their periodic alerts.
+        // Only an explicitly repeatable, authorized scope can alert again before
+        // a read receipt. Unknown senders remain quiet even in that scope.
         let quiet = self
             .database()?
             .query_row(
-            "SELECT EXISTS(SELECT 1 FROM attention WHERE route=?1 AND scope=?2) AND EXISTS(SELECT 1 FROM repeat_alerts WHERE route=?1) AND NOT EXISTS(SELECT 1 FROM repeat_alerts WHERE route=?1 AND scope=?2)",
+            "SELECT NOT EXISTS(SELECT 1 FROM scope_senders a JOIN queue q ON q.route=a.route AND q.scope=a.scope AND q.credential=a.credential WHERE q.route=?1 AND q.scope=?2) OR NOT EXISTS(SELECT 1 FROM scopes WHERE route=?1 AND scope=?2 AND enabled=1) OR (EXISTS(SELECT 1 FROM attention WHERE route=?1 AND scope=?2) AND NOT EXISTS(SELECT 1 FROM repeat_alerts WHERE route=?1 AND scope=?2))",
                 params![route, scope],
                 |r| r.get::<_, bool>(0),
             )

@@ -23,7 +23,7 @@ elo.now is a messaging app for small groups and teams. A **Space** keeps one gro
 1. Install elo.now, choose **New with elo?**, enter your name and set a password. Save the recovery code somewhere safe; it is how you recover your identity if you lose the device.
 2. Choose **Create a Space**, give it a name and enter a contact email. You become its primary owner. The **General** conversation is ready automatically.
 3. In **Spaces**, tap the Share icon beside your Space. Send its QR code or invitation link to someone you trust.
-4. That person chooses **Join a Space** and scans the code or opens the link. If the invitation requires approval, approve their request in **Invitations**.
+4. That person chooses **Join a Space** and scans the code or opens the link. If the invitation requires approval, approve their request in **Approvals**.
 5. Open **General** to send your first message. Add other channels or start a direct conversation as needed. You can enable notifications in Settings.
 
 Joining someone else's group? Start at step 1, then choose **Join a Space** instead of creating one. A recovery code restores your identity; use a separate encrypted backup if you also need to restore supported chat history.
@@ -32,7 +32,7 @@ Joining someone else's group? Start at step 1, then choose **Join a Space** inst
 
 - [iPhone on the App Store](https://apps.apple.com/app/id6814766127)
 - [Android on Google Play](https://play.google.com/store/apps/details?id=now.elo)
-- [Latest desktop release for macOS, Windows and Linux](https://github.com/elo-now/elo-now/releases/latest)
+- [Desktop releases for macOS, Windows and Linux](https://github.com/elo-now/elo-now/releases)
 
 Store links become available after the respective store approves and releases the app. Check the desktop release notes for supported architectures and signing status.
 
@@ -53,7 +53,7 @@ English is the currently supported interface language. Publisher-operated hostin
 
 A **Space** is an organizational context: a company or team with its own access and conversations. A **Replica** is a storage and delivery server. They are different concepts; changing a server does not by itself define who belongs to a conversation.
 
-1. A sender creates a message on their device. The Rust core signs it and encrypts it for the authorized recipients.
+1. Before encrypting new content in a hosted Space, the app checks a short-lived confirmation of chat permissions from its pinned host. Normal synchronization refreshes these confirmations in batches; each message does not require a separate request. Known permission changes invalidate the cached result immediately. If no valid confirmation is available, sending waits for the host. The Rust core signs and encrypts the message for the authorized device keys.
 2. The device uploads the encrypted object to a configured Replica. The Replica stores ciphertext and delivery metadata rather than the message text.
 3. Recipients synchronize the encrypted object, decrypt it on their own devices and verify its signature and authorization before accepting it.
 4. With system notifications enabled, a separate wake service sends a generic alert through Firebase Cloud Messaging and APNs. The current push payload does not include the message text or conversation name; its routing target is encrypted. Opening the alert takes the app to the relevant conversation.
@@ -68,6 +68,8 @@ flowchart LR
 
 Profiles and conversation history are kept on participating devices. A Space enrollment service handles joining and General membership. Joining General gives access to new messages; it does not automatically reveal earlier history. Recovery codes restore identity, while separately exported encrypted backups restore supported conversation data.
 
+**Security limits:** recovery alone does not revoke a lost device. Hosted sends require current server-confirmed permissions; unavailable hosts pause sending. Revocation cannot erase existing copies, and there is no forward secrecy for retained message objects. Standalone mode and older deployed versions have different guarantees. Read the [threat model](THREAT_MODEL.md) before relying on these protections.
+
 ### Where attachments and calls go
 
 Files are encrypted on the sender's device before upload. The hosting operator chooses where to keep the encrypted file bytes: local storage, MEGA through WebDAV, or S3-compatible object storage. Publisher-operated hosting currently uses MEGA. Attachment storage does not need the file decryption keys. Individual files are limited to 5 MB on publisher-operated hosting.
@@ -80,7 +82,13 @@ The design uses Ed25519 signatures, the age encryption format and HTTPS transpor
 
 These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. The General enrollment service holds an authorized participant key for General, so organizational administrators are part of its trust model.
 
+Newly linked and recovered devices receive independent keys. To link a device, show the QR from **Devices → +**, scan it on the new device, then choose **Accept** on the original device. The new device opens the transferred profile with the same password. Keep this QR private. An unlocked, admitted device can revoke another device through **Delete** and confirmation. Server confirmation is required, private-chat controllers must update recipient keys, and copies already on a device cannot be erased. These protocol changes require matching app and server versions; see the [threat model](THREAT_MODEL.md) for rollout boundaries and remaining risks.
+
 This is an actively developed MVP. Open source makes the implementation available for inspection; it is not proof that every component has been audited or that the application is immune to vulnerabilities.
+
+### Server and app updates
+
+App releases and server API versions are separate. The next security baseline is a clean cutover without support for previous clients or migration of existing runtime data. Later compatible releases preserve their supported contracts. The new source checks for updates in the background without delaying access to local profiles or saved chats. Required updates are disabled by default on the server and have separate minimum versions for each platform. When required, a single-line orange banner stays below the header and new online actions pause; local features remain available. Users install updates from their store or the desktop releases page. Existing store builds do not acquire this mechanism automatically. See [API compatibility and updates](docs/API_COMPATIBILITY.md) for configuration and rollout, and [self-hosting](docs/SELF_HOSTING.md) for the installation guide.
 
 ## Polski
 
@@ -137,7 +145,7 @@ npm ci
 npm run tauri -- dev
 ```
 
-The default source build does not include a hosted Demo's access credentials, live server endpoints, Firebase configuration or signing identities. Use a local profile/demo or connect to a Space prepared by its operator.
+The default source build contains the public service origin described above, but no demo access credentials, private server configuration, Firebase project configuration or signing identities. Use a local profile/demo or connect to a Space prepared by its operator.
 
 ## Repository layout
 
@@ -154,12 +162,6 @@ The default source build does not include a hosted Demo's access credentials, li
 | `vendor/tauri-plugin-notification` | Bundled notification plugin with local fixes and upstream licenses |
 
 This repository contains application source and build resources. The marketing website, brandbook, internal decisions, development conversations, private notes, operational configurations, user profiles, signing credentials and compiled packages are not part of it. Deterministic test fixtures and test-only passwords are public test data; never use them for real accounts.
-
-### Server and app updates
-
-Application releases and API versions are separate. Future compatible server releases should preserve existing client contracts; incompatible security changes require a coordinated rollout. A startup update check with separate minimum versions for each platform is being prepared for a future release. It opens the official download page and does not silently install software. Published version 1.0.0 does not contain this gate.
-
-See [API compatibility and application updates](docs/API_COMPATIBILITY.md) for the planned configuration, rollout order, rollback and current implementation boundaries. The next security baseline is a clean cutover without older-client support or existing-data migration. Later compatible upgrades should preserve supported endpoints while users update; a release still waiting for store review must not become the required minimum.
 
 ## License
 

@@ -210,14 +210,15 @@ import WebRTC
         if id == "remote-screen", channels.count == 3 { return channels[2].receiver.track as? RTCVideoTrack }
         return nil
     }
-    func poll() -> [String: Any] {
-        let pending = signals; signals.removeAll()
+    func poll(drain: Bool = true) -> [String: Any] {
+        let pending = drain ? signals : []
+        if drain { signals.removeAll() }
         var tracks: [[String: Any]] = []
         if camera != nil { tracks.append(["id": "local-camera", "source": "camera", "local": true]) }
         for (id, source) in [("remote-camera", "camera"), ("remote-screen", "screen")] {
             if videoTrack(id) != nil { tracks.append(["id": id, "source": source, "local": false]) }
         }
-        return ["connection": connection, "revision": revision, "signals": pending, "tracks": tracks]
+        return ["connection": connection, "revision": revision, "signals": pending, "tracks": tracks, "media": state]
     }
     func stop() {
         guard !stopped else { return }

@@ -95,7 +95,7 @@ impl AttachmentDescriptor {
             || self
                 .name
                 .chars()
-                .any(|c| c.is_control() || c == '/' || c == '\\')
+                .any(|c| crate::record::unsafe_display_character(c) || c == '/' || c == '\\')
             || self.mime.is_empty()
             || self.mime.len() > 127
             || !self.mime.contains('/')

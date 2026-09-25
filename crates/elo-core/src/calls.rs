@@ -186,6 +186,28 @@ pub fn sign_command(
     )
 }
 
+/// Device authorship alone is not membership admission.
+pub fn verify_command_authorship(
+    credential: &crate::identity::VerifiedCredential,
+    signed: &SignedRecord,
+    audience: &str,
+    now: u64,
+) -> Result<Command> {
+    let command: Command = signed.decode()?;
+    if command.v != 1
+        || command.kind != "call.command"
+        || command.audience != audience
+        || command.credential_id != credential.id()
+    {
+        return Err(RecordError::Authority);
+    }
+    record::hex::<16>(&command.nonce)?;
+    check_time(command.issued_at, command.expires_at, now)?;
+    signed.verify_signature(credential.key())?;
+    command.operation.validate()?;
+    Ok(command)
+}
+
 pub fn verify_command(
     authority: &Authority,
     signed: &SignedRecord,

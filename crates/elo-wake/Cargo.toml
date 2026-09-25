@@ -23,9 +23,12 @@ subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+appattest = { version = "=0.1.1", default-features = false }
+minicbor = "=0.25.1"
 
 [dev-dependencies]
 tempfile.workspace = true
+appattest = { version = "=0.1.1", default-features = false, features = ["testing"] }
 
 [lints]
 workspace = true

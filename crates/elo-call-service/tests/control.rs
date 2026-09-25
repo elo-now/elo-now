@@ -441,7 +441,10 @@ fn only_one_process_owns_state_and_idle_proof_eviction_keeps_the_durable_fence()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(columns, ["scope", "head", "sequence", "blocked"]);
+    assert_eq!(
+        columns,
+        ["scope", "head", "sequence", "blocked", "recovery"]
+    );
 }
 
 #[test]
@@ -531,4 +534,218 @@ fn background_decline_only_ends_a_current_ring_addressed_to_the_recipient() {
             .background_decline(&call.call_id, f.peer.identity_id())
             .is_empty()
     );
+}
+
+#[test]
+fn historical_fences_do_not_exhaust_live_chat_capacity() {
+    let f = Fixture::new(false);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    drop(Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap());
+    let mut db = rusqlite::Connection::open(&path).unwrap();
+    let tx = db.transaction().unwrap();
+    for i in 0..4100 {
+        tx.execute(
+            "INSERT INTO fences(scope,head,sequence) VALUES(?1,?2,1)",
+            rusqlite::params![
+                format!("{:064x}:{:064x}:{:032x}", i + 1, i + 2, i + 3),
+                f.authority.head_id().unwrap().to_string()
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let mut engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    let request = f.request(&f.owner, start(CallKind::Group), NOW, true);
+    let prepared = engine.prepare(request, None, NOW).unwrap();
+    assert!(engine.execute(prepared, NOW).is_ok());
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM fences", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4101
+    );
+}
+
+#[test]
+fn proof_job_authenticates_device_before_config_history() {
+    let f = Fixture::new(false);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &dir.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let mut request = f.request(&f.owner, Operation::Subscribe, NOW, true);
+    request.proof.as_mut().unwrap().configs = vec!["not-a-signed-config".into()];
+    let job = engine.preparation(request, None).unwrap();
+    let (_, identity) = job.authenticate(NOW).unwrap();
+    assert_eq!(identity, f.owner.identity_id());
+    assert!(job.verify(NOW).is_err());
+}
+
+#[test]
+fn compact_checkpoints_keep_rollback_and_fork_floors_after_restart() {
+    let mut f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let mut engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    let mut old = f.request(&f.owner, Operation::Subscribe, NOW, false);
+    old.proof = Some(
+        f.authority
+            .call_proof_signed(f.owner.signing_key())
+            .unwrap(),
+    );
+    let prepared = engine
+        .prepare(
+            elo_call_service::engine::Request {
+                command: old.command.clone(),
+                proof: old.proof.clone(),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+    let scope = engine.execute(prepared, NOW).unwrap().scope;
+    let base = f.authority.clone();
+    f.remove_peer();
+    let mut current = f.request(&f.owner, Operation::Subscribe, NOW, false);
+    current.proof = Some(
+        f.authority
+            .call_proof_signed(f.owner.signing_key())
+            .unwrap(),
+    );
+    let prepared = engine
+        .prepare(
+            elo_call_service::engine::Request {
+                command: current.command.clone(),
+                proof: current.proof.clone(),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+    engine.execute(prepared, NOW).unwrap();
+    drop(engine);
+    let mut engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    let prepared = engine.prepare(old, None, NOW).unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW),
+        Err(CallError::Unauthorized)
+    ));
+    let mut branch = base;
+    let mut c = branch.head().unwrap().clone();
+    c.sequence += 1;
+    c.previous_config_id = branch.head_id();
+    c.nonce = elo_core::record::random_hex::<16>().unwrap();
+    c.action.operation = "replace".into();
+    branch
+        .apply_config(c.sign(f.owner.signing_key()).unwrap())
+        .unwrap();
+    f.authority = branch;
+    let mut fork = f.request(&f.owner, Operation::Subscribe, NOW, false);
+    fork.proof = Some(
+        f.authority
+            .call_proof_signed(f.owner.signing_key())
+            .unwrap(),
+    );
+    let prepared = engine.prepare(fork, None, NOW).unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW),
+        Err(CallError::Unauthorized)
+    ));
+    assert!(!engine.authorized(scope, f.owner.credential().id()));
+    drop(engine);
+    let engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    assert!(engine.prepare(current, None, NOW).is_err());
+}
+
+#[test]
+fn an_old_controller_cannot_invent_checkpoint_ancestry_to_undo_recovery() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_core::{authority::StreamConfig, calls, record::SignedRecord, vault::Session};
+    let mut f = Fixture::new(false);
+    let old = f.authority.clone();
+    let fresh = Session::recover(&f.owner_recovery, f.owner.identity_id()).unwrap();
+    f.authority.add_credential(fresh.credential().clone());
+    let cert = f
+        .authority
+        .sign_recovery(
+            fresh.credential(),
+            &f.owner_recovery
+                .recover_root(f.owner.identity_id())
+                .unwrap(),
+        )
+        .unwrap();
+    let change = f
+        .authority
+        .prepare_recovery(&cert, fresh.signing_key())
+        .unwrap();
+    f.authority.apply_config(change).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("calls.sqlite");
+    let mut engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    let mut request = f.request(&fresh, Operation::Subscribe, NOW, false);
+    request.proof = Some(f.authority.call_proof_signed(fresh.signing_key()).unwrap());
+    let prepared = engine.prepare(request, None, NOW).unwrap();
+    engine.execute(prepared, NOW).unwrap();
+    drop(engine);
+    let mut engine = Engine::open(&path, AUDIENCE.into(), Limits::default()).unwrap();
+    // The old device can sign a lie about opaque ancestor hashes, but cannot
+    // extend the remembered root-signed controller-recovery generation.
+    let mut proof = old.call_proof_signed(f.owner.signing_key()).unwrap();
+    let mut config: StreamConfig = old.head().unwrap().clone();
+    config.sequence = 3;
+    config.previous_config_id = f.authority.head_id();
+    config.action.operation = "replace".into();
+    let signed = config.sign(f.owner.signing_key()).unwrap();
+    let mut checkpoint =
+        SignedRecord::parse(&STANDARD.decode(proof.checkpoint.as_ref().unwrap()).unwrap())
+            .unwrap()
+            .body()
+            .clone();
+    checkpoint["config_id"] = serde_json::json!(signed.id());
+    checkpoint["sequence"] = 3.into();
+    checkpoint["ancestry"] = serde_json::json!([
+        old.head_id().unwrap(),
+        f.authority.head_id().unwrap(),
+        signed.id()
+    ]);
+    proof.configs = vec![STANDARD.encode(signed.bytes())];
+    proof.checkpoint = Some(
+        STANDARD.encode(
+            SignedRecord::sign(
+                &serde_json::to_vec(&checkpoint).unwrap(),
+                f.owner.signing_key(),
+            )
+            .unwrap()
+            .bytes(),
+        ),
+    );
+    let forged = proof.verify(old.space(), old.stream()).unwrap();
+    assert!(forged.proves_config_at(f.authority.head_id().unwrap(), 2));
+    assert!(!forged.proves_recovery_ancestor(Some(cert.id())));
+    let command = calls::sign_command(
+        &forged,
+        &f.owner,
+        old.space(),
+        AUDIENCE,
+        Operation::Subscribe,
+        NOW,
+    )
+    .unwrap();
+    let prepared = engine
+        .prepare(
+            elo_call_service::engine::Request {
+                command: STANDARD.encode(command.bytes()),
+                proof: Some(proof),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW),
+        Err(CallError::Unauthorized)
+    ));
 }

@@ -1,11 +1,34 @@
 //! Signed, recipient-bound wake routes travel inside the existing encrypted discovery exchange.
 use super::*;
+use crate::ids::ObjectId;
 use crate::invite::shared::DeliveryAddress;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::Duration;
 
 pub use crate::invite::shared::WakeRoute as Route;
+
+/// Capability rotation is needed for revocation, not new members or mute toggles.
+pub fn policy_requires_rotation(previous: &Value, next: &Value) -> bool {
+    let strings = |value: &Value| -> BTreeSet<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    if !strings(&next["blocked_senders"]).is_subset(&strings(&previous["blocked_senders"])) {
+        return true;
+    }
+    previous["scopes"].as_array().into_iter().flatten().any(|old| {
+        let current = next["scopes"].as_array().into_iter().flatten().find(|s| s["scope"] == old["scope"]);
+        !strings(&old["senders"]).is_subset(&current.map(|s| strings(&s["senders"])).unwrap_or_default())
+            // Replace capabilities originally advertised without device restrictions.
+            || old.get("senders").is_none()
+    })
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Advertisement {
@@ -68,9 +91,22 @@ impl ClientApp {
         let route_changed = state.own_wake != route;
         state.own_wake = route.clone();
         let before = state.jobs.len();
-        state
-            .jobs
-            .retain(|id, job| !id.starts_with("wake:") || job.target.expires_at > time);
+        let known = if route.is_some() {
+            self.known_people()?
+        } else {
+            BTreeMap::new()
+        };
+        let recipients: BTreeSet<_> = known.values().flat_map(|c| c.keys().copied()).collect();
+        state.jobs.retain(|id, job| {
+            !id.starts_with("wake:")
+                || (!route_changed
+                    && job.target.expires_at > time
+                    && id
+                        .split(':')
+                        .nth(1)
+                        .and_then(|c| c.parse::<RecordId>().ok())
+                        .is_some_and(|c| recipients.contains(&c)))
+        });
         let Some(route) = route else {
             state.jobs.retain(|id, _| !id.starts_with("wake:"));
             if route_changed || before != state.jobs.len() {
@@ -87,7 +123,7 @@ impl ClientApp {
         )?;
         let day = time / 86_400_000;
         let mut changed = route_changed || before != state.jobs.len();
-        for credentials in self.known_people()?.values() {
+        for credentials in known.values() {
             for recipient in credentials.values() {
                 for peer in self
                     .session
@@ -101,10 +137,10 @@ impl ClientApp {
                         peer.signing_public_key,
                         peer.mailbox_id
                     );
-                    // Republish once after the same-page membership discovery fix.
-                    // Older clients may have consumed an advertisement before
-                    // refreshing their verified member set. The signed wire stays v1.
-                    let id = format!("{prefix}membership-aware:{}:{day}", route.id);
+                    // Include the capability version so an in-place rotation is
+                    // advertised immediately, including after an interrupted save.
+                    let version = ObjectId::of_ciphertext(route.notify_key.as_bytes());
+                    let id = format!("{prefix}{}:{version}:{day}", route.id);
                     if state.jobs.contains_key(&id) {
                         continue;
                     }
@@ -380,14 +416,29 @@ impl ClientApp {
             .collect::<Vec<_>>();
         if let Some(spaces) = &self.spaces {
             let mut scopes = BTreeMap::new();
+            let mut introductions = BTreeSet::new();
             for client in spaces.clients(self) {
                 for value in client.notification_policy_local(route)?["scopes"]
                     .as_array()
                     .ok_or("Invalid notification policy.")?
                 {
+                    if value["allow_unknown"] == true {
+                        for tag in value["senders"]
+                            .as_array()
+                            .ok_or("Invalid notification policy.")?
+                        {
+                            introductions.insert(
+                                tag.as_str()
+                                    .ok_or("Invalid notification policy.")?
+                                    .to_owned(),
+                            );
+                        }
+                        continue;
+                    }
                     scopes.insert(field(value, "scope")?.to_owned(), value.clone());
                 }
             }
+            scopes.insert(scope(route, None)?, json!({"scope":scope(route,None)?,"enabled":true,"alert_once":false,"allow_unknown":true,"senders":introductions}));
             return Ok(
                 json!({"introductions":true,"scopes":scopes.into_values().collect::<Vec<_>>(),"authenticated_senders":true,"blocked_senders":blocked}),
             );
@@ -399,14 +450,63 @@ impl ClientApp {
     }
     fn notification_policy_local(&self, route: &Route) -> Result<Value> {
         let mut scopes = Vec::new();
+        // A private chat may not yet have incorporated a General device change.
+        // Intersect its members with the current hosting roster before authorizing wakes.
+        let active = self
+            .call_host
+            .as_ref()
+            .map(|host| {
+                self.authorities
+                    .0
+                    .iter()
+                    .find(|a| a.space() == host.scope.space && a.stream() == host.scope.stream)
+                    .map(|a| {
+                        a.head().map(|h| {
+                            h.members
+                                .iter()
+                                .flat_map(|m| m.credential_ids.iter().copied())
+                                .collect::<BTreeSet<_>>()
+                        })
+                    })
+                    .transpose()
+                    .map(|v| v.unwrap_or_default())
+            })
+            .transpose()?;
         for (pin, a) in self.pins.iter().zip(&self.authorities.0) {
-            let member = a.head()?.members.iter().any(|m| {
-                m.identity_id == self.session.identity_id()
-                    && m.capabilities.contains(&Capability::Read)
-            });
-            scopes.push(json!({"scope":scope(route,Some((pin.space,pin.stream)))?,"enabled":member && !self.read.muted_streams.contains(&pin.stream)}));
+            let member = self.authorities.space_ready(a)
+                && a.head()?.members.iter().any(|m| {
+                    m.identity_id == self.session.identity_id()
+                        && m.capabilities.contains(&Capability::Read)
+                        && m.credential_ids.contains(&self.session.credential().id())
+                        && active
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(&self.session.credential().id()))
+                });
+            let senders: BTreeSet<_> = a
+                .head()?
+                .members
+                .iter()
+                .filter(|m| {
+                    member
+                        && !self.blocked.contains(m.identity_id)
+                        && m.capabilities.contains(&Capability::Read)
+                        && m.capabilities.contains(&Capability::Post)
+                })
+                .flat_map(|m| m.credential_ids.iter())
+                .filter(|id| active.as_ref().is_none_or(|ids| ids.contains(id)))
+                .map(|id| super::super::push_sender::credential_tag(&route.id, *id))
+                .collect();
+            scopes.push(json!({"scope":scope(route,Some((pin.space,pin.stream)))?,"enabled":member && !self.read.muted_streams.contains(&pin.stream),"senders":senders}));
         }
-        scopes.push(json!({"scope":scope(route,None)?,"enabled":true,"alert_once":false}));
+        let introductions: BTreeSet<_> = self
+            .known_people()?
+            .values()
+            .flat_map(|c| {
+                c.keys()
+                    .map(|id| super::super::push_sender::credential_tag(&route.id, *id))
+            })
+            .collect();
+        scopes.push(json!({"scope":scope(route,None)?,"enabled":true,"alert_once":false,"allow_unknown":true,"senders":introductions}));
         Ok(json!({"introductions":true,"scopes":scopes}))
     }
     /// Recipient-created call contexts stay encrypted until the profile unlocks.
@@ -501,6 +601,38 @@ impl ClientApp {
                     crate::calls::require_member(authority, client.session.credential().id())?;
                     return Ok(serde_json::to_value(target)?);
                 }
+            }
+        }
+        Err("This call is no longer available.".into())
+    }
+    /// Resolve a decrypted incoming call against this unlocked profile. Never
+    /// accept a hosting endpoint, roster, or credential from the push payload.
+    pub fn incoming_call_context(&self, encoded: &str) -> Result<Value> {
+        let target = self.open_call_notification(encoded)?;
+        let clients = self
+            .spaces
+            .as_ref()
+            .map(|spaces| spaces.clients(self))
+            .unwrap_or_else(|| vec![self]);
+        for client in clients {
+            for (pin, authority) in client.pins.iter().zip(&client.authorities.0) {
+                if target["space"] != json!(pin.space) || target["stream"] != json!(pin.stream) {
+                    continue;
+                }
+                let host = client.call_host.as_ref().ok_or("Join a Space first.")?;
+                let head = authority.head()?;
+                if head.members.len() != 2 {
+                    return Err("This call is no longer available.".into());
+                }
+                let members = head
+                    .members
+                    .iter()
+                    .map(|m| (m.identity_id.to_string(), json!(m.credential_ids)))
+                    .collect::<serde_json::Map<String, Value>>();
+                return Ok(json!({"expected_identity":self.identity_id(),
+                    "target_space":host.scope.space,"hosting_space_id":host.scope.space,
+                    "space":pin.space,"stream":pin.stream,
+                    "credential":client.session.credential().id(),"config_id":authority.head_id(),"members":members}));
             }
         }
         Err("This call is no longer available.".into())
@@ -670,6 +802,121 @@ fn wake_request(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn synchronized_policy_removes_blocked_read_only_and_retired_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::app::ProfileDraft::new()
+            .unwrap()
+            .save(
+                dir.path().join("profile"),
+                "synthetic notification password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        let (peer, recovery) = Session::create().unwrap();
+        let replacement = Session::recover(&recovery, peer.identity_id()).unwrap();
+        let route = Route {
+            endpoint: "https://notifications.example/".into(),
+            id: "a".repeat(32),
+            notify_key: "b".repeat(64),
+            scope_key: "c".repeat(64),
+            since: 1,
+        };
+        let mut authority = app.authorities.0[0].clone();
+        authority.add_credential(peer.credential().clone());
+        authority.add_credential(replacement.credential().clone());
+        let mut config = authority.head().unwrap().clone();
+        config.members.push(crate::authority::Member {
+            identity_id: peer.identity_id(),
+            identity_type: "HUMAN".into(),
+            root_public_key: field(peer.credential().record().body(), "root_public_key")
+                .unwrap()
+                .into(),
+            capabilities: vec![Capability::Read, Capability::Post],
+            credential_ids: vec![peer.credential().id()],
+            external: false,
+        });
+        config.members.sort_by_key(|m| m.identity_id);
+        let install = |app: &mut ClientApp,
+                       authority: &mut Authority,
+                       config: &mut crate::authority::StreamConfig| {
+            config.sequence += 1;
+            config.previous_config_id = authority.head_id();
+            config.nonce = record::random_hex::<16>().unwrap();
+            config.action.operation = "replace".into();
+            authority
+                .apply_config(config.sign(app.session.signing_key()).unwrap())
+                .unwrap();
+            app.authorities.0 = vec![authority.clone()].into();
+        };
+        install(&mut app, &mut authority, &mut config);
+        let chat_scope = scope(&route, Some((authority.space(), authority.stream()))).unwrap();
+        let tags = |app: &ClientApp| -> Value {
+            app.notification_policy(&route).unwrap()["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["scope"] == chat_scope)
+                .unwrap()["senders"]
+                .clone()
+        };
+        let old = json!(crate::app::push_sender::credential_tag(
+            &route.id,
+            peer.credential().id()
+        ));
+        let new = json!(crate::app::push_sender::credential_tag(
+            &route.id,
+            replacement.credential().id()
+        ));
+        assert!(tags(&app).as_array().unwrap().contains(&old));
+        assert!(!tags(&app).as_array().unwrap().contains(&new));
+        let block = |enabled| json!({"expected_identity":app.identity_id(),"identity":peer.identity_id(),"name":"Synthetic peer","blocked":enabled});
+        let on = block(true);
+        let off = block(false);
+        app.update_block(&on).unwrap();
+        assert!(!tags(&app).as_array().unwrap().contains(&old));
+        app.update_block(&off).unwrap();
+        assert!(tags(&app).as_array().unwrap().contains(&old));
+        let peer_index = config
+            .members
+            .iter()
+            .position(|m| m.identity_id == peer.identity_id())
+            .unwrap();
+        config.members[peer_index].capabilities = vec![Capability::Read];
+        install(&mut app, &mut authority, &mut config);
+        assert!(!tags(&app).as_array().unwrap().contains(&old));
+        config.members[peer_index]
+            .capabilities
+            .push(Capability::Post);
+        config.members[peer_index].credential_ids = vec![replacement.credential().id()];
+        install(&mut app, &mut authority, &mut config);
+        assert!(!tags(&app).as_array().unwrap().contains(&old));
+        assert!(tags(&app).as_array().unwrap().contains(&new));
+        config.members.remove(peer_index);
+        install(&mut app, &mut authority, &mut config);
+        assert!(!tags(&app).as_array().unwrap().contains(&new));
+        app.close().await.unwrap();
+    }
+    #[test]
+    fn capability_rotation_follows_revocations_not_additions_or_mute() {
+        let original = json!({"scopes":[{"scope":"chat","enabled":true,"senders":["device-a","device-b"]}],"blocked_senders":[]});
+        assert!(!policy_requires_rotation(&Value::Null, &original));
+        assert!(!policy_requires_rotation(&original, &original));
+        let mut added = original.clone();
+        added["scopes"][0]["senders"] = json!(["device-a", "device-b", "device-c"]);
+        assert!(!policy_requires_rotation(&original, &added));
+        added["scopes"][0]["enabled"] = json!(false);
+        assert!(!policy_requires_rotation(&original, &added));
+        let mut removed = original.clone();
+        removed["scopes"][0]["senders"] = json!(["device-b"]);
+        assert!(policy_requires_rotation(&original, &removed));
+        assert!(policy_requires_rotation(&original, &json!({"scopes":[]})));
+        let mut blocked = original.clone();
+        blocked["blocked_senders"] = json!(["identity"]);
+        assert!(policy_requires_rotation(&original, &blocked));
+        assert!(!policy_requires_rotation(&blocked, &original));
+    }
+    #[tokio::test]
     async fn encrypted_targets_and_recipient_policy_are_bound_to_the_profile() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = crate::app::ProfileDraft::new()
@@ -693,6 +940,24 @@ mod tests {
         let pin = app.pins[0].clone();
         let before = app.notification_policy(&route).unwrap();
         let scope = scope(&route, Some((pin.space, pin.stream))).unwrap();
+        let tag = super::super::super::push_sender::credential_tag(
+            &route.id,
+            app.session.credential().id(),
+        );
+        assert_eq!(
+            before["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["scope"] == scope)
+                .unwrap()["senders"],
+            json!([tag])
+        );
+        assert!(
+            !before
+                .to_string()
+                .contains(&app.session.credential().id().to_string())
+        );
         assert!(
             !serde_json::to_string(&before)
                 .unwrap()

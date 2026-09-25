@@ -27,6 +27,7 @@ const PASSWORD: &str = "synthetic notification delivery password";
 struct Delivery {
     fail: AtomicBool,
     attempts: Mutex<Vec<Value>>,
+    expected_key: Mutex<String>,
 }
 async fn receive(
     State(delivery): State<Arc<Delivery>>,
@@ -35,7 +36,7 @@ async fn receive(
 ) -> StatusCode {
     assert_eq!(
         headers["authorization"],
-        format!("Bearer {}", "b".repeat(64))
+        format!("Bearer {}", delivery.expected_key.lock().unwrap())
     );
     delivery.attempts.lock().unwrap().push(body);
     if delivery.fail.load(Ordering::SeqCst) {
@@ -78,19 +79,25 @@ fn chat<'a>(view: &'a Value, stream: &Value) -> &'a Value {
 
 #[tokio::test]
 async fn encrypted_message_wake_retries_after_sender_restart_while_recipient_is_closed() {
-    check_encrypted_message_wake(false).await;
+    check_encrypted_message_wake(false, false).await;
 }
 
 #[tokio::test]
 async fn notifications_enabled_after_contact_exchange_arrive_through_signed_discovery() {
-    check_encrypted_message_wake(true).await;
+    check_encrypted_message_wake(true, false).await;
 }
 
-async fn check_encrypted_message_wake(discover_route: bool) {
+#[tokio::test]
+async fn rotated_notify_key_is_rediscovered_on_the_same_day_and_survives_sender_restart() {
+    check_encrypted_message_wake(true, true).await;
+}
+
+async fn check_encrypted_message_wake(discover_route: bool, rotate: bool) {
     let temp = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let delivery = Arc::new(Delivery::default());
+    *delivery.expected_key.lock().unwrap() = "b".repeat(64);
     delivery.fail.store(true, Ordering::SeqCst);
     let router = Router::new()
         .route("/v1/routes/{id}/wake", post(receive))
@@ -101,7 +108,7 @@ async fn check_encrypted_message_wake(discover_route: bool) {
     for app in [&mut sender, &mut recipient] {
         app.configure_push(&url, true).unwrap();
     }
-    let route = Route {
+    let mut route = Route {
         endpoint: url.clone(),
         id: "a".repeat(32),
         notify_key: "b".repeat(64),
@@ -130,9 +137,12 @@ async fn check_encrypted_message_wake(discover_route: bool) {
             .unwrap();
     }
     let replica_server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     if discover_route {
         // Both contact cards predate opt-in: no route is embedded in either card.
@@ -149,6 +159,19 @@ async fn check_encrypted_message_wake(discover_route: bool) {
             .operate(json!({"op":"invitation_sync","force":true}))
             .await
             .unwrap();
+    }
+    if rotate {
+        route.notify_key = "d".repeat(64);
+        recipient.advertise_wake_route(Some(route.clone())).unwrap();
+        recipient
+            .operate(json!({"op":"invitation_sync","force":true}))
+            .await
+            .unwrap();
+        sender
+            .operate(json!({"op":"invitation_sync","force":true}))
+            .await
+            .unwrap();
+        *delivery.expected_key.lock().unwrap() = route.notify_key.clone();
     }
     let created = sender.operate(json!({"op":"contact_create_chat","request_id":"01".repeat(16),"name":"Private notification test","chat_kind":"chat","people":[recipient.view().await.unwrap()["identity"]]})).await.unwrap();
     let stream = created["stream"].clone();

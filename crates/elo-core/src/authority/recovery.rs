@@ -109,6 +109,13 @@ impl Authority {
         Ok(())
     }
     fn chain_at(&self, mut id: Option<RecordId>) -> Result<Vec<SignedRecord>> {
+        if let Some(proof) = &self.checkpoint_evidence {
+            return if id == self.head {
+                Ok(proof.recovery.clone())
+            } else {
+                Err(RecordError::Authority)
+            };
+        }
         let mut chain = Vec::new();
         while let Some(next) = id {
             let c = self.config(next)?;
@@ -129,6 +136,9 @@ impl Authority {
         &self.credentials[&self.body.controller_credential_id]
     }
     pub fn recovery_records(&self) -> Result<Vec<SignedRecord>> {
+        if let Some(proof) = &self.checkpoint_evidence {
+            return Ok(proof.recovery.clone());
+        }
         let mut records = BTreeMap::new();
         for (_, c) in self.configs.values() {
             if let Some(r) = embedded(c)? {
@@ -146,7 +156,8 @@ impl Authority {
         root: &SigningKey,
     ) -> Result<SignedRecord> {
         let initial = self.initial_controller();
-        if self.is_forked()
+        if self.checkpoint_evidence.is_some()
+            || self.is_forked()
             || initial.identity() != IdentityId::of_root_key(root.verifying_key().as_bytes())
             || fresh.identity() != initial.identity()
         {
@@ -267,13 +278,25 @@ impl Authority {
         if c.members != expected || c.owner_credential_ids != self.owner_devices(&expected) {
             return Err(RecordError::Authority);
         }
-        // A restored/reissued old key must not masquerade as a fresh controller.
+        // Roster synchronization may already have admitted the recovering device.
+        // Only that exact, still-active credential may reuse its membership keys;
+        // former controllers and credentials wrapping old keys remain forbidden.
+        let already_active = parent
+            .members
+            .iter()
+            .any(|m| m.identity_id == initial.identity() && m.credential_ids.contains(&fresh.id()));
         let mut ancestor = c.previous_config_id;
         while let Some(id) = ancestor {
             let config = self.config(id)?;
+            let controller = self.credential(config.controller_credential_id)?;
+            if controller.key() == fresh.key() || controller.recipient() == fresh.recipient() {
+                return Err(RecordError::Authority);
+            }
             for id in config.members.iter().flat_map(|m| &m.credential_ids) {
                 let old = self.credential(*id)?;
-                if old.key() == fresh.key() || old.recipient() == fresh.recipient() {
+                if (old.key() == fresh.key() || old.recipient() == fresh.recipient())
+                    && (!already_active || old.id() != fresh.id())
+                {
                     return Err(RecordError::Authority);
                 }
             }

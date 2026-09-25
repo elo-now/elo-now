@@ -16,6 +16,7 @@ use std::{
 };
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
+pub mod biometric;
 const MAX_VAULT: usize = 256 * 1024;
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -45,6 +46,8 @@ struct Secrets {
     credential: String,
     signing_seed: String,
     age_identity: String,
+    #[serde(default)]
+    history_keys: Vec<String>,
     peers: Vec<PeerDescriptor>,
     controller_mode: ControllerMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,8 @@ impl Drop for Secrets {
     fn drop(&mut self) {
         self.signing_seed.zeroize();
         self.age_identity.zeroize();
+        self.history_keys.zeroize();
+        self.transfer_nonce.zeroize();
         for peer in &mut self.peers {
             peer.read_token.zeroize();
             peer.write_token.zeroize();
@@ -63,7 +68,7 @@ impl Drop for Secrets {
 }
 pub struct Session {
     pub(crate) key: SigningKey,
-    pub(crate) age: age::x25519::Identity,
+    pub(crate) age: crate::crypto::DecryptionKeys,
     pub(crate) credential: VerifiedCredential,
     pub(crate) peers: Vec<PeerDescriptor>,
     pub(crate) controller_mode: ControllerMode,
@@ -72,6 +77,7 @@ pub struct Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        self.transfer_nonce.zeroize();
         for peer in &mut self.peers {
             peer.read_token.zeroize();
             peer.write_token.zeroize();
@@ -134,7 +140,10 @@ impl Session {
             .map_err(|_| VaultError::Invalid)?;
         Ok(Self {
             key,
-            age,
+            age: crate::crypto::DecryptionKeys {
+                current: age,
+                history: vec![],
+            },
             credential,
             peers: vec![],
             controller_mode: ControllerMode::Follower,
@@ -146,6 +155,58 @@ impl Session {
         let root = card.recover_root(expected)?;
         Self::enroll(&root)
     }
+    /// Independent device keys; only decryption keys and transport settings survive.
+    pub(crate) fn companion(&self, card: &RecoveryCard) -> Result<Self> {
+        let mut next = Self::recover(card, self.identity_id())?;
+        next.inherit_history(self)?;
+        Ok(next)
+    }
+    pub(crate) fn linked_companion(&self) -> Result<Self> {
+        let key = generate_signing_key().map_err(|_| VaultError::Invalid)?;
+        let age = age::x25519::Identity::generate();
+        let credential = DeviceCredential::issue_companion(
+            &self.credential,
+            &self.key,
+            &key.verifying_key(),
+            &age.to_public(),
+        )
+        .map_err(|_| VaultError::Invalid)?;
+        let mut next = Self {
+            key,
+            age: crate::crypto::DecryptionKeys {
+                current: age,
+                history: vec![],
+            },
+            credential,
+            peers: vec![],
+            controller_mode: ControllerMode::Follower,
+            controller_spaces: Some(vec![]),
+            transfer_nonce: record::random_hex::<32>().map_err(|_| VaultError::Invalid)?,
+        };
+        next.inherit_history(self)?;
+        Ok(next)
+    }
+    pub(crate) fn inherit_history(&mut self, previous: &Self) -> Result<()> {
+        if self.identity_id() != previous.identity_id() {
+            return Err(VaultError::Invalid);
+        }
+        for key in std::iter::once(&previous.age.current).chain(previous.age.history.iter()) {
+            if key.to_public() != self.age.to_public()
+                && !self
+                    .age
+                    .history
+                    .iter()
+                    .any(|k| k.to_public() == key.to_public())
+            {
+                if self.age.history.len() >= 32 {
+                    return Err(VaultError::Invalid);
+                }
+                self.age.history.push(key.clone());
+            }
+        }
+        self.peers = previous.peers.clone();
+        Ok(())
+    }
     pub fn identity_id(&self) -> IdentityId {
         self.credential.identity()
     }
@@ -155,7 +216,7 @@ impl Session {
     pub fn signing_key(&self) -> &SigningKey {
         &self.key
     }
-    pub fn age_identity(&self) -> &age::x25519::Identity {
+    pub fn age_identity(&self) -> &crate::crypto::DecryptionKeys {
         &self.age
     }
     pub fn peers(&self) -> &[PeerDescriptor] {
@@ -224,6 +285,7 @@ impl Session {
         self.controller_mode = ControllerMode::Retired;
     }
     fn plaintext(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let seed = Zeroizing::new(self.key.to_bytes());
         let secrets = Secrets {
             v: 1,
             identity_id: self.identity_id(),
@@ -232,8 +294,14 @@ impl Session {
                 .ok_or(VaultError::Invalid)?
                 .into(),
             credential: STANDARD.encode(self.credential.record().bytes()),
-            signing_seed: encode_hex(&self.key.to_bytes()),
-            age_identity: self.age.to_string().expose_secret().to_owned(),
+            signing_seed: encode_hex(&*seed),
+            age_identity: self.age.current.to_string().expose_secret().to_owned(),
+            history_keys: self
+                .age
+                .history
+                .iter()
+                .map(|k| k.to_string().expose_secret().to_owned())
+                .collect(),
             peers: self.peers.clone(),
             controller_mode: self.controller_mode,
             controller_spaces: self.controller_spaces.clone(),
@@ -249,8 +317,10 @@ impl Session {
     pub fn seal(&self, passphrase: SecretString) -> Result<Vec<u8>> {
         validate_passphrase(&passphrase)?;
         let plaintext = self.plaintext()?;
-        // Keep age's calibrated cost. No reduced-work test mode.
-        let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
+        let recipient = crate::crypto::passphrase::recipient(passphrase.clone());
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .map_err(|_| VaultError::Invalid)?;
         let mut ciphertext = Vec::new();
         let mut writer = encryptor
             .wrap_output(&mut ciphertext)
@@ -310,9 +380,20 @@ impl Session {
         {
             return Err(VaultError::Invalid);
         }
+        if secrets.history_keys.len() > 32 {
+            return Err(VaultError::Invalid);
+        }
+        let history = secrets
+            .history_keys
+            .iter()
+            .map(|key| key.parse().map_err(|_| VaultError::Invalid))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             key,
-            age,
+            age: crate::crypto::DecryptionKeys {
+                current: age,
+                history,
+            },
             credential,
             peers: std::mem::take(&mut secrets.peers),
             controller_mode: secrets.controller_mode,
@@ -600,5 +681,35 @@ mod cache_tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn companion_retains_history_but_has_independent_signing_and_decryption_keys() {
+        let (source, card) = Session::create().unwrap();
+        let companion = source.companion(&card).unwrap();
+        assert_ne!(source.credential().id(), companion.credential().id());
+        assert_ne!(
+            source.signing_key().verifying_key(),
+            companion.signing_key().verifying_key()
+        );
+        let old = crate::crypto::seal_bytes(b"past", &[source.age.to_public()], 1024).unwrap();
+        assert_eq!(
+            crate::crypto::open_bytes(&old, &companion.age, 1024).unwrap(),
+            b"past"
+        );
+        let new = crate::crypto::seal_bytes(b"future", &[companion.age.to_public()], 1024).unwrap();
+        assert!(crate::crypto::open_bytes(&new, &source.age, 1024).is_err());
+        let password = "synthetic independent device password";
+        let reopened = Session::open(
+            &companion.seal(password.into()).unwrap(),
+            password.into(),
+            source.identity_id(),
+        )
+        .unwrap();
+        assert_eq!(reopened.credential().id(), companion.credential().id());
+        assert_eq!(
+            crate::crypto::open_bytes(&old, &reopened.age, 1024).unwrap(),
+            b"past"
+        );
+        assert!(reopened.controller_mode() == ControllerMode::Follower);
     }
 }

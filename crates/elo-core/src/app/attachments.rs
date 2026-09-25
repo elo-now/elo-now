@@ -226,6 +226,7 @@ impl ClientApp {
             },
         };
         descriptor.validate()?;
+        self.require_fresh_membership(&self.authorities.0[index]).await?;
         let prepared = crate::files::prepare_external(
             &self.authorities.0[index],
             self.session.credential().id(),
@@ -316,12 +317,13 @@ impl ClientApp {
         if message_actions::Projection::new(&self.originals(authority).await?).is_deleted(&record) {
             return Err("This message was deleted.".into());
         }
-        let share = crate::files::VerifiedFileShare::verify(
+        let recipient = crypto::history_recipient(
             &record,
             authority,
-            self.session.credential().id(),
-            true,
+            self.identity_id(),
+            self.session.age_identity(),
         )?;
+        let share = crate::files::VerifiedFileShare::verify(&record, authority, recipient, true)?;
         let descriptor = share
             .attachment()
             .ok_or("This file uses the older attachment format.")?

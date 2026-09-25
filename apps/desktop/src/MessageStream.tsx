@@ -70,8 +70,6 @@ export function MessageStream({
   onRefresh,
   onRead,
   onOpen,
-  onChats,
-  onYou,
 }: {
   view: View;
   active: boolean;
@@ -81,8 +79,6 @@ export function MessageStream({
   onRefresh: () => Promise<void>;
   onRead: (entry: StreamEntry) => Promise<boolean>;
   onOpen: (entry: StreamEntry) => void;
-  onChats: () => void;
-  onYou: () => void;
 }) {
   const entries = useMemo(() => unreadStreamEntries(view), [view]);
   const [limit, setLimit] = useState(60);
@@ -332,27 +328,7 @@ export function MessageStream({
     >
       <ScreenHeader
         title={t("nav.stream")}
-        actions={
-          !mobile && (
-            <>
-              <RefreshButton onRefresh={onRefresh} />
-              <button
-                className="icon"
-                aria-label={t("nav.chats")}
-                onClick={onChats}
-              >
-                <Icon name="chats" />
-              </button>
-              <button
-                className="icon"
-                aria-label={t("nav.you")}
-                onClick={onYou}
-              >
-                <Icon name="person" />
-              </button>
-            </>
-          )
-        }
+        actions={!mobile && <RefreshButton onRefresh={onRefresh} />}
       />
       <div className="stream-viewport" ref={viewport}>
         <div

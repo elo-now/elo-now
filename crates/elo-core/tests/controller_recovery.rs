@@ -40,6 +40,71 @@ fn advance(a: &Authority, signer: &Person) -> SignedRecord {
     c.action.request_record_id = None;
     c.sign(&signer.key).unwrap()
 }
+fn set_owner_devices(a: &mut Authority, controller: &Person, devices: &[&Person]) {
+    for device in devices {
+        a.add_credential(device.c.clone());
+    }
+    let mut c = a.head().unwrap().clone();
+    let member = c
+        .members
+        .iter_mut()
+        .find(|m| m.identity_id == controller.c.identity())
+        .unwrap();
+    member.credential_ids = devices.iter().map(|d| d.c.id()).collect();
+    member.credential_ids.sort();
+    c.owner_credential_ids = member.credential_ids.clone();
+    c.sequence += 1;
+    c.previous_config_id = a.head_id();
+    c.nonce = random_hex::<16>().unwrap();
+    c.recovery = None;
+    c.action.operation = "device.updated".into();
+    c.action.request_record_id = None;
+    assert_eq!(
+        a.apply_config(c.sign(&controller.key).unwrap()).unwrap(),
+        ConfigAdmission::Applied
+    );
+}
+#[test]
+fn recovery_accepts_an_enrolled_device_but_not_removed_or_reissued_keys() {
+    let (owner, _, mut a, _) = setup();
+    let new = fresh(&owner, 99);
+    set_owner_devices(&mut a, &owner, &[&owner, &new]);
+    let (recovered, _, _) = recover(&a, &owner, &new);
+    assert_eq!(recovered.controller().id(), new.c.id());
+    // Admission is not sufficient: the explicit root authorization is required.
+    assert!(a.apply_config(advance(&a, &new)).is_err());
+    for reuse_signing in [false, true] {
+        let unrelated = fresh(&owner, 100);
+        let key = if reuse_signing {
+            &new.key
+        } else {
+            &unrelated.key
+        };
+        let age = if reuse_signing {
+            &unrelated.age
+        } else {
+            &new.age
+        };
+        let credential =
+            DeviceCredential::issue(&owner.root, &key.verifying_key(), &age.to_public()).unwrap();
+        let mut alias = a.clone();
+        alias.add_credential(credential.clone());
+        let cert = alias.sign_recovery(&credential, &owner.root).unwrap();
+        assert!(alias.prepare_recovery(&cert, key).is_err());
+    }
+    set_owner_devices(&mut a, &owner, &[&owner]);
+    let cert = a.sign_recovery(&new.c, &owner.root).unwrap();
+    assert!(a.prepare_recovery(&cert, &new.key).is_err());
+}
+#[test]
+fn readmitting_a_former_controller_does_not_allow_recovery_with_its_old_keys() {
+    let (owner, _, old, _) = setup();
+    let new = fresh(&owner, 99);
+    let (mut a, _, _) = recover(&old, &owner, &new);
+    set_owner_devices(&mut a, &new, &[&owner, &new]);
+    let cert = a.sign_recovery(&owner.c, &owner.root).unwrap();
+    assert!(a.prepare_recovery(&cert, &owner.key).is_err());
+}
 #[test]
 fn lost_controller_replaced_without_changing_space_history_or_other_members() {
     let (owner, reader, old, messages) = setup();

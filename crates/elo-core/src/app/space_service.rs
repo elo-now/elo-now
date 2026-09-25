@@ -2,10 +2,11 @@
 //! permanent mailbox credentials; those are encrypted for an approved device.
 use super::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use std::time::Duration;
 mod attachments;
 mod calls;
+mod devices;
 mod roles;
+mod storage;
 use attachments::*;
 use roles::Roles;
 
@@ -13,6 +14,27 @@ pub const PREFIX: &str = "elo://space/v1#";
 pub const LIFETIMES: [u64; 6] = [60, 600, 1800, 3600, 86400, 100 * 365 * 86400];
 const LIMIT: usize = 8 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 24 * 1024 * 1024;
+
+// Preserve the failure category without returning server bodies or endpoint URLs.
+pub(super) fn space_transport_error(error: reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "Space server timed out."
+    } else {
+        "Space server unreachable."
+    }
+}
+
+pub(super) fn space_status_error(status: reqwest::StatusCode) -> &'static str {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "Space access denied.",
+        StatusCode::NOT_FOUND => "Space endpoint unavailable.",
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "Space server timed out.",
+        StatusCode::TOO_MANY_REQUESTS => "Space server is busy.",
+        _ if status.is_server_error() => "Space server unavailable.",
+        _ => "Space request rejected.",
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +130,8 @@ struct Applicant {
     #[serde(default)]
     note: String,
     request: team::EnrollmentRequest,
+    #[serde(default)]
+    requested_at: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +156,55 @@ struct ServiceState {
     attachment_access: BTreeMap<String, AttachmentAccess>,
     #[serde(default)]
     call_heads: BTreeMap<String, calls::PublishedHead>,
+}
+
+impl ServiceState {
+    fn prune_applicants(&mut self, current: u64) {
+        self.applicants.retain(|_, applicant| {
+            applicant.status != "pending"
+                || (current.saturating_sub(applicant.requested_at) < 7 * 86_400_000
+                    && self
+                        .offers
+                        .get(&applicant.invitation)
+                        .is_some_and(|offer| !offer.revoked && offer.expires_at > current))
+        });
+        if self.applicants.len() >= record::MAX_CHAT_CREDENTIALS {
+            self.applicants.retain(|_, applicant| {
+                !matches!(applicant.status.as_str(), "declined" | "removed")
+            });
+        }
+    }
+
+    fn require_applicant_capacity(
+        &self,
+        identity: IdentityId,
+        invitation: &str,
+        pending: bool,
+    ) -> Result<()> {
+        let active = |a: &&Applicant| a.status == "approved";
+        if pending {
+            let requests: Vec<_> = self
+                .applicants
+                .values()
+                .filter(|a| a.status == "pending")
+                .collect();
+            // A leaked invitation cannot consume every slot. Revoking that invitation
+            // frees its requests; approved members use a separate admission budget.
+            if requests.len() >= 256
+                || requests
+                    .iter()
+                    .filter(|a| a.invitation == invitation)
+                    .count()
+                    >= 32
+                || requests.iter().filter(|a| a.identity == identity).count() >= 4
+            {
+                return Err("Space request limit reached.".into());
+            }
+        } else if self.applicants.values().filter(active).count() >= record::MAX_CHAT_CREDENTIALS {
+            return Err("Space member limit reached.".into());
+        }
+        Ok(())
+    }
 }
 
 /// A contact address, never an email header or proof of identity.
@@ -338,6 +411,7 @@ impl ClientApp {
         let state = self.service_state()?;
         let roles = state.roles.as_ref().ok_or("Space roles unavailable.")?;
         if request.invitation.is_some()
+            || credential.authorizing_device().is_some()
             || command.v != 1
             || command.kind != "space.command"
             || command.space != config.address.scope.space
@@ -384,6 +458,14 @@ impl ClientApp {
         Ok(json!({"status":"deleted"}))
     }
     /// Used only by the host to enforce current membership at its transport gate.
+    pub fn space_access_devices(&self) -> Result<Vec<RecordId>> {
+        Ok(self.authorities.0[0]
+            .head()?
+            .members
+            .iter()
+            .flat_map(|member| member.credential_ids.iter().copied())
+            .collect())
+    }
     pub fn space_access_members(&self) -> Result<Vec<IdentityId>> {
         let state = self.service_state()?;
         let mut identities = BTreeSet::from([self.identity_id()]);
@@ -512,33 +594,35 @@ impl ClientApp {
     }
     async fn space_http(&self, address: &SpaceAddress, request: Request) -> Result<Value> {
         address.validate(self.allow_loopback)?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(4))
-            .timeout(Duration::from_secs(12))
-            .build()?;
-        let mut response = client
+        let mut response = self
+            .space_http_client
             .post(&address.url)
             .json(&request)
             .send()
             .await
-            .map_err(|_| "Could not connect to this Space. Try again.")?;
+            .map_err(space_transport_error)?;
         let deleted = response.status() == reqwest::StatusCode::GONE;
         if !response.status().is_success() && !deleted {
-            return Err("Could not update this Space. Try again.".into());
+            return Err(space_status_error(response.status()).into());
         }
         let mut bytes = Zeroizing::new(Vec::new());
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(space_transport_error)? {
             if bytes.len() + chunk.len() > RESPONSE_LIMIT {
                 return Err("Space response is too large.".into());
             }
             bytes.extend_from_slice(&chunk);
         }
         if deleted {
-            return Self::verify_space_deletion(address, serde_json::from_slice(&bytes)?);
+            return Self::verify_space_deletion(
+                address,
+                serde_json::from_slice(&bytes).map_err(|_| "Invalid Space response.")?,
+            );
         }
-        self.open_space_response(address, &request.nonce, serde_json::from_slice(&bytes)?)
+        self.open_space_response(
+            address,
+            &request.nonce,
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid Space response.")?,
+        )
     }
     pub(super) fn open_space_response(
         &self,
@@ -586,23 +670,10 @@ impl ClientApp {
         Ok(value)
     }
     fn service_state(&self) -> Result<ServiceState> {
-        let path = self.directory.join("space-service.age");
-        if !path.try_exists()? {
-            return Ok(ServiceState::default());
-        }
-        let bytes = vault::read_private(&path)?;
-        Ok(serde_json::from_slice(&Zeroizing::new(
-            crypto::open_bytes(&bytes, self.session.age_identity(), LIMIT)?,
-        ))?)
+        storage::load(self)
     }
     fn save_service_state(&self, state: &ServiceState) -> Result<()> {
-        let bytes = Zeroizing::new(serde_json::to_vec(state)?);
-        vault::write_private(
-            &self.directory.join("space-service.age"),
-            &crypto::seal_bytes(&bytes, &[self.session.age_identity().to_public()], LIMIT)?,
-            true,
-        )?;
-        Ok(())
+        storage::save(self, state)
     }
     /// Local administrator bootstrap; the caller already holds the private
     /// service profile. This method is never exposed as an unauthenticated HTTP action.
@@ -614,6 +685,7 @@ impl ClientApp {
         }
         let mut state = self.service_state()?;
         let current = time()?;
+        state.prune_applicants(current);
         state
             .offers
             .retain(|_, offer| !offer.revoked && offer.expires_at > current);
@@ -686,6 +758,10 @@ impl ClientApp {
         }
         let mut state = self.service_state()?;
         let current = time()?;
+        if let Some(replica) = replica {
+            self.apply_device_revocations(&mut state, replica).await?;
+        }
+        state.prune_applicants(current);
         let mut recipient = None;
         if state.roles.is_none() {
             let mut roles = Roles::bootstrap(&config.owners)?;
@@ -717,6 +793,29 @@ impl ClientApp {
                     .as_deref()
                     .ok_or("Missing device proof.")?,
             )?;
+            if let Some(replica) = replica {
+                replica.require_active_device(credential.id())?;
+            }
+            if let Some(authorizer) = credential.authorizing_device() {
+                let head = self.authorities.0[0].head()?;
+                let already_enrolled = head.members.iter().any(|member| {
+                    member.identity_id == credential.identity()
+                        && member.credential_ids.contains(&credential.id())
+                });
+                if !already_enrolled {
+                    // A linked device cannot resurrect a revoked/removed parent.
+                    // Previously admitted companions remain independently revocable.
+                    if let Some(replica) = replica {
+                        replica.require_active_device(authorizer)?;
+                    }
+                    if !head.members.iter().any(|member| {
+                        member.identity_id == credential.identity()
+                            && member.credential_ids.contains(&authorizer)
+                    }) {
+                        return Err("The authorizing device is no longer in this Space.".into());
+                    }
+                }
+            }
             let signed = decode_record(request.record.as_deref().ok_or("Missing signature.")?)?;
             signed.verify_signature(credential.key())?;
             let command: Command = signed.decode()?;
@@ -742,34 +841,63 @@ impl ClientApp {
             }
             let cacheable = !matches!(
                 command.action.as_str(),
-                "join" | "status" | "manage" | "storage"
+                "join"
+                    | "status"
+                    | "manage"
+                    | "storage"
+                    | "chat_head_check"
+                    | "device_list"
+                    | "device_revoke"
             );
-            if cacheable && let Some((_, _, reply)) = state.replies.get(&replay_key) {
+            if command.action == "chat_head_check" {
+                // This read has no side effects to replay. Always sign a fresh,
+                // nonce-bound answer without rewriting the encrypted service
+                // state or consuming the mutation replay quota.
+                self.finish_member_removals(&state).await?;
+                match self.check_space_chat_head(&state, &credential, &command.body) {
+                    Ok(value) => value,
+                    Err(error) => json!({"error":error.to_string()}),
+                }
+            } else if cacheable && let Some((_, _, reply)) = state.replies.get(&replay_key) {
                 reply.clone()
             } else {
-                if state.replies.len() >= 8192 {
+                let prefix = format!("{}:", credential.id());
+                if cacheable
+                    && (state.replies.len() >= 8192
+                        || state
+                            .replies
+                            .keys()
+                            .filter(|key| key.starts_with(&prefix))
+                            .count()
+                            >= 256)
+                {
                     return Err("Space is busy. Try again.".into());
                 }
                 let result = self
                     .space_command(config, &mut state, &credential, command, replica)
                     .await;
+                let succeeded = result.is_ok();
                 let value = match result {
                     Ok(value) => value,
                     Err(error) => json!({"error":error.to_string()}),
                 };
-                state.replies.insert(
-                    replay_key,
-                    (
-                        current,
-                        signed.id().to_string(),
-                        if cacheable {
-                            value.clone()
-                        } else {
-                            Value::Null
-                        },
-                    ),
-                );
-                self.save_service_state(&state)?;
+                if succeeded && cacheable {
+                    state.replies.insert(
+                        replay_key,
+                        (
+                            current,
+                            signed.id().to_string(),
+                            if cacheable {
+                                value.clone()
+                            } else {
+                                Value::Null
+                            },
+                        ),
+                    );
+                }
+                if succeeded {
+                    self.save_service_state(&state)?;
+                }
                 value
             }
         };
@@ -820,6 +948,25 @@ impl ClientApp {
         if state.erased_accounts.contains(&identity) {
             return Err("This account was deleted from this service.".into());
         }
+        if credential.authorizing_device().is_some()
+            && matches!(
+                command.action.as_str(),
+                "contact_update"
+                    | "storage"
+                    | "storage_prune"
+                    | "manage"
+                    | "invite"
+                    | "revoke"
+                    | "decide"
+                    | "role_change"
+                    | "role_decide"
+                    | "attachment_retention"
+                    | "attachment_cleanup_preview"
+                    | "attachment_cleanup"
+            )
+        {
+            return Err("Manage this Space from your original device.".into());
+        }
         let owner = state
             .roles
             .as_ref()
@@ -834,6 +981,12 @@ impl ClientApp {
         }
         let roles = state.roles.as_ref().ok_or("Space roles unavailable.")?;
         match command.action.as_str() {
+            "device_list" => self.space_device_list(credential),
+            "device_revoke" => {
+                self.space_revoke_device(state, credential, &command.body, replica)
+                    .await
+            }
+            "chat_head_check" => self.check_space_chat_head(state, credential, &command.body),
             "call_head_publish" => self.publish_space_call_head(state, credential, &command.body),
             "contact"
                 if state
@@ -883,6 +1036,7 @@ impl ClientApp {
             "join" => {
                 let note = join_note(&command.body)?;
                 let token = field(&command.body, "token")?;
+                state.prune_applicants(current);
                 let (offer_id, offer) = state
                     .offers
                     .iter()
@@ -901,9 +1055,9 @@ impl ClientApp {
                         .get(&key)
                         .is_some_and(|a| a.status == "removed" || a.status == "declined")
                 {
-                    if state.applicants.len() >= record::MAX_CHAT_CREDENTIALS {
-                        return Err("Space request limit reached.".into());
-                    }
+                    let pending = state.removals.contains_key(&identity)
+                        || (offer.require_approval && !owner);
+                    state.require_applicant_capacity(identity, offer_id, pending)?;
                     state.applicants.insert(
                         key.clone(),
                         Applicant {
@@ -926,6 +1080,7 @@ impl ClientApp {
                                 String::new()
                             },
                             request,
+                            requested_at: current,
                         },
                     );
                     self.save_service_state(state)?;
@@ -935,9 +1090,19 @@ impl ClientApp {
                     }
                     applicant.request = request;
                 }
-                self.space_join_reply(config, state, &key).await
+                self.space_join_reply(config, state, &key, None).await
             }
             "status" => {
+                let heads = command
+                    .body
+                    .get("chat_heads")
+                    .map(|value| {
+                        value
+                            .as_array()
+                            .filter(|heads| heads.len() <= 64)
+                            .ok_or("Space request rejected.")
+                    })
+                    .transpose()?;
                 let key = credential.id().to_string();
                 let request: team::EnrollmentRequest =
                     serde_json::from_value(command.body["enrollment"].clone())?;
@@ -956,9 +1121,10 @@ impl ClientApp {
                         json!({"name":config.name,"status":"removed","membership_epoch":state.removals[&identity]}),
                     );
                 }
-                if let Some(applicant) = state.applicants.get_mut(&key) {
+                let mut result = if let Some(applicant) = state.applicants.get_mut(&key) {
                     applicant.request = request;
-                    self.space_join_reply(config, state, &key).await
+                    self.space_join_reply(config, state, &key, Some(&command.body))
+                        .await?
                 } else {
                     // Legacy General members retain membership, with their own signed
                     // request proving the encryption recipient before any access export.
@@ -974,6 +1140,7 @@ impl ClientApp {
                     {
                         return Err("Join this Space using an invitation first.".into());
                     }
+                    state.require_applicant_capacity(identity, "", false)?;
                     state.applicants.insert(
                         key.clone(),
                         Applicant {
@@ -983,10 +1150,25 @@ impl ClientApp {
                             invitation: String::new(),
                             note: String::new(),
                             request,
+                            requested_at: current,
                         },
                     );
-                    self.space_join_reply(config, state, &key).await
+                    self.space_join_reply(config, state, &key, None).await?
+                };
+                if result["status"] == "approved"
+                    && let Some(heads) = heads
+                {
+                    result["chat_heads"] = json!(
+                        heads
+                            .iter()
+                            .map(|head| {
+                                self.check_space_chat_head(state, credential, head)
+                                    .unwrap_or_else(|error| json!({"error":error.to_string()}))
+                            })
+                            .collect::<Vec<_>>()
+                    );
                 }
+                Ok(result)
             }
             "manage" if owner => {
                 let (attachment_used, attachment_reserved) = bytes_in_state(state);
@@ -1045,10 +1227,14 @@ impl ClientApp {
                     .get_mut(field(&command.body, "id")?)
                     .ok_or("Invitation not found.")?
                     .revoked = true;
+                state.prune_applicants(current);
                 self.save_service_state(state)?;
                 Ok(json!({}))
             }
             "decide" if owner => {
+                if command.body["approve"] == true {
+                    state.require_applicant_capacity(identity, "", false)?;
+                }
                 let applicant = state
                     .applicants
                     .get_mut(field(&command.body, "id")?)
@@ -1111,6 +1297,7 @@ impl ClientApp {
         config: &ServiceConfig,
         state: &ServiceState,
         key: &str,
+        known: Option<&Value>,
     ) -> Result<Value> {
         let applicant = state.applicants.get(key).ok_or("Request not found.")?;
         if applicant.status != "approved" {
@@ -1118,12 +1305,30 @@ impl ClientApp {
                 json!({"name":config.name,"status":applicant.status,"membership_epoch":state.removals.get(&applicant.identity).copied().unwrap_or(0)}),
             );
         }
-        let packet = self
-            .enroll_approved_space_member(applicant.request.clone())
-            .await?;
+        let general = &self.authorities.0[0];
+        let epoch = state
+            .removals
+            .get(&applicant.identity)
+            .copied()
+            .unwrap_or(0);
+        let unchanged = known.is_some_and(|known| {
+            known["known_general_head"] == json!(general.head_id())
+                && known["membership_epoch"].as_u64() == Some(epoch)
+                && key.parse().ok().is_some_and(|id| {
+                    crate::calls::require_member(general, id).ok() == Some(applicant.identity)
+                })
+        });
+        let packet = if unchanged {
+            None
+        } else {
+            Some(
+                self.enroll_approved_space_member(applicant.request.clone())
+                    .await?,
+            )
+        };
         let roles = state.roles.as_ref().ok_or("Space roles unavailable.")?;
         Ok(
-            json!({"name":config.name,"status":"approved","membership_epoch":state.removals.get(&applicant.identity).copied().unwrap_or(0),"owner":roles.is_owner(applicant.identity),"role":roles.role(applicant.identity),"roles_revision":roles.revision,"role_requests":roles.requests_for(applicant.identity),"contact_email":roles.contact_email,"message_lifetime_seconds":config.address.message_lifetime_seconds,"peer":config.peer,"enrollment":packet}),
+            json!({"name":config.name,"status":"approved","membership_epoch":epoch,"owner":roles.is_owner(applicant.identity),"role":roles.role(applicant.identity),"roles_revision":roles.revision,"role_requests":roles.requests_for(applicant.identity),"contact_email":roles.contact_email,"message_lifetime_seconds":config.address.message_lifetime_seconds,"peer":config.peer,"general_head":self.authorities.0[0].head_id(),"enrollment":packet}),
         )
     }
 
@@ -1140,6 +1345,205 @@ impl ClientApp {
                 });
         }
         Ok(members.into_values().collect())
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn pending_requests_are_isolated_by_invite_identity_and_expiry() {
+        let now = 10 * 86_400_000;
+        let identity = IdentityId::from_bytes([1; 32]);
+        let mut state = ServiceState::default();
+        state.offers.insert(
+            "leaked".into(),
+            Offer {
+                token: "test".into(),
+                issued_at: now,
+                expires_at: now + 86_400_000,
+                require_approval: true,
+                revoked: false,
+            },
+        );
+        for index in 0..32u8 {
+            state.applicants.insert(
+                index.to_string(),
+                Applicant {
+                    identity: IdentityId::from_bytes([index; 32]),
+                    name: "Applicant".into(),
+                    status: "pending".into(),
+                    invitation: "leaked".into(),
+                    note: String::new(),
+                    request: team::EnrollmentRequest {
+                        v: 1,
+                        contact: String::new(),
+                        proof: String::new(),
+                    },
+                    requested_at: now,
+                },
+            );
+        }
+        assert!(
+            state
+                .require_applicant_capacity(identity, "leaked", true)
+                .is_err()
+        );
+        assert!(
+            state
+                .require_applicant_capacity(identity, "fresh", true)
+                .is_ok()
+        );
+        assert!(
+            state
+                .require_applicant_capacity(identity, "leaked", false)
+                .is_ok()
+        );
+        for applicant in state.applicants.values_mut().take(4) {
+            applicant.identity = identity;
+        }
+        assert!(
+            state
+                .require_applicant_capacity(identity, "fresh", true)
+                .is_err()
+        );
+        state.offers.get_mut("leaked").unwrap().revoked = true;
+        state.prune_applicants(now);
+        assert!(state.applicants.is_empty());
+        state.offers.get_mut("leaked").unwrap().revoked = false;
+        state.offers.get_mut("leaked").unwrap().expires_at = now + 100 * 86_400_000;
+        state.applicants.insert(
+            "old".into(),
+            Applicant {
+                identity,
+                name: "Old".into(),
+                status: "pending".into(),
+                invitation: "leaked".into(),
+                note: String::new(),
+                request: team::EnrollmentRequest {
+                    v: 1,
+                    contact: String::new(),
+                    proof: String::new(),
+                },
+                requested_at: now - 7 * 86_400_000,
+            },
+        );
+        state.prune_applicants(now);
+        assert!(
+            state.applicants.is_empty(),
+            "polling must not extend a pending slot indefinitely"
+        );
+    }
+
+    #[tokio::test]
+    async fn space_http_preserves_failure_categories_and_hides_server_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = ProfileDraft::new()
+            .unwrap()
+            .save_named(
+                temp.path().join("profile"),
+                "synthetic transport password".into(),
+                "General",
+                "Tester",
+            )
+            .await
+            .unwrap();
+        client.allow_loopback = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let status = Arc::new(AtomicU16::new(200));
+        let state = status.clone();
+        let app = axum::Router::new().fallback(move || {
+            let state = state.clone();
+            async move {
+                let code = state.load(Ordering::SeqCst);
+                if code == 599 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                (
+                    axum::http::StatusCode::from_u16(code).unwrap(),
+                    "private diagnostic with synthetic-secret",
+                )
+            }
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let invitation = SpaceInvitation {
+            v: 1,
+            address: SpaceAddress {
+                url: format!("{base}/team/v1/spaces"),
+                scope: client.team_scope().unwrap(),
+                message_lifetime_seconds: 86_400,
+            },
+            token: "ab".repeat(32),
+        };
+        for (code, expected) in [
+            (400, "Space request rejected."),
+            (403, "Space access denied."),
+            (404, "Space endpoint unavailable."),
+            (429, "Space server is busy."),
+            (503, "Space server unavailable."),
+            (504, "Space server timed out."),
+            (200, "Invalid Space response."),
+            (410, "Invalid Space response."),
+        ] {
+            status.store(code, Ordering::SeqCst);
+            let error = client
+                .preview_space(&invitation)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected, "preview status {code}");
+            let creation = client
+                .create_hosted(
+                    &format!("{base}/spaces/v1/create"),
+                    &"cd".repeat(16),
+                    "Family",
+                    "owner@example.test",
+                    86_400,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            let creation_expected = match code {
+                429 => {
+                    "Space hosting is currently at capacity. Try again later or join an existing Space."
+                }
+                404 => "Space hosting unavailable.",
+                410 => "Space request rejected.",
+                _ => expected,
+            };
+            assert_eq!(creation, creation_expected, "creation status {code}");
+        }
+        status.store(599, Ordering::SeqCst);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(&base)
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(space_transport_error(error), "Space server timed out.");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            client
+                .preview_space(&invitation)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Space server unreachable."
+        );
+        client.close().await.unwrap();
     }
 }
 

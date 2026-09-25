@@ -40,7 +40,7 @@ async fn resume_checks_archive_password_and_signature_then_commits_once() {
     }
     let original = source.store.stats().await.unwrap().records;
     let bytes = source
-        .export_snapshot(PASSWORD.into(), false, MAX_FILES)
+        .export_snapshot(PASSWORD.into(), false, MAX_FILES, None)
         .await
         .unwrap()
         .bytes;
@@ -64,7 +64,7 @@ async fn resume_checks_archive_password_and_signature_then_commits_once() {
     );
     // Another valid encryption of the same data is not the checkpoint's archive.
     let another = source
-        .export_snapshot(PASSWORD.into(), false, MAX_FILES)
+        .export_snapshot(PASSWORD.into(), false, MAX_FILES, None)
         .await
         .unwrap()
         .bytes;
@@ -220,7 +220,7 @@ async fn recovery_rejects_links_without_changing_their_targets() {
     let source = profile(tmp.path().join("source")).await;
     let id = source.identity_id();
     let bytes = source
-        .export_snapshot(PASSWORD.into(), false, MAX_FILES)
+        .export_snapshot(PASSWORD.into(), false, MAX_FILES, None)
         .await
         .unwrap()
         .bytes;
@@ -297,4 +297,63 @@ fn recovery_tree_accepts_only_local_cache_for_an_archived_space() {
         std::os::unix::fs::symlink(temp.path().join("outside"), root.join(&relative)).unwrap();
         assert!(safe_tree(&root, &files).is_err());
     }
+}
+
+#[tokio::test]
+async fn recovery_code_resume_keeps_one_fresh_device_and_separate_restores_get_new_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let draft = ProfileDraft::new().unwrap();
+    let source = draft
+        .save(tmp.path().join("source"), PASSWORD.into(), "General")
+        .await
+        .unwrap();
+    let bytes = source
+        .export_recovery_backup(&draft.card().phrase)
+        .await
+        .unwrap();
+    let id = source.identity_id();
+    let path = tmp.path().join("resumed");
+    let attempt = |directory: PathBuf| RestoreRequest {
+        directory,
+        bytes: &bytes,
+        secret: draft.card().phrase.clone().into(),
+        expected: id,
+        password: PASSWORD.into(),
+        allow_loopback: true,
+        resume: true,
+        paged: true,
+    };
+    let error = restore(attempt(path.clone()), &paused_at(RestoreStage::Saving, 1))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().starts_with("Recovery paused."));
+    let journal: SignedCheckpoint =
+        serde_json::from_slice(&vault::read_private(&path.join(".initializing")).unwrap()).unwrap();
+    let planned = Session::open(
+        &STANDARD
+            .decode(journal.checkpoint.device_vault.as_ref().unwrap())
+            .unwrap(),
+        PASSWORD.into(),
+        id,
+    )
+    .unwrap();
+    assert_ne!(planned.credential().id(), source.session.credential().id());
+    let resumed = restore(attempt(path), &RestoreProgress::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.session.credential().id(), planned.credential().id());
+    let another = restore(
+        attempt(tmp.path().join("another")),
+        &RestoreProgress::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        another.session.credential().id(),
+        resumed.session.credential().id()
+    );
+    resumed.close().await.unwrap();
+    another.close().await.unwrap();
+    source.close().await.unwrap();
 }

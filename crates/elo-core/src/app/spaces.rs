@@ -62,6 +62,8 @@ struct Catalog {
     #[serde(default)]
     creation: Option<CreationIntent>,
     #[serde(default)]
+    creation_retry: Option<CreationIntent>,
+    #[serde(default)]
     notification_generation: u64,
     #[serde(default)]
     account_hosts: BTreeSet<String>,
@@ -112,9 +114,17 @@ fn remove_child(path: &Path) -> Result<()> {
     }
     check_directory(path)?;
     let files = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut empty_transfer_cache = None;
     for file in &files {
         let name = file.file_name();
         let name = name.to_str().ok_or("Unexpected Space file.")?;
+        if name == "attachment-transfers"
+            && file.file_type()?.is_dir()
+            && std::fs::read_dir(file.path())?.next().is_none()
+        {
+            empty_transfer_cache = Some(file.path());
+            continue;
+        }
         if !file.file_type()?.is_file()
             || !(DATA_FILES.contains(&name)
                 || [
@@ -130,13 +140,34 @@ fn remove_child(path: &Path) -> Result<()> {
             return Err("This Space contains an unexpected file; its data was preserved.".into());
         }
     }
+    // Completed transfers leave this empty private directory. Never recurse:
+    // unexpected contents or a symbolic link still preserve the whole Space.
+    if let Some(cache) = &empty_transfer_cache {
+        std::fs::remove_dir(cache)?;
+    }
     for file in files {
-        std::fs::remove_file(file.path())?;
+        if empty_transfer_cache.as_ref() != Some(&file.path()) {
+            std::fs::remove_file(file.path())?;
+        }
     }
     std::fs::remove_dir(path)?;
     Ok(())
 }
 impl ClientApp {
+    pub(super) fn device_addresses(&self) -> Vec<SpaceAddress> {
+        let mut addresses = BTreeMap::new();
+        if let Some(address) = &self.call_host {
+            addresses.insert(address.url.clone(), address.clone());
+        }
+        if let Some(spaces) = &self.spaces {
+            for entry in &spaces.catalog.entries {
+                if let Some(address) = &entry.address {
+                    addresses.insert(address.url.clone(), address.clone());
+                }
+            }
+        }
+        addresses.into_values().collect()
+    }
     pub(super) fn account_hosts(&self) -> Result<BTreeSet<String>> {
         let mut hosts = BTreeSet::new();
         if let Some(spaces) = &self.spaces {
@@ -303,6 +334,7 @@ impl ClientApp {
                 v: 1,
                 setup: false,
                 creation: None,
+                creation_retry: None,
                 notification_generation: 0,
                 account_hosts: BTreeSet::new(),
                 active: Some(id.clone()),
@@ -525,6 +557,36 @@ impl ClientApp {
             .as_ref()
             .and_then(|s| s.catalog.active.as_deref())
     }
+    pub(super) fn selected_space_client(&self) -> Result<&ClientApp> {
+        let Some(spaces) = &self.spaces else {
+            return Ok(self);
+        };
+        match spaces.selected_child_id()? {
+            Some(id) => spaces
+                .children
+                .get(id)
+                .ok_or_else(|| "Space unavailable.".into()),
+            None => Ok(self),
+        }
+    }
+    pub(super) fn selected_space_client_mut(&mut self) -> Result<&mut ClientApp> {
+        let child = self
+            .spaces
+            .as_ref()
+            .map(|spaces| spaces.selected_child_id().map(|id| id.map(str::to_owned)))
+            .transpose()?
+            .flatten();
+        match child {
+            Some(id) => self
+                .spaces
+                .as_mut()
+                .unwrap()
+                .children
+                .get_mut(&id)
+                .ok_or_else(|| "Space unavailable.".into()),
+            None => Ok(self),
+        }
+    }
     pub fn notification_generation(&self) -> u64 {
         self.spaces
             .as_ref()
@@ -577,6 +639,20 @@ impl Spaces {
     }
     pub(super) fn children(&self) -> &BTreeMap<String, ClientApp> {
         &self.children
+    }
+    fn selected_child_id(&self) -> Result<Option<&str>> {
+        let id = self
+            .catalog
+            .active
+            .as_deref()
+            .ok_or("Join a Space first.")?;
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == id && entry.status == "joined")
+            .ok_or("Space unavailable.")?;
+        Ok((!entry.root).then_some(id))
     }
     pub(super) async fn close(self) -> Result<()> {
         for (_, child) in self.children {
@@ -916,14 +992,40 @@ impl Spaces {
                     return Err("This mailbox is already connected as another Space.".into());
                 }
             }
-            let enrollment: team::EnrollmentReply =
+            let enrollment: Option<team::EnrollmentReply> =
                 serde_json::from_value(result["enrollment"].clone())?;
+            if enrollment.is_none() {
+                let existing = if old.is_some_and(|i| self.catalog.entries[i].root) {
+                    &*root
+                } else {
+                    self.children.get(&id).ok_or("Invalid Space response.")?
+                };
+                let general = existing
+                    .authorities
+                    .0
+                    .iter()
+                    .find(|a| {
+                        a.space() == address.scope.space && a.stream() == address.scope.stream
+                    })
+                    .ok_or("Invalid Space response.")?;
+                if result["general_head"] != json!(general.head_id())
+                    || crate::calls::require_member(general, existing.session.credential().id())
+                        .is_err()
+                {
+                    return Err("Chat permissions need to be refreshed.".into());
+                }
+            }
             if old.is_some_and(|i| self.catalog.entries[i].root) {
                 // Migration never replaces or rewrites existing profile data.
-                root.accept_space_enrollment(enrollment).await?;
+                if let Some(enrollment) = enrollment {
+                    root.accept_space_enrollment(enrollment).await?;
+                }
             } else if let Some(child) = self.children.get_mut(&id) {
-                child.accept_space_enrollment(enrollment).await?;
+                if let Some(enrollment) = enrollment {
+                    child.accept_space_enrollment(enrollment).await?;
+                }
             } else {
+                let enrollment = enrollment.ok_or("Invalid Space response.")?;
                 let directory = child_path(root, &id)?;
                 let parent = root.directory.join("spaces");
                 if !parent.try_exists()? {
@@ -1120,7 +1222,15 @@ impl Spaces {
             if !record::valid_display_name(name) {
                 return Err("Enter a Space name.".into());
             }
-            self.catalog.creation = Some(CreationIntent {
+            // A failed join may follow a successful server allocation. Reuse
+            // its idempotency key for unchanged input without locking the form.
+            let retry = self.catalog.creation_retry.take().filter(|intent| {
+                intent.host == host
+                    && intent.name == name
+                    && intent.contact_email == email
+                    && intent.message_lifetime_seconds == message_lifetime_seconds
+            });
+            self.catalog.creation = Some(retry.unwrap_or(CreationIntent {
                 contact_email: email.into(),
                 host: host.into(),
                 request_id: record::random_hex::<16>()?,
@@ -1128,7 +1238,7 @@ impl Spaces {
                 message_lifetime_seconds,
                 space: None,
                 invitation: None,
-            });
+            }));
             // Persist before the network request: retries after termination use
             // exactly the same identity and creation ID on the host.
             self.save(root)?;
@@ -1180,6 +1290,7 @@ impl Spaces {
         // The host's bootstrap invitation is reusable and already requires
         // approval. Reuse it for sharing instead of creating a second offer.
         self.catalog.creation.as_mut().unwrap().invitation = Some(link);
+        self.catalog.creation_retry = None;
         self.save(root)
     }
     async fn poll(&mut self, root: &mut ClientApp) -> Result<()> {
@@ -1207,18 +1318,46 @@ impl Spaces {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(if foreground { 2 } else { 24 });
         let enrollment = root.team_enrollment_request(&address.scope)?;
-        let status = tokio::time::timeout_at(
-            deadline,
-            root.call_space(&address, "status", json!({"enrollment":enrollment})),
-        )
-        .await;
+        let client = if entry.root {
+            Some(&*root)
+        } else {
+            self.children.get(&entry.id)
+        };
+        let probe = client.and_then(|client| client.membership_probe().ok());
+        let general_head = client.and_then(|client| {
+            client
+                .authorities
+                .0
+                .iter()
+                .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
+                .and_then(Authority::head_id)
+        });
+        let mut body = json!({"enrollment":enrollment,"known_general_head":general_head,"membership_epoch":entry.membership_epoch});
+        if let Some(probe) = &probe {
+            body["chat_heads"] = json!(probe.requests);
+        }
+        let status =
+            tokio::time::timeout_at(deadline, root.call_space(&address, "status", body)).await;
         if let Ok(Ok(result)) = status {
+            let confirmations = json!({"chat_heads":result["chat_heads"]});
             if self
                 .add_joined(root, address.clone(), result)
                 .await
                 .is_err()
             {
                 return Ok(true);
+            }
+            if let Some(probe) = probe {
+                let client = if entry.root {
+                    Some(&*root)
+                } else {
+                    self.children.get(&entry.id)
+                };
+                if let Some(client) = client {
+                    client
+                        .accept_membership_probe(probe, &confirmations)
+                        .await?;
+                }
             }
         } else {
             return Ok(true);
@@ -1372,15 +1511,15 @@ impl Spaces {
             }
             "space_create" => {
                 if let Err(error) = self.create(root, &v).await {
-                    // Keep the entered fields in the form, but release a local
-                    // intent that did not join a Space so they can be edited.
+                    // Release the form for editing, but retain the allocation
+                    // key so an unchanged retry cannot create a duplicate Space.
                     if self
                         .catalog
                         .creation
                         .as_ref()
                         .is_some_and(|intent| intent.space.is_none())
                     {
-                        self.catalog.creation = None;
+                        self.catalog.creation_retry = self.catalog.creation.take();
                         self.save(root)?;
                     }
                     return Err(error);
@@ -1487,6 +1626,19 @@ impl Spaces {
                     .clone()
                     .ok_or("This Space has no invitation service.")?;
                 let action = op.strip_prefix("space_").ok_or("Invalid action.")?;
+                if matches!(
+                    op,
+                    "space_decide" | "space_role_change" | "space_role_decide" | "space_delete"
+                ) {
+                    let client = if entry.root {
+                        Some(&*root)
+                    } else {
+                        self.children.get(id)
+                    };
+                    if let Some(client) = client {
+                        client.invalidate_membership_checks().await;
+                    }
+                }
                 result["result"] = root.call_space(&address, action, v["body"].clone()).await?;
                 if matches!(
                     result["result"]["status"].as_str(),
@@ -1866,10 +2018,11 @@ impl ClientApp {
             self.session.activate_new_space_controller(space)?;
             self.persist_vault()?;
         }
-        // Keep the personal seed first so the existing empty-General rule hides it.
+        // The local marker hides this setup stream until it contains real history.
         self.pins.insert(
             0,
             Pin {
+                personal_seed: Some(true),
                 name: "General".into(),
                 space,
                 stream,
@@ -1890,6 +2043,42 @@ mod tests {
     use super::super::space_service::ServiceConfig;
     use super::*;
     const PASSWORD: &str = "synthetic spaces test password";
+    #[test]
+    fn space_cleanup_accepts_empty_transfer_cache_and_preserves_unexpected_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let space = temp.path().join("space");
+        std::fs::create_dir(&space).unwrap();
+        std::fs::write(space.join("vault.age"), b"preserve until validated").unwrap();
+        let cache = space.join("attachment-transfers");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("unexpected.txt"), b"user data").unwrap();
+        assert!(remove_child(&space).is_err());
+        assert_eq!(
+            std::fs::read(space.join("vault.age")).unwrap(),
+            b"preserve until validated"
+        );
+        assert_eq!(
+            std::fs::read(cache.join("unexpected.txt")).unwrap(),
+            b"user data"
+        );
+        std::fs::remove_file(cache.join("unexpected.txt")).unwrap();
+        remove_child(&space).unwrap();
+        assert!(!space.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn space_cleanup_rejects_transfer_cache_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let space = temp.path().join("space");
+        let external = temp.path().join("external");
+        std::fs::create_dir(&space).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(space.join("vault.age"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&external, space.join("attachment-transfers")).unwrap();
+        assert!(remove_child(&space).is_err());
+        assert_eq!(std::fs::read(space.join("vault.age")).unwrap(), b"keep");
+        assert!(external.is_dir());
+    }
     async fn profile(base: &Path, name: &str) -> ClientApp {
         ProfileDraft::new()
             .unwrap()
@@ -1904,7 +2093,7 @@ mod tests {
             .unwrap()
     }
     async fn command(
-        server: &mut ClientApp,
+        server: &std::sync::Arc<tokio::sync::Mutex<ClientApp>>,
         config: &ServiceConfig,
         client: &ClientApp,
         action: &str,
@@ -1912,8 +2101,35 @@ mod tests {
     ) -> Result<Value> {
         let request = client.space_request(&config.address, action, body)?;
         let nonce = request.nonce.clone();
-        let answer = server.serve_space(config, request).await?;
+        let answer = server.lock().await.serve_space(config, request).await?;
         client.open_space_response(&config.address, &nonce, answer)
+    }
+    fn serve_test_space(
+        server: std::sync::Arc<tokio::sync::Mutex<ClientApp>>,
+        config: ServiceConfig,
+        listener: tokio::net::TcpListener,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = axum::Router::new().route(
+            "/team/v1/spaces",
+            axum::routing::post(
+                move |axum::Json(request): axum::Json<super::super::space_service::Request>| {
+                    let server = server.clone();
+                    let config = config.clone();
+                    async move {
+                        server
+                            .lock()
+                            .await
+                            .serve_space(&config, request)
+                            .await
+                            .map(axum::Json)
+                            .map_err(|_| axum::http::StatusCode::BAD_REQUEST)
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        })
     }
     async fn attach(client: &mut ClientApp, address: SpaceAddress, value: Value) -> String {
         let mut spaces = client.spaces.take().unwrap();
@@ -1922,13 +2138,202 @@ mod tests {
         id
     }
     #[tokio::test]
+    async fn signed_status_reuses_unchanged_enrollment_and_read_checks_do_not_write_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = profile(temp.path(), "service").await;
+        let mut owner = profile(temp.path(), "owner").await;
+        let replica = crate::replica::ReplicaStore::open(temp.path().join("replica"))
+            .await
+            .unwrap();
+        let mailbox = replica.create_mailbox(8 * 1024 * 1024).await.unwrap();
+        let peer = PeerDescriptor {
+            url: "http://127.0.0.1:9/".into(),
+            signing_public_key: record::encode_hex(replica.key().as_bytes()),
+            mailbox_id: mailbox.mailbox_id,
+            read_token: Some(mailbox.read_token),
+            write_token: Some(mailbox.write_token),
+        };
+        server.ensure_peer(peer.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ServiceConfig {
+            name: "Permission test".into(),
+            address: SpaceAddress {
+                url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
+                scope: server.team_scope().unwrap(),
+                message_lifetime_seconds: 86400,
+            },
+            owners: vec![owner.identity_id()],
+            contact_email: None,
+            peer,
+        };
+        let invitation = SpaceInvitation::parse(
+            &server.bootstrap_space_invitation(&config.address).unwrap(),
+            true,
+        )
+        .unwrap();
+        let state_path = server.directory.join("space-service.sqlite");
+        let server = std::sync::Arc::new(tokio::sync::Mutex::new(server));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let service = server.clone();
+        let service_config = config.clone();
+        let router = axum::Router::new().route(
+            "/team/v1/spaces",
+            axum::routing::post(
+                move |axum::Json(request): axum::Json<super::super::space_service::Request>| {
+                    let service = service.clone();
+                    let config = service_config.clone();
+                    if decode_record(request.record.as_ref().unwrap())
+                        .unwrap()
+                        .body()["action"]
+                        == "chat_head_check"
+                    {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    async move {
+                        axum::Json(
+                            service
+                                .lock()
+                                .await
+                                .serve_space(&config, request)
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                },
+            ),
+        );
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        owner.begin_space_setup().await.unwrap();
+        let enrollment = owner
+            .team_enrollment_request(&config.address.scope)
+            .unwrap();
+        let full = command(
+            &server,
+            &config,
+            &owner,
+            "join",
+            json!({"token":invitation.token,"enrollment":enrollment}),
+        )
+        .await
+        .unwrap();
+        assert!(!full["enrollment"].is_null());
+        let id = attach(&mut owner, config.address.clone(), full.clone()).await;
+        let child = &owner.spaces.as_ref().unwrap().children[&id];
+        let probe = child.membership_probe().unwrap();
+        let body = json!({"enrollment":enrollment,"known_general_head":full["general_head"],"membership_epoch":0,"chat_heads":probe.requests});
+        let compact = command(&server, &config, &owner, "status", body.clone())
+            .await
+            .unwrap();
+        assert!(
+            compact["enrollment"].is_null(),
+            "unchanged permissions must not resend the enrollment packet"
+        );
+        assert_eq!(compact["general_head"], full["general_head"]);
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+        assert!(compact_bytes < full_bytes);
+        eprintln!(
+            "Space status: full {} bytes, unchanged {} bytes including chat confirmations",
+            full_bytes, compact_bytes
+        );
+        child
+            .accept_membership_probe(probe, &compact)
+            .await
+            .unwrap();
+        let general = child
+            .authorities
+            .0
+            .iter()
+            .find(|a| a.space() == config.address.scope.space)
+            .unwrap();
+        child.require_fresh_membership(general).await.unwrap(); // Sync supplied the proof.
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let snapshot = vault::read_private(&state_path).unwrap();
+        for _ in 0..3 {
+            command(
+                &server,
+                &config,
+                &owner,
+                "chat_head_check",
+                json!({"space":general.space(),"stream":general.stream(),"head":general.head_id()}),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            vault::read_private(&state_path).unwrap(),
+            snapshot,
+            "read checks must not rewrite or grow encrypted service state"
+        );
+        attach(&mut owner, config.address.clone(), compact).await;
+        let mut spaces = owner.spaces.take().unwrap();
+        let entry = spaces
+            .catalog
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap()
+            .clone();
+        spaces.children[&id].invalidate_membership_checks().await;
+        assert!(!spaces.poll_entry(&mut owner, entry, false).await.unwrap());
+        let child = &spaces.children[&id];
+        let general = child
+            .authorities
+            .0
+            .iter()
+            .find(|a| a.space() == config.address.scope.space)
+            .unwrap();
+        child.require_fresh_membership(general).await.unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the ordinary poll must renew confirmations without a separate check"
+        );
+        owner.spaces = Some(spaces);
+        // A stale head or different admission epoch forces the full signed packet.
+        for patch in [
+            json!({"known_general_head":"ff".repeat(32)}),
+            json!({"membership_epoch":1}),
+        ] {
+            let mut request = body.clone();
+            for (key, value) in patch.as_object().unwrap() {
+                request[key] = value.clone();
+            }
+            let response = command(&server, &config, &owner, "status", request)
+                .await
+                .unwrap();
+            assert!(!response["enrollment"].is_null());
+        }
+        let mut oversized = body;
+        oversized["chat_heads"] = json!(vec![json!({}); 65]);
+        assert!(
+            command(&server, &config, &owner, "status", oversized)
+                .await
+                .is_err()
+        );
+        owner.close().await.unwrap();
+        worker.abort();
+        let _ = worker.await;
+        std::sync::Arc::try_unwrap(server)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .close()
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
     async fn failed_hosted_creation_releases_fields_for_editing() {
         let temp = tempfile::tempdir().unwrap();
         let mut user = profile(temp.path(), "owner").await;
         user.enable_spaces().await.unwrap();
         let host = "http://127.0.0.1:1/spaces/v1/create";
         let mut spaces = user.spaces.take().unwrap();
-        for name in ["First name", "Edited name"] {
+        let mut previous = None;
+        for name in ["First name", "First name", "Edited name"] {
             let result = spaces
                 .operate(
                     &mut user,
@@ -1937,6 +2342,11 @@ mod tests {
                 .await;
             assert!(result.is_err());
             assert!(spaces.catalog.creation.is_none());
+            let retry = spaces.catalog.creation_retry.as_ref().unwrap();
+            if let Some((old_name, old_id)) = &previous {
+                assert_eq!(retry.request_id == *old_id, name == *old_name);
+            }
+            previous = Some((name, retry.request_id.clone()));
         }
         user.spaces = Some(spaces);
         user.close().await.unwrap();
@@ -2037,6 +2447,129 @@ mod tests {
         server.abort();
         user.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn management_recovery_uses_selected_space_and_rejects_foreign_hosting_scope() {
+        async fn container(child: ClientApp, parent: PathBuf, id: &str) -> ClientApp {
+            make_directory(&parent).unwrap();
+            let session = child.session.isolated_space();
+            vault::write_private(
+                &parent.join("vault.age"),
+                &session.seal(child.password.clone()).unwrap(),
+                false,
+            )
+            .unwrap();
+            vault::write_private(
+                &parent.join("profile.json"),
+                &vault::read_private(&child.directory.join("profile.json")).unwrap(),
+                false,
+            )
+            .unwrap();
+            let mut root = ClientApp::open_session(parent, child.password.clone(), true, session)
+                .await
+                .unwrap();
+            root.enable_spaces().await.unwrap();
+            let spaces = root.spaces.as_mut().unwrap();
+            let mut entry = spaces.catalog.entries[0].clone();
+            entry.id = id.into();
+            entry.root = false;
+            spaces.catalog.active = Some(id.into());
+            spaces.catalog.entries = vec![entry];
+            spaces.children.insert(id.into(), child);
+            root
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (draft, owner, helper, restored) =
+            super::super::control_recovery::tests::fixture(temp.path()).await;
+        let pin = owner.pins[0].clone();
+        let id = "ab".repeat(32);
+        let mut helper = container(helper, temp.path().join("helper-root"), &id).await;
+        let mut restored = container(restored, temp.path().join("restored-root"), &id).await;
+        let request = restored.control_recovery_request();
+        let device = restored.control_recovery_device();
+        let choices = helper.control_recovery_choices(&request).await.unwrap();
+        assert_eq!(choices["chats"].as_array().unwrap().len(), 1);
+        assert_eq!(choices["chats"][0]["stream"], json!(pin.stream));
+        let package = helper
+            .control_recovery_export(&request, pin.space, pin.stream, device)
+            .await
+            .unwrap();
+        let address = SpaceAddress {
+            url: "http://127.0.0.1:9/team/v1/spaces".into(),
+            scope: team::TeamScope {
+                space: id.parse().unwrap(),
+                stream: pin.stream,
+                root: pin.root.clone(),
+                controller: owner.team_scope().unwrap().controller,
+            },
+            message_lifetime_seconds: 86400,
+        };
+        helper.selected_space_client_mut().unwrap().call_host = Some(address.clone());
+        restored.selected_space_client_mut().unwrap().call_host = Some(address.clone());
+        let hosted = helper
+            .control_recovery_export(&request, pin.space, pin.stream, device)
+            .await
+            .unwrap();
+        assert_eq!(hosted["hosting_space"], id);
+        restored.control_recovery_preview(&hosted).await.unwrap();
+        assert!(
+            restored.control_recovery_preview(&package).await.is_err(),
+            "an unscoped file cannot be imported into a hosted Space"
+        );
+        restored
+            .selected_space_client_mut()
+            .unwrap()
+            .call_host
+            .as_mut()
+            .unwrap()
+            .scope
+            .space = SpaceId::from_bytes([7; 32]);
+        assert!(restored.control_recovery_preview(&hosted).await.is_err());
+        restored.selected_space_client_mut().unwrap().call_host = None;
+        assert!(restored.control_recovery_preview(&hosted).await.is_err());
+        helper.selected_space_client_mut().unwrap().call_host = None;
+        // Complete the cryptographic exchange inside selected local compartments.
+        // Hosted admission itself is exercised by the service and physical QA tests.
+        let mut preview = restored.control_recovery_preview(&package).await.unwrap();
+        preview["confirmed"] = true.into();
+        restored
+            .control_recovery_confirm(&package, &preview, &draft.card().phrase)
+            .await
+            .unwrap();
+        assert!(
+            restored.pins.is_empty(),
+            "the root compartment must remain untouched"
+        );
+        let notice = restored
+            .control_recovery_share(pin.space, pin.stream)
+            .unwrap();
+        let mut adoption = helper.control_recovery_preview(&notice).await.unwrap();
+        adoption["confirmed"] = true.into();
+        helper
+            .control_recovery_confirm(&notice, &adoption, "")
+            .await
+            .unwrap();
+        assert!(helper.pins.is_empty());
+        let child = helper.selected_space_client().unwrap();
+        let i = child
+            .authority_index(&json!({"space":pin.space,"stream":pin.stream}))
+            .unwrap();
+        assert_eq!(child.authorities.0[i].controller().id(), device);
+        helper.spaces.as_mut().unwrap().catalog.active = None;
+        assert!(
+            helper.control_recovery_choices(&request).await.is_err(),
+            "no selected Space must not fall back to the root"
+        );
+        helper.spaces.as_mut().unwrap().catalog.active = Some(id.clone());
+        helper.spaces.as_mut().unwrap().catalog.entries[0].status = "checking".into();
+        assert!(
+            helper.control_recovery_choices(&request).await.is_err(),
+            "unverified Spaces cannot supply recovery proofs"
+        );
+        owner.close().await.unwrap();
+        helper.close().await.unwrap();
+        restored.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn prepared_personal_scope_avoids_a_second_vault_write_and_survives_reopen() {
         let temp = tempfile::tempdir().unwrap();
@@ -2220,6 +2753,7 @@ mod tests {
             .await
             .unwrap();
         let mut configurations = Vec::new();
+        let mut listeners = Vec::new();
         for (name, server) in [("Company A", &mut first), ("Company B", &mut second)] {
             let mailbox = replica.create_mailbox(8 * 1024 * 1024).await.unwrap();
             let peer = PeerDescriptor {
@@ -2230,10 +2764,13 @@ mod tests {
                 write_token: Some(mailbox.write_token),
             };
             server.ensure_peer(peer.clone()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let service_url = format!("http://{}/team/v1/spaces", listener.local_addr().unwrap());
+            listeners.push(listener);
             configurations.push(ServiceConfig {
                 name: name.into(),
                 address: SpaceAddress {
-                    url: "http://127.0.0.1:9/team/v1/spaces".into(),
+                    url: service_url,
                     scope: server.team_scope().unwrap(),
                     message_lifetime_seconds: 86_400,
                 },
@@ -2242,6 +2779,16 @@ mod tests {
                 peer,
             });
         }
+        let first = std::sync::Arc::new(tokio::sync::Mutex::new(first));
+        let second = std::sync::Arc::new(tokio::sync::Mutex::new(second));
+        let mut services = [&first, &second]
+            .into_iter()
+            .zip(&configurations)
+            .zip(listeners)
+            .map(|((server, config), listener)| {
+                serve_test_space(server.clone(), config.clone(), listener)
+            })
+            .collect::<Vec<_>>();
         owner.begin_space_setup().await.unwrap();
         assert_eq!(owner.view().await.unwrap()["space_setup"], true);
         assert!(
@@ -2292,7 +2839,7 @@ mod tests {
             .space_request(&a.address, "manage", json!({}))
             .unwrap();
         let nonce = request.nonce.clone();
-        let response = first.serve_space(a, request).await.unwrap();
+        let response = first.lock().await.serve_space(a, request).await.unwrap();
         assert!(response.ciphertext.is_some());
         assert!(
             owner
@@ -2342,10 +2889,10 @@ mod tests {
                 .bytes(),
             ),
         );
-        assert!(first.serve_space(a, expired).await.is_err());
+        assert!(first.lock().await.serve_space(a, expired).await.is_err());
         assert!(
             command(
-                &mut first,
+                &first,
                 a,
                 &user,
                 "invite",
@@ -2355,7 +2902,7 @@ mod tests {
             .is_err()
         );
         let offer = command(
-            &mut first,
+            &first,
             a,
             &owner,
             "invite",
@@ -2372,7 +2919,7 @@ mod tests {
         );
         let enrollment = user.team_enrollment_request(&a.address.scope).unwrap();
         let pending = command(
-            &mut first,
+            &first,
             a,
             &user,
             "join",
@@ -2384,11 +2931,11 @@ mod tests {
         assert!(pending.get("peer").is_none());
         let a_id = attach(&mut user, a.address.clone(), pending).await;
         assert!(user.spaces.as_ref().unwrap().children.is_empty());
-        let manage = command(&mut first, a, &owner, "manage", json!({}))
+        let manage = command(&first, a, &owner, "manage", json!({}))
             .await
             .unwrap();
         command(
-            &mut first,
+            &first,
             a,
             &owner,
             "decide",
@@ -2396,18 +2943,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let approved = command(
-            &mut first,
-            a,
-            &user,
-            "status",
-            json!({"enrollment":enrollment}),
-        )
-        .await
-        .unwrap();
+        let approved = command(&first, a, &user, "status", json!({"enrollment":enrollment}))
+            .await
+            .unwrap();
         attach(&mut user, a.address.clone(), approved).await;
         let offer_b = command(
-            &mut second,
+            &second,
             b,
             &owner,
             "invite",
@@ -2416,7 +2957,7 @@ mod tests {
         .await
         .unwrap();
         let invitation_b = SpaceInvitation::parse(offer_b["link"].as_str().unwrap(), true).unwrap();
-        let approved_b=command(&mut second,b,&user,"join",json!({"token":invitation_b.token,"enrollment":user.team_enrollment_request(&b.address.scope).unwrap()})).await.unwrap();
+        let approved_b=command(&second,b,&user,"join",json!({"token":invitation_b.token,"enrollment":user.team_enrollment_request(&b.address.scope).unwrap()})).await.unwrap();
         let b_id = attach(&mut user, b.address.clone(), approved_b).await;
         for (id, expected_peer, text) in [(&a_id, &a.peer, "Only A"), (&b_id, &b.peer, "Only B")] {
             user.operate(json!({"op":"space_select","id":id}))
@@ -2525,6 +3066,19 @@ mod tests {
                 .peers = peers;
         }
         let backup = user.export_profile(PASSWORD.into()).await.unwrap();
+        // Joining needs the live service for call permissions. Only the restore
+        // stage is offline, to exercise quarantined history without approval.
+        for task in services.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(
+            user.call_space(&a.address, "status", json!({}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Space server unreachable."
+        );
         let mut restored = ClientApp::restore_profile(
             temp.path().join("restored"),
             &backup,
@@ -2535,8 +3089,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // These fixtures deliberately use an offline endpoint. Restored managed
-        // compartments stay hidden until a fresh pinned service answer is applied.
+        // Restored managed compartments stay hidden until a fresh pinned
+        // service answer is applied after the servers become reachable again.
         assert!(
             restored
                 .spaces
@@ -2552,10 +3106,15 @@ mod tests {
             restored.export_profile(PASSWORD.into()).await.is_err(),
             "do not omit quarantined history silently from a new backup"
         );
-        for (server, config) in [
-            (&mut first, &configurations[0]),
-            (&mut second, &configurations[1]),
-        ] {
+        for (server, config) in [&first, &second].into_iter().zip(&configurations) {
+            let url = reqwest::Url::parse(&config.address.url).unwrap();
+            let listener =
+                tokio::net::TcpListener::bind((url.host_str().unwrap(), url.port().unwrap()))
+                    .await
+                    .unwrap();
+            services.push(serve_test_space(server.clone(), config.clone(), listener));
+        }
+        for (server, config) in [(&first, &configurations[0]), (&second, &configurations[1])] {
             let enrollment = restored
                 .team_enrollment_request(&config.address.scope)
                 .unwrap();
@@ -2607,21 +3166,26 @@ mod tests {
         assert_eq!(user.identity_id(), identity);
         assert_eq!(user.notification_generation(), 2);
         assert_eq!(user.view().await.unwrap()["streams"], before["streams"]);
-        command(
-            &mut second,
-            b,
-            &owner,
-            "revoke",
-            json!({"id":offer_b["id"]}),
-        )
-        .await
-        .unwrap();
-        assert!(command(&mut second,b,&owner,"join",json!({"token":invitation_b.token,"enrollment":owner.team_enrollment_request(&b.address.scope).unwrap()})).await.is_err());
+        command(&second, b, &owner, "revoke", json!({"id":offer_b["id"]}))
+            .await
+            .unwrap();
+        assert!(command(&second,b,&owner,"join",json!({"token":invitation_b.token,"enrollment":owner.team_enrollment_request(&b.address.scope).unwrap()})).await.is_err());
         let wrong = user.space_request(&a.address, "manage", json!({})).unwrap();
-        assert!(second.serve_space(b, wrong).await.is_err());
+        assert!(second.lock().await.serve_space(b, wrong).await.is_err());
         user.close().await.unwrap();
         owner.close().await.unwrap();
-        first.close().await.unwrap();
-        second.close().await.unwrap();
+        for task in services {
+            task.abort();
+            let _ = task.await;
+        }
+        for server in [first, second] {
+            std::sync::Arc::try_unwrap(server)
+                .ok()
+                .unwrap()
+                .into_inner()
+                .close()
+                .await
+                .unwrap();
+        }
     }
 }

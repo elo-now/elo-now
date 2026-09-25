@@ -65,6 +65,12 @@ pub(super) async fn register(
     if input.enabled && input.platform == "android" && input.token != saved.token {
         return Err(StatusCode::FORBIDDEN);
     }
+    if input.enabled
+        && input.platform == "ios"
+        && !voip_ownership::verified(&db, &id, &input.token)?
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if input
         .subscriptions
         .iter()
@@ -216,7 +222,7 @@ pub(super) async fn event(
 }
 
 fn allowed(db: &Connection, route: &str, scope: &str, sender: &str, time: i64) -> Result<bool> {
-    db.query_row("SELECT EXISTS(SELECT 1 FROM routes r JOIN call_devices d ON d.route=r.id JOIN scopes s ON s.route=r.id JOIN route_accounts a ON a.route=r.id WHERE r.id=?1 AND r.active=1 AND r.expires>?4 AND s.scope=?2 AND s.enabled=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=r.id AND b.sender=?3) AND NOT EXISTS(SELECT 1 FROM erased_accounts e WHERE e.identity=a.identity))",params![route,scope,sender,time],|r|r.get(0)).map_err(db_error)
+    db.query_row("SELECT EXISTS(SELECT 1 FROM routes r JOIN call_devices d ON d.route=r.id JOIN scopes s ON s.route=r.id JOIN route_accounts a ON a.route=r.id WHERE r.id=?1 AND r.active=1 AND r.expires>?4 AND ((d.platform='android' AND d.token=r.token) OR (d.platform='ios' AND EXISTS(SELECT 1 FROM voip_bindings v WHERE v.route=r.id AND v.token=d.token))) AND s.scope=?2 AND s.enabled=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=r.id AND b.sender=?3) AND NOT EXISTS(SELECT 1 FROM erased_accounts e WHERE e.identity=a.identity))",params![route,scope,sender,time],|r|r.get(0)).map_err(db_error)
 }
 
 pub(super) async fn deliver(relay: &Relay) -> Result<bool> {
@@ -262,32 +268,40 @@ pub(super) async fn deliver(relay: &Relay) -> Result<bool> {
             .map_err(db_error)?;
         return Ok(true);
     }
-    let sent = if platform == "ios" {
+    let (sent, retryable) = if platform == "ios" {
         if let Some(apns) = &relay.apns {
-            apns.incoming(&token,&json!({"aps":{},"elo_call":"1","elo_ticket":ticket,"elo_registration":route,"elo_call_id":call_id,"elo_scope":scope,"elo_target":target,"elo_expires":expires.to_string(),"elo_video":if video{"1"}else{"0"}})).await.is_ok()
+            let result = apns.incoming(&token,&json!({"aps":{},"elo_call":"1","elo_ticket":ticket,"elo_registration":route,"elo_call_id":call_id,"elo_scope":scope,"elo_target":target,"elo_expires":expires.to_string(),"elo_video":if video{"1"}else{"0"}})).await;
+            let retryable = matches!(
+                &result,
+                Err(crate::apns::Error::Delivery | crate::apns::Error::TokenExpired)
+            );
+            (result.is_ok(), retryable)
         } else {
-            false
+            (false, false)
         }
     } else {
-        relay
-            .provider
-            .send(
-                token,
-                Notice::Call {
-                    registration: route.clone(),
-                    call_id: call_id.clone(),
-                    scope,
-                    target,
-                    expires: expires as u64,
-                    video,
-                    ticket,
-                },
-            )
-            .await
-            .is_ok()
+        (
+            relay
+                .provider
+                .send(
+                    token,
+                    Notice::Call {
+                        registration: route.clone(),
+                        call_id: call_id.clone(),
+                        scope,
+                        target,
+                        expires: expires as u64,
+                        video,
+                        ticket,
+                    },
+                )
+                .await
+                .is_ok(),
+            true,
+        )
     };
     let db = relay.database()?;
-    if sent || attempts >= 2 {
+    if sent || !retryable || attempts >= 2 {
         db.execute(
             "UPDATE call_queue SET sent=1 WHERE route=? AND call_id=?",
             params![route, call_id],

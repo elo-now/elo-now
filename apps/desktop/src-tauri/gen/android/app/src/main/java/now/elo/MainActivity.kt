@@ -5,6 +5,8 @@ import android.os.Bundle
 import android.os.Environment
 import android.graphics.Color
 import android.view.View
+import android.view.WindowManager
+import java.io.File
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
@@ -17,6 +19,26 @@ import androidx.core.view.WindowCompat
 class MainActivity : TauriActivity() {
   private external fun initializeTls()
   override val handleBackNavigation: Boolean = false
+
+  // Tauri's generated camera picker calls this API. Redirect only its Pictures
+  // directory into internal storage, including on Android 7–9 where other apps
+  // with storage permission can read external app directories.
+  override fun getExternalFilesDir(type: String?): File? =
+    if (type == Environment.DIRECTORY_PICTURES) File(cacheDir, "elo-captures").apply {
+      check(isDirectory || mkdirs()) { "Camera storage is unavailable" }
+    } else super.getExternalFilesDir(type)
+
+  override fun onPause() {
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    super.onPause()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    // Screenshots remain a deliberate user action while the app is visible;
+    // the system's background task preview must not expose conversations.
+    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+  }
 
   override fun onNewIntent(intent: Intent) {
     // A restored task can receive a notification before the plugins load.
@@ -71,9 +93,25 @@ class MainActivity : TauriActivity() {
   }
 
   private fun clearPhotoCaptures() {
-    getExternalFilesDir(Environment.DIRECTORY_PICTURES)?.listFiles()?.forEach { file ->
+    listOf(getExternalFilesDir(Environment.DIRECTORY_PICTURES),
+      super.getExternalFilesDir(Environment.DIRECTORY_PICTURES)).filterNotNull().forEach { directory ->
+      directory.listFiles()?.forEach { file ->
       if (file.isFile && file.name.matches(Regex("JPEG_\\d{8}_\\d{6}_.*\\.jpg"))) {
         file.delete()
+      }
+      }
+    }
+  }
+
+  private fun clearOldShareFiles() {
+    // The native share plugin copies encrypted recovery QR images here so
+    // FileProvider can grant a receiver access. Earlier builds tried the
+    // cache root and left a copy before FileProvider rejected it.
+    for (directory in listOf(File(cacheDir, "elo-captures"), cacheDir)) {
+      directory.listFiles()?.forEach { file ->
+        if (file.isFile && file.name.matches(Regex("elo-[0-9a-f]{32}\\.png"))) {
+          file.delete()
+        }
       }
     }
   }
@@ -85,6 +123,7 @@ class MainActivity : TauriActivity() {
     initializeTls()
     enableEdgeToEdge()
     clearPhotoCaptures()
+    clearOldShareFiles()
     super.onCreate(savedInstanceState)
 
     // Older Android WebViews do not expose system bars or the keyboard to CSS.

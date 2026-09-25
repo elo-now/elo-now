@@ -11,9 +11,19 @@ ExecStart=/opt/elo/bin/livekit-server --config /etc/elo/media/livekit.yaml
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+LimitNOFILE=8192
+TasksMax=512
 ReadWritePaths=/var/lib/elo/media
 
 [Install]

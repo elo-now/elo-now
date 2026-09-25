@@ -52,9 +52,12 @@ async fn replies_survive_missing_original_history_offline_delivery_and_restart()
     let peer = temp.path().join("peer.json");
     vault::write_private(&peer, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     let mut owner = ClientApp::open(owner_path.clone(), PASSWORD.into(), true)
         .await

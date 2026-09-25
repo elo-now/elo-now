@@ -7,6 +7,9 @@ pub fn encode(card: &RecoveryCard, password: SecretString) -> Result<String> {
     if password.expose_secret().chars().count() < 12 || password.expose_secret().len() > 1024 {
         return Err("Use at least 12 characters for the recovery QR password".into());
     }
+    if !crypto::passphrase::strong_export_secret(&password) {
+        return Err("Choose a less predictable password, such as four unrelated words.".into());
+    }
     card.recover_root(card.identity_id)?;
     let plain = Zeroizing::new(serde_json::to_vec(card)?);
     let encrypted = profile_backup::encrypt(&plain, password)?;

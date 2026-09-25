@@ -1,5 +1,6 @@
 mod common;
 use common::*;
+use elo_core::retention_access::{Context, Operation, Proof, public_key};
 use elo_core::{
     crypto,
     erasure::{self, RetentionClaim},
@@ -12,6 +13,42 @@ use elo_core::{
     vault::Session,
 };
 use rusqlite::Connection;
+const REQUEST_SECRET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const ACCEPT_SECRET: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+fn proof(
+    replica: &ReplicaStore,
+    mailbox: elo_core::ids::MailboxId,
+    session: &Session,
+    object: ObjectId,
+    record: RecordId,
+    accept: bool,
+) -> Proof {
+    let context = Context {
+        operation: if accept {
+            Operation::Accept
+        } else {
+            Operation::Request
+        },
+        replica: replica.peer_id(),
+        mailbox,
+        object,
+        record,
+        actor: session.credential().into(),
+    };
+    Proof::issue(
+        if accept {
+            ACCEPT_SECRET
+        } else {
+            REQUEST_SECRET
+        },
+        &context,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    )
+    .unwrap()
+}
 
 fn time(n: u64) -> LocalTime {
     LocalTime::from_millis(n).unwrap()
@@ -59,6 +96,8 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
             record_id: record,
             lifetime_seconds: 21_600,
             direct_peer: None,
+            request_key: public_key(REQUEST_SECRET).unwrap(),
+            accept_key: None,
         },
     );
     let body_id = ObjectId::of_ciphertext(&body);
@@ -71,6 +110,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
             body_object_id: body_id,
             record_id: record,
             lifetime_seconds: 21_600,
+            request_key: public_key(REQUEST_SECRET).unwrap(),
         },
     );
     let locator_id = ObjectId::of_ciphertext(&locator);
@@ -83,7 +123,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
                 bytes,
                 TransferHint::Eager,
                 true,
-                Some(alice.identity_id()),
+                Some(alice.credential().into()),
             )
             .await
             .unwrap();
@@ -116,6 +156,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
                 body_object_id: body_id,
                 record_id: record,
                 lifetime_seconds: 21_600,
+                request_key: public_key(REQUEST_SECRET).unwrap(),
             }),
         )
         .unwrap()
@@ -129,13 +170,19 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
                 body.clone(),
                 TransferHint::Eager,
                 true,
-                Some(bob.identity_id()),
+                Some(bob.credential().into()),
             )
             .await,
         Err(ReplicaError::Expired)
     ));
     replica
-        .request_message(mailbox.mailbox_id, bob.identity_id(), body_id, record)
+        .request_message(
+            mailbox.mailbox_id,
+            bob.credential().into(),
+            body_id,
+            record,
+            proof(&replica, mailbox.mailbox_id, &bob, body_id, record, false),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -166,7 +213,13 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
         .await
         .unwrap();
     replica
-        .request_message(mailbox.mailbox_id, bob.identity_id(), body_id, record)
+        .request_message(
+            mailbox.mailbox_id,
+            bob.credential().into(),
+            body_id,
+            record,
+            proof(&replica, mailbox.mailbox_id, &bob, body_id, record, false),
+        )
         .await
         .unwrap();
     replica
@@ -177,7 +230,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
             body.clone(),
             TransferHint::Eager,
             true,
-            Some(bob.identity_id()),
+            Some(bob.credential().into()),
         )
         .await
         .unwrap();
@@ -209,6 +262,8 @@ async fn direct_peer_acceptance_removes_only_the_body() {
             record_id: record,
             lifetime_seconds: 86_400,
             direct_peer: Some(bob.identity_id()),
+            request_key: public_key(REQUEST_SECRET).unwrap(),
+            accept_key: Some(public_key(ACCEPT_SECRET).unwrap()),
         },
     );
     let body_id = ObjectId::of_ciphertext(&body);
@@ -221,6 +276,7 @@ async fn direct_peer_acceptance_removes_only_the_body() {
             body_object_id: body_id,
             record_id: record,
             lifetime_seconds: 86_400,
+            request_key: public_key(REQUEST_SECRET).unwrap(),
         },
     );
     let locator_id = ObjectId::of_ciphertext(&locator);
@@ -233,19 +289,31 @@ async fn direct_peer_acceptance_removes_only_the_body() {
                 bytes,
                 TransferHint::Eager,
                 true,
-                Some(alice.identity_id()),
+                Some(alice.credential().into()),
             )
             .await
             .unwrap();
     }
     assert!(matches!(
         replica
-            .accept_message(mailbox.mailbox_id, alice.identity_id(), body_id, record)
+            .accept_message(
+                mailbox.mailbox_id,
+                alice.credential().into(),
+                body_id,
+                record,
+                proof(&replica, mailbox.mailbox_id, &alice, body_id, record, true)
+            )
             .await,
         Err(ReplicaError::Unauthorized)
     ));
     replica
-        .accept_message(mailbox.mailbox_id, bob.identity_id(), body_id, record)
+        .accept_message(
+            mailbox.mailbox_id,
+            bob.credential().into(),
+            body_id,
+            record,
+            proof(&replica, mailbox.mailbox_id, &bob, body_id, record, true),
+        )
         .await
         .unwrap();
     assert!(matches!(

@@ -56,6 +56,12 @@ targets:
         NSPhotoLibraryAddUsageDescription: Save your password-protected recovery QR image to Photos.
         NSCameraUsageDescription: Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
         NSMicrophoneUsageDescription: Use your microphone during audio and video calls.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: TaoScene
+                UISceneDelegateClassName: TaoSceneDelegate
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
@@ -63,8 +69,8 @@ targets:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
-        CFBundleShortVersionString: 1.0.0
-        CFBundleVersion: "1082"
+        CFBundleShortVersionString: 1.0.1
+        CFBundleVersion: "1084"
         CFBundleURLTypes:
           - CFBundleURLName: now.elo
             CFBundleURLSchemes: [elo]
@@ -73,6 +79,7 @@ targets:
       properties:
         application-identifier: $(DEVELOPMENT_TEAM).$(PRODUCT_BUNDLE_IDENTIFIER)
         aps-environment: development
+        com.apple.developer.devicecheck.appattest-environment: production
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

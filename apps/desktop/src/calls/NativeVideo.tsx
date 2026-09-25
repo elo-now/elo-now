@@ -8,12 +8,50 @@ let last = "";
 let busy = false;
 let retryAfter = 0;
 let current: MediaTile["native"];
+const clipped = new Map<HTMLElement, { original: string; applied: string }>();
+
+function previewCutout(visible: Binding[]) {
+  const next = new Map<HTMLElement, string>();
+  for (const { element, tile } of visible) {
+    if (!tile.local || !element.closest(".call-self-preview")) continue;
+    const main = element
+      .closest(".call-stage")
+      ?.querySelector<HTMLElement>(":scope > .call-participant[data-main]");
+    if (!main) continue;
+    const r = main.getBoundingClientRect(),
+      p = element.getBoundingClientRect();
+    const x = p.left - r.left,
+      y = p.top - r.top;
+    // UIKit video sits below the WebView. The remote audio-only placeholder
+    // must leave a hole for the overlapping native self preview.
+    next.set(
+      main,
+      `path(evenodd, "M0 0H${r.width}V${r.height}H0Z M${x} ${y}H${x + p.width}V${y + p.height}H${x}Z")`,
+    );
+  }
+  for (const [element, { original }] of clipped) {
+    if (next.has(element)) continue;
+    element.style.clipPath = original;
+    clipped.delete(element);
+  }
+  for (const [element, value] of next) {
+    const previous = clipped.get(element);
+    if (previous?.applied === value) continue;
+    clipped.set(element, {
+      original: previous?.original ?? element.style.clipPath,
+      applied: value,
+    });
+    element.style.clipPath = value;
+  }
+}
 
 /** Native video stays behind the transparent full-screen call surface. The
  * existing HTML badges and controls remain above it, without forwarding frames. */
 async function layout() {
   frame = 0;
-  const visible = [...bindings].filter(({ element }) => element.isConnected);
+  const visible = [...bindings]
+    .filter(({ element }) => element.isConnected)
+    .sort((a, b) => Number(a.tile.local) - Number(b.tile.local));
   const media = visible[0]?.tile.native;
   const frames = visible
     .filter(({ tile }) => tile.native?.session === media?.session)
@@ -48,6 +86,7 @@ async function layout() {
         "native-call-video",
         unchanged && !!frames.length,
       );
+      previewCutout(unchanged ? visible : []);
     } catch {
       retryAfter = performance.now() + 1000;
       if (!bindings.size) {
@@ -55,10 +94,13 @@ async function layout() {
         last = JSON.stringify([undefined, []]);
       }
       document.documentElement.classList.remove("native-call-video");
+      previewCutout([]);
     } finally {
       busy = false;
     }
   }
+  if (document.documentElement.classList.contains("native-call-video"))
+    previewCutout(visible);
   if (bindings.size || busy || last !== JSON.stringify([undefined, []]))
     frame = requestAnimationFrame(() => void layout());
 }
@@ -70,8 +112,10 @@ export function NativeVideo({ tile, name }: { tile: MediaTile; name: string }) {
     if (!frame) frame = requestAnimationFrame(() => void layout());
     return () => {
       bindings.delete(binding);
-      if (!bindings.size)
+      if (!bindings.size) {
         document.documentElement.classList.remove("native-call-video");
+        previewCutout([]);
+      }
       if (!frame) frame = requestAnimationFrame(() => void layout());
     };
   }, [tile.native?.session, tile.native?.track]);

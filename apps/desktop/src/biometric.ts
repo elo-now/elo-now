@@ -14,8 +14,8 @@ const legacySecret = {
   domain: "now.elo.profile",
   name: "vault-password-v1",
 } as const;
-const credentialPrefix = "elo-biometry:v2:";
-const offerKey = "elo.biometricOffer.v2:";
+const credentialPrefix = "elo-biometry:v3:";
+const offerKey = "elo.biometricOffer.v3:";
 
 export type BiometricProfile = { id: string; identity: string };
 
@@ -23,7 +23,7 @@ const profileKey = (profile: BiometricProfile) =>
   `${profile.identity}:${profile.id}`;
 const secret = (profile: BiometricProfile) => ({
   domain: "now.elo.profile",
-  name: `vault-password-v2:${profileKey(profile)}`,
+  name: `vault-key-v3:${profileKey(profile)}`,
 });
 async function activeProfile(
   expectedIdentity?: string,
@@ -45,6 +45,10 @@ async function requireActiveProfile(profile: BiometricProfile): Promise<void> {
 /** The old global entry has no profile binding and must never unlock another profile. */
 export async function clearLegacyBiometricUnlock(): Promise<void> {
   await removeData(legacySecret);
+  const environment = await invoke<{ saved_profiles: BiometricProfile[] }>("profile_environment");
+  for (const profile of environment.saved_profiles) {
+    await removeData({ domain: "now.elo.profile", name: `vault-password-v2:${profileKey(profile)}` });
+  }
   localStorage.removeItem("elo.biometricOffer.v1");
 }
 
@@ -57,7 +61,7 @@ export type BiometricState = {
 };
 
 export type BiometricCredential = {
-  password: string;
+  key: string;
   demoProfile?: string;
 };
 
@@ -118,12 +122,19 @@ export async function enableBiometricUnlock(
   profile: BiometricProfile,
 ): Promise<void> {
   await requireActiveProfile(profile);
-  await setData({
-    ...secret(profile),
-    data:
-      credentialPrefix +
-      JSON.stringify({ version: 2, ...profile, password, demoProfile }),
+  const { key } = await invoke<{ key: string }>("profile_task", {
+    request: { op: "biometric_enroll", ...profile, password },
   });
+  try {
+    await setData({
+      ...secret(profile),
+      data: credentialPrefix + JSON.stringify({ version: 3, ...profile, key, demoProfile }),
+    });
+    await removeData({ domain: "now.elo.profile", name: `vault-password-v2:${profileKey(profile)}` });
+  } catch (error) {
+    await invoke("profile_task", { request: { op: "biometric_forget", ...profile } });
+    throw error;
+  }
 }
 
 export async function disableBiometricUnlock(
@@ -131,6 +142,7 @@ export async function disableBiometricUnlock(
 ): Promise<void> {
   const target = profile ?? (await activeProfile());
   if (!target) return;
+  await invoke("profile_task", { request: { op: "biometric_forget", ...target } });
   await removeData(secret(target));
   localStorage.removeItem(offerKey + profileKey(target));
 }
@@ -152,14 +164,14 @@ export async function readBiometricCredential(
     if (data.startsWith(credentialPrefix)) {
       const decoded = JSON.parse(data.slice(credentialPrefix.length));
       if (
-        decoded?.version === 2 &&
+        decoded?.version === 3 &&
         decoded.id === profile.id &&
         decoded.identity === profile.identity &&
-        typeof decoded.password === "string" &&
+        typeof decoded.key === "string" && decoded.key.startsWith("AGE-SECRET-KEY-1") &&
         (decoded.demoProfile === undefined ||
           typeof decoded.demoProfile === "string")
       )
-        return { password: decoded.password, demoProfile: decoded.demoProfile };
+        return { key: decoded.key, demoProfile: decoded.demoProfile };
     }
   } catch {
     /* Invalid or unbound entries require explicit reenrollment. */

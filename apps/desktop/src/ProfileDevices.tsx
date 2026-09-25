@@ -1,3 +1,7 @@
+import { ActionDialog } from "./ActionDialog";
+import { ScreenHeader } from "./ScreenHeader";
+import { ControlRecovery } from "./ControlRecovery";
+import { LinkedDevices } from "./LinkedDevices";
 import { cancelProfileReminders } from "./reminders";
 import { PasswordInput } from "./PasswordInput";
 import { useEffect, useState } from "react";
@@ -11,63 +15,60 @@ import { profileTask, RecoveryQr } from "./ProfileRecovery";
 import { RecoveryCodePanel } from "./RecoveryCodePanel";
 import { parseRecoveryCode, recoveryCode } from "./recoveryCode";
 
-type Request = { id: string; name: string; code: string };
-export function DevicesSettings({ mobile }: { mobile: boolean }) {
-  const [svg, setSvg] = useState(""),
-    [link, setLink] = useState(""),
-    [busy, setBusy] = useState(false);
-  const [requests, setRequests] = useState<Request[]>([]),
-    [selected, setSelected] = useState<Request | null>(null);
-  const [approved, setApproved] = useState(false),
-    [confirmed, setConfirmed] = useState(false),
-    [password, setPassword] = useState("");
-  const [retry, setRetry] = useState(0);
-  const [pollFailed, setPollFailed] = useState(false);
+type Request = { id: string; name: string };
+type AcceptedDevice = {
+  id: string;
+  credential: string;
+  current: boolean;
+  name: string;
+};
+export function DevicesSettings({ onBack }: { onBack: () => void }) {
+  const [screen, setScreen] = useState<"list" | "qr" | "done">("list");
+  const [svg, setSvg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [requests, setRequests] = useState<Request[]>([]);
+  const [accepted, setAccepted] = useState<AcceptedDevice | null>(null);
+  const [removing, setRemoving] = useState<Request | null>(null);
   const [expires, setExpires] = useState<number | null>(null);
   const [clock, setClock] = useState(Date.now);
+  const [pollFailed, setPollFailed] = useState(false);
+  const [canLink, setCanLink] = useState(true);
   const remaining = Math.max(0, Math.ceil(((expires ?? clock) - clock) / 1000));
   const expired = expires !== null && remaining === 0;
   const time = `${Math.floor(remaining / 60)
     .toString()
     .padStart(2, "0")}:${(remaining % 60).toString().padStart(2, "0")}`;
-  const { reportError, onInvalid, notify } = useToast();
+  const { reportError } = useToast();
   const perform = async (work: () => Promise<void>) => {
+    if (busy) return;
     setBusy(true);
     try {
       await work();
-    } catch (e) {
-      if (!/cancel/i.test(String(e))) reportError(e);
+    } catch (error) {
+      reportError(error);
     } finally {
       setBusy(false);
     }
   };
   const start = async () => {
-    const result = await profileTask<{
-      svg: string;
-      code: string;
-      expires: number;
-    }>("pair_start");
+    const result = await profileTask<{ svg: string; expires: number }>(
+      "pair_start",
+    );
     setSvg(result.svg);
-    setLink(result.code);
     setExpires(result.expires);
     setClock(Date.now());
-    setPollFailed(false);
     setRequests([]);
-    setSelected(null);
-    setPassword("");
-    setConfirmed(false);
-    setApproved(false);
+    setAccepted(null);
+    setPollFailed(false);
+    setScreen("qr");
   };
   const close = async () => {
     await profileTask("cancel");
     setSvg("");
-    setLink("");
     setExpires(null);
     setRequests([]);
-    setSelected(null);
-    setPassword("");
-    setConfirmed(false);
-    setApproved(false);
+    setPollFailed(false);
+    setScreen("list");
   };
   useEffect(
     () => () => {
@@ -76,22 +77,25 @@ export function DevicesSettings({ mobile }: { mobile: boolean }) {
     [],
   );
   useEffect(() => {
-    if (!svg || approved || expired) return;
+    if (!svg || accepted || expired) return;
     const timer = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [svg, approved, expired]);
+  }, [svg, accepted, expired]);
   useEffect(() => {
-    if (!svg || approved || expired) return;
+    if (!svg || accepted || expired || busy) return;
     let live = true;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
-      if (expires !== null && Date.now() >= expires) return;
       try {
         const result = await profileTask<{ requests: Request[] }>("pair_poll");
-        if (live) setRequests(result.requests);
-      } catch (e) {
-        if (live && (expires === null || Date.now() < expires)) {
-          reportError(e);
+        if (live) {
+          setRequests(result.requests);
+          if (result.requests.length > 0) setScreen("list");
+          setPollFailed(false);
+        }
+      } catch (error) {
+        if (live) {
+          reportError(error);
           setPollFailed(true);
         }
         return;
@@ -103,170 +107,181 @@ export function DevicesSettings({ mobile }: { mobile: boolean }) {
       live = false;
       clearTimeout(timer);
     };
-  }, [svg, approved, retry, expires, expired]);
+  }, [svg, accepted, expired, busy]);
   return (
-    <div className="settings-page recovery-page devices-page">
-      {!svg && <p className="page-description">{t("devices.help")}</p>}
-      {!svg ? (
-        <button disabled={busy} onClick={() => void perform(start)}>
-          {!busy && <Icon name="plus" />}
-          {t(busy ? "devices.preparing" : "devices.link")}
-        </button>
-      ) : approved ? (
-        <>
-          <p>{t("devices.sent")}</p>
-          <p className="muted">{t("devices.companionHelp")}</p>
-          <button
-            className="secondary"
-            disabled={busy}
-            onClick={() => void perform(close)}
-          >
-            {t("devices.done")}
-          </button>
-        </>
-      ) : expired ? (
-        <>
-          <p className="muted device-link-help" role="status">
-            {t("devices.expired")}
-          </p>
-          <button disabled={busy} onClick={() => void perform(start)}>
-            {t("devices.newCode")}
-          </button>
-        </>
-      ) : selected ? (
-        <form
-          onInvalid={onInvalid}
-          onSubmit={(e) => {
-            e.preventDefault();
-            void perform(async () => {
-              await profileTask("pair_approve", {
-                id: selected.id,
-                code: selected.code,
-                confirmed,
-                password,
-              });
-              setApproved(true);
-              setPassword("");
-              setSvg("sent");
-              setLink("");
-            });
-          }}
-        >
-          <h3>{selected.name}</h3>
-          <p className="muted">{t("devices.compare")}</p>
-          <p className="pair-comparison">{selected.code}</p>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={confirmed}
-              onChange={(e) => setConfirmed(e.target.checked)}
-            />
-            {t("devices.confirmCode")}
-          </label>
-          <label>
-            {t("unlock.password")}
-            <PasswordInput
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="off"
-              maxLength={1024}
-            />
-          </label>
-          <p className="muted">{t("devices.approveHelp")}</p>
-          <button disabled={busy || !confirmed}>
-            {busy ? t("sync.busy") : t("devices.approve")}
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            disabled={busy}
-            onClick={() => {
-              setSelected(null);
-              setPassword("");
-              setConfirmed(false);
-            }}
-          >
-            {t("onboarding.back")}
-          </button>
-        </form>
-      ) : (
-        <>
-          <p className="muted device-link-help">{t("devices.codeHelp")}</p>
-          {requests.length === 0 && !pollFailed && (
-            <p
-              className="muted device-link-waiting"
-              role="timer"
-              aria-live="off"
-            >
-              {t("devices.noRequests", { time })}
-            </p>
-          )}
-          <div
-            className="private-qr"
-            role="img"
-            aria-label={t("devices.qrLabel")}
-            dangerouslySetInnerHTML={{ __html: svg }}
-          />
-          <p className="invitation-code-alternative">{t("invite.or")}</p>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={(event) => {
-              const box = event.currentTarget.getBoundingClientRect();
-              void perform(async () => {
-                if (mobile)
-                  await shareText(link, {
-                    position: { x: box.x + box.width / 2, y: box.bottom },
-                  });
-                else {
-                  await navigator.clipboard.writeText(link);
-                  notify(t("devices.copied"));
-                }
-              });
-            }}
-          >
-            <Icon name={mobile ? "share" : "copy"} />
-            {t(mobile ? "invite.shareLink" : "invite.copy")}
-          </button>
-          {pollFailed && (
+    <>
+      <ScreenHeader
+        title={t(screen === "qr" ? "devices.link" : "devices.title")}
+        desktopRoot={screen === "list"}
+        onBack={screen === "list" ? onBack : () => setScreen("list")}
+        backLabel={t(screen === "list" ? "settings.back" : "devices.back")}
+        actions={
+          screen === "list" && canLink && requests.length === 0 ? (
             <button
               type="button"
-              className="ghost"
-              onClick={() => {
-                setPollFailed(false);
-                setRetry((v) => v + 1);
-              }}
+              className="icon"
+              aria-label={t("devices.link")}
+              disabled={busy}
+              onClick={() => (svg ? setScreen("qr") : void perform(start))}
             >
-              {t("devices.retry")}
+              <Icon name="plus" />
             </button>
-          )}
-          {requests.map((request) => (
-            <button
-              className="recovery-choice"
-              key={request.id}
-              onClick={() => setSelected(request)}
-            >
-              <Icon name="device" />
-              <span>{request.name}</span>
-              <Icon name="next" />
+          ) : undefined
+        }
+      />
+      <div
+        className="settings-page recovery-page devices-page"
+        data-device-screen={screen}
+      >
+        {screen === "list" && (
+          <>
+            <LinkedDevices
+              extraDevice={accepted}
+              onDeleted={() => setAccepted(null)}
+              onCanLink={setCanLink}
+            />
+            {requests
+              .filter((request) => !accepted)
+              .map((request) => (
+                <div className="linked-device-row" key={request.id}>
+                  <span>
+                    {request.name}
+                    <small className={expired ? "error" : undefined}>
+                      {t(expired ? "devices.expired" : "devices.pending")}
+                    </small>
+                  </span>
+                  <div className="linked-device-actions">
+                    <button
+                      disabled={busy || expired}
+                      onClick={() =>
+                        void perform(async () => {
+                          await profileTask("pair_approve", { id: request.id });
+                          const result = await profileTask<{
+                            credential: string;
+                            device_id: string;
+                          }>("pair_poll");
+                          setAccepted({
+                            id: result.device_id,
+                            credential: result.credential,
+                            name: request.name,
+                            current: false,
+                          });
+                          setRequests([]);
+                          setSvg("");
+                          setExpires(null);
+                          setScreen("done");
+                        })
+                      }
+                    >
+                      {t(busy ? "sync.busy" : "devices.accept")}
+                    </button>
+                    <button
+                      className="secondary danger"
+                      disabled={busy}
+                      onClick={() => setRemoving(request)}
+                    >
+                      {t("devices.delete")}
+                    </button>
+                  </div>
+                </div>
+              ))}
+          </>
+        )}
+        {screen === "done" && (
+          <>
+            <p className="device-link-help" role="status">
+              {t("devices.sent")}
+            </p>
+            <button disabled={busy} onClick={() => void perform(close)}>
+              {t("devices.done")}
             </button>
-          ))}
-        </>
-      )}
-    </div>
+          </>
+        )}
+        {screen === "qr" &&
+          (svg && (expired || pollFailed) ? (
+            <>
+              <p className="error device-link-help" role="status">
+                {t(expired ? "devices.expired" : "devices.requestFailed")}
+              </p>
+              <button disabled={busy} onClick={() => void perform(start)}>
+                {t("devices.newCode")}
+              </button>
+            </>
+          ) : svg ? (
+            <>
+              <p className="device-link-help">{t("devices.codeHelp")}</p>
+              <div
+                className="private-qr"
+                role="img"
+                aria-label={t("devices.qrLabel")}
+                dangerouslySetInnerHTML={{ __html: svg }}
+              />
+              <p
+                className="muted device-link-waiting"
+                role="timer"
+                aria-live="off"
+              >
+                {t("devices.noRequests", { time })}
+              </p>
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => void perform(close)}
+              >
+                {t("dialog.cancel")}
+              </button>
+            </>
+          ) : null)}
+        {removing && (
+          <ActionDialog
+            title={t("devices.deleteRequestTitle")}
+            onClose={() => !busy && setRemoving(null)}
+          >
+            <p>{t("devices.deleteRequestHelp", { name: removing.name })}</p>
+            <div className="space-choice">
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => setRemoving(null)}
+              >
+                {t("dialog.cancel")}
+              </button>
+              <button
+                className="danger"
+                disabled={busy}
+                onClick={() =>
+                  void perform(async () => {
+                    await profileTask("pair_reject", { id: removing.id });
+                    setRemoving(null);
+                    setRequests([]);
+                    setSvg("");
+                    setExpires(null);
+                  })
+                }
+              >
+                {t("devices.delete")}
+              </button>
+            </div>
+          </ActionDialog>
+        )}
+      </div>
+    </>
   );
 }
 
 export function RecoverySettings({
+  onBack,
   mobile,
   identity,
   demoProfile,
 }: {
+  onBack: () => void;
   mobile: boolean;
   identity: string;
   demoProfile?: string;
 }) {
+  const [controlRecovery, setControlRecovery] = useState(false);
+  const [menuAnchor, setMenuAnchor] = useState<DOMRect | null>(null);
   const [material, setMaterial] = useState(""),
     [busy, setBusy] = useState(false),
     [saved, setSaved] = useState(false),
@@ -313,132 +328,184 @@ export function RecoverySettings({
     },
     [],
   );
+  const cancelRemoval = () => {
+    setRemoving(false);
+    setPassword("");
+    setMaterial("");
+    setConfirmed(false);
+  };
+  if (controlRecovery)
+    return (
+      <ControlRecovery
+        mobile={mobile}
+        onClose={() => setControlRecovery(false)}
+      />
+    );
   return (
-    <div className="settings-page recovery-page">
-      {!removing ? (
-        <>
-          <p className="page-description">{t("recover.settingsHelp")}</p>
-          <RecoveryCodePanel
-            value={material}
-            onChange={(value) => {
-              setMaterial(value);
-              setSaved(false);
-              setOmitted(0);
-            }}
-            disabled={busy}
-          >
-            <RecoveryQr
-              mobile={mobile}
-              disabled={busy || !material.trim()}
-              onPrepare={async () => (await prepare()).phrase}
-            />
-          </RecoveryCodePanel>
-          <section className="recovery-backup-section">
-            <h3>{t("recover.backupTitle")}</h3>
-            <p className="page-description">
-              {t(
-                mobile
-                  ? "recover.backupMobileHelp"
-                  : "recover.backupDesktopHelp",
-              )}
-            </p>
-            <p className="page-description">{t("recover.backupSizeHelp")}</p>
+    <>
+      <ScreenHeader
+        title={t(removing ? "recover.removeDevice" : "recover.settingsTitle")}
+        desktopRoot={!removing}
+        onBack={busy ? undefined : removing ? cancelRemoval : onBack}
+        actions={
+          !removing &&
+          !demoProfile && (
             <button
-              className="secondary"
-              disabled={busy || !material.trim()}
-              onClick={() => {
-                void perform(async () => {
-                  setSaved(false);
-                  setOmitted(0);
-                  const card = await verify();
-                  const result = await profileTask<{
-                    saved: boolean;
-                    shared?: boolean;
-                    omitted_messages?: number;
-                  }>("backup", {
-                    words: card.phrase,
-                  });
-                  setSaved(result.saved);
-                  setOmitted(
-                    result.saved || result.shared
-                      ? (result.omitted_messages ?? 0)
-                      : 0,
-                  );
-                });
-              }}
-            >
-              {busy ? t("sync.busy") : t("recover.saveBackup")}
-            </button>
-            <p className="page-description">{t("recover.restoreBackupHelp")}</p>
-            {saved && <p className="muted">{t("recover.saved")}</p>}
-            {omitted > 0 && (
-              <p className="muted" role="status">
-                {t("recover.backupOmitted", { count: omitted })}
-              </p>
-            )}
-          </section>
-          {!demoProfile && (
-            <button
-              className="danger-outline recovery-remove"
+              type="button"
+              className="icon"
+              aria-label={t("nav.more")}
+              aria-haspopup="menu"
+              aria-expanded={!!menuAnchor}
               disabled={busy}
-              onClick={() => setRemoving(true)}
+              onClick={(event) =>
+                setMenuAnchor(event.currentTarget.getBoundingClientRect())
+              }
             >
+              <Icon name="more" />
+            </button>
+          )
+        }
+      />
+      <div className="settings-page recovery-page">
+        {!removing ? (
+          <>
+            <h3>{t("recover.qrTitle")}</h3>
+            <p className="page-description">{t("recover.settingsHelp")}</p>
+            <p className="page-description">{t("recover.settingsCodeHelp")}</p>
+            <RecoveryCodePanel
+              value={material}
+              onChange={(value) => {
+                setMaterial(value);
+                setSaved(false);
+                setOmitted(0);
+              }}
+              disabled={busy}
+            >
+              <RecoveryQr
+                mobile={mobile}
+                disabled={busy || !material.trim()}
+                onPrepare={async () => (await prepare()).phrase}
+              />
+            </RecoveryCodePanel>
+            <section className="recovery-backup-section">
+              <h3>{t("recover.backupTitle")}</h3>
+              <p className="page-description">
+                {t(
+                  mobile
+                    ? "recover.backupMobileHelp"
+                    : "recover.backupDesktopHelp",
+                )}
+              </p>
+              <p className="page-description">{t("recover.backupSizeHelp")}</p>
+              <button
+                className="secondary"
+                disabled={busy || !material.trim()}
+                onClick={() => {
+                  void perform(async () => {
+                    setSaved(false);
+                    setOmitted(0);
+                    const card = await verify();
+                    const result = await profileTask<{
+                      saved: boolean;
+                      shared?: boolean;
+                      omitted_messages?: number;
+                    }>("backup", {
+                      words: card.phrase,
+                    });
+                    setSaved(result.saved);
+                    setOmitted(
+                      result.saved || result.shared
+                        ? (result.omitted_messages ?? 0)
+                        : 0,
+                    );
+                  });
+                }}
+              >
+                {busy ? t("sync.busy") : t("recover.saveBackup")}
+              </button>
+              <p className="page-description">
+                {t("recover.restoreBackupHelp")}
+              </p>
+              {saved && <p className="muted">{t("recover.saved")}</p>}
+              {omitted > 0 && (
+                <p className="muted" role="status">
+                  {t("recover.backupOmitted", { count: omitted })}
+                </p>
+              )}
+            </section>
+          </>
+        ) : (
+          <form
+            onInvalid={onInvalid}
+            onSubmit={(e) => {
+              e.preventDefault();
+              void perform(async () => {
+                // Verify first; biometric deletion must not run after a mistyped password.
+                await invoke("verify_password", { password });
+                await cancelProfileReminders(identity, mobile);
+                if (mobile) await disableBiometricUnlock();
+                await profileTask("remove", { password, identity, confirmed });
+                window.location.reload();
+              });
+            }}
+          >
+            <p>{t("recover.removeHelp")}</p>
+            <label>
+              {t("unlock.password")}
+              <PasswordInput
+                required
+                autoComplete="off"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                maxLength={1024}
+              />
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={confirmed}
+                onChange={(e) => setConfirmed(e.target.checked)}
+              />
+              {t("recover.removeConfirm")}
+            </label>
+            <button className="danger-outline" disabled={busy || !confirmed}>
               {t("recover.removeDevice")}
             </button>
-          )}
-        </>
-      ) : (
-        <form
-          onInvalid={onInvalid}
-          onSubmit={(e) => {
-            e.preventDefault();
-            void perform(async () => {
-              // Verify first; biometric deletion must not run after a mistyped password.
-              await invoke("verify_password", { password });
-              await cancelProfileReminders(identity, mobile);
-              if (mobile) await disableBiometricUnlock();
-              await profileTask("remove", { password, identity, confirmed });
-              window.location.reload();
-            });
-          }}
+          </form>
+        )}
+      </div>
+      {menuAnchor && (
+        <ActionDialog
+          title={t("nav.actions")}
+          anchor={menuAnchor}
+          menu
+          onClose={() => setMenuAnchor(null)}
         >
-          <h3>{t("recover.removeDevice")}</h3>
-          <p>{t("recover.removeHelp")}</p>
-          <label>
-            {t("unlock.password")}
-            <PasswordInput
-              required
-              autoComplete="off"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              maxLength={1024}
-            />
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={confirmed}
-              onChange={(e) => setConfirmed(e.target.checked)}
-            />
-            {t("recover.removeConfirm")}
-          </label>
-          <button className="danger-outline" disabled={busy || !confirmed}>
-            {t("recover.removeDevice")}
-          </button>
           <button
-            className="ghost"
             type="button"
-            disabled={busy}
+            role="menuitem"
             onClick={() => {
-              setRemoving(false);
-              setPassword("");
-              setConfirmed(false);
+              setMenuAnchor(null);
+              setMaterial("");
+              setControlRecovery(true);
             }}
           >
-            {t("onboarding.back")}
+            {t("control.title")}
           </button>
-        </form>
+          <button
+            type="button"
+            role="menuitem"
+            className="danger-action"
+            onClick={() => {
+              setMenuAnchor(null);
+              setMaterial("");
+              setRemoving(true);
+            }}
+          >
+            {t("recover.removeDevice")}
+          </button>
+        </ActionDialog>
       )}
-    </div>
+    </>
   );
 }

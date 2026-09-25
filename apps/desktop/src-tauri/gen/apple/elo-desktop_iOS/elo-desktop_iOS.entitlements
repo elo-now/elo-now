@@ -4,6 +4,8 @@
 <dict>
 	<key>application-identifier</key>
 	<string>$(DEVELOPMENT_TEAM).$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>com.apple.developer.devicecheck.appattest-environment</key>
+	<string>production</string>
 	<key>aps-environment</key>
 	<string>development</string>
 </dict>

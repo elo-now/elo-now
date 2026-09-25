@@ -23,7 +23,9 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, Semaphore, broadcast};
+use tokio::sync::{Mutex, Semaphore};
+mod events;
+mod subscriptions;
 use zeroize::Zeroizing;
 
 pub type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, CallError>> + Send + 'a>>;
@@ -96,17 +98,37 @@ impl HostingAdmission {
             struct Reply {
                 allowed: bool,
             }
-            let response = self
-                .client
-                .post(&self.url)
-                .bearer_auth(self.key.as_str())
-                .json(&json!({"space_id":space,"identity_id":identity,"device":device}))
-                .send()
-                .await
-                .map_err(|_| CallError::Unavailable)?;
-            if !response.status().is_success() {
-                return Err(CallError::Unavailable);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let body = json!({"space_id":space,"identity_id":identity,"device":device});
+            let mut response = None;
+            for attempt in 0..2 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(CallError::Unavailable);
+                }
+                let result = self
+                    .client
+                    .post(&self.url)
+                    .bearer_auth(self.key.as_str())
+                    .json(&body)
+                    .timeout(remaining)
+                    .send()
+                    .await;
+                match result {
+                    Ok(reply) if reply.status().is_success() => {
+                        response = Some(reply);
+                        break;
+                    }
+                    Ok(reply)
+                        if attempt == 0 && matches!(reply.status().as_u16(), 502 | 503 | 504) => {}
+                    Err(error) if attempt == 0 && (error.is_connect() || error.is_timeout()) => {}
+                    _ => return Err(CallError::Unavailable),
+                }
+                // Only a transient read failure is retried, once, within the same
+                // deadline. A membership denial is never retried or cached as allowed.
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            let response = response.ok_or(CallError::Unavailable)?;
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| CallError::Unavailable)? {
@@ -138,13 +160,75 @@ impl Admission for HostingAdmission {
     }
 }
 
+#[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn transient_read_retries_once_but_denial_and_bad_auth_do_not() {
+        for initial in [503u16, 403, 200] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = count.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/internal/calls/admission",
+                listener.local_addr().unwrap()
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(move || {
+                        let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if attempt == 0 && initial != 200 {
+                                axum::http::StatusCode::from_u16(initial)
+                                    .unwrap()
+                                    .into_response()
+                            } else {
+                                axum::Json(json!({"allowed": initial != 200})).into_response()
+                            }
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            });
+            let admission = HostingAdmission::new(&url, Zeroizing::new("11".repeat(32))).unwrap();
+            let result = admission
+                .allowed(
+                    SpaceId::from_bytes([1; 32]),
+                    IdentityId::from_bytes([2; 32]),
+                )
+                .await;
+            match initial {
+                503 => {
+                    assert!(result.unwrap());
+                    assert_eq!(count.load(Ordering::SeqCst), 2);
+                }
+                403 => {
+                    assert!(result.is_err());
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                }
+                _ => {
+                    assert!(!result.unwrap());
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                }
+            }
+            task.abort();
+        }
+    }
+}
+
 pub struct Service {
     engine: Mutex<Engine>,
     admission: Arc<dyn Admission>,
     media: Option<Arc<crate::media::Provider>>,
-    events: broadcast::Sender<Event>,
+    events: Arc<events::Events>,
     wake: Option<Arc<crate::wake::Delivery>>,
     connections: Arc<Semaphore>,
+    verification: Arc<Semaphore>,
 }
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -162,7 +246,7 @@ impl Service {
         max_connections: usize,
         media: Option<Arc<crate::media::Provider>>,
     ) -> Arc<Self> {
-        let (events, _) = broadcast::channel(256);
+        let events = Arc::new(events::Events::default());
         Arc::new(Self {
             engine: Mutex::new(engine),
             admission,
@@ -170,6 +254,7 @@ impl Service {
             events,
             wake: None,
             connections: Arc::new(Semaphore::new(max_connections.clamp(1, 4096))),
+            verification: Arc::new(Semaphore::new(2)),
         })
     }
     pub fn with_wake(mut self: Arc<Self>, wake: Arc<crate::wake::Delivery>) -> Arc<Self> {
@@ -240,7 +325,7 @@ impl Service {
     }
     fn publish(&self, events: Vec<Event>) {
         for event in events {
-            let _ = self.events.send(event);
+            self.events.send(event);
         }
     }
     async fn publish_media(&self, events: Vec<Event>) -> Result<(), CallError> {
@@ -301,6 +386,8 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
     let mut device: Option<RecordId> = None;
     let mut identity: Option<IdentityId> = None;
     let mut scopes = BTreeSet::<Scope>::new();
+    let mut admission_cursor = None;
+    let mut grants = subscriptions::Grants::new();
     let authentication = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(authentication);
     let mut admission_tick = tokio::time::interval(Duration::from_secs(5));
@@ -320,33 +407,52 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 if time.saturating_sub(window) >= 10 { window = time; commands = 0; }
                 commands += 1;
                 if commands > 120 { break; }
+                // Bound both deserialization and proof work, including unauthenticated sockets.
+                let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(3), service.verification.clone().acquire_owned()).await else {
+                    let _ = send(&mut socket, json!({"type":"error","code":CallError::Unavailable})).await;
+                    break;
+                };
                 let request = match serde_json::from_str::<Request>(&text) {
                     Ok(request) => request,
                     Err(_) => { let _ = send(&mut socket, json!({"type":"error","code":CallError::Invalid})).await; break; }
                 };
-                let prepared = service.engine.lock().await.prepare(request, device, time);
+                let job = service.engine.lock().await.preparation(request, device);
+                let authenticated = match job {
+                    Ok(job) => tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        job.authenticate(time).map(|auth| (job, auth))
+                    }).await.unwrap_or(Err(CallError::Unavailable)),
+                    Err(error) => Err(error),
+                };
+                let (job, (command, sender)) = match authenticated {
+                    Ok(value) => value,
+                    Err(code) => { let _ = send(&mut socket, json!({"type":"error","code":code})).await; break; }
+                };
+                // Hosting admission precedes verification of attacker-supplied config history.
+                if !matches!(service.admission.device_allowed(command.hosting_space_id, sender,
+                    command.credential_id, command.scope, command.config_id).await, Ok(true)) {
+                    let scope = Scope::from(&command);
+                    scopes.remove(&scope);
+                    let events = service.engine.lock().await.registry.revoke_member(scope, sender);
+                    let _ = service.publish_media(events).await;
+                    let _ = send(&mut socket, json!({"type":"error","code":CallError::Unauthorized})).await;
+                    break;
+                }
+                let Ok(Ok(permit)) = tokio::time::timeout(Duration::from_secs(3), service.verification.clone().acquire_owned()).await else { break; };
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    job.verify(time)
+                }).await.unwrap_or(Err(CallError::Unavailable));
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
-                    Err(code) => { if !send(&mut socket, json!({"type":"error","code":code})).await { break; } continue; }
+                    Err(code) => { let _ = send(&mut socket, json!({"type":"error","code":code})).await; break; }
                 };
                 let wants_media=matches!(prepared.command.operation, elo_core::calls::Operation::ConnectMedia { .. });
                 let request_id = prepared.request_id;
                 let scope = Scope::from(&prepared.command);
-                if scopes.len() >= 32 && !scopes.contains(&scope) {
+                if scopes.len() >= 4096 && !scopes.contains(&scope) {
                     if !send(&mut socket, json!({"type":"error","request_id":request_id,"code":CallError::Unavailable})).await { break; }
                     continue;
-                }
-                let admission = service.admission.device_allowed(scope.hosting_space_id, prepared.identity, prepared.command.credential_id, prepared.command.scope, prepared.command.config_id).await;
-                match admission {
-                    Ok(true) => {}
-                    result => {
-                        scopes.remove(&scope);
-                        let events = service.engine.lock().await.registry.revoke_member(scope, prepared.identity);
-                        let _ = service.publish_media(events).await;
-                        let code = result.err().unwrap_or(CallError::Unauthorized);
-                        if !send(&mut socket, json!({"type":"error","request_id":request_id,"code":code})).await { break; }
-                        continue;
-                    }
                 }
                 let bound_device = prepared.command.credential_id;
                 let bound_identity = prepared.identity;
@@ -358,6 +464,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 match applied {
                     Ok(result) => {
                         device = Some(bound_device); identity = Some(bound_identity); scopes.insert(scope);
+                        receiver.update(bound_device, &scopes);
                         if service.publish_media(result.events).await.is_err() {
                             let ended=service.engine.lock().await.registry.revoke_member(scope,bound_identity);
                             let _ = service.publish_media(ended).await;
@@ -376,7 +483,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 }
             }
             event = receiver.recv(), if device.is_some() => {
-                let Ok(event) = event else { break; }; // A slow consumer reconnects for a fresh snapshot.
+                let Some(event) = event else { break; }; // A slow consumer reconnects for a fresh snapshot.
                 let scope = match &event {
                     Event::Presence { call } => call.scope,
                     Event::Ended { scope, .. } | Event::Signal { scope, .. } => *scope,
@@ -385,19 +492,52 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 if !scopes.contains(&scope) || matches!(&event, Event::Signal { to, .. } if *to != credential) { continue; }
                 if !service.engine.lock().await.authorized(scope, credential) {
                     scopes.remove(&scope);
+                    receiver.update(credential, &scopes);
                     if !send(&mut socket, json!({"type":"access_revoked","scope":scope})).await { break; }
                     continue;
+                }
+                // Idle checks are staggered; never forward fresh presence or
+                // media signals on an expired hosting admission. A terminal
+                // event still clears an already known call after revocation.
+                if !matches!(&event, Event::Ended { .. }) {
+                    let head = service.engine.lock().await.authorized_head(scope, credential, now());
+                    let allowed = if let Some(head) = head {
+                        subscriptions::admitted(&service, &mut grants, scope, identity.unwrap(), credential, head, false).await
+                    } else { false };
+                    if !allowed {
+                        scopes.remove(&scope);
+                        grants.remove(&scope);
+                        receiver.update(credential, &scopes);
+                        let ended = service.engine.lock().await.registry.revoke_member(scope, identity.unwrap());
+                        let _ = service.publish_media(ended).await;
+                        if !send(&mut socket, json!({"type":"access_revoked","scope":scope})).await { break; }
+                        continue;
+                    }
                 }
                 if !send(&mut socket, serde_json::to_value(&event).unwrap()).await { break; }
             }
             _ = admission_tick.tick(), if device.is_some() => {
-                for scope in scopes.clone() {
+                let mut urgent = BTreeSet::new();
+                {
+                    let mut engine = service.engine.lock().await;
+                    for scope in &scopes {
+                        // Cheap local use keeps a live proof available. Network
+                        // admission is bounded separately, rather than per chat.
+                        if engine.authorized_head(*scope, device.unwrap(), now()).is_none()
+                            || engine.registry.presence(scope).is_some_and(|call| call.participants.values().any(|participant| participant.credential_id == device.unwrap())) {
+                            urgent.insert(*scope);
+                        }
+                    }
+                }
+                for scope in subscriptions::next_batch(&scopes, &urgent, &mut admission_cursor) {
                     let head = service.engine.lock().await.authorized_head(scope, device.unwrap(), now());
                     let admitted = if let Some(head) = head {
-                        matches!(service.admission.device_allowed(scope.hosting_space_id, identity.unwrap(), device.unwrap(), scope.conversation, head).await, Ok(true))
+                        subscriptions::admitted(&service, &mut grants, scope, identity.unwrap(), device.unwrap(), head, true).await
                     } else { false };
                     if !admitted {
                         scopes.remove(&scope);
+                        grants.remove(&scope);
+                        receiver.update(device.unwrap(), &scopes);
                         let events = service.engine.lock().await.registry.revoke_member(scope, identity.unwrap());
                         let _ = service.publish_media(events).await;
                         if !send(&mut socket, json!({"type":"access_revoked","scope":scope})).await { return; }

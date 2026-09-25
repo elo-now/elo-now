@@ -315,7 +315,7 @@ pub struct VerifiedFile {
 }
 pub fn open(
     ciphertext: &[u8],
-    identity: &age::x25519::Identity,
+    identity: &dyn crate::crypto::DecryptionIdentity,
     own: RecordId,
     share: &VerifiedFileShare,
     a: &Authority,
@@ -323,7 +323,7 @@ pub fn open(
     if share.body.v != 1
         || share.body.attachment.is_some()
         || Some(ObjectId::of_ciphertext(ciphertext)) != share.body.object_id
-        || a.credential(own)?.recipient() != identity.to_public()
+        || !identity.owns(&a.credential(own)?.recipient())
         || !share.body.recipient_credentials.contains(&own)
     {
         return Err(RecordError::Authority);

@@ -1,10 +1,15 @@
 //! Explicit server-copy cleanup. Local history and control records are untouched.
 use super::*;
+use crate::{
+    identity::revocations::Revocations,
+    retention_access::{Actor, Context, Operation, Proof},
+};
 
 const LOCATOR_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const REQUEST_LIFETIME_MS: u64 = 5 * 60 * 1000;
 const ACCEPTANCE_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
-const METADATA_BYTES: i64 = 256;
+// Conservative quota reservation includes keys, request proofs and SQLite indexes.
+const METADATA_BYTES: i64 = 1024;
 
 #[derive(Clone)]
 pub(super) enum UploadRetention {
@@ -16,6 +21,8 @@ pub(super) enum UploadRetention {
         lifetime_seconds: u64,
         issuer: IdentityId,
         direct_peer: Option<IdentityId>,
+        request_key: String,
+        accept_key: Option<String>,
     },
     MessageLocator {
         locator_nonce: String,
@@ -23,6 +30,7 @@ pub(super) enum UploadRetention {
         record_id: RecordId,
         lifetime_seconds: u64,
         issuer: IdentityId,
+        request_key: String,
     },
 }
 
@@ -43,24 +51,30 @@ pub(super) fn classify(
             record_id,
             lifetime_seconds,
             direct_peer,
+            request_key,
+            accept_key,
         }) => UploadRetention::MessageBody {
             locator_nonce,
             record_id,
             lifetime_seconds,
             issuer: content.credential.identity(),
             direct_peer,
+            request_key,
+            accept_key,
         },
         Some(crate::erasure::RetentionClaim::MessageLocator {
             locator_nonce,
             body_object_id,
             record_id,
             lifetime_seconds,
+            request_key,
         }) => UploadRetention::MessageLocator {
             locator_nonce,
             body_object_id,
             record_id,
             lifetime_seconds,
             issuer: content.credential.identity(),
+            request_key,
         },
         None if legacy_message => UploadRetention::LegacyMessage,
         None => UploadRetention::Retain,
@@ -140,7 +154,7 @@ pub(super) fn sweep(c: &Connection, time: u64) -> Result<bool> {
         )?;
     }
     changed |= c.execute(
-        "DELETE FROM message_requests WHERE expires_local_ms<=?1",
+        "DELETE FROM message_requests WHERE proof_expires_ms<=?1 OR proof_expires_ms IS NULL",
         [time as i64],
     )? > 0;
     changed |= c.execute(
@@ -152,6 +166,7 @@ pub(super) fn sweep(c: &Connection, time: u64) -> Result<bool> {
 
 pub(super) fn check_upload(
     c: &Connection,
+    revocations: &Revocations,
     mailbox: MailboxId,
     object: ObjectId,
     retention: &UploadRetention,
@@ -160,7 +175,14 @@ pub(super) fn check_upload(
 ) -> Result<()> {
     let root = root(c, mailbox)?;
     match retention {
-        UploadRetention::MessageLocator { issuer, .. } => {
+        UploadRetention::MessageLocator {
+            issuer,
+            request_key,
+            ..
+        } => {
+            if request_key.is_empty() {
+                return Err(ReplicaError::Invalid);
+            }
             if actor != Some(*issuer) {
                 return Err(ReplicaError::Unauthorized);
             }
@@ -171,7 +193,15 @@ pub(super) fn check_upload(
             lifetime_seconds,
             issuer,
             direct_peer,
+            request_key,
+            accept_key: _,
         } => {
+            if actor.is_none() {
+                return Err(ReplicaError::Unauthorized);
+            }
+            if request_key.is_empty() {
+                return Err(ReplicaError::Invalid);
+            }
             let previous: Option<(String, String, i64, String, Option<String>, Option<i64>)> = c
                 .query_row(
                     "SELECT locator_nonce,record_id,lifetime_seconds,originating_issuer,direct_peer,expired_local_ms FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2",
@@ -200,12 +230,7 @@ pub(super) fn check_upload(
                 if previous.5.is_none() {
                     return Ok(());
                 }
-                let window: Option<i64> = c
-                    .query_row(
-                        "SELECT MAX(expires_local_ms) FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND expires_local_ms>?3",
-                        params![root, object.to_string(), time as i64],
-                        |r| r.get(0),
-                    )?;
+                let window = valid_window(c, revocations, mailbox, &root, object, time)?;
                 if window.is_none() {
                     return Err(ReplicaError::Expired);
                 }
@@ -213,11 +238,11 @@ pub(super) fn check_upload(
                 if actor != Some(*issuer) {
                     return Err(ReplicaError::Unauthorized);
                 }
-                let locator: Option<(String, String, i64)> = c
+                let locator: Option<(String, String, i64, Option<String>)> = c
                     .query_row(
-                        "SELECT locator_nonce,record_id,lifetime_seconds FROM message_locators WHERE root_mailbox_id=?1 AND body_object_id=?2 AND expires_local_ms>?3",
+                        "SELECT locator_nonce,record_id,lifetime_seconds,request_key FROM message_locators WHERE root_mailbox_id=?1 AND body_object_id=?2 AND expires_local_ms>?3",
                         params![root, object.to_string(), time as i64],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
                 if locator
@@ -225,6 +250,7 @@ pub(super) fn check_upload(
                         locator_nonce.clone(),
                         record_id.to_string(),
                         *lifetime_seconds as i64,
+                        Some(request_key.clone()),
                     ))
                 {
                     return Err(ReplicaError::Invalid);
@@ -250,11 +276,12 @@ pub(super) fn record_upload(
             body_object_id,
             record_id,
             lifetime_seconds,
+            request_key,
             ..
         } => {
             c.execute(
-                "INSERT INTO message_locators VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_mailbox_id,object_id) DO NOTHING",
-                params![root, object.to_string(), body_object_id.to_string(), record_id.to_string(), locator_nonce, *lifetime_seconds as i64, time as i64, time.saturating_add(LOCATOR_LIFETIME_MS) as i64],
+                "INSERT INTO message_locators VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(root_mailbox_id,object_id) DO NOTHING",
+                params![root, object.to_string(), body_object_id.to_string(), record_id.to_string(), locator_nonce, *lifetime_seconds as i64, time as i64, time.saturating_add(LOCATOR_LIFETIME_MS) as i64, request_key],
             )?;
         }
         UploadRetention::MessageBody {
@@ -263,26 +290,28 @@ pub(super) fn record_upload(
             lifetime_seconds,
             issuer,
             direct_peer,
+            request_key,
+            accept_key,
         } => {
-            let old: Option<i64> = c
+            let old: Option<(i64, Option<i64>)> = c
                 .query_row(
-                    "SELECT expires_local_ms FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2",
+                    "SELECT expires_local_ms,expired_local_ms FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2",
                     params![root, object.to_string()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?,r.get(1)?)),
                 )
                 .optional()?;
-            let expiry = if old.is_some() {
-                c.query_row(
+            let expiry = match old {
+                Some((expiry, None)) => expiry as u64,
+                Some((_, Some(_))) => c.query_row(
                     "SELECT MAX(expires_local_ms) FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND expires_local_ms>?3",
                     params![root, object.to_string(), time as i64],
                     |r| r.get::<_, i64>(0),
-                )? as u64
-            } else {
-                time.saturating_add(lifetime_seconds.saturating_mul(1000))
+                )? as u64,
+                None => time.saturating_add(lifetime_seconds.saturating_mul(1000)),
             };
             c.execute(
-                "INSERT INTO message_bodies VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL) ON CONFLICT(root_mailbox_id,object_id) DO UPDATE SET expires_local_ms=excluded.expires_local_ms,expired_local_ms=NULL,refill_until_ms=excluded.expires_local_ms",
-                params![root, object.to_string(), record_id.to_string(), locator_nonce, issuer.to_string(), direct_peer.map(|v|v.to_string()), *lifetime_seconds as i64, time as i64, expiry as i64],
+                "INSERT INTO message_bodies VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL,?10,?11) ON CONFLICT(root_mailbox_id,object_id) DO UPDATE SET expires_local_ms=excluded.expires_local_ms,expired_local_ms=NULL,refill_until_ms=CASE WHEN message_bodies.expired_local_ms IS NOT NULL THEN excluded.expires_local_ms ELSE message_bodies.refill_until_ms END",
+                params![root, object.to_string(), record_id.to_string(), locator_nonce, issuer.to_string(), direct_peer.map(|v|v.to_string()), *lifetime_seconds as i64, time as i64, expiry as i64, request_key, accept_key],
             )?;
         }
         UploadRetention::LegacyMessage => {
@@ -350,19 +379,85 @@ fn ensure_metadata_room(c: &Connection, root: &str, delta: i64) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn authorize_actor(
+    c: &Connection,
+    revocations: &Revocations,
+    mailbox: MailboxId,
+    actor: Actor,
+) -> Result<()> {
+    if revocations
+        .get(actor.credential)
+        .map_err(|_| ReplicaError::Storage)?
+        .is_some()
+    {
+        return Err(ReplicaError::Unauthorized);
+    }
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE mailbox_id=?1)",
+        [mailbox.to_string()],
+        |r| r.get(0),
+    )?;
+    let denied: bool = c.query_row("WITH RECURSIVE ancestry(id) AS (SELECT ?1 UNION SELECT d.parent_id FROM mailbox_delegations d JOIN ancestry a ON d.mailbox_id=a.id) SELECT EXISTS(SELECT 1 FROM ancestry JOIN space_access_roots r ON r.mailbox_id=ancestry.id WHERE NOT EXISTS(SELECT 1 FROM space_access_members m WHERE m.mailbox_id=r.mailbox_id AND m.identity_id=?2)) OR EXISTS(SELECT 1 FROM erased_identities WHERE identity_id=?2) OR EXISTS(SELECT 1 FROM mailbox_delegations d JOIN ancestry a ON d.mailbox_id=a.id WHERE d.expires_at<=?3)", params![mailbox.to_string(),actor.identity.to_string(),now()? as i64], |r|r.get(0))?;
+    if !exists || denied {
+        return Err(ReplicaError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn valid_window(
+    c: &Connection,
+    revocations: &Revocations,
+    mailbox: MailboxId,
+    root: &str,
+    object: ObjectId,
+    time: u64,
+) -> Result<Option<i64>> {
+    let rows = {
+        let mut q = c.prepare("SELECT requester_identity,requester_credential,expires_local_ms FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND expires_local_ms>?3")?;
+        q.query_map(params![root, object.to_string(), time as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut expiry = None;
+    for (identity, credential, until) in rows {
+        let actor = Actor {
+            identity: identity.parse().map_err(|_| ReplicaError::Storage)?,
+            credential: credential.parse().map_err(|_| ReplicaError::Storage)?,
+        };
+        match authorize_actor(c, revocations, mailbox, actor) {
+            Ok(()) => expiry = Some(expiry.map_or(until, |old: i64| old.max(until))),
+            Err(ReplicaError::Unauthorized) => {
+                c.execute("DELETE FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND requester_identity=?3", params![root,object.to_string(),identity])?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(expiry)
+}
+
 pub(super) fn active_requests(
     c: &Connection,
+    revocations: &Revocations,
     mailbox: MailboxId,
     time: u64,
 ) -> Result<Vec<ObjectId>> {
     let root = root(c, mailbox)?;
-    let mut query = c.prepare(
-        "SELECT DISTINCT body_object_id FROM message_requests WHERE root_mailbox_id=?1 AND expires_local_ms>?2 ORDER BY body_object_id LIMIT 128",
-    )?;
-    let rows = query.query_map(params![root, time as i64], |row| row.get::<_, String>(0))?;
+    let objects = {
+        let mut q = c.prepare("SELECT DISTINCT body_object_id FROM message_requests WHERE root_mailbox_id=?1 AND expires_local_ms>?2 ORDER BY body_object_id LIMIT 128")?;
+        q.query_map(params![root, time as i64], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
     let mut result = Vec::new();
-    for value in rows {
-        result.push(value?.parse().map_err(|_| ReplicaError::Storage)?);
+    for object in objects {
+        let object = object.parse().map_err(|_| ReplicaError::Storage)?;
+        if valid_window(c, revocations, mailbox, &root, object, time)?.is_some() {
+            result.push(object);
+        }
     }
     Ok(result)
 }
@@ -486,35 +581,34 @@ impl ReplicaStore {
     pub async fn request_message(
         &self,
         mailbox: MailboxId,
-        identity: IdentityId,
+        actor: Actor,
         object: ObjectId,
         record: RecordId,
+        proof: Proof,
     ) -> Result<()> {
+        let revocations = self.revocations.clone();
+        let replica = self.peer_id();
         self.call(move |db| {
             let time = now()?;
+            authorize_actor(&db.connection, &revocations, mailbox, actor)?;
             sweep(&db.connection, time)?;
             let root = root(&db.connection, mailbox)?;
-            let available: bool = db.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_bodies b JOIN message_locators l ON l.root_mailbox_id=b.root_mailbox_id AND l.body_object_id=b.object_id WHERE b.root_mailbox_id=?1 AND b.object_id=?2 AND b.record_id=?3 AND b.expired_local_ms IS NOT NULL AND l.expires_local_ms>?4)",
-                params![root,object.to_string(),record.to_string(),time as i64],
-                |r| r.get(0),
-            )?;
-            if !available {
-                return Err(ReplicaError::NotFound);
-            }
-            let existing: bool = db.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND requester_identity=?3)",
-                params![root,object.to_string(),identity.to_string()],
-                |r| r.get(0),
-            )?;
-            ensure_metadata_room(
-                &db.connection,
-                &root,
-                if existing { 0 } else { METADATA_BYTES },
-            )?;
+            let body: Option<(String, bool)> = db.connection.query_row(
+                "SELECT b.request_key,b.expired_local_ms IS NOT NULL FROM message_bodies b JOIN message_locators l ON l.root_mailbox_id=b.root_mailbox_id AND l.body_object_id=b.object_id AND l.request_key=b.request_key WHERE b.root_mailbox_id=?1 AND b.object_id=?2 AND b.record_id=?3 AND l.expires_local_ms>?4 AND b.request_key IS NOT NULL",
+                params![root,object.to_string(),record.to_string(),time as i64], |r|Ok((r.get(0)?,r.get(1)?)),
+            ).optional()?;
+            let (key, expired) = body.ok_or(ReplicaError::NotFound)?;
+            proof.verify(&key, &Context { operation: Operation::Request, replica, mailbox, object, record, actor }, time).map_err(|_| ReplicaError::Unauthorized)?;
+            valid_window(&db.connection, &revocations, mailbox, &root, object, time)?;
+            let existing: Option<(i64, String)> = db.connection.query_row("SELECT expires_local_ms,proof_nonce FROM message_requests WHERE root_mailbox_id=?1 AND body_object_id=?2 AND requester_identity=?3", params![root,object.to_string(),actor.identity.to_string()], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            // Retransmission, including after refill, never restarts the window.
+            if existing.as_ref().is_some_and(|(expiry, nonce)| *expiry > time as i64 || nonce == &proof.nonce) { return Ok(()); }
+            if !expired { return Err(ReplicaError::NotFound); }
+            ensure_metadata_room(&db.connection, &root, if existing.is_some() { 0 } else { METADATA_BYTES })?;
+            let expiry = proof.expires_ms.min(time.saturating_add(REQUEST_LIFETIME_MS));
             db.connection.execute(
-                "INSERT INTO message_requests VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(root_mailbox_id,body_object_id,requester_identity) DO UPDATE SET requested_local_ms=excluded.requested_local_ms,expires_local_ms=excluded.expires_local_ms,record_id=excluded.record_id",
-                params![root,object.to_string(),record.to_string(),identity.to_string(),time as i64,time.saturating_add(REQUEST_LIFETIME_MS) as i64],
+                "INSERT INTO message_requests VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(root_mailbox_id,body_object_id,requester_identity) DO UPDATE SET requested_local_ms=excluded.requested_local_ms,expires_local_ms=excluded.expires_local_ms,record_id=excluded.record_id,requester_credential=excluded.requester_credential,proof_nonce=excluded.proof_nonce,proof_expires_ms=excluded.proof_expires_ms",
+                params![root,object.to_string(),record.to_string(),actor.identity.to_string(),time as i64,expiry as i64,actor.credential.to_string(),proof.nonce,proof.expires_ms as i64],
             )?;
             Ok(())
         }).await
@@ -523,27 +617,39 @@ impl ReplicaStore {
     pub async fn accept_message(
         &self,
         mailbox: MailboxId,
-        identity: IdentityId,
+        actor: Actor,
         object: ObjectId,
         record: RecordId,
+        proof: Proof,
     ) -> Result<()> {
+        let revocations = self.revocations.clone();
+        let replica = self.peer_id();
         self.call(move |db| {
             let time = now()?;
+            authorize_actor(&db.connection, &revocations, mailbox, actor)?;
             sweep(&db.connection, time)?;
             let root = root(&db.connection, mailbox)?;
-            let allowed: bool = db.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2 AND record_id=?3 AND direct_peer=?4 AND expired_local_ms IS NULL)",
-                params![root,object.to_string(),record.to_string(),identity.to_string()],
-                |r| r.get(0),
-            )?;
-            if !allowed {
-                return Err(ReplicaError::Unauthorized);
-            }
+            let key: Option<String> = db.connection.query_row(
+                "SELECT accept_key FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2 AND record_id=?3 AND direct_peer=?4 AND accept_key IS NOT NULL",
+                params![root,object.to_string(),record.to_string(),actor.identity.to_string()], |r|r.get(0),
+            ).optional()?;
+            proof.verify(&key.ok_or(ReplicaError::Unauthorized)?, &Context { operation: Operation::Accept, replica, mailbox, object, record, actor }, time).map_err(|_| ReplicaError::Unauthorized)?;
+            let previous: Option<i64> = db.connection.query_row("SELECT COALESCE(proof_expires_ms,0) FROM message_acceptances WHERE root_mailbox_id=?1 AND body_object_id=?2 AND accepting_identity=?3", params![root,object.to_string(),actor.identity.to_string()], |r|r.get(0)).optional()?;
+            // A high-water mark also rejects older acceptances after a newer
+            // acceptance replaced the last nonce. Clock rollback may delay this
+            // optional early drop; the normal body TTL remains the backstop.
+            if previous.is_some_and(|deadline| proof.expires_ms <= deadline as u64) { return Ok(()); }
+            let live: bool = db.connection.query_row("SELECT expired_local_ms IS NULL FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2", params![root,object.to_string()], |r|r.get(0))?;
+            if !live { return Err(ReplicaError::Expired); }
+            ensure_metadata_room(&db.connection, &root, if previous.is_some() { 0 } else { METADATA_BYTES })?;
             let tx = db.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "INSERT OR REPLACE INTO message_acceptances VALUES(?1,?2,?3,?4,?5)",
-                params![root,object.to_string(),identity.to_string(),time as i64,time.saturating_add(ACCEPTANCE_LIFETIME_MS) as i64],
+                "INSERT OR REPLACE INTO message_acceptances VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![root,object.to_string(),actor.identity.to_string(),time as i64,time.saturating_add(ACCEPTANCE_LIFETIME_MS) as i64,proof.nonce,proof.expires_ms as i64],
             )?;
+            // Retain the nonce until its signed deadline, but close the fulfilled
+            // window so a retry cannot immediately resurrect the body.
+            tx.execute("UPDATE message_requests SET expires_local_ms=requested_local_ms WHERE root_mailbox_id=?1 AND body_object_id=?2 AND requester_identity=?3", params![root,object.to_string(),actor.identity.to_string()])?;
             remove_body(&tx,&root,&object.to_string(),time)?;
             tx.commit()?;
             maintenance::reclaim(&db.connection)?;

@@ -21,10 +21,20 @@ const request =
 export async function nativeMediaPermission(identity: string, video: boolean) {
   await request(identity)({ op: "permissions", video });
 }
+export async function takeIncomingControl(identity: string, id: string) {
+  await request(identity)({ op: "handoff", id });
+}
+export async function nativeIncomingAction(
+  identity: string,
+  callId: string,
+  op: "answer" | "decline",
+) {
+  return (await request(identity)({ op, call_id: callId })).handled === true;
+}
 
 /** The native peer owns capture/playback. Only authenticated signaling crosses IPC. */
 export class NativePeer implements MediaAdapter {
-  readonly id = crypto.randomUUID();
+  readonly id: string;
   private stopped = false;
   private ready: Promise<void>;
   private timer?: ReturnType<typeof setTimeout>;
@@ -46,14 +56,20 @@ export class NativePeer implements MediaAdapter {
     private connected: () => void,
     transport?: NativeRequest,
     context?: Record<string, unknown>,
+    managedId?: string,
   ) {
+    this.id = managedId ?? crypto.randomUUID();
     this.invoke = transport ?? request(identity);
-    this.ready = this.invoke({
-      op: "start",
-      id: this.id,
-      ice_servers: access.ice_servers,
-      context,
-    }).then(async () => {
+    this.ready = (
+      managedId
+        ? Promise.resolve()
+        : this.invoke({
+            op: "start",
+            id: this.id,
+            ice_servers: access.ice_servers,
+            context,
+          })
+    ).then(async () => {
       if (this.stopped) {
         await this.invoke({ op: "stop", id: this.id });
         return;

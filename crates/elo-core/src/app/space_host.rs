@@ -1,5 +1,6 @@
 //! Identity-signed, retryable hosted Space creation. No client secret leaves the device.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const CREATE_LIMIT: usize = 64 * 1024;
@@ -8,6 +9,70 @@ pub const CREATE_LIMIT: usize = 64 * 1024;
 pub struct CreateRequest {
     pub record: String,
     pub credential: String,
+    pub work: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creation_work_is_bound_to_the_signed_command_and_credential() {
+        let mut request = CreateRequest {
+            record: "synthetic signed command".into(),
+            credential: "synthetic credential".into(),
+            work: 0,
+        };
+        let start = std::time::Instant::now();
+        request.solve_work().unwrap();
+        eprintln!("Synthetic creation work: {:?}", start.elapsed());
+        request.verify_work().unwrap();
+        request.record.push('x');
+        assert!(request.verify_work().is_err());
+        request.record.pop();
+        request.credential.push('x');
+        assert!(request.verify_work().is_err());
+        request.credential.pop();
+        request.work = request.work.wrapping_add(1);
+        assert!(request.verify_work().is_err());
+    }
+}
+
+// Paid once per signed creation, never during chat synchronization. Verification
+// costs one hash and precedes signature checks and profile/Argon2 provisioning.
+const CREATE_WORK_BITS: u32 = 20;
+impl CreateRequest {
+    fn work_prefix(&self) -> Sha256 {
+        let mut hash = Sha256::new();
+        hash.update(b"elo.space.create.work.v1\0");
+        hash.update(Sha256::digest(self.record.as_bytes()));
+        hash.update(Sha256::digest(self.credential.as_bytes()));
+        hash
+    }
+    fn valid_work(prefix: &Sha256, nonce: u64) -> bool {
+        let mut hash = prefix.clone();
+        hash.update(nonce.to_be_bytes());
+        let result = hash.finalize();
+        u32::from_be_bytes(result[..4].try_into().unwrap()).leading_zeros() >= CREATE_WORK_BITS
+    }
+    pub fn verify_work(&self) -> Result<()> {
+        if self.record.len() + self.credential.len() > CREATE_LIMIT
+            || !Self::valid_work(&self.work_prefix(), self.work)
+        {
+            return Err("Invalid Space creation proof.".into());
+        }
+        Ok(())
+    }
+    fn solve_work(&mut self) -> Result<()> {
+        let prefix = self.work_prefix();
+        for nonce in 0..64 * (1 << CREATE_WORK_BITS) {
+            if Self::valid_work(&prefix, nonce) {
+                self.work = nonce;
+                return Ok(());
+            }
+        }
+        Err("Space creation proof timed out.".into())
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +114,7 @@ pub fn verify_create(
     expected_host: &str,
     current: u64,
 ) -> Result<(CreateCommand, VerifiedCredential)> {
+    request.verify_work()?;
     if request.record.len() + request.credential.len() > CREATE_LIMIT {
         return Err("Space request is too large.".into());
     }
@@ -96,6 +162,24 @@ impl ClientApp {
         contact_email: &str,
         message_lifetime_seconds: u64,
     ) -> Result<CreateRequest> {
+        let mut request = self.hosted_create_payload(
+            host,
+            request_id,
+            name,
+            contact_email,
+            message_lifetime_seconds,
+        )?;
+        request.solve_work()?;
+        Ok(request)
+    }
+    fn hosted_create_payload(
+        &self,
+        host: &str,
+        request_id: &str,
+        name: &str,
+        contact_email: &str,
+        message_lifetime_seconds: u64,
+    ) -> Result<CreateRequest> {
         validate_host(host, self.allow_loopback)?;
         record::hex::<16>(request_id)?;
         if !record::valid_display_name(name) {
@@ -119,6 +203,7 @@ impl ClientApp {
                     .bytes(),
             ),
             credential: STANDARD.encode(self.session.credential().record().bytes()),
+            work: 0,
         })
     }
     pub(super) async fn create_hosted(
@@ -129,13 +214,18 @@ impl ClientApp {
         contact_email: &str,
         message_lifetime_seconds: u64,
     ) -> Result<String> {
-        let request = self.hosted_create_request(
+        let mut request = self.hosted_create_payload(
             host,
             request_id,
             name,
             contact_email,
             message_lifetime_seconds,
         )?;
+        let request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
+            request.solve_work()?;
+            Ok(request)
+        })
+        .await??;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -147,21 +237,29 @@ impl ClientApp {
             .json(&request)
             .send()
             .await
-            .map_err(|_| "Could not create your Space. Try again to continue safely.")?;
+            .map_err(space_service::space_transport_error)?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err("Space hosting is currently at capacity. Try again later or join an existing Space.".into());
         }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err("Space hosting unavailable.".into());
+        }
         if !response.status().is_success() {
-            return Err("Could not create your Space. Try again to continue safely.".into());
+            return Err(space_service::space_status_error(response.status()).into());
         }
         let mut bytes = Zeroizing::new(Vec::new());
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(space_service::space_transport_error)?
+        {
             if bytes.len() + chunk.len() > CREATE_LIMIT * 2 {
                 return Err("Space hosting response is too large.".into());
             }
             bytes.extend_from_slice(&chunk);
         }
-        let response: CreateResponse = serde_json::from_slice(&bytes)?;
+        let response: CreateResponse =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid Space response.")?;
         let value: Value = serde_json::from_slice(&Zeroizing::new(crypto::open_bytes(
             &STANDARD.decode(response.ciphertext)?,
             self.session.age_identity(),

@@ -1,4 +1,5 @@
 import { RefreshButton } from "./RefreshButton";
+import { UpdateGate } from "./UpdateGate";
 import { canReadVisibleMessages } from "./messageReadVisibility";
 import { PageSurface, useDesktopLayout } from "./PageSurface";
 import { ProfileEditor, type ProfilePresentation } from "./ProfileEditor";
@@ -32,6 +33,7 @@ import "./mobile.css";
 import "./messageStream.css";
 import "./messageThreads.css";
 import "./desktop.css";
+import "./update.css";
 import { Icon, NewIndicator } from "./Icon";
 import { ActionDialog } from "./ActionDialog";
 import { FloatingSearch, SearchField } from "./Search";
@@ -1339,8 +1341,11 @@ function App() {
   };
   const lockProfile = () =>
     void perform(async () => {
-      await invoke("lock");
-      clearProfileSession();
+      try {
+        await invoke("lock");
+      } finally {
+        clearProfileSession();
+      }
     });
   const dismissBiometricOffer = () => {
     if (biometricOfferCredential.current.profile)
@@ -1517,7 +1522,6 @@ function App() {
             mobile={mobile}
             view={view}
             hideAvatars={preferences.hideAvatars}
-            onMessages={() => openHome("chats")}
             busy={busy}
             onPerson={(id, name) => {
               if (busy) return;
@@ -1553,8 +1557,6 @@ function App() {
           onRefresh={refresh}
           onRead={readStreamMessage}
           onOpen={openStreamMessage}
-          onChats={() => openHome("chats")}
-          onYou={() => openSettings("profile")}
         />
         {threadActive && stream && selectedThread && (
           <ThreadView
@@ -1863,6 +1865,13 @@ function App() {
         <main className="conversation content-pane">
           <ScreenHeader
             title={stream?.name ?? t("channel.start")}
+            search={
+              <SearchField
+                label={t("search.messages")}
+                value={messageQuery}
+                onChange={setMessageQuery}
+              />
+            }
             participants={
               stream && isDirectChat(stream, view.identity) && !personalDM
                 ? stream.members
@@ -1923,15 +1932,6 @@ function App() {
             <p className="notice" role="status">
               {syncSummary}
             </p>
-          )}
-          {desktopLayout && (
-            <div className="desktop-message-search">
-              <SearchField
-                label={t("search.messages")}
-                value={messageQuery}
-                onChange={setMessageQuery}
-              />
-            </div>
           )}
           <div className="searchable-list">
             <PullToRefresh
@@ -2907,7 +2907,9 @@ createRoot(document.getElementById("root")!).render(
     <ToastProvider>
       <WindowChrome />
       <AccountDeletionNotice />
-      <App />
+      <UpdateGate>
+        <App />
+      </UpdateGate>
     </ToastProvider>
   </React.StrictMode>,
 );

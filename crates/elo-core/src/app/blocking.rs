@@ -6,7 +6,10 @@ const MAX_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Default)]
 pub(super) struct Blocked(Arc<RwLock<BTreeMap<IdentityId, String>>>);
 impl Blocked {
-    pub(super) fn open(directory: &Path, identity: &age::x25519::Identity) -> Result<Self> {
+    pub(super) fn open(
+        directory: &Path,
+        identity: &dyn crate::crypto::DecryptionIdentity,
+    ) -> Result<Self> {
         let path = directory.join("blocked.age");
         let entries = if path.exists() {
             let bytes = Zeroizing::new(crypto::open_bytes(

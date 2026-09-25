@@ -6,13 +6,15 @@ use tauri::Manager;
 #[derive(Default)]
 pub(crate) struct MediaGate {
     #[cfg(all(target_os = "ios", feature = "mobile-push"))]
-    current: std::sync::Mutex<Option<MediaSession>>,
+    pub(crate) current: std::sync::Mutex<Option<MediaSession>>,
 }
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
-struct MediaSession {
-    id: String,
-    identity: String,
-    lease: Option<tokio::task::AbortHandle>,
+pub(crate) struct MediaSession {
+    pub(crate) id: String,
+    pub(crate) identity: String,
+    pub(crate) lease: Option<tokio::task::AbortHandle>,
+    pub(crate) incoming: Option<Value>,
+    pub(crate) incoming_context: Option<Value>,
 }
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
 impl MediaSession {
@@ -24,7 +26,7 @@ impl MediaSession {
 }
 
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
-async fn dispatch(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
+pub(crate) async fn dispatch(app: tauri::AppHandle, request: Value) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>().call(
             "nativeMedia",
@@ -121,10 +123,23 @@ pub(crate) async fn native_call_media(
 ) -> Result<Value, String> {
     #[cfg(all(target_os = "ios", feature = "mobile-push"))]
     {
+        let mut request = request;
         if request.to_string().len() > 196608 {
             return Err("invalid".into());
         }
         let op = request["op"].as_str().ok_or("invalid")?;
+        if op == "incoming_status" {
+            return crate::incoming_answer::status(&app, &identity).await;
+        }
+        if matches!(op, "answer" | "decline") {
+            return crate::incoming_answer::action(
+                &app,
+                &identity,
+                op,
+                request["call_id"].as_str().ok_or("invalid")?,
+            )
+            .await;
+        }
         if ![
             "permissions",
             "start",
@@ -135,6 +150,7 @@ pub(crate) async fn native_call_media(
             "speaker",
             "render",
             "stop",
+            "handoff",
         ]
         .contains(&op)
         {
@@ -154,6 +170,7 @@ pub(crate) async fn native_call_media(
             return Err("invalid".into());
         }
         if op == "start" {
+            crate::release_policy::require_online(&app)?;
             let mut runtime = state.lock().await;
             let client = runtime.client.as_mut().ok_or("unauthorized")?;
             if client.identity_id().to_string() != identity {
@@ -197,6 +214,8 @@ pub(crate) async fn native_call_media(
                     id: id.clone(),
                     identity: identity.clone(),
                     lease: None,
+                    incoming: None,
+                    incoming_context: None,
                 });
             }
             let result = dispatch(app.clone(), request.clone()).await;
@@ -233,6 +252,58 @@ pub(crate) async fn native_call_media(
             }
             return result;
         }
+        if op == "handoff" {
+            let runtime = state.lock().await;
+            if runtime
+                .client
+                .as_ref()
+                .map(|c| c.identity_id().to_string())
+                .as_deref()
+                != Some(identity.as_str())
+            {
+                return Err("unauthorized".into());
+            }
+            let gate = app.state::<MediaGate>();
+            let mut current = gate.current.lock().map_err(|_| "unavailable")?;
+            let session = current
+                .as_mut()
+                .filter(|s| s.id == id && s.identity == identity)
+                .ok_or("ended")?;
+            let incoming = session.incoming.as_ref().ok_or("ended")?;
+            if incoming["phase"] != "connected" {
+                return Err("unavailable".into());
+            }
+            let call_id = incoming["call_id"].as_str().ok_or("invalid")?.to_owned();
+            let context = session.incoming_context.clone().ok_or("invalid")?;
+            let mut url = reqwest::Url::parse(context["audience"].as_str().ok_or("invalid")?)
+                .map_err(|_| "invalid")?;
+            url.set_scheme("wss").map_err(|_| "invalid")?;
+            url.set_path(&format!("{}/connect", url.path().trim_end_matches('/')));
+            let target = crate::call_lease::Target {
+                url: url.to_string(),
+                call_id: call_id.clone(),
+                identity: identity.clone(),
+                scope: serde_json::json!({"hosting_space_id":context["hosting_space_id"],"conversation":{"space_id":context["space"],"stream_id":context["stream"]}}),
+            };
+            if let Some(task) = session.lease.take() {
+                task.abort();
+            }
+            // The foreground controller already authenticated its socket. Keep
+            // this exact media peer and transfer only signaling ownership.
+            session.incoming = None;
+            session.incoming_context = None;
+            let task = tokio::spawn(crate::call_lease::run(
+                LeaseDriver {
+                    app: app.clone(),
+                    id,
+                    call_id,
+                    context,
+                },
+                target,
+            ));
+            session.lease = Some(task.abort_handle());
+            return Ok(serde_json::json!({}));
+        }
         {
             let gate = app.state::<MediaGate>();
             let mut current = gate.current.lock().map_err(|_| "unavailable")?;
@@ -248,7 +319,22 @@ pub(crate) async fn native_call_media(
             }
             if op == "stop" {
                 if let Some(session) = current.take() {
+                    if let Some(incoming) = &session.incoming {
+                        request["op"] = "end_call".into();
+                        request["call_id"] = incoming["call_id"].clone();
+                    }
                     session.cancel();
+                }
+            } else if current
+                .as_ref()
+                .is_some_and(|session| session.incoming.is_some())
+            {
+                // The native coordinator is the sole consumer of SDP/ICE. UI
+                // polling can observe tracks without stealing queued signals.
+                if op == "poll" {
+                    request["op"] = "snapshot".into();
+                } else if matches!(op, "offer" | "signal") {
+                    return Err("unauthorized".into());
                 }
             }
         }

@@ -236,6 +236,7 @@ function knownSenderName(
 ): string | undefined {
   if (identity === view.identity) return profileName(view) || undefined;
   return (
+    view.contacts?.find((person) => person.id === identity)?.name ??
     stream?.rows
       ?.filter(
         (row) =>
@@ -244,7 +245,6 @@ function knownSenderName(
       )
       .at(-1)?.body.payload?.sender_name ??
     stream?.member_names?.[identity] ??
-    view.contacts?.find((person) => person.id === identity)?.name ??
     view.demo_names?.[identity]
   );
 }

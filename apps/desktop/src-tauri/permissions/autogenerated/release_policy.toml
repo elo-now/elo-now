@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-release-policy"
+description = "Enables the release_policy command without any pre-configured scope."
+commands.allow = ["release_policy"]
+
+[[permission]]
+identifier = "deny-release-policy"
+description = "Denies the release_policy command without any pre-configured scope."
+commands.deny = ["release_policy"]

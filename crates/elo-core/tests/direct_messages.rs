@@ -101,9 +101,12 @@ async fn selected_dm_invites_are_private_durable_and_complete_group_membership_i
     let path = dir.path().join("peer.json");
     vault::write_private(&path, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     for app in [&mut owner, &mut maya, &mut sam, &mut outsider] {
         app.operate(json!({"op":"add_peer","path":path}))
@@ -446,9 +449,12 @@ async fn actions_cross_a_real_replica_without_the_author_online_and_private_mark
     let peer = dir.path().join("peer.json");
     vault::write_private(&peer, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     for app in [&mut owner, &mut maya] {
         app.operate(json!({"op":"add_peer","path":peer}))
@@ -739,9 +745,12 @@ async fn personal_dm_bootstrap_and_message_survive_sender_offline_with_explicit_
     let path = dir.path().join("peer.json");
     vault::write_private(&path, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     for app in [&mut alex, &mut maya, &mut sam] {
         app.operate(json!({"op":"add_peer","path":path}))
@@ -874,7 +883,11 @@ async fn discovery_backlog_resumes_without_poll_delay_and_delivers_a_new_dm_once
     let reads = Arc::new(AtomicUsize::new(0));
     let fail_armed = armed.clone();
     let fail_reads = reads.clone();
-    let router = elo_core::http::router(replica).layer(axum::middleware::from_fn(
+    let router = elo_core::http::router(
+        replica,
+        &format!("http://{}", listener.local_addr().unwrap()),
+    )
+    .layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let armed = fail_armed.clone();
             let reads = fail_reads.clone();

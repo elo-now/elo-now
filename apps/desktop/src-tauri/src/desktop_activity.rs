@@ -242,7 +242,7 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
         let mut identity = String::new();
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if !hidden(&app) {
+            if !hidden(&app) || crate::release_policy::required(&app) {
                 schedule = Schedule::new(Instant::now());
                 continue;
             }

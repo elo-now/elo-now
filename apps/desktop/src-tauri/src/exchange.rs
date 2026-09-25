@@ -3,8 +3,13 @@
 use crate::State;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -13,14 +18,84 @@ use zeroize::Zeroizing;
 const MAX_EXCHANGE: usize = 12 * 1024 * 1024;
 const MAX_ATTACHMENT: usize = 5 * 1024 * 1024;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Upload,
+    Download,
+}
+#[derive(Default)]
+pub(crate) struct ExchangeFiles(Mutex<BTreeMap<String, (PathBuf, Purpose)>>, AtomicU64);
+impl ExchangeFiles {
+    pub(crate) fn generation(&self) -> u64 {
+        self.1.load(Ordering::SeqCst)
+    }
+    fn reset(&self) -> Result<(), String> {
+        let mut files = self.0.lock().map_err(|_| "Exchange is unavailable")?;
+        files.clear();
+        self.1.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn issue(&self, path: PathBuf, purpose: Purpose) -> Result<String, String> {
+        let mut files = self.0.lock().map_err(|_| "Exchange is unavailable")?;
+        if files.len() >= 128 {
+            return Err("Too many pending exchange files".into());
+        }
+        let handle = elo_core::record::random_hex::<32>().map_err(|e| e.to_string())?;
+        files.insert(handle.clone(), (path, purpose));
+        Ok(handle)
+    }
+    fn resolve(&self, handle: &str, purpose: Purpose) -> Result<PathBuf, String> {
+        self.0
+            .lock()
+            .map_err(|_| "Exchange is unavailable")?
+            .get(handle)
+            .filter(|(_, allowed)| *allowed == purpose)
+            .map(|(path, _)| path.clone())
+            .ok_or_else(|| "Invalid exchange handle".into())
+    }
+}
+
+// Renderer values are capabilities issued by native pickers, never filesystem paths.
+pub(crate) fn resolve_transfer(
+    app: &tauri::AppHandle,
+    request: &mut serde_json::Value,
+) -> Result<(), String> {
+    let (field, purpose) = match request["op"].as_str() {
+        Some("attachment_upload") => ("path", Purpose::Upload),
+        Some("attachment_download") => ("output", Purpose::Download),
+        _ => return Err("Unsupported attachment transfer".into()),
+    };
+    let handle = request[field].as_str().ok_or("Invalid exchange handle")?;
+    let path = app.state::<ExchangeFiles>().resolve(handle, purpose)?;
+    if purpose == Purpose::Upload {
+        validate_file(&path)?;
+    }
+    request[field] = serde_json::json!(path);
+    Ok(())
+}
+fn validate_file(path: &std::path::Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_EXCHANGE as u64 {
+        return Err("Invalid exchange file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err("Invalid exchange file".into());
+        }
+    }
+    Ok(())
+}
+
 fn attachment_name(name: &str) -> String {
     let name = name.trim().chars().take(255).collect::<String>();
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+        || name.chars().any(|character| {
+            elo_core::record::unsafe_display_character(character) || matches!(character, '/' | '\\')
+        })
     {
         "attachment.bin".to_owned()
     } else {
@@ -121,6 +196,38 @@ fn uniform_qr_codes(contents: &[String]) -> Result<Vec<qrcode::QrCode>, String> 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn opaque_handles_reject_paths_wrong_purpose_and_old_sessions() {
+        let files = super::ExchangeFiles::default();
+        let path = std::path::PathBuf::from("/tmp/native-selected-file");
+        let handle = files.issue(path.clone(), super::Purpose::Upload).unwrap();
+        assert_ne!(handle, path.to_string_lossy());
+        assert_eq!(
+            files.resolve(&handle, super::Purpose::Upload).unwrap(),
+            path
+        );
+        assert!(
+            files
+                .resolve("/etc/passwd", super::Purpose::Upload)
+                .is_err()
+        );
+        assert!(files.resolve(&handle, super::Purpose::Download).is_err());
+        let generation = files.generation();
+        files.reset().unwrap();
+        assert_ne!(files.generation(), generation);
+        assert!(files.resolve(&handle, super::Purpose::Upload).is_err());
+    }
+    #[test]
+    fn misleading_filename_direction_controls_are_rejected() {
+        assert_eq!(
+            super::attachment_name("report\u{202e}fdp.exe"),
+            "attachment.bin"
+        );
+        assert_eq!(
+            super::attachment_name("report\u{200b}.pdf"),
+            "attachment.bin"
+        );
+    }
+    #[test]
     fn selected_attachment_uses_provider_name_not_document_id() {
         let document = "content://com.android.providers.downloads.documents/document/75"
             .parse()
@@ -202,6 +309,7 @@ fn directory(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::error::Erro
     Ok(dir)
 }
 pub fn clear(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    app.state::<ExchangeFiles>().reset()?;
     for item in std::fs::read_dir(directory(app)?)? {
         let item = item?;
         // Only files created by this module; never recurse into other folders.
@@ -229,11 +337,26 @@ pub(crate) fn clear_disconnected(
             && !item.file_type().map_err(|e| e.to_string())?.is_dir()
         {
             std::fs::remove_file(item.path()).map_err(|e| e.to_string())?;
+            app.state::<ExchangeFiles>()
+                .0
+                .lock()
+                .map_err(|_| "Exchange is unavailable")?
+                .retain(|_, (path, _)| *path != item.path());
         }
     }
     Ok(())
 }
 pub(crate) fn new_path(app: &tauri::AppHandle, extension: &str) -> Result<PathBuf, String> {
+    if app
+        .state::<ExchangeFiles>()
+        .0
+        .lock()
+        .map_err(|_| "Exchange is unavailable")?
+        .len()
+        >= 128
+    {
+        return Err("Too many pending exchange files".into());
+    }
     Ok(directory(app).map_err(|e| e.to_string())?.join(format!(
         "elo-{}.{}",
         elo_core::record::random_hex::<16>().map_err(|e| e.to_string())?,
@@ -279,9 +402,13 @@ pub async fn choose_attachment(
     app: tauri::AppHandle,
     state: tauri::State<'_, State>,
 ) -> Result<Option<serde_json::Value>, String> {
-    if state.lock().await.client.is_none() {
-        return Err("The profile is locked".into());
-    }
+    let generation = {
+        let guard = state.lock().await;
+        if guard.client.is_none() {
+            return Err("The profile is locked".into());
+        }
+        app.state::<ExchangeFiles>().generation()
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_file(move |file| {
         let _ = tx.send(file);
@@ -289,6 +416,11 @@ pub async fn choose_attachment(
     let Some(file) = rx.await.map_err(|_| "File picker closed unexpectedly")? else {
         return Ok(None);
     };
+    // A native dialog may outlive logout or a profile change.
+    let guard = state.lock().await;
+    if guard.client.is_none() || app.state::<ExchangeFiles>().generation() != generation {
+        return Err("The profile is locked".into());
+    }
     #[cfg(target_os = "android")]
     let display_name = crate::android_files::display_name(&app, &file);
     #[cfg(not(target_os = "android"))]
@@ -326,7 +458,7 @@ pub async fn choose_attachment(
     }
     output.sync_all().map_err(|e| e.to_string())?;
     Ok(Some(serde_json::json!({
-        "path": path.to_string_lossy(),
+        "path": app.state::<ExchangeFiles>().issue(path, Purpose::Upload)?,
         "name": name,
         "size_bytes": size,
     })))
@@ -339,7 +471,8 @@ pub async fn stage_attachment(
     name: String,
     data: String,
 ) -> Result<serde_json::Value, String> {
-    if state.lock().await.client.is_none() {
+    let guard = state.lock().await;
+    if guard.client.is_none() {
         return Err("The profile is locked".into());
     }
     // Reject oversized input before decoding so the WebView cannot use this
@@ -359,7 +492,7 @@ pub async fn stage_attachment(
     let path = new_path(&app, "attachment")?;
     elo_core::vault::write_private(&path, &bytes, false).map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
-        "path": path.to_string_lossy(),
+        "path": app.state::<ExchangeFiles>().issue(path, Purpose::Upload)?,
         "name": attachment_name(&name),
         "size_bytes": bytes.len(),
     }))
@@ -374,15 +507,15 @@ pub async fn discard_exchange(
     if state.lock().await.client.is_none() {
         return Err("The profile is locked".into());
     }
-    let path = PathBuf::from(path);
-    let base = directory(&app).map_err(|e| e.to_string())?;
-    if path.parent() != Some(base.as_path())
-        || !path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("elo-"))
-    {
-        return Err("Only an app-created exchange file may be removed".into());
-    }
+    let Some((path, _)) = app
+        .state::<ExchangeFiles>()
+        .0
+        .lock()
+        .map_err(|_| "Exchange is unavailable")?
+        .remove(&path)
+    else {
+        return Ok(());
+    };
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -410,7 +543,7 @@ pub async fn prepare_export(
     } else {
         new_path(&app, extension)?
     };
-    Ok(path.to_string_lossy().into_owned())
+    app.state::<ExchangeFiles>().issue(path, Purpose::Download)
 }
 #[tauri::command]
 pub async fn save_export(
@@ -423,19 +556,10 @@ pub async fn save_export(
     if guard.client.is_none() {
         return Err("The profile is locked".into());
     }
-    let path = PathBuf::from(path);
-    let base = directory(&app).map_err(|e| e.to_string())?;
-    if path.parent() != Some(base.as_path())
-        || !path
-            .file_name()
-            .is_some_and(|s| s.to_string_lossy().starts_with("elo-"))
-    {
-        return Err("Only an app-created exchange file may be exported".into());
-    }
-    let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_EXCHANGE as u64 {
-        return Err("Invalid export file".into());
-    }
+    let path = app
+        .state::<ExchangeFiles>()
+        .resolve(&path, Purpose::Download)?;
+    validate_file(&path)?;
     let name = filename
         .filter(|name| {
             !name.is_empty()
@@ -444,7 +568,7 @@ pub async fn save_export(
                 && *name != ".."
                 && !name
                     .chars()
-                    .any(|c| c.is_control() || c == '/' || c == '\\')
+                    .any(|c| elo_core::record::unsafe_display_character(c) || c == '/' || c == '\\')
         })
         .unwrap_or_else(|| {
             path.file_name()
@@ -461,6 +585,7 @@ pub async fn save_export(
     let Some(file) = rx.await.map_err(|_| "File picker closed unexpectedly")? else {
         return Ok(false);
     };
+    let destination_path = file.clone().into_path().ok();
     let mut destination = app
         .fs()
         .open(
@@ -475,6 +600,11 @@ pub async fn save_export(
     let mut source = std::fs::File::open(&path).map_err(|e| e.to_string())?;
     std::io::copy(&mut source, &mut destination).map_err(|e| e.to_string())?;
     destination.sync_all().map_err(|e| e.to_string())?;
+    if let Some(path) = destination_path {
+        crate::download_protection::mark(&path).map_err(
+            |_| "Could not mark this download as untrusted. Choose another destination.",
+        )?;
+    }
     // Keep the private source until lock, including after uncertain provider writes.
     Ok(true)
 }

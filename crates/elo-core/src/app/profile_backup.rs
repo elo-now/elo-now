@@ -22,6 +22,8 @@ const FILES: &[&str] = &[
     "blocked.age",
     "invitations.age",
     "spaces.age",
+    "device-revocations.age",
+    "device-names.age",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -41,7 +43,9 @@ pub fn encrypt(bytes: &[u8], secret: SecretString) -> Result<Vec<u8>> {
     {
         return Err("Invalid profile backup".into());
     }
-    let encryptor = age::Encryptor::with_user_passphrase(secret);
+    let recipient = crypto::passphrase::recipient(secret);
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))?;
     let mut encrypted = Vec::new();
     let mut writer = encryptor.wrap_output(&mut encrypted)?;
     writer.write_all(bytes)?;
@@ -61,11 +65,16 @@ pub fn decrypt(bytes: &[u8], secret: SecretString) -> Result<Zeroizing<Vec<u8>>>
         return Err("Invalid profile backup".into());
     }
     let mut identity = age::scrypt::Identity::new(secret);
-    identity.set_max_work_factor(20);
+    identity.set_max_work_factor(crypto::passphrase::IMPORT_MAX_WORK_FACTOR);
     let mut out = Zeroizing::new(Vec::new());
     decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|_| "The backup could not be unlocked with this recovery key")?
+        .map_err(|error| match error {
+            age::DecryptError::ExcessiveWork { .. } => {
+                "This backup needs too much memory. Export a new backup on its original device."
+            }
+            _ => "The backup could not be unlocked with this recovery key",
+        })?
         .take(MAX_BACKUP as u64 + 1)
         .read_to_end(&mut out)
         .map_err(|_| "Invalid or incomplete profile backup")?;
@@ -122,11 +131,21 @@ impl ClientApp {
     }
 
     pub async fn export_profile_with_report(&self, secret: SecretString) -> Result<RecoveryBackup> {
-        self.export_snapshot(secret, false, MAX_FILES).await
+        if !crypto::passphrase::strong_export_secret(&secret) {
+            return Err("Choose a less predictable password, such as four unrelated words.".into());
+        }
+        self.export_snapshot(secret, false, MAX_FILES, None).await
     }
 
-    pub(super) async fn export_device_copy(&self, secret: SecretString) -> Result<Vec<u8>> {
-        Ok(self.export_snapshot(secret, true, MAX_FILES).await?.bytes)
+    pub(super) async fn export_device_copy(
+        &self,
+        secret: SecretString,
+        device: &Session,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .export_snapshot(secret, true, MAX_FILES, Some(device))
+            .await?
+            .bytes)
     }
 
     async fn export_snapshot(
@@ -134,6 +153,7 @@ impl ClientApp {
         secret: SecretString,
         include_files: bool,
         maximum: usize,
+        device: Option<&Session>,
     ) -> Result<RecoveryBackup> {
         if self
             .spaces
@@ -158,7 +178,7 @@ impl ClientApp {
         let mut files = BTreeMap::new();
         let mut total = 0usize;
         for (prefix, app) in &profiles {
-            app.backup_metadata(prefix, &secret, &mut files, &mut total, maximum)?;
+            app.backup_metadata(prefix, &secret, &mut files, &mut total, maximum, device)?;
         }
         let stores: Vec<_> = profiles.iter().map(|(_, app)| *app).collect();
         let remaining = maximum.saturating_sub(total);
@@ -196,8 +216,17 @@ impl ClientApp {
         files: &mut BTreeMap<String, String>,
         total: &mut usize,
         maximum: usize,
+        device: Option<&Session>,
     ) -> Result<()> {
-        let vault = self.session.seal(secret.clone())?;
+        let mut companion;
+        let session = if let Some(device) = device {
+            companion = device.isolated_space();
+            companion.inherit_history(&self.session)?;
+            &companion
+        } else {
+            &self.session
+        };
+        let vault = session.seal(secret.clone())?;
         *total += vault.len();
         if *total > maximum {
             return Err("Profile settings and security data exceed the backup size limit.".into());
@@ -214,6 +243,13 @@ impl ClientApp {
                 Ok(_) => {}
             }
             let bytes = Zeroizing::new(read_exchange(&path, maximum.saturating_sub(*total))?);
+            let bytes = if *name == "profile.json" && device.is_some() {
+                let mut public: Value = serde_json::from_slice(&bytes)?;
+                public["credential_id"] = json!(session.credential().id());
+                Zeroizing::new(serde_json::to_vec(&public)?)
+            } else {
+                bytes
+            };
             *total += bytes.len();
             if *total > maximum {
                 return Err(
@@ -425,6 +461,7 @@ mod tests {
                         action,
                     },
                     locator: None,
+                    access: None,
                 },
                 app.session.signing_key(),
             )
@@ -490,7 +527,7 @@ mod tests {
         // A reduced test budget exercises the exact production selection path.
         let maximum = 512 * 1024;
         let exported = app
-            .export_snapshot(PASSWORD.into(), false, maximum)
+            .export_snapshot(PASSWORD.into(), false, maximum, None)
             .await
             .unwrap();
         assert!(exported.included_data_bytes <= maximum);
@@ -522,7 +559,7 @@ mod tests {
         );
         // A settings/security overflow must fail, never emit an invalid archive.
         assert!(
-            app.export_snapshot(PASSWORD.into(), false, 4096)
+            app.export_snapshot(PASSWORD.into(), false, 4096, None)
                 .await
                 .is_err()
         );

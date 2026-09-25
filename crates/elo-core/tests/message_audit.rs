@@ -31,9 +31,12 @@ async fn audit_is_scoped_read_only_private_and_persistent_with_signed_changes() 
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let node = replica.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(node))
-            .await
-            .unwrap();
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(node, &origin))
+        }
+        .await
+        .unwrap();
     });
     app.ensure_peer(PeerDescriptor {
         url,

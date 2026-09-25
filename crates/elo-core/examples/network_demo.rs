@@ -98,9 +98,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             write_token: None,
         });
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, elo_core::http::router(store))
-                .await
-                .unwrap()
+            {
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                axum::serve(listener, elo_core::http::router(store, &origin))
+            }
+            .await
+            .unwrap()
         }));
     }
     let loaded = config.load()?;

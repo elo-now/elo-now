@@ -7,6 +7,7 @@ use crate::{
 use std::io::{Read, Write};
 use thiserror::Error;
 mod packing;
+pub(crate) mod passphrase;
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("invalid object size or recipient set")]
@@ -20,6 +21,68 @@ pub enum CryptoError {
 }
 pub type Result<T> = std::result::Result<T, CryptoError>;
 pub const MAX_CIPHERTEXT: usize = 16 * 1024 * 1024;
+/// The current recipient plus decryption-only keys retained for local history.
+/// Historical keys never authorize a request or become encryption recipients.
+pub trait DecryptionIdentity: Send + Sync {
+    fn to_public(&self) -> age::x25519::Recipient;
+    fn identities(&self) -> Vec<&dyn age::Identity>;
+    fn owns(&self, recipient: &age::x25519::Recipient) -> bool {
+        &self.to_public() == recipient
+    }
+}
+impl DecryptionIdentity for age::x25519::Identity {
+    fn to_public(&self) -> age::x25519::Recipient {
+        self.to_public()
+    }
+    fn identities(&self) -> Vec<&dyn age::Identity> {
+        vec![self]
+    }
+}
+
+#[derive(Clone)]
+pub struct DecryptionKeys {
+    pub(crate) current: age::x25519::Identity,
+    pub(crate) history: Vec<age::x25519::Identity>,
+}
+impl DecryptionKeys {
+    pub fn to_public(&self) -> age::x25519::Recipient {
+        self.current.to_public()
+    }
+}
+impl DecryptionIdentity for DecryptionKeys {
+    fn to_public(&self) -> age::x25519::Recipient {
+        self.to_public()
+    }
+    fn identities(&self) -> Vec<&dyn age::Identity> {
+        std::iter::once(&self.current)
+            .chain(self.history.iter())
+            .map(|key| key as &dyn age::Identity)
+            .collect()
+    }
+    fn owns(&self, recipient: &age::x25519::Recipient) -> bool {
+        &self.current.to_public() == recipient
+            || self.history.iter().any(|key| &key.to_public() == recipient)
+    }
+}
+
+/// Select a historical recipient only for locally accepted content. The caller
+/// still verifies the record's signature, scope and original recipient set.
+pub(crate) fn history_recipient(
+    record: &SignedRecord,
+    authority: &crate::authority::Authority,
+    identity: crate::ids::IdentityId,
+    keys: &dyn DecryptionIdentity,
+) -> crate::record::Result<RecordId> {
+    let ids: Vec<RecordId> = serde_json::from_value(record.body()["recipient_credentials"].clone())
+        .map_err(|_| crate::record::RecordError::Json)?;
+    ids.into_iter()
+        .find(|id| {
+            authority.credential(*id).is_ok_and(|credential| {
+                credential.identity() == identity && keys.owns(&credential.recipient())
+            })
+        })
+        .ok_or(crate::record::RecordError::Authority)
+}
 /// Every entry must already be approved by the authority layer, including self
 /// and owner copies. This exact-set check does not itself establish membership.
 pub fn seal_chat(record: &SignedRecord, credentials: &[VerifiedCredential]) -> Result<Vec<u8>> {
@@ -75,7 +138,10 @@ pub(crate) fn seal_bytes(
     }
     Ok(ciphertext)
 }
-pub fn open_record(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<SignedRecord> {
+pub fn open_record(
+    ciphertext: &[u8],
+    identity: &dyn crate::crypto::DecryptionIdentity,
+) -> Result<SignedRecord> {
     let bytes = packing::unpack(open_bytes(ciphertext, identity, MAX_RECORD)?, MAX_RECORD)?;
     let record = SignedRecord::parse(&bytes).map_err(|_| CryptoError::Decrypt)?;
     crate::erasure::verify_original(ciphertext, &record)?;
@@ -83,7 +149,7 @@ pub fn open_record(ciphertext: &[u8], identity: &age::x25519::Identity) -> Resul
 }
 pub(crate) fn open_bytes(
     ciphertext: &[u8],
-    identity: &age::x25519::Identity,
+    identity: &dyn crate::crypto::DecryptionIdentity,
     maximum: usize,
 ) -> Result<Vec<u8>> {
     if ciphertext.is_empty() || ciphertext.len() > MAX_CIPHERTEXT {
@@ -98,7 +164,7 @@ pub(crate) fn open_bytes(
         return Err(CryptoError::Decrypt);
     }
     let mut reader = decryptor
-        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .decrypt(identity.identities().into_iter())
         .map_err(|_| CryptoError::Decrypt)?
         .take(maximum as u64 + 1);
     let mut plaintext = Vec::new();
@@ -112,7 +178,10 @@ pub(crate) fn open_bytes(
 }
 
 /// Bounded dispatch for implemented object kinds. Each schema enforces its own limit.
-pub fn open_object(ciphertext: &[u8], identity: &age::x25519::Identity) -> Result<SignedRecord> {
+pub fn open_object(
+    ciphertext: &[u8],
+    identity: &dyn crate::crypto::DecryptionIdentity,
+) -> Result<SignedRecord> {
     let bytes = packing::unpack(
         open_bytes(ciphertext, identity, crate::files::MAX_FILE_RECORD)?,
         MAX_RECORD,

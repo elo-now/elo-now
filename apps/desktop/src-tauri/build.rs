@@ -8,6 +8,7 @@ fn main() {
         "ELO_SPACE_HOST_URL",
         "TAURI_ELO_SPACE_HOST_URL",
         "TAURI_ELO_WAKE_URL",
+        "ELO_DISTRIBUTION_CHANNEL",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -26,6 +27,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "profile_environment",
             "profile_task",
+            "control_task",
             "open_demo",
             "prepare_profile",
             "cancel_profile",
@@ -45,6 +47,10 @@ fn main() {
             "save_export",
             "open_mail_draft",
             "invitation_qr",
+            "copy_recovery_code",
+            "release_policy",
+            "check_release_policy",
+            "open_update",
         ]),
     ))
     .expect("application build configuration");

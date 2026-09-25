@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Recovery code input fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React from 'react';
+      import { createRoot } from 'react-dom/client';
+      import { mockIPC } from '@tauri-apps/api/mocks';
+      import { CodeInput, ProfileRecovery } from '/src/ProfileRecovery.tsx';
+      import { DevicesSettings } from '/src/ProfileDevices.tsx';
+      import { ToastProvider } from '/src/Toast.tsx';
+      import '/src/style.css';
+      import '/src/mobile.css';
+      import '/src/invitations.css';
+      const params = new URLSearchParams(location.search);
+      document.documentElement.dataset.theme = params.get('theme') || 'light';
+      document.documentElement.dataset.uiScale = params.get('scale') || 'normal';
+      // Synthetic scanner/decoder results only; no camera, profile or network.
+      window.codeInputQA = { fail: false, requests: [], ready: false, finishFail: false, finishes: 0, opened: false, accepted: false, rejected: false };
+      mockIPC((command, args) => {
+        if (command === 'profile_task' && args.request.op === 'device_list') return { devices: [{ id: 'synthetic-mac', credential: 'synthetic-mac-proof', name: 'Mac', current: true }], pending: 0, unavailable: 0, can_link: true };
+        if (command === 'profile_task' && args.request.op === 'pair_start') return { svg: '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100"/></svg>', expires: Date.now() + 600000 };
+        if (command === 'profile_task' && args.request.op === 'pair_poll') return { requests: [{ id: 'synthetic-request', name: 'Android' }], credential: 'synthetic-android-proof', device_id: 'synthetic-android' };
+        if (command === 'profile_task' && args.request.op === 'pair_approve') { codeInputQA.accepted = true; return {}; }
+        if (command === 'profile_task' && args.request.op === 'pair_reject') { codeInputQA.rejected = true; return {}; }
+        if (command.includes('check_permissions')) return { camera: 'granted' };
+        if (command.endsWith('|scan')) return { content: 'synthetic-scanned-code' };
+        if (command === 'profile_task' && args.request.op === 'read_qr_image') {
+          if (codeInputQA.fail) throw 'No recovery code found';
+          return { code: 'synthetic-image-code' };
+        }
+        if (command === 'profile_task' && args.request.op === 'pair_request') {
+          codeInputQA.requests.push(args.request);
+          return { identity: 'synthetic-identity', code: 'SYNTHETIC COMPARISON', ready: false };
+        }
+        if (command === 'profile_task' && args.request.op === 'pair_receive') return { identity: 'synthetic-identity', ready: codeInputQA.ready };
+        if (command === 'profile_task' && args.request.op === 'pair_finish') {
+          codeInputQA.finishes++;
+          if (codeInputQA.finishFail) throw 'network error';
+          return { identity: 'synthetic-identity' };
+        }
+        return {};
+      });
+      function InputFixture() {
+        const [code, setCode] = React.useState('');
+        return React.createElement('main', { className: 'profile-recovery-screen' }, React.createElement('div', { className: 'onboarding-body' },
+          React.createElement(CodeInput, { mobile: !params.has('desktop'), code, onChange: setCode }),
+          React.createElement('button', { disabled: !code, onClick() { codeInputQA.requests.push({ code }); } }, 'Use code')));
+      }
+      createRoot(document.getElementById('root')).render(
+        React.createElement(ToastProvider, null,
+          params.has('source') ? React.createElement(DevicesSettings, { mobile: !params.has('desktop') }) : params.has('pairing') ? React.createElement(ProfileRecovery, { mobile: true, hasProfile: true, onBack() {}, onOpen() { codeInputQA.opened = true; } }) : React.createElement(InputFixture))
+      );
+    </script>
+  </body>
+</html>

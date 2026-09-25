@@ -52,6 +52,8 @@ struct Checkpoint {
     format: String,
     backup: ObjectId,
     opening: bool,
+    #[serde(default)]
+    device_vault: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +272,7 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
         format: "elo.restore/v1".into(),
         backup: fingerprint,
         opening: false,
+        device_vault: None,
     };
     let existing = std::fs::symlink_metadata(&directory).is_ok();
     if existing {
@@ -292,6 +295,22 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
         if journal.format != "elo.restore/v1" || journal.backup != fingerprint {
             return Err("Select the same backup to continue recovery".into());
         }
+        let restored_device = journal
+            .device_vault
+            .as_ref()
+            .map(|encoded| -> Result<Session> {
+                Ok(Session::open(
+                    &STANDARD.decode(encoded)?,
+                    password.clone(),
+                    expected,
+                )?)
+            })
+            .transpose()?;
+        let restored_id = restored_device
+            .as_ref()
+            .unwrap_or(&session)
+            .credential()
+            .id();
         // The resumed vault was sealed with the password chosen on the
         // first attempt. Never replace it or revive controller authority.
         for name in files
@@ -305,7 +324,7 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
                 let sealed = Zeroizing::new(vault::read_private(&path)?);
                 let restored = Session::open(&sealed, password.clone(), expected)
                     .map_err(|_| "Use the password chosen when recovery started")?;
-                if restored.credential().id() != session.credential().id()
+                if restored.credential().id() != restored_id
                     || restored.controller_mode() != vault::ControllerMode::Follower
                 {
                     return Err("Invalid recovery checkpoint".into());
@@ -315,8 +334,42 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
         }
         clear_temporary(&directory)?;
     } else {
+        // The recovery phrase authorizes fresh device keys. A companion bundle
+        // already contains independent keys and uses a random transfer password.
+        if let Ok(draft) = ProfileDraft::recover(secret.expose_secret(), &expected.to_string()) {
+            journal.device_vault =
+                Some(STANDARD.encode(session.companion(draft.card())?.seal(password.clone())?));
+        }
         private_directory(&directory)?;
         checkpoint(&directory, &journal, &session, false)?;
+    }
+    let destination = journal
+        .device_vault
+        .as_ref()
+        .map(|encoded| -> Result<Session> {
+            Ok(Session::open(
+                &STANDARD.decode(encoded)?,
+                password.clone(),
+                expected,
+            )?)
+        })
+        .transpose()?;
+    if let Some(device) = &destination {
+        for prefix in
+            std::iter::once(String::new()).chain(space_ids.iter().map(|id| format!("spaces/{id}/")))
+        {
+            let vault_name = format!("{prefix}vault.age");
+            let previous = Session::open(&files[&vault_name], password.clone(), expected)?;
+            if previous.credential().id() != device.credential().id() {
+                let mut child = device.isolated_space();
+                child.inherit_history(&previous)?;
+                files.insert(vault_name, Zeroizing::new(child.seal(password.clone())?));
+            }
+            let public_name = format!("{prefix}profile.json");
+            let mut public: Value = serde_json::from_slice(&files[&public_name])?;
+            public["credential_id"] = json!(device.credential().id());
+            files.insert(public_name, Zeroizing::new(serde_json::to_vec(&public)?));
+        }
     }
     let result: Result<ClientApp> = async {
         if !space_ids.is_empty() {
@@ -341,7 +394,11 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
             } else if journal.opening {
                 // A verified removal may have purged this compartment before
                 // Ready was committed. Never recreate it from the old archive.
-                if !super::super::spaces::restore_file_removed(&directory, &session, &name)? {
+                if !super::super::spaces::restore_file_removed(
+                    &directory,
+                    destination.as_ref().unwrap_or(&session),
+                    &name,
+                )? {
                     return Err("Incomplete recovery checkpoint".into());
                 }
             } else {

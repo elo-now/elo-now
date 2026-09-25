@@ -1,3 +1,4 @@
+import { UpdateBanner } from "./UpdateGate";
 import { useRef, type ReactNode, type RefObject } from "react";
 import { useBackSwipe } from "./useBackSwipe";
 import { ParticipantTitle } from "./ParticipantTitle";
@@ -12,6 +13,7 @@ export function ScreenHeader({
   onBack,
   backLabel,
   actions,
+  search,
   titleRef,
   participants,
   desktopRoot = false,
@@ -21,6 +23,7 @@ export function ScreenHeader({
   onBack?: () => void;
   backLabel?: string;
   actions?: ReactNode;
+  search?: ReactNode;
   titleRef?: RefObject<HTMLHeadingElement | null>;
   /** Menu destinations use the persistent desktop navigation instead of Back. */
   desktopRoot?: boolean;
@@ -64,7 +67,13 @@ export function ScreenHeader({
           )}
         </h2>
       </div>
-      <div className="screen-header-actions">{actions}</div>
+      <div className="screen-header-actions">
+        {desktop && search && (
+          <div className="desktop-header-search">{search}</div>
+        )}
+        {actions}
+      </div>
+      <UpdateBanner />
     </header>
   );
 }

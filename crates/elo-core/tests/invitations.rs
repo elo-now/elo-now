@@ -293,7 +293,7 @@ async fn replica_delivery_survives_lost_ack_restart_and_keeps_approval_explicit(
     let url = format!("http://{address}");
     let lose_ack = Arc::new(AtomicBool::new(true));
     let flag = lose_ack.clone();
-    let router = elo_core::http::router(store.clone()).layer(middleware::from_fn(
+    let router = elo_core::http::router(store.clone(), &url).layer(middleware::from_fn(
         move |request: Request, next: Next| {
             let flag = flag.clone();
             async move {
@@ -379,7 +379,7 @@ async fn replica_delivery_survives_lost_ack_restart_and_keeps_approval_explicit(
         "queued"
     );
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-    let router = elo_core::http::router(store.clone());
+    let router = elo_core::http::router(store.clone(), &url);
     server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

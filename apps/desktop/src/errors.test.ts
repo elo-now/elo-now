@@ -3,6 +3,97 @@ import { distinctErrorDetail, presentError } from "./errors";
 import { en } from "./locales/en";
 
 describe("native error presentation", () => {
+  it("explains cleanup errors without implying that logout failed", () => {
+    for (const [reason, key] of [
+      ["profile_logout_notifications_pending", "profile.logoutNotificationsPending"],
+      ["profile_logout_cleanup_pending", "profile.logoutCleanupPending"],
+    ] as const) {
+      expect(presentError(reason)).toEqual({ message: en[key] });
+    }
+  });
+  it("distinguishes device confirmation, wrong password and missing recovery code", () => {
+    for (const [reason, key] of [
+      [
+        "Compare and confirm the code on both devices",
+        "recover.error.pairCode",
+      ],
+      [
+        "device_revocation_confirmation_required",
+        "devices.error.confirmRevocation",
+      ],
+      ["profile_password_required", "devices.error.passwordRequired"],
+      ["The password is incorrect", "error.passwordCheck"],
+      ["recovery_code_required", "devices.error.recoveryRequired"],
+    ] as const) {
+      expect(presentError(reason)).toEqual({ message: en[key] });
+    }
+  });
+  it("distinguishes unreachable servers, denied access, busy services and expired invitations", () => {
+    for (const [reason, key] of [
+      [
+        "Could not connect to this Space. Try again.",
+        "error.replicaConnection",
+      ],
+      ["Space server unreachable.", "error.replicaConnection"],
+      ["This device was revoked.", "error.deviceRevoked"],
+      [
+        "Device linking was interrupted. Create a new code.",
+        "recover.error.pairInterrupted",
+      ],
+      ["Chat permissions need to be refreshed.", "error.chatPermissionsStale"],
+      [
+        "Chat devices have changed. The chat owner needs to update access.",
+        "error.chatDevicesChanged",
+      ],
+      ["Too many pending device changes.", "error.deviceChangesPending"],
+      ["Space server timed out.", "error.serverTimeout"],
+      ["Space server unavailable.", "error.serverUnavailable"],
+      ["Space access denied.", "error.replicaAccess"],
+      ["Space endpoint unavailable.", "error.spaceUnavailable"],
+      ["Space request rejected.", "error.requestRejected"],
+      ["Space server is busy.", "error.serverBusy"],
+      ["Hosting capacity reached.", "error.hostingCapacity"],
+      ["Space hosting unavailable.", "error.hostingUnavailable"],
+      [
+        "This Space invitation has expired or was revoked.",
+        "error.spaceInvitationExpired",
+      ],
+      [
+        "Space roles have changed. Refresh and try again.",
+        "error.spaceRolesChanged",
+      ],
+      ["Invalid Space response.", "error.serverResponse"],
+      ["Invalid exchange handle", "error.exchangeExpired"],
+      ["transport request failed: Http(403)", "error.replicaAccess"],
+      ["transport request failed: Http(503)", "error.serverUnavailable"],
+    ] as const) {
+      for (const error of [
+        reason,
+        new Error(reason),
+        { message: en["error.generic"], cause: { message: reason } },
+      ])
+        expect(presentError(error)).toEqual({ message: en[key] });
+    }
+  });
+
+  it("does not mistake an unavailable endpoint for a deleted Space or expose server diagnostics", () => {
+    expect(presentError("Space endpoint unavailable.").message).not.toBe(
+      en["spaces.error.deleted"],
+    );
+    expect(presentError("This Space was deleted.").message).toBe(
+      en["spaces.error.deleted"],
+    );
+    for (const reason of [
+      "Space server unreachable. token=private-test-token",
+      "Server error at /private/profile with secret test-token",
+      JSON.stringify({
+        message: "<html>Server error</html>",
+        token: "private-test-token",
+      }),
+    ])
+      expect(presentError(reason)).toEqual({ message: en["error.generic"] });
+  });
+
   it("explains a full Space without exposing the HTTP error or duplicate details", () => {
     for (const message of [
       "mailbox quota exceeded",

@@ -196,7 +196,7 @@ async fn foreground_sync_uploads_before_a_stalled_reader_and_restarts_without_du
     // Repeatedly cancelling it must not leave an otherwise valid message queued.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
-    let router = elo_core::http::router(replica.clone()).layer(axum::middleware::from_fn(
+    let router = elo_core::http::router(replica.clone(), &url).layer(axum::middleware::from_fn(
         |request: axum::extract::Request, next: axum::middleware::Next| async move {
             if request.method() == axum::http::Method::POST {
                 tokio::time::sleep(std::time::Duration::from_millis(2300)).await;

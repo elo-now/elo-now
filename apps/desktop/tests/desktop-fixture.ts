@@ -172,6 +172,10 @@ const management = {
 const calls: { command: string; request?: Record<string, any> }[] = [];
 const latency: Record<string, number> = {};
 const failures: Record<string, string> = {};
+const pairing = {
+  request: null as null | { id: string; name: string },
+  accepted: false,
+};
 const transfers = new Map<
   string,
   { resolve: () => void; reject: (error: Error) => void }
@@ -181,6 +185,7 @@ Object.assign(window, {
     calls,
     latency,
     failures,
+    pairing,
     async transferProgress(received: number, total = 1048576) {
       for (const transfer_id of transfers.keys())
         await emit("attachment-transfer-progress", {
@@ -305,6 +310,41 @@ mockIPC(
     if (command.includes("biometry"))
       return { isAvailable: false, biometryType: 0 };
     if (command === "invitation_qr") return [qr];
+    if (
+      command === "profile_task" &&
+      ["device_list", "device_revoke"].includes(args.request?.op)
+    )
+      return {
+        devices: [
+          {
+            id: "1".repeat(64),
+            credential: "synthetic-current-credential",
+            current: true,
+          },
+          {
+            id: "2".repeat(64),
+            credential: "synthetic-other-credential",
+            current: false,
+          },
+        ],
+        pending: calls.some((call) => call.request?.op === "device_revoke")
+          ? 1
+          : 0,
+        unavailable: 0,
+      };
+    if (command === "profile_task" && args.request?.op === "pair_approve") {
+      pairing.accepted = true;
+      return {};
+    }
+    if (command === "profile_task" && args.request?.op === "pair_poll") {
+      return pairing.accepted
+        ? {
+            requests: [],
+            credential: "synthetic-accepted-credential",
+            device_id: "3".repeat(64),
+          }
+        : { requests: pairing.request ? [pairing.request] : [] };
+    }
     if (command === "profile_task")
       return {
         svg: qr,

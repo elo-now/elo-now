@@ -142,7 +142,7 @@ impl Host {
         })
     }
     pub(super) async fn process_account_deletions(&self) -> Result<()> {
-        let Ok(_accounts) = self.accounts.try_lock() else {
+        let Ok(_accounts) = self.accounts.try_write() else {
             return Ok(());
         };
         for entry in std::fs::read_dir(self.config.root.join("account-deletions"))? {
@@ -204,6 +204,9 @@ impl Host {
                 .replica
                 .set_space_members(space.mailbox, client.space_access_members()?)
                 .await?;
+            space
+                .replica
+                .set_admitted_devices(client.space_access_devices()?)?;
             let path = self.config.root.join("spaces").join(&id);
             let reservation_path = path.join("reservation.json");
             let mut reservation: Reservation =
@@ -268,9 +271,17 @@ pub(super) async fn request(
         current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if host
+        .revocations
+        .get(credential.id())
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .is_some()
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let _accounts = host
         .accounts
-        .try_lock()
+        .try_write()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut result = host
         .account_inspect(credential.identity())
@@ -323,9 +334,12 @@ mod tests {
             root: temp.path().join("host"),
             public_url: base.clone(),
             max_spaces_per_identity: 3,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
             call_admission_key: None,
+            client_policy: Default::default(),
             attachment_storage: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
@@ -358,6 +372,9 @@ mod tests {
             .unwrap();
         member.operate(json!({"op":"send","space":chat["space"],"stream":chat["stream"],"text":"Delete this account's message","created_at":"2026-09-15T12:00:00Z"})).await.unwrap();
         member.operate(json!({"op":"sync"})).await.unwrap();
+        // The owner's pre-join configuration must not encrypt new content until
+        // the newly joined member's signed roster has been synchronized.
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
         owner.operate(json!({"op":"send","space":chat["space"],"stream":chat["stream"],"text":"Keep another member's message","created_at":"2026-09-15T12:00:01Z"})).await.unwrap();
         owner.operate(json!({"op":"sync"})).await.unwrap();
         let blocked = owner

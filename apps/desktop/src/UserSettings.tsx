@@ -143,14 +143,18 @@ export function UserSettings({
   }[page];
   return (
     <>
-      {page !== "profile" && page !== "licenses" && page !== "spaces" && (
-        <ScreenHeader
-          title={title}
-          desktopRoot={page !== "edit-profile"}
-          onBack={() => onPage("profile")}
-          backLabel={t("settings.back")}
-        />
-      )}
+      {page !== "profile" &&
+        page !== "licenses" &&
+        page !== "spaces" &&
+        page !== "recovery" &&
+        page !== "devices" && (
+          <ScreenHeader
+            title={title}
+            desktopRoot={page !== "edit-profile"}
+            onBack={() => onPage("profile")}
+            backLabel={t("settings.back")}
+          />
+        )}
       {page === "profile" && (
         <div className="settings-page profile-page" aria-label={title}>
           <div className="profile-content">
@@ -301,9 +305,12 @@ export function UserSettings({
       )}
       {page === "spaces" && spacesPage}
       {page === "blocked-users" && blockedUsersPage}
-      {page === "devices" && <DevicesSettings mobile={mobile} />}
+      {page === "devices" && (
+        <DevicesSettings onBack={() => onPage("profile")} />
+      )}
       {page === "recovery" && (
         <RecoverySettings
+          onBack={() => onPage("profile")}
           mobile={mobile}
           identity={identity}
           demoProfile={demoProfile}
@@ -619,7 +626,7 @@ function AppearanceSettings({
       />
       <button
         type="button"
-        className="settings-toggle"
+        className="settings-toggle hide-avatars-toggle"
         role="switch"
         aria-checked={preferences.hideAvatars}
         onClick={() =>

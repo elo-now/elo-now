@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { t } from "./i18n";
 import { useToast } from "./Toast";
+import { invoke } from "@tauri-apps/api/core";
 
 /** The same recovery material layout during registration and in settings. */
 export function RecoveryCodePanel({
@@ -25,6 +26,7 @@ export function RecoveryCodePanel({
           onChange ? (event) => onChange(event.target.value) : undefined
         }
         readOnly={!onChange}
+        disabled={disabled}
         placeholder={onChange ? t("recover.codePlaceholder") : undefined}
         rows={6}
         maxLength={2048}
@@ -42,7 +44,7 @@ export function RecoveryCodePanel({
             setCopying(true);
             void (async () => {
               try {
-                await navigator.clipboard.writeText(value);
+                await invoke("copy_recovery_code", { text: value });
                 notify(t("onboarding.codeCopied"));
               } catch (error) {
                 reportError(error);

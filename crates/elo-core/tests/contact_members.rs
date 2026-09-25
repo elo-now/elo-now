@@ -53,9 +53,12 @@ async fn server(root: &Path, apps: &mut [&mut ClientApp]) -> tokio::task::JoinHa
             .unwrap();
     }
     tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap();
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap();
     })
 }
 async fn sync(app: &mut ClientApp) {

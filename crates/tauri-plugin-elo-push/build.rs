@@ -14,7 +14,7 @@ fn main() {
     }
 }
 
-fn link_webrtc(root: &std::path::Path) {
+fn xcode_products_directory() -> String {
     let simulator = std::env::var("TARGET")
         .is_ok_and(|target| target.ends_with("-sim") || target.starts_with("x86_64-"));
     let platform = if simulator {
@@ -27,7 +27,13 @@ fn link_webrtc(root: &std::path::Path) {
     } else {
         "Release"
     };
-    let products = format!("{configuration}-{platform}");
+    format!("{configuration}-{platform}")
+}
+
+fn link_webrtc(root: &std::path::Path) {
+    let simulator = std::env::var("TARGET")
+        .is_ok_and(|target| target.ends_with("-sim") || target.starts_with("x86_64-"));
+    let products = xcode_products_directory();
     let directory = [
         root.join("out/Products").join(&products),
         root.join("Products").join(&products),
@@ -60,7 +66,8 @@ fn link_webrtc(root: &std::path::Path) {
 /// not need this and keep the symbols global already.
 fn globalize_xcode_27_bridge_symbols(root: &std::path::Path) {
     let archive = root
-        .join("out/Products/Release-iphoneos")
+        .join("out/Products")
+        .join(xcode_products_directory())
         .join("libtauri-plugin-elo-push.a");
     if !archive.exists() {
         return;

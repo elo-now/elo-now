@@ -317,6 +317,19 @@ impl SwiftLinker {
             command
                 // Build the package (duh)
                 .arg("build")
+                // All package sources in this application are public. Do not
+                // read unrelated publisher credentials while resolving them.
+                .args(["--disable-keychain", "--disable-netrc"])
+                // Cargo's bounded worker count must also bound nested SwiftPM.
+                .args([
+                    "--jobs",
+                    &env::var("NUM_JOBS")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(2)
+                        .clamp(1, 2)
+                        .to_string(),
+                ])
                 // SDK path for regular compilation (idk)
                 .args(["--sdk", sdk_path.trim()])
                 // Release/Debug configuration
@@ -513,8 +526,8 @@ fn globalize_cdecl_symbols(archive: &std::path::Path, package_name: &str) {
             let member = header.rsplit('(').next().unwrap_or(header);
             if let Some(module) = member.strip_suffix(".o") {
                 let normalized_module = norm(module);
-                in_own_member = normalized_module == pkg
-                    || (pkg == "tauri" && normalized_module == "swiftrs");
+                in_own_member =
+                    normalized_module == pkg || (pkg == "tauri" && normalized_module == "swiftrs");
                 continue;
             }
         }

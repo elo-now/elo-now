@@ -368,7 +368,8 @@ impl ClientApp {
             .collect();
         Ok(Packet::Team {
             scope: scope.clone(),
-            ciphertext: STANDARD.encode(authority.seal_snapshot(recipient)?),
+            ciphertext: STANDARD
+                .encode(authority.seal_snapshot_signed(recipient, self.session.signing_key())?),
             contacts,
         })
     }
@@ -528,6 +529,7 @@ impl ClientApp {
             self.authorities.0[i] = merged;
         } else {
             self.pins.push(Pin {
+                personal_seed: Some(false),
                 name: "General".into(),
                 space: scope.space,
                 stream: scope.stream,
@@ -711,9 +713,12 @@ mod tests {
         }
         let transport = Peer::new(peer.clone(), true).unwrap();
         let http = tokio::spawn(async move {
-            axum::serve(listener, crate::http::router(replica))
-                .await
-                .unwrap()
+            {
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                axum::serve(listener, crate::http::router(replica, &origin))
+            }
+            .await
+            .unwrap()
         });
         let mut state = alex.invitation_state().unwrap();
         if route_first {

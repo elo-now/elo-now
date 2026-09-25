@@ -236,7 +236,9 @@ impl ClientApp {
                 Packet::Direct {
                     bundle: bundle.clone(),
                     contact: Box::new(draft.contact.clone().ok_or("Missing sender proof.")?),
-                    ciphertext: STANDARD.encode(authority.seal_snapshot(&recipient)?),
+                    ciphertext: STANDARD.encode(
+                        authority.seal_snapshot_signed(&recipient, self.session.signing_key())?,
+                    ),
                 },
             ));
         }
@@ -382,6 +384,7 @@ impl ClientApp {
             .merge_into_store(None, &self.store, self.session.age_identity(), now()?)
             .await?;
         self.pins.push(Pin {
+            personal_seed: Some(false),
             chat_kind: Some(ChatKind::Direct),
             name,
             space: a.space(),

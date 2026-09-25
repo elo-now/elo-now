@@ -25,7 +25,7 @@ use std::{
     path::Path as FilePath,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tower::ServiceExt;
 mod account_deletion;
 mod calls;
@@ -36,6 +36,10 @@ pub(super) struct HostConfig {
     pub root: PathBuf,
     pub public_url: String,
     pub max_spaces_per_identity: usize,
+    #[serde(default = "default_max_spaces")]
+    pub max_spaces: usize,
+    #[serde(default = "default_daily_creations")]
+    pub max_space_creations_per_day: usize,
     pub mailbox_quota_bytes: u64,
     #[serde(default)]
     pub operator_snapshot: Option<PathBuf>,
@@ -43,7 +47,24 @@ pub(super) struct HostConfig {
     pub call_admission_key: Option<PathBuf>,
     #[serde(default)]
     pub attachment_storage: Option<AttachmentStorageConfig>,
+    #[serde(default)]
+    pub client_policy: elo_core::client_policy::ClientPolicy,
 }
+fn default_max_spaces() -> usize {
+    1000
+}
+fn default_daily_creations() -> usize {
+    100
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct CreationBudget {
+    day: u64,
+    count: usize,
+    #[serde(default)]
+    networks: BTreeMap<String, usize>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reservation {
@@ -72,22 +93,45 @@ struct HostedSpace {
     transport: Router,
     serving: RwLock<bool>,
     client: Mutex<Option<ClientApp>>,
+    command_slots: Semaphore,
     config: ServiceConfig,
     mailbox: elo_core::ids::MailboxId,
 }
 struct Host {
     config: HostConfig,
+    revocations: elo_core::identity::revocations::Revocations,
     call_admission_key: Option<Zeroizing<Vec<u8>>>,
     spaces: RwLock<BTreeMap<String, Arc<HostedSpace>>>,
     // A single admitted creator bounds Argon2 work and makes reservations atomic.
     creation: Mutex<()>,
-    accounts: Mutex<()>,
+    allocations: std::sync::Mutex<BTreeMap<String, Option<IdentityId>>>,
+    accounts: RwLock<()>,
     started: std::time::Instant,
     allow_loopback: bool,
     attachment_storage: Option<Arc<dyn AttachmentStorage>>,
 }
 fn current() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
+}
+fn creation_network(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> String {
+    use std::net::{IpAddr, Ipv4Addr};
+    // Only the local reverse proxy may supply an address. It must overwrite this
+    // header, not append to a client-controlled forwarding chain.
+    let ip = peer
+        .filter(|ip| ip.is_loopback())
+        .and_then(|_| headers.get("x-real-ip"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .or(peer)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let prefix = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => ip.to_string(),
+            None => record::encode_hex(&ip.octets()[..8]),
+        },
+    };
+    record::encode_hex(&Sha256::digest(prefix.as_bytes()))
 }
 fn private_directory(path: &FilePath) -> Result<()> {
     if path.exists() {
@@ -122,6 +166,7 @@ fn reservation_id(creator: IdentityId, request_id: &str) -> String {
 }
 impl Host {
     async fn open(config: HostConfig, allow_loopback: bool) -> Result<Arc<Self>> {
+        config.client_policy.validate()?;
         space_host::validate_host(
             &format!("{}/spaces/v1/create", config.public_url),
             allow_loopback,
@@ -145,11 +190,15 @@ impl Host {
             None => None,
         };
         let host = Arc::new(Self {
+            revocations: elo_core::identity::revocations::Revocations::open(
+                config.root.join("revoked-devices"),
+            )?,
             call_admission_key: calls::load_key(config.call_admission_key.as_deref())?,
             config,
             spaces: RwLock::new(BTreeMap::new()),
             creation: Mutex::new(()),
-            accounts: Mutex::new(()),
+            allocations: std::sync::Mutex::new(BTreeMap::new()),
+            accounts: RwLock::new(()),
             started: std::time::Instant::now(),
             allow_loopback,
             attachment_storage,
@@ -197,6 +246,10 @@ impl Host {
             {
                 return Err("Hosting reservation mismatch.".into());
             }
+            host.allocations
+                .lock()
+                .map_err(|_| "Hosting allocation index unavailable.")?
+                .insert(id.clone(), reservation.creator);
             if entry.path().join("config.json").exists() {
                 let space = host.open_ready(&id, &reservation, None).await?;
                 host.spaces.write().await.insert(id, space);
@@ -227,7 +280,9 @@ impl Host {
         {
             return Err("Hosted Space configuration mismatch.".into());
         }
-        let replica = ReplicaStore::open(path.join("replica")).await?;
+        let replica = ReplicaStore::open(path.join("replica"))
+            .await?
+            .with_revocations(self.revocations.clone());
         if replica.supports_account_erasure().await? {
             replica.require_content_ownership().await?;
         }
@@ -263,12 +318,18 @@ impl Host {
                 client.space_access_members()?,
             )
             .await?;
+        replica.set_admitted_devices(client.space_access_devices()?)?;
         Ok(Arc::new(HostedSpace {
             id: id.to_owned(),
-            transport: elo_core::http::space_router(replica.clone(), id.parse()?),
+            transport: elo_core::http::space_router(
+                replica.clone(),
+                id.parse()?,
+                &self.config.public_url,
+            ),
             replica,
             serving: RwLock::new(true),
             client: Mutex::new(Some(client)),
+            command_slots: Semaphore::new(16),
             mailbox: reservation.mailbox.mailbox_id,
             config,
         }))
@@ -304,13 +365,19 @@ impl Host {
             }
             space.replica.delete_mailbox_tree(deleted.mailbox).await?;
         } else if path.join("replica").exists() {
-            let replica = ReplicaStore::open(path.join("replica")).await?;
+            let replica = ReplicaStore::open(path.join("replica"))
+                .await?
+                .with_revocations(self.revocations.clone());
             replica.delete_mailbox_tree(deleted.mailbox).await?;
         }
         if path.exists() {
             private_directory(&path)?;
             std::fs::remove_dir_all(&path)?;
         }
+        self.allocations
+            .lock()
+            .map_err(|_| "Hosting allocation index unavailable.")?
+            .remove(id);
         // Hosting backups are separated per Space, never a mixed full database.
         let backup = self.config.root.join("backups").join(id);
         if backup.exists() {
@@ -319,10 +386,19 @@ impl Host {
         }
         Ok(deleted.receipt)
     }
+    #[cfg(test)]
     async fn provision(
         &self,
         command: &CreateCommand,
         creator: IdentityId,
+    ) -> Result<(String, Reservation)> {
+        self.provision_from_network(command, creator, None).await
+    }
+    async fn provision_from_network(
+        &self,
+        command: &CreateCommand,
+        creator: IdentityId,
+        network: Option<String>,
     ) -> Result<(String, Reservation)> {
         let id = reservation_id(creator, &command.request_id);
         let path = self.config.root.join("spaces").join(&id);
@@ -339,20 +415,48 @@ impl Host {
         let mut reservation: Reservation = if reservation_path.exists() {
             serde_json::from_slice(&Zeroizing::new(vault::read_private(&reservation_path)?))?
         } else {
-            let entries = std::fs::read_dir(self.config.root.join("spaces"))?
-                .collect::<std::io::Result<Vec<_>>>()?;
-            let mut owned = 0;
-            for entry in &entries {
-                let r: Reservation = serde_json::from_slice(&Zeroizing::new(vault::read_private(
-                    &entry.path().join("reservation.json"),
-                )?))?;
-                if r.creator == Some(creator) {
-                    owned += 1;
-                }
+            let (allocated, owned) = {
+                let index = self
+                    .allocations
+                    .lock()
+                    .map_err(|_| "Hosting allocation index unavailable.")?;
+                (
+                    index.len(),
+                    index.values().filter(|id| **id == Some(creator)).count(),
+                )
+            };
+            if allocated >= self.config.max_spaces {
+                return Err("Hosting capacity reached.".into());
             }
             if owned >= self.config.max_spaces_per_identity {
                 return Err("Hosting capacity reached.".into());
             }
+            // Persist a deployment-wide budget, including identities minted by an attacker.
+            let budget_path = self.config.root.join("creation-budget.json");
+            let mut budget: CreationBudget = if budget_path.exists() {
+                serde_json::from_slice(&vault::read_private(&budget_path)?)?
+            } else {
+                CreationBudget::default()
+            };
+            let day = current()? / 86_400_000;
+            if budget.day != day {
+                budget = CreationBudget {
+                    day,
+                    ..Default::default()
+                };
+            }
+            if budget.count >= self.config.max_space_creations_per_day {
+                return Err("Hosting capacity reached.".into());
+            }
+            if let Some(network) = network {
+                let count = budget.networks.entry(network).or_default();
+                if *count >= 10 {
+                    return Err("Hosting capacity reached.".into());
+                }
+                *count += 1;
+            }
+            budget.count += 1;
+            save(&budget_path, &budget)?;
             let value = Reservation {
                 creator: Some(creator),
                 request_id: command.request_id.clone(),
@@ -374,6 +478,10 @@ impl Host {
             private_directory(&stage)?;
             save(&stage.join("reservation.json"), &value)?;
             std::fs::rename(stage, &path)?;
+            self.allocations
+                .lock()
+                .map_err(|_| "Hosting allocation index unavailable.")?
+                .insert(id.clone(), Some(creator));
             std::fs::File::open(self.config.root.join("spaces"))?.sync_all()?;
             value
         };
@@ -388,7 +496,9 @@ impl Host {
         if !self.spaces.read().await.contains_key(&id) {
             let mut prepared = None;
             if !path.join("config.json").exists() {
-                let replica = ReplicaStore::open(path.join("replica")).await?;
+                let replica = ReplicaStore::open(path.join("replica"))
+                    .await?
+                    .with_revocations(self.revocations.clone());
                 replica
                     .reserve_mailbox(reservation.mailbox.clone(), self.config.mailbox_quota_bytes)
                     .await?;
@@ -469,11 +579,13 @@ impl Host {
 }
 async fn create(
     State(host): State<Arc<Host>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     Json(request): Json<CreateRequest>,
 ) -> std::result::Result<Json<CreateResponse>, StatusCode> {
     let _accounts = host
         .accounts
-        .try_lock()
+        .try_read()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let expected = format!("{}/spaces/v1/create", host.config.public_url);
     let (command, credential) = space_host::verify_create(
@@ -482,6 +594,17 @@ async fn create(
         current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if credential.authorizing_device().is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if host
+        .revocations
+        .get(credential.id())
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .is_some()
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if host.account_requested(credential.identity()) {
         return Err(StatusCode::GONE);
     }
@@ -490,7 +613,11 @@ async fn create(
         .try_lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let (_, reservation) = host
-        .provision(&command, credential.identity())
+        .provision_from_network(
+            &command,
+            credential.identity(),
+            Some(creation_network(peer.map(|peer| peer.0.0.ip()), &headers)),
+        )
         .await
         .map_err(|e| {
             if e.to_string() == "Hosting capacity reached." {
@@ -517,7 +644,7 @@ async fn command(
 ) -> std::result::Result<axum::response::Response, StatusCode> {
     let _accounts = host
         .accounts
-        .try_lock()
+        .try_read()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let _: ObjectId = id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
     if elo_core::app::space_service::request_identity(&request)
@@ -552,11 +679,32 @@ async fn command(
         .get(&id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
-    let mut guard = space
-        .client
-        .try_lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    // Brief membership delivery must not make a healthy Space unavailable.
+    // Bound both the queue and wait; no client retry or extra request is needed.
+    let _slot = space
+        .command_slots
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let mut guard = tokio::time::timeout(Duration::from_secs(2), space.client.lock())
+        .await
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let client = guard.as_mut().ok_or(StatusCode::GONE)?;
+    if let Some(encoded) = request.credential.as_ref() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let record =
+            elo_core::record::SignedRecord::parse(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if host
+            .revocations
+            .get(record.id())
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .is_some()
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
     if let Some(receipt) = client
         .authorize_space_deletion(&space.config, &request)
         .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -598,6 +746,14 @@ async fn command(
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
         )
         .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    space
+        .replica
+        .set_admitted_devices(
+            client
+                .space_access_devices()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+        )
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     reply
         .map(|r| Json(r).into_response())
@@ -649,8 +805,14 @@ async fn attachment_upload(
             return StatusCode::GONE;
         };
         match client.attachment_upload_grant(&token, current().unwrap_or_default()) {
-            Ok(grant) => grant,
-            Err(_) => return StatusCode::UNAUTHORIZED,
+            Ok(grant)
+                if grant
+                    .credential
+                    .is_some_and(|id| host.revocations.get(id).is_ok_and(|p| p.is_none())) =>
+            {
+                grant
+            }
+            _ => return StatusCode::UNAUTHORIZED,
         }
     };
     if headers
@@ -728,6 +890,14 @@ async fn attachment_upload(
         let _ = storage.delete(&id, &grant.object_id.to_string()).await;
         return StatusCode::GONE;
     };
+    if !grant
+        .credential
+        .is_some_and(|id| host.revocations.get(id).is_ok_and(|proof| proof.is_none()))
+    {
+        let _ = storage.delete(&id, &grant.object_id.to_string()).await;
+        let _ = client.attachment_mark_missing(grant.attachment_id);
+        return StatusCode::UNAUTHORIZED;
+    }
     match client.attachment_upload_complete(&token, current().unwrap_or_default()) {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(_) => {
@@ -763,8 +933,14 @@ async fn attachment_download(
             return StatusCode::GONE.into_response();
         };
         match client.attachment_download_grant(&token, current().unwrap_or_default()) {
-            Ok(grant) => grant,
-            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+            Ok(grant)
+                if grant
+                    .credential
+                    .is_some_and(|id| host.revocations.get(id).is_ok_and(|p| p.is_none())) =>
+            {
+                grant
+            }
+            _ => return StatusCode::UNAUTHORIZED.into_response(),
         }
     };
     let stored = match storage.get(&id, &grant.object_id.to_string()).await {
@@ -901,6 +1077,7 @@ async fn replica_request(
 
 fn app(host: Arc<Host>) -> Router {
     Router::new()
+        .route(elo_core::client_policy::PATH, get(client_policy))
         .route("/spaces/v1/create", post(create))
         .route(
             elo_core::app::account_deletion::PATH,
@@ -923,6 +1100,14 @@ fn app(host: Arc<Host>) -> Router {
         .layer(DefaultBodyLimit::max(space_host::CREATE_LIMIT))
         .fallback(replica_request)
         .with_state(host)
+}
+async fn client_policy(State(host): State<Arc<Host>>) -> impl IntoResponse {
+    // No identity, device ID or authentication is needed for discovery.
+    // Unknown additive fields must be ignored by clients of this v1 schema.
+    let mut value = serde_json::to_value(&host.config.client_policy).unwrap();
+    value["api"] = json!({"hosting":[1],"replica":[1],"calls":[1],"notifications":[1]});
+    value["security"] = json!({"mailbox_request_proof":2,"retention_access":2,"voip_ownership":1,"space_creation_work":1});
+    ([(header::CACHE_CONTROL, "no-store")], Json(value))
 }
 pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<()> {
     if !bind.ip().is_loopback() || bind.port() == 65535 {
@@ -979,11 +1164,14 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
         tokio::net::TcpListener::bind(std::net::SocketAddr::new(bind.ip(), bind.port() + 1))
             .await?;
     let operator_task = tokio::spawn(async move { axum::serve(operator_listener, operator).await });
-    let result = axum::serve(public_listener, app(host.clone()))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await;
+    let result = axum::serve(
+        public_listener,
+        app(host.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
     task.abort();
     operator_task.abort();
     let _ = task.await;
@@ -1040,6 +1228,176 @@ mod tests {
         drop(host);
     }
     #[tokio::test]
+    async fn public_release_policy_preserves_v1_contract_without_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        // Older operator configurations omit the additive policy field.
+        let config: HostConfig = serde_json::from_value(json!({
+            "root": temp.path().join("host"),
+            "public_url": "https://host.example.test",
+            "max_spaces_per_identity": 2,
+            "mailbox_quota_bytes": 150_000_000
+        }))
+        .unwrap();
+        let host = Host::open(config, false).await.unwrap();
+        let response = app(host.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(elo_core::client_policy::PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), elo_core::client_policy::MAX_BYTES)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["api"]["hosting"], json!([1]));
+        assert_eq!(value["security"]["mailbox_request_proof"], 2);
+        assert_eq!(value["security"]["space_creation_work"], 1);
+        // A v1 client can ignore additional capability fields.
+        let policy: elo_core::client_policy::ClientPolicy = serde_json::from_slice(&bytes).unwrap();
+        policy.validate().unwrap();
+        assert!(policy.platforms.values().all(|p| p.minimum.is_none()));
+        close_host(host).await;
+    }
+
+    #[tokio::test]
+    async fn hosting_capacity_and_daily_budget_apply_across_creator_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = HostConfig {
+            root: temp.path().join("host"),
+            public_url: "https://host.example.test".into(),
+            max_spaces_per_identity: 2,
+            max_spaces: 0,
+            max_space_creations_per_day: 1,
+            mailbox_quota_bytes: 150_000_000,
+            operator_snapshot: None,
+            call_admission_key: None,
+            client_policy: Default::default(),
+            attachment_storage: None,
+        };
+        let command = CreateCommand {
+            v: 1,
+            kind: "space.create".into(),
+            host: "https://host.example.test/spaces/v1/create".into(),
+            request_id: "11".repeat(16),
+            issued: current().unwrap(),
+            name: "Capacity test".into(),
+            contact_email: "owner@example.test".into(),
+            message_lifetime_seconds: 86400,
+        };
+        let host = Host::open(config.clone(), false).await.unwrap();
+        for id in ["11", "22"] {
+            let error = host
+                .provision(&command, id.repeat(32).parse().unwrap())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "Hosting capacity reached.");
+        }
+        assert_eq!(
+            std::fs::read_dir(config.root.join("spaces"))
+                .unwrap()
+                .count(),
+            0
+        );
+        save(
+            &config.root.join("creation-budget.json"),
+            &CreationBudget {
+                day: current().unwrap() / 86_400_000,
+                count: 1,
+                networks: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        close_host(host).await;
+        let host = Host::open(
+            HostConfig {
+                max_spaces: 1000,
+                ..config.clone()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        for id in ["33", "44"] {
+            let error = host
+                .provision(&command, id.repeat(32).parse().unwrap())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "Hosting capacity reached.");
+        }
+        close_host(host).await;
+
+        let network = creation_network(Some("192.0.2.1".parse().unwrap()), &HeaderMap::new());
+        save(
+            &config.root.join("creation-budget.json"),
+            &CreationBudget {
+                day: current().unwrap() / 86_400_000,
+                count: 10,
+                networks: BTreeMap::from([(network.clone(), 10)]),
+            },
+        )
+        .unwrap();
+        let host = Host::open(
+            HostConfig {
+                max_spaces: 1000,
+                max_space_creations_per_day: 100,
+                ..config
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        for id in ["55", "66"] {
+            let error = host
+                .provision_from_network(
+                    &command,
+                    id.repeat(32).parse().unwrap(),
+                    Some(network.clone()),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "Hosting capacity reached.");
+        }
+        let other = creation_network(Some("192.0.2.2".parse().unwrap()), &HeaderMap::new());
+        host.provision_from_network(&command, "77".repeat(32).parse().unwrap(), Some(other))
+            .await
+            .unwrap();
+        close_host(host).await;
+    }
+
+    #[test]
+    fn creation_network_groups_ipv6_and_does_not_trust_external_forwarding() {
+        let headers = HeaderMap::new();
+        let a = creation_network(Some("2001:db8:abcd:12::1".parse().unwrap()), &headers);
+        let b = creation_network(Some("2001:db8:abcd:12:ffff::2".parse().unwrap()), &headers);
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            creation_network(Some("2001:db8:abcd:13::1".parse().unwrap()), &headers)
+        );
+        assert_eq!(
+            creation_network(Some("::ffff:192.0.2.1".parse().unwrap()), &headers),
+            creation_network(Some("192.0.2.1".parse().unwrap()), &headers)
+        );
+        let mut forged = HeaderMap::new();
+        forged.insert("x-real-ip", "203.0.113.1".parse().unwrap());
+        assert_eq!(
+            a,
+            creation_network(Some("2001:db8:abcd:12::1".parse().unwrap()), &forged)
+        );
+        assert_eq!(
+            creation_network(Some("127.0.0.1".parse().unwrap()), &forged),
+            creation_network(Some("203.0.113.1".parse().unwrap()), &headers)
+        );
+    }
+    #[tokio::test]
     async fn device_link_uses_selected_space_and_transfers_the_entire_profile() {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use elo_core::app::pairing::{PREFIX, PairSource, PairTarget};
@@ -1051,9 +1409,12 @@ mod tests {
                 root: temp.path().join("host"),
                 public_url: base.clone(),
                 max_spaces_per_identity: 3,
+                max_spaces: default_max_spaces(),
+                max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 256 * 1024 * 1024,
                 operator_snapshot: None,
                 call_admission_key: None,
+                client_policy: Default::default(),
                 attachment_storage: None,
             },
             true,
@@ -1061,7 +1422,18 @@ mod tests {
         .await
         .unwrap();
         let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
-        let mut owner = profile(&temp.path().join("owner")).await;
+        let draft = elo_core::app::ProfileDraft::new().unwrap();
+        let card: elo_core::vault::RecoveryCard =
+            serde_json::from_value(serde_json::to_value(draft.card()).unwrap()).unwrap();
+        let client = draft
+            .save_named(temp.path().join("owner"), PASSWORD.into(), "Test", "Test")
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        let mut owner = ClientApp::open(temp.path().join("owner"), PASSWORD.into(), true)
+            .await
+            .unwrap();
+        owner.begin_space_setup().await.unwrap();
         assert_eq!(
             PairSource::new(&owner).await.err().unwrap().to_string(),
             "Connect to a Space before linking a device."
@@ -1099,14 +1471,51 @@ mod tests {
             .operate(json!({"op":"space_select","id":ids[0]}))
             .await
             .unwrap();
+        owner
+            .operate(json!({"op":"create_chat","name":"Device keys","chat_kind":"chat"}))
+            .await
+            .unwrap();
+        let private_chat = owner.view().await.unwrap()["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|chat| chat["name"] == "Device keys")
+            .unwrap()
+            .clone();
+        owner.name_current_device("Test Mac").unwrap();
+        let mut rejected_source = PairSource::new(&owner).await.unwrap();
+        let mut rejected_target =
+            PairTarget::new(&rejected_source.link().unwrap(), "Rejected phone", true).unwrap();
+        rejected_target.send().await.unwrap();
+        let rejected = rejected_source.poll().await.unwrap();
+        rejected_source
+            .reject(rejected["requests"][0]["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected_target.poll().await.unwrap_err().to_string(),
+            "Device linking was declined."
+        );
         let mut source = PairSource::new(&owner).await.unwrap();
         let link = source.link().unwrap();
-        let offer: Value = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
+        assert!(
+            link.len() <= 2331,
+            "pairing QR payload has {} bytes",
+            link.len()
+        );
+        let unpack = |link: &str| -> Value {
+            let packed = URL_SAFE_NO_PAD
                 .decode(link.strip_prefix(PREFIX).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+                .unwrap();
+            let mut plain = Vec::new();
+            std::io::Read::read_to_end(
+                &mut flate2::read::ZlibDecoder::new(packed.as_slice()),
+                &mut plain,
+            )
+            .unwrap();
+            serde_json::from_slice(&plain).unwrap()
+        };
+        let offer = unpack(&link);
         let selected = owner.view().await.unwrap()["replicas"][0]["id"].clone();
         let descriptor: PeerDescriptor = serde_json::from_value(offer["mailbox"].clone()).unwrap();
         assert_eq!(
@@ -1117,19 +1526,20 @@ mod tests {
         target.send().await.unwrap();
         let pending = source.poll().await.unwrap();
         let request = &pending["requests"][0];
-        let code = target.summary().unwrap()["code"]
-            .as_str()
-            .unwrap()
-            .to_owned();
         source
-            .approve(&owner, request["id"].as_str().unwrap(), &code)
+            .accept(&owner, request["id"].as_str().unwrap())
             .await
             .unwrap();
         target.poll().await.unwrap();
         let mut linked = target
-            .finish(temp.path().join("linked"), PASSWORD.into(), &code)
+            .finish_linked(temp.path().join("linked"))
             .await
             .unwrap();
+        assert!(linked.password_matches(&PASSWORD.into()));
+        assert!(
+            PairSource::new(&linked).await.is_err(),
+            "companions cannot delegate again"
+        );
         linked.enable_spaces().await.unwrap();
         assert_eq!(linked.identity_id(), owner.identity_id());
         assert_eq!(linked.connected_space_ids().len(), 2);
@@ -1154,6 +1564,208 @@ mod tests {
                 "device transfer retains each Space's separate history"
             );
         }
+        assert_ne!(
+            linked.view().await.unwrap()["credential"],
+            owner.view().await.unwrap()["credential"]
+        );
+        owner
+            .operate(json!({"op":"space_select","id":ids[0]}))
+            .await
+            .unwrap();
+        linked
+            .operate(json!({"op":"space_select","id":ids[0]}))
+            .await
+            .unwrap();
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        assert_eq!(
+            owner.linked_devices().await.unwrap()["devices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "both devices enrolled before recipient refresh"
+        );
+        for _ in 0..3 {
+            owner.operate(json!({"op":"sync"})).await.unwrap();
+            linked.operate(json!({"op":"sync"})).await.unwrap();
+        }
+        let current = owner.view().await.unwrap();
+        let updated = current["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|chat| chat["stream"] == private_chat["stream"])
+            .unwrap();
+        assert_eq!(
+            updated["members"][0]["credential_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "private chats adopt the paired device's independent key"
+        );
+        linked.operate(json!({"op":"send","space":private_chat["space"],"stream":private_chat["stream"],"text":"From the independent device","created_at":"2026-09-21T10:01:00Z"})).await.unwrap();
+        owner
+            .operate(json!({"op":"create_chat","name":"After pairing","chat_kind":"chat"}))
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            owner.operate(json!({"op":"sync"})).await.unwrap();
+            linked.operate(json!({"op":"sync"})).await.unwrap();
+            if linked.view().await.unwrap()["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|chat| chat["name"] == "After pairing")
+            {
+                break;
+            }
+        }
+        assert!(
+            linked.view().await.unwrap()["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|chat| chat["name"] == "After pairing"),
+            "new conversations from the same profile reach its independent device"
+        );
+        let roster = owner.linked_devices().await.unwrap();
+        assert_eq!(roster["devices"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            roster["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["current"] == false)
+                .unwrap()["name"],
+            "New device"
+        );
+        assert_eq!(linked.linked_devices().await.unwrap()["can_link"], false);
+        let retired = roster["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["current"] == false)
+            .unwrap();
+        let retired_id: elo_core::ids::RecordId = retired["id"].as_str().unwrap().parse().unwrap();
+        let original = roster["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["current"] == true)
+            .unwrap();
+        let original_id: elo_core::ids::RecordId =
+            original["id"].as_str().unwrap().parse().unwrap();
+        // A valid credential for the profile is insufficient without admission
+        // of this exact requesting device in the hosted Space.
+        {
+            use base64::engine::general_purpose::STANDARD;
+            use elo_core::{
+                identity::{DeviceRevocation, VerifiedCredential},
+                record::{self, SignedRecord},
+                vault::Session,
+            };
+            let unadmitted = Session::recover(&card, owner.identity_id()).unwrap();
+            let root = card.recover_root(owner.identity_id()).unwrap();
+            let target = VerifiedCredential::verify(
+                &STANDARD
+                    .decode(retired["credential"].as_str().unwrap())
+                    .unwrap(),
+                &root.verifying_key(),
+            )
+            .unwrap();
+            let proof = DeviceRevocation::issue_from_device(
+                unadmitted.credential(),
+                unadmitted.signing_key(),
+                &target,
+            )
+            .unwrap();
+            let service = host.spaces.read().await.values().next().unwrap().clone();
+            let nonce = record::random_hex::<16>().unwrap();
+            let command = SignedRecord::sign(
+                &serde_json::to_vec(&json!({
+                    "v":1,"kind":"space.command","space":service.config.address.scope.space,
+                    "nonce":nonce,"issued":super::current().unwrap(),"action":"device_revoke",
+                    "body":{"proof":STANDARD.encode(proof.bytes())}
+                }))
+                .unwrap(),
+                unadmitted.signing_key(),
+            )
+            .unwrap();
+            let reply = service
+                .client
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .serve_hosted_space(
+                    &service.config,
+                    elo_core::app::space_service::Request {
+                        nonce,
+                        invitation: None,
+                        record: Some(STANDARD.encode(command.bytes())),
+                        credential: Some(STANDARD.encode(unadmitted.credential().record().bytes())),
+                    },
+                    &service.replica,
+                )
+                .await
+                .unwrap();
+            use elo_core::crypto::DecryptionIdentity;
+            let encrypted = STANDARD.decode(reply.ciphertext.unwrap()).unwrap();
+            let decryptor = age::Decryptor::new(encrypted.as_slice()).unwrap();
+            let mut reader = decryptor
+                .decrypt(unadmitted.age_identity().identities().into_iter())
+                .unwrap();
+            let mut plain = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut plain).unwrap();
+            let rejected: Value = serde_json::from_slice(&plain).unwrap();
+            assert_eq!(
+                rejected["error"],
+                "Join this Space using an invitation first."
+            );
+            assert!(host.revocations.get(retired_id).unwrap().is_none());
+        }
+        let result = owner
+            .revoke_linked_device(retired["credential"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result["pending"], 0);
+        assert_eq!(result["devices"].as_array().unwrap().len(), 1);
+        let denied = linked
+            .revoke_linked_device(original["credential"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            denied["pending"].as_u64().unwrap() > 0,
+            "a retired sender cannot complete another removal"
+        );
+        assert!(host.revocations.get(original_id).unwrap().is_none());
+        assert!(
+            linked
+                .call_account_deletion(
+                    &format!("{base}/accounts/v1/deletion"),
+                    elo_core::app::account_deletion::Action::Inspect
+                )
+                .await
+                .is_err(),
+            "a retired device cannot inspect or delete the account"
+        );
+        let stale = owner.operate(json!({"op":"send","space":private_chat["space"],"stream":private_chat["stream"],"text":"Must not encrypt to retired device","created_at":"2026-09-21T10:02:00Z"})).await.unwrap_err();
+        assert!(
+            stale.to_string().contains("Chat devices have changed")
+                || stale.to_string().contains("Chat permissions")
+        );
+        assert!(
+            !owner
+                .view()
+                .await
+                .unwrap()
+                .to_string()
+                .contains("Must not encrypt to retired device")
+        );
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        owner.operate(json!({"op":"sync"})).await.unwrap();
+        owner.operate(json!({"op":"send","space":private_chat["space"],"stream":private_chat["stream"],"text":"Only current devices","created_at":"2026-09-21T10:03:00Z"})).await.unwrap();
         // Disconnect must never fall back to the former root mailbox or a stale
         // child. Another joined Space remains a valid pairing transport.
         owner
@@ -1161,12 +1773,7 @@ mod tests {
             .await
             .unwrap();
         let next = PairSource::new(&owner).await.unwrap().link().unwrap();
-        let next: Value = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(next.strip_prefix(PREFIX).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+        let next = unpack(&next);
         let selected = owner.view().await.unwrap()["replicas"][0]["id"].clone();
         let descriptor: PeerDescriptor = serde_json::from_value(next["mailbox"].clone()).unwrap();
         assert_eq!(
@@ -1182,7 +1789,17 @@ mod tests {
         owner.close().await.unwrap();
         task.abort();
         let _ = task.await;
+        let restart_config = host.config.clone();
         close_host(host).await;
+        let restarted = Host::open(restart_config, true).await.unwrap();
+        assert!(
+            restarted.revocations.get(retired_id).unwrap().is_some(),
+            "host restart preserves the global device ban"
+        );
+        for space in restarted.spaces.read().await.values() {
+            assert!(space.replica.require_active_device(retired_id).is_err());
+        }
+        close_host(restarted).await;
     }
 
     #[tokio::test]
@@ -1195,9 +1812,12 @@ mod tests {
             root: temp.path().join("host"),
             public_url: base.clone(),
             max_spaces_per_identity: 3,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
             call_admission_key: None,
+            client_policy: Default::default(),
             attachment_storage: Some(AttachmentStorageConfig::Local {
                 root: external.clone(),
             }),
@@ -1447,9 +2067,12 @@ mod tests {
             root: temp.path().join("host"),
             public_url: base.clone(),
             max_spaces_per_identity: 2,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
             call_admission_key: None,
+            client_policy: Default::default(),
             attachment_storage: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
@@ -1692,13 +2315,31 @@ mod tests {
             root: temp.path().join("hosting"),
             public_url: base.clone(),
             max_spaces_per_identity: 1,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
             call_admission_key: None,
+            client_policy: Default::default(),
             attachment_storage: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
-        let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
+        let fail_first_join = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail = fail_first_join.clone();
+        let router = app(host.clone()).layer(axum::middleware::from_fn(
+            move |request: Request, next: axum::middleware::Next| {
+                let fail = fail.clone();
+                async move {
+                    if request.uri().path().ends_with("/team/v1/spaces")
+                        && fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+        let task = tokio::spawn(axum::serve(listener, router).into_future());
         let mut owner = profile(&temp.path().join("owner")).await;
         let mut guest = profile(&temp.path().join("guest")).await;
         assert!(
@@ -1712,6 +2353,23 @@ mod tests {
         invalid["contact_email"] = json!("owner@example.test\r\nBcc: stranger@example.test");
         assert!(owner.operate(invalid).await.is_err());
         assert_eq!(host.spaces.read().await.len(), 0);
+        assert_eq!(
+            owner
+                .operate(create.clone())
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "Space server unavailable."
+        );
+        assert_eq!(host.spaces.read().await.len(), 1);
+        assert!(owner.view().await.unwrap()["space_creation"].is_null());
+        owner.close().await.unwrap();
+        owner = ClientApp::open(temp.path().join("owner"), PASSWORD.into(), true)
+            .await
+            .unwrap();
+        owner.enable_spaces().await.unwrap();
+        // The quota is one: recreating instead of resuming would fail here.
         let first = owner.operate(create.clone()).await.unwrap();
         assert_eq!(
             first["view"]["spaces"][0]["contact_email"],
@@ -1729,6 +2387,41 @@ mod tests {
             space
         );
         assert_eq!(host.spaces.read().await.len(), 1);
+        let hosted = host.spaces.read().await.values().next().unwrap().clone();
+        let invite_request = json!({"op":"space_invite","id":space,"body":{"lifetime":86400,"require_approval":true}});
+        {
+            let guard = hosted.client.lock().await;
+            let pending = owner.operate(invite_request.clone());
+            tokio::pin!(pending);
+            tokio::select! {
+                result = &mut pending => panic!("brief contention must wait, got {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            drop(guard);
+            pending.await.unwrap();
+        }
+        // A stuck worker or full queue must still have a bounded failure mode.
+        let guard = hosted.client.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            owner.operate(invite_request.clone()),
+        )
+        .await
+        .expect("Space command waited beyond its server budget");
+        assert_eq!(result.err().unwrap().to_string(), "Space server is busy.");
+        drop(guard);
+        let slots = hosted.command_slots.acquire_many(16).await.unwrap();
+        assert_eq!(
+            owner
+                .operate(invite_request)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "Space server is busy."
+        );
+        drop(slots);
+        drop(hosted);
         owner.close().await.unwrap();
         task.abort();
         let _ = task.await;
@@ -1844,7 +2537,13 @@ mod tests {
             .unwrap()
             .replica
             .clone();
-        let fixture = b"PUBLIC HOSTED CONTROL FIXTURE".to_vec();
+        let fixture_author = elo_core::vault::Session::create().unwrap().0;
+        let fixture = elo_core::erasure::wrap(
+            b"PUBLIC HOSTED CONTROL FIXTURE".to_vec(),
+            fixture_author.credential(),
+            fixture_author.signing_key(),
+        )
+        .unwrap();
         replica
             .post(
                 transport.mailbox_id,
@@ -1945,12 +2644,21 @@ mod tests {
         let payload = vec![42u8; 100];
         let object = ObjectId::of_ciphertext(&payload);
         replica
-            .post(
+            .post_authenticated(
                 child.descriptor.mailbox_id,
                 child.descriptor.write_token.clone(),
                 object,
                 payload,
                 elo_core::replica::TransferHint::Eager,
+                false,
+                Some(elo_core::retention_access::Actor {
+                    identity: guest.identity_id(),
+                    credential: guest.view().await.unwrap()["credential"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                }),
             )
             .await
             .unwrap();
@@ -2078,9 +2786,12 @@ mod tests {
             root: temp.path().join("node-a"),
             public_url: base.clone(),
             max_spaces_per_identity: 3,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
             call_admission_key: None,
+            client_policy: Default::default(),
             attachment_storage: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
@@ -2121,7 +2832,12 @@ mod tests {
         let peer = Peer::new(descriptor.clone(), true)
             .unwrap()
             .with_identity(&session);
-        let payload = b"synthetic persisted object before relocation".to_vec();
+        let payload = elo_core::erasure::wrap(
+            b"synthetic persisted object before relocation".to_vec(),
+            session.credential(),
+            session.signing_key(),
+        )
+        .unwrap();
         let object = ObjectId::of_ciphertext(&payload);
         host.spaces.read().await[&id]
             .replica
@@ -2199,7 +2915,12 @@ mod tests {
         let after = peer.inventory(0).await.unwrap();
         assert_eq!(before.storage_generation, after.storage_generation);
         assert_eq!(before.head, after.head);
-        let new_payload = b"synthetic object after relocation".to_vec();
+        let new_payload = elo_core::erasure::wrap(
+            b"synthetic object after relocation".to_vec(),
+            session.credential(),
+            session.signing_key(),
+        )
+        .unwrap();
         let new_id = ObjectId::of_ciphertext(&new_payload);
         node_b.spaces.read().await[&id]
             .replica

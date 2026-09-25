@@ -81,9 +81,12 @@ async fn message_backup_keeps_file_messages_without_sent_or_downloaded_content()
     app.ensure_peer(descriptor.clone()).unwrap();
     owner.ensure_peer(descriptor).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, crate::http::router(replica))
-            .await
-            .unwrap();
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, crate::http::router(replica, &origin))
+        }
+        .await
+        .unwrap();
     });
     let sent = temp.path().join("sent.txt");
     let received = temp.path().join("received.txt");
@@ -139,7 +142,10 @@ async fn message_backup_keeps_file_messages_without_sent_or_downloaded_content()
     let before = app.store.backup_image(8 * 1024 * 1024).await.unwrap();
     let backup = app.export_profile(PASSWORD.into()).await.unwrap();
     // Trusted device linking remains a separate complete copy.
-    let device_copy = app.export_device_copy(PASSWORD.into()).await.unwrap();
+    let device_copy = app
+        .export_device_copy(PASSWORD.into(), &app.session)
+        .await
+        .unwrap();
     assert!(device_copy.len() > backup.len() + 100_000);
     assert_eq!(
         app.store.backup_image(8 * 1024 * 1024).await.unwrap(),
@@ -586,4 +592,103 @@ async fn chat_type_creation_is_validated_and_legacy_dm_migration_is_durable() {
     owner.close().await.unwrap();
     alice.close().await.unwrap();
     bob.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn personal_seed_stays_hidden_after_device_updates_without_hiding_real_chats() {
+    let temp = TempDir::new().unwrap();
+    let draft = ProfileDraft::new().unwrap();
+    let mut app = draft
+        .save(temp.path().join("profile"), PASSWORD.into(), "General")
+        .await
+        .unwrap();
+    app.allow_loopback = true;
+    app.create_chat("General", None, ChatKind::Chat)
+        .await
+        .unwrap();
+    let seed = app.pins[0].clone();
+    let ordinary = app.pins[1].clone();
+    let foreign = profile(temp.path().join("foreign")).await;
+    let descriptor = team::TeamDescriptor {
+        v: 1,
+        url: "http://127.0.0.1:9/team/v1/enroll".into(),
+        token: "ab".repeat(32),
+        scope: foreign.team_scope().unwrap(),
+        message_lifetime_seconds: 86400,
+    };
+    app.configure_team(descriptor.clone()).unwrap();
+    let authority = &mut app.authorities.0[0];
+    let mut config = authority.head().unwrap().clone();
+    config.sequence += 1;
+    config.previous_config_id = authority.head_id();
+    config.nonce = record::random_hex::<16>().unwrap();
+    config.action.operation = "replace".into();
+    authority
+        .commit_update(
+            &app.store,
+            config.sign(app.session.signing_key()).unwrap(),
+            app.session.age_identity(),
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+    // Reproduce an existing seed written before the explicit marker existed.
+    app.pins[0].personal_seed = None;
+    app.persist_workspace().unwrap();
+    app.close().await.unwrap();
+    let mut app = ClientApp::open(temp.path().join("profile"), PASSWORD.into(), true)
+        .await
+        .unwrap();
+    app.configure_team(descriptor).unwrap();
+    assert_eq!(app.pins[0].personal_seed, Some(true));
+    assert_eq!(app.pins[1].personal_seed, Some(false));
+    app.pins.swap(0, 1);
+    app.authorities.0.swap(0, 1);
+    for paged in [false, true] {
+        if paged {
+            app.enable_paged_views();
+        }
+        let view = app.view().await.unwrap();
+        assert_eq!(view["streams"].as_array().unwrap().len(), 1);
+        assert_eq!(view["streams"][0]["stream"], json!(ordinary.stream));
+    }
+    let recovered =
+        ProfileDraft::recover(&draft.card().phrase, &draft.card().identity_id.to_string())
+            .unwrap()
+            .save(temp.path().join("recovered"), PASSWORD.into(), "General")
+            .await
+            .unwrap();
+    let request = recovered.control_recovery_request();
+    let choices = app.control_recovery_choices(&request).await.unwrap();
+    assert_eq!(choices["chats"].as_array().unwrap().len(), 1);
+    assert_eq!(choices["chats"][0]["stream"], json!(ordinary.stream));
+    assert!(
+        app.control_recovery_export(
+            &request,
+            seed.space,
+            seed.stream,
+            recovered.control_recovery_device()
+        )
+        .await
+        .is_err()
+    );
+    app.operate(json!({"op":"send", "space":seed.space, "stream":seed.stream, "text":"Preserve existing history", "created_at":"2026-09-25T09:00:00Z"})).await.unwrap();
+    assert_eq!(
+        app.view().await.unwrap()["streams"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "a seed with real history stays accessible"
+    );
+    assert_eq!(
+        app.control_recovery_choices(&request).await.unwrap()["chats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    recovered.close().await.unwrap();
+    foreign.close().await.unwrap();
+    app.close().await.unwrap();
 }

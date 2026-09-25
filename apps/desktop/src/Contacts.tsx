@@ -18,7 +18,6 @@ export function Contacts({
   busy,
   onPerson,
   onScan,
-  onMessages,
   onCode,
 }: {
   view: View;
@@ -27,7 +26,6 @@ export function Contacts({
   busy: boolean;
   onPerson: (id: string, name: string) => void;
   onScan: () => void;
-  onMessages: () => void;
   onCode: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -39,24 +37,24 @@ export function Contacts({
     <section className="contacts-page content-pane">
       <ScreenHeader
         title={t("nav.contacts")}
+        search={
+          <SearchField
+            label={t("contacts.search")}
+            value={query}
+            onChange={setQuery}
+          />
+        }
         actions={
           <>
-            <button
-              className="icon"
-              aria-label={t("invite.myCode")}
-              onClick={onCode}
-            >
-              <Icon name="qr" />
-            </button>
-            <span className="desktop-only">
+            {mobile && (
               <button
                 className="icon"
-                aria-label={t("nav.chats")}
-                onClick={onMessages}
+                aria-label={t("invite.myCode")}
+                onClick={onCode}
               >
-                <Icon name="chats" />
+                <Icon name="qr" />
               </button>
-            </span>
+            )}
             <button
               type="button"
               className="icon"
@@ -70,13 +68,6 @@ export function Contacts({
         }
       />
       <PageContent className="contacts-viewport">
-        <div className="contacts-desktop-toolbar desktop-only">
-          <SearchField
-            label={t("contacts.search")}
-            value={query}
-            onChange={setQuery}
-          />
-        </div>
         <div className="contacts-list">
           {visible.length ? (
             <ul className="dm-people">

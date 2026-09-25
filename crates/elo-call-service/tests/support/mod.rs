@@ -15,6 +15,7 @@ pub const NOW: u64 = 1_800_000_000;
 
 pub struct Fixture {
     pub owner: Session,
+    pub owner_recovery: elo_core::vault::RecoveryCard,
     pub peer: Session,
     pub peer_device: Session,
     pub third: Session,
@@ -115,6 +116,7 @@ impl Fixture {
             .unwrap();
         Self {
             owner,
+            owner_recovery: card,
             peer,
             peer_device,
             third,

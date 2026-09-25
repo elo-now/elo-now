@@ -1,4 +1,5 @@
 use super::*;
+mod authorization;
 #[derive(Default)]
 struct Fake {
     sent: Mutex<Vec<Notice>>,
@@ -24,13 +25,20 @@ fn headers(key: &str) -> HeaderMap {
     h.insert("authorization", format!("Bearer {key}").parse().unwrap());
     h
 }
+fn test_sender() -> &'static elo_core::vault::Session {
+    static SENDER: std::sync::OnceLock<elo_core::vault::Session> = std::sync::OnceLock::new();
+    SENDER.get_or_init(|| elo_core::vault::Session::create().unwrap().0)
+}
+fn test_sender_tag(route: &str) -> String {
+    elo_core::app::push_sender::credential_tag(route, test_sender().credential().id())
+}
+fn signed_wake(sender: &elo_core::vault::Session, route: &str, n: u8, scope: &str) -> Wake {
+    let mut body = json!({"event":format!("{n:064x}"),"scope":scope,"target":URL_SAFE_NO_PAD.encode([7u8; 100])});
+    elo_core::app::push_sender::sign(sender, route, &mut body).unwrap();
+    serde_json::from_value(body).unwrap()
+}
 fn wake_input(n: u8, scope: &str) -> Wake {
-    Wake {
-        sender: None,
-        event: format!("{n:064x}"),
-        scope: scope.into(),
-        target: URL_SAFE_NO_PAD.encode([7u8; 100]),
-    }
+    signed_wake(test_sender(), &"a".repeat(32), n, scope)
 }
 async fn setup(relay: &Arc<Relay>, provider: &Fake) -> (String, String, String, String) {
     let (id, owner, key, scope) = (
@@ -291,8 +299,9 @@ async fn allow(
         Path(id.into()),
         headers(owner),
         Json(Policy {
-            authenticated_senders: false,
+            authenticated_senders: true,
             blocked_senders: Vec::new(),
+            notify_key: None,
             revision,
             introductions: true,
             scopes: vec![
@@ -300,11 +309,15 @@ async fn allow(
                     scope: scope.into(),
                     enabled,
                     alert_once: true,
+                    senders: vec![test_sender_tag(&"a".repeat(32))],
+                    allow_unknown: false,
                 },
                 Scope {
                     scope: "f".repeat(64),
                     enabled: true,
                     alert_once: false,
+                    senders: vec![test_sender_tag(&"a".repeat(32))],
+                    allow_unknown: true,
                 },
             ],
         }),
@@ -320,7 +333,7 @@ fn due(relay: &Relay) {
         .unwrap();
 }
 #[tokio::test]
-async fn legacy_clients_keep_alerts_and_introductions_remain_repeatable() {
+async fn introductions_remain_repeatable_and_unsigned_policy_downgrades_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let provider = Arc::new(Fake::default());
     let relay = Relay::open(&temp.path().join("db"), provider.clone()).unwrap();
@@ -339,41 +352,10 @@ async fn legacy_clients_keep_alerts_and_introductions_remain_repeatable() {
         due(&relay);
         assert!(relay.deliver_due().await.unwrap());
     }
-    // Downgrading replaces the capability declaration, including omitted scopes.
-    // Old policy serialization must keep its digest so identical retries still work.
     let old = format!(
         r#"{{"revision":2,"introductions":true,"scopes":[{{"scope":"{scope}","enabled":true}}]}}"#
     );
-    let legacy: Policy = serde_json::from_str(&old).unwrap();
-    assert_eq!(serde_json::to_string(&legacy).unwrap(), old);
-    policy(
-        State(relay.clone()),
-        Path(id.clone()),
-        headers(&owner),
-        Json(legacy),
-    )
-    .await
-    .unwrap();
-    policy(
-        State(relay.clone()),
-        Path(id.clone()),
-        headers(&owner),
-        Json(serde_json::from_str(&old).unwrap()),
-    )
-    .await
-    .unwrap();
-    for n in 3..=4 {
-        wake(
-            State(relay.clone()),
-            Path(id.clone()),
-            headers(&key),
-            Json(wake_input(n, &scope)),
-        )
-        .await
-        .unwrap();
-        due(&relay);
-        assert!(relay.deliver_due().await.unwrap());
-    }
+    assert!(serde_json::from_str::<Policy>(&old).is_err());
     assert_eq!(
         provider
             .sent
@@ -382,7 +364,7 @@ async fn legacy_clients_keep_alerts_and_introductions_remain_repeatable() {
             .iter()
             .filter(|n| matches!(n, Notice::Wake { quiet: false, .. }))
             .count(),
-        4
+        2
     );
 }
 #[tokio::test]
@@ -514,7 +496,7 @@ async fn a_hundred_unread_messages_alert_once_until_the_latest_is_read() {
     .unwrap();
     due(&relay);
     assert!(!relay.deliver_due().await.unwrap());
-    // Other conversations retain their independent first alert.
+    // An undeclared scope can trigger a quiet sync, never an audible alert.
     wake(
         State(relay.clone()),
         Path(id.clone()),
@@ -525,7 +507,7 @@ async fn a_hundred_unread_messages_alert_once_until_the_latest_is_read() {
     .unwrap();
     due(&relay);
     assert!(relay.deliver_due().await.unwrap());
-    assert_eq!(audible(), 3);
+    assert_eq!(audible(), 2);
     // Reading an event that is still coalesced in the queue cancels it.
     wake(
         State(relay.clone()),
@@ -567,8 +549,9 @@ async fn recipient_policy_cancels_queued_wakes_and_unknown_scopes_are_quiet() {
             Path(id.clone()),
             headers(&key),
             Json(Policy {
-                authenticated_senders: false,
+                authenticated_senders: true,
                 blocked_senders: Vec::new(),
+                notify_key: None,
                 revision: 1,
                 introductions: true,
                 scopes: vec![]
@@ -606,14 +589,17 @@ async fn recipient_policy_cancels_queued_wakes_and_unknown_scopes_are_quiet() {
             Path(id.clone()),
             headers(&owner),
             Json(Policy {
-                authenticated_senders: false,
+                authenticated_senders: true,
                 blocked_senders: Vec::new(),
+                notify_key: None,
                 revision: 1,
                 introductions: true,
                 scopes: vec![Scope {
                     scope: scope.clone(),
                     enabled: true,
-                    alert_once: true
+                    alert_once: true,
+                    senders: vec![test_sender_tag(&"a".repeat(32))],
+                    allow_unknown: false,
                 }]
             })
         )
@@ -719,14 +705,17 @@ async fn policy_retries_are_idempotent_and_removing_a_scope_keeps_it_muted() {
             Path(id.clone()),
             headers(&owner),
             Json(Policy {
-                authenticated_senders: false,
+                authenticated_senders: true,
                 blocked_senders: Vec::new(),
+                notify_key: None,
                 revision: 1,
                 introductions: true,
                 scopes: vec![Scope {
                     scope: scope.clone(),
                     enabled: false,
-                    alert_once: true
+                    alert_once: true,
+                    senders: vec![test_sender_tag(&"a".repeat(32))],
+                    allow_unknown: false,
                 }]
             })
         )
@@ -739,8 +728,9 @@ async fn policy_retries_are_idempotent_and_removing_a_scope_keeps_it_muted() {
         Path(id.clone()),
         headers(&owner),
         Json(Policy {
-            authenticated_senders: false,
+            authenticated_senders: true,
             blocked_senders: Vec::new(),
+            notify_key: None,
             revision: 2,
             introductions: true,
             scopes: vec![],
@@ -779,6 +769,7 @@ async fn blocked_identity_cannot_wake_through_new_scopes_or_devices_and_queued_a
     let relay = Relay::open(&tmp.path().join("private/wake.sqlite"), provider.clone()).unwrap();
     let (route, owner, key, scope) = setup(&relay, &provider).await;
     let (sender, card) = elo_core::vault::Session::create().unwrap();
+    let allowed = elo_core::vault::Session::create().unwrap().0;
     let blocked = elo_core::app::push_sender::sender_tag(&route, sender.identity_id());
     let set_policy = |revision, tags| Policy {
         revision,
@@ -787,9 +778,15 @@ async fn blocked_identity_cannot_wake_through_new_scopes_or_devices_and_queued_a
             scope: scope.clone(),
             enabled: true,
             alert_once: true,
+            senders: vec![
+                elo_core::app::push_sender::credential_tag(&route, sender.credential().id()),
+                elo_core::app::push_sender::credential_tag(&route, allowed.credential().id()),
+            ],
+            allow_unknown: false,
         }],
         authenticated_senders: true,
         blocked_senders: tags,
+        notify_key: None,
     };
     policy(
         State(relay.clone()),
@@ -840,7 +837,10 @@ async fn blocked_identity_cannot_wake_through_new_scopes_or_devices_and_queued_a
     for request in [
         signed(&sender, 21, &scope),
         signed(&recovered, 22, &"f".repeat(64)),
-        wake_input(23, &scope),
+        Wake {
+            sender: None,
+            ..wake_input(23, &scope)
+        },
     ] {
         assert_eq!(
             wake(
@@ -875,7 +875,6 @@ async fn blocked_identity_cannot_wake_through_new_scopes_or_devices_and_queued_a
             .unwrap(),
         0
     );
-    let allowed = elo_core::vault::Session::create().unwrap().0;
     wake(
         State(relay.clone()),
         Path(route.clone()),
@@ -981,6 +980,19 @@ async fn native_calls_require_current_recipient_policy_and_never_reappear_after_
             target: URL_SAFE_NO_PAD.encode([7u8; 100]),
         }],
     };
+    let mut unproved_ios = configure(true, &"f".repeat(64));
+    unproved_ios.platform = "ios".into();
+    assert_eq!(
+        calls::register(
+            State(relay.clone()),
+            Path(route.clone()),
+            headers(&owner),
+            Json(unproved_ios)
+        )
+        .await
+        .unwrap_err(),
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         calls::register(
             State(relay.clone()),
@@ -1033,6 +1045,74 @@ async fn native_calls_require_current_recipient_policy_and_never_reappear_after_
     };
     assert_eq!(sent(), 1);
     assert!(!calls::deliver(&relay).await.unwrap());
+    // Old registrations from before the ownership requirement cannot ring.
+    relay
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE call_devices SET platform='ios',token=? WHERE route=?",
+            params!["f".repeat(64), route],
+        )
+        .unwrap();
+    calls::event(State(relay.clone()), headers(&private_key), Json(ring(100)))
+        .await
+        .unwrap();
+    assert_eq!(
+        relay
+            .database()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM call_queue WHERE call_id=?",
+                [format!("{:032x}", 100)],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    // Enrollment permits only the exact attested token. Rotating it invalidates delivery.
+    {
+        let db = relay.database().unwrap();
+        db.execute(
+            "INSERT INTO voip_keys VALUES('synthetic-key',?,X'00',1,?)",
+            params![identity.to_string(), now().unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO voip_bindings VALUES(?,?,'synthetic-key')",
+            params![route, "f".repeat(64)],
+        )
+        .unwrap();
+    }
+    calls::event(State(relay.clone()), headers(&private_key), Json(ring(101)))
+        .await
+        .unwrap();
+    assert_eq!(
+        relay
+            .database()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM call_queue WHERE call_id=?",
+                [format!("{:032x}", 101)],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    relay
+        .database()
+        .unwrap()
+        .execute("DELETE FROM voip_bindings", [])
+        .unwrap();
+    assert!(calls::deliver(&relay).await.unwrap());
+    assert_eq!(sent(), 1);
+    calls::register(
+        State(relay.clone()),
+        Path(route.clone()),
+        headers(&owner),
+        Json(configure(true, "synthetic-device-token")),
+    )
+    .await
+    .unwrap();
     calls::event(
         State(relay.clone()),
         headers(&private_key),
@@ -1163,4 +1243,120 @@ async fn native_calls_require_current_recipient_policy_and_never_reappear_after_
         StatusCode::NOT_FOUND
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn failed_registration_releases_capacity_and_does_not_take_delivery_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Fake::default());
+    *provider.failure.lock().unwrap() = true;
+    let relay = Relay::open(&dir.path().join("wake.sqlite"), provider).unwrap();
+    let session = elo_core::vault::Session::create().unwrap().0;
+    let id = "d".repeat(32);
+    // A locked delivery worker must not hold up device possession checks.
+    let _delivery = relay.delivery_gate.lock().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        register(
+            State(relay.clone()),
+            Path(id.clone()),
+            headers(&"a".repeat(64)),
+            Json(Registration {
+                token: "synthetic-failed-token".into(),
+                notify_key: "b".repeat(64),
+                binding: route_binding(&session, &relay.endpoint, &id, "synthetic-failed-token"),
+            }),
+        ),
+    )
+    .await
+    .expect("registration must not wait for unrelated delivery");
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        relay
+            .database()
+            .unwrap()
+            .query_row("SELECT count(*) FROM routes", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_full_shared_ledger_preserves_other_routes_and_counters_survive_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("wake.sqlite");
+    let relay = Relay::open(&path, Arc::new(Fake::default())).unwrap();
+    {
+        let mut db = relay.database().unwrap();
+        let tx = db.transaction().unwrap();
+        for route in ["noisy", "quiet", "other-device"] {
+            tx.execute(
+                "INSERT INTO routes VALUES(?,x'01',x'02','test-token','',1,9999999999,NULL,0)",
+                [route],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO route_accounts VALUES('quiet','owner'),('other-device','owner')",
+            [],
+        )
+        .unwrap();
+        // Simulate a full shared ledger without sending external notifications.
+        tx.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<250000)
+            INSERT INTO events SELECT 'noisy',printf('%064x',x),9999999999 FROM n;",
+        )
+        .unwrap();
+        assert!(!event_capacity(&tx, "noisy").unwrap());
+        assert!(event_capacity(&tx, "quiet").unwrap());
+        for n in 0..64 {
+            assert!(event_capacity(&tx, "quiet").unwrap());
+            tx.execute(
+                "INSERT INTO events VALUES('quiet',?,9999999999)",
+                [format!("{n:064x}")],
+            )
+            .unwrap();
+        }
+        assert!(!event_capacity(&tx, "quiet").unwrap());
+        assert!(event_capacity(&tx, "other-device").unwrap());
+        tx.execute(
+            "INSERT OR IGNORE INTO events VALUES('quiet',?,9999999999)",
+            [format!("{:064x}", 0)],
+        )
+        .unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT count FROM route_event_totals WHERE route='quiet'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            64
+        );
+        tx.execute("DELETE FROM routes WHERE id='noisy'", [])
+            .unwrap();
+        assert!(event_capacity(&tx, "quiet").unwrap());
+        assert_eq!(
+            tx.query_row("SELECT count FROM event_totals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            64
+        );
+        tx.commit().unwrap();
+    }
+    drop(relay);
+    let reopened = Relay::open(&path, Arc::new(Fake::default())).unwrap();
+    let db = reopened.database().unwrap();
+    assert_eq!(
+        db.query_row("SELECT count FROM event_totals", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        64
+    );
+    assert!(event_capacity(&db, "quiet").unwrap());
+    // Extra devices owned by the same identity do not multiply its quota.
+    db.execute_batch(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<8128)
+        INSERT INTO events SELECT 'other-device',printf('%064x',x),9999999999 FROM n;",
+    )
+    .unwrap();
+    assert!(!event_capacity(&db, "quiet").unwrap());
 }

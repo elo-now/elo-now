@@ -61,9 +61,11 @@ mod attachments;
 mod blocking;
 mod calls;
 mod chats;
+mod devices;
 mod groups;
 mod history_reader;
 mod invitations;
+mod membership;
 mod message_actions;
 mod message_audit;
 pub mod pairing;
@@ -75,6 +77,7 @@ pub use history_reader::HistorySnapshot;
 use history_reader::Shared;
 mod profile;
 pub use invitations::{push, team};
+pub mod control_recovery;
 pub mod profile_backup;
 mod recovery;
 pub mod recovery_qr;
@@ -87,6 +90,10 @@ pub use profile::ProfileDraft;
 #[serde(deny_unknown_fields)]
 struct Pin {
     name: String,
+    // Local presentation metadata, never part of a signed chat configuration.
+    // None identifies workspaces written before this marker existed.
+    #[serde(default)]
+    personal_seed: Option<bool>,
     space: SpaceId,
     stream: StreamId,
     root: String,
@@ -198,6 +205,8 @@ pub struct ClientApp {
     push_allow_loopback: bool,
     team: Option<team::TeamDescriptor>,
     call_host: Option<space_service::SpaceAddress>,
+    membership_checks: membership::MembershipChecks,
+    space_http_client: reqwest::Client,
     team_next: u64,
     spaces: Option<Box<spaces::Spaces>>,
     presentation: std::sync::Arc<presentation::Presentation>,
@@ -248,6 +257,14 @@ fn write_export(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 impl ClientApp {
+    fn is_personal_seed(&self, pin: &Pin, authority: &Authority) -> Result<bool> {
+        Ok(self.team.is_some()
+            && pin.personal_seed == Some(true)
+            && pin.name == "General"
+            && authority.head()?.members.len() == 1
+            && authority.controller().identity() == self.session.identity_id())
+    }
+
     /// Checks the unlock password without exposing the retained secret.
     pub fn password_matches(&self, candidate: &SecretString) -> bool {
         bool::from(
@@ -297,6 +314,12 @@ impl ClientApp {
         if session.identity_id() != expected {
             return Err("The session does not match this profile.".into());
         }
+        let space_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(12))
+            .build()?;
         let peers = session
             .peers()
             .iter()
@@ -342,7 +365,7 @@ impl ClientApp {
         let store = ClientStore::open(&directory).await?;
         let loaded: Result<Vec<_>> = async {
             let mut all = Vec::new();
-            for p in &mut pins {
+            for (index, p) in pins.iter_mut().enumerate() {
                 let bytes = store
                     .authority_snapshot(p.space, p.stream)
                     .await?
@@ -354,6 +377,15 @@ impl ClientApp {
                     &root_key(&p.root)?,
                     p.stream,
                 )?;
+                if index == 0
+                    && p.name == "General"
+                    && p.personal_seed.is_none()
+                    && authority.initial_controller().identity() == session.identity_id()
+                    && authority.genesis().decode::<SpaceGenesis>()?.owners.len() == 1
+                {
+                    p.personal_seed = Some(true);
+                    migrate_workspace = true;
+                }
                 let kind = authority
                     .head()?
                     .chat_kind
@@ -392,6 +424,8 @@ impl ClientApp {
                     spaces: None,
                     presentation: Default::default(),
                     call_host: None,
+                    membership_checks: Default::default(),
+                    space_http_client,
                 };
                 if migrate_workspace && let Err(error) = app.persist_workspace() {
                     app.store.close().await?;
@@ -554,17 +588,7 @@ impl ClientApp {
             } else {
                 self.originals(a).await?
             };
-            if self.team.is_some()
-                && self
-                    .pins
-                    .first()
-                    .is_some_and(|first| first.stream == p.stream)
-                && p.name == "General"
-                && originals.is_empty()
-                && a.head()?.sequence == 1
-                && a.head()?.members.len() == 1
-                && a.controller().identity() == self.session.identity_id()
-            {
+            if self.is_personal_seed(p, a)? && originals.is_empty() {
                 continue;
             }
             let actions = message_actions::Projection::new(&originals);
@@ -750,6 +774,7 @@ impl ClientApp {
             self.persist_vault()?;
         }
         self.pins.push(Pin {
+            personal_seed: Some(name == "General"),
             chat_kind: Some(ChatKind::Chat),
             name: name.into(),
             space,
@@ -763,6 +788,9 @@ impl ClientApp {
         Ok(())
     }
     pub async fn operate(&mut self, v: Value) -> Result<Value> {
+        if matches!(v["op"].as_str(), Some("sync" | "sync_live")) {
+            self.retry_device_revocations(false).await?;
+        }
         if v["op"] == "set_user_blocked" {
             self.update_block(&v)?;
             return Ok(json!({"view":self.view().await?}));
@@ -901,21 +929,11 @@ impl ClientApp {
                 self.create_space(name, &card).await?;
             }
             "import_stream" => {
-                let space: SpaceId = field(&v, "space")?.parse()?;
-                let stream: StreamId = field(&v, "stream")?.parse()?;
-                let root = field(&v, "root")?;
-                let name = field(&v, "name")?;
-                if name.is_empty() || name.len() > 120 {
-                    return Err("invalid channel name".into());
-                }
-                let bytes = read_exchange(Path::new(field(&v, "path")?), MAX_EXCHANGE)?;
-                let incoming = Authority::open_snapshot(
-                    &bytes,
-                    self.session.age_identity(),
-                    space,
-                    &root_key(root)?,
-                    stream,
-                )?;
+                let (bytes, incoming, pin) = self.recovery_input(&v)?;
+                let space = pin.space;
+                let stream = pin.stream;
+                let root = pin.root.as_str();
+                let name = pin.name.as_str();
                 let index = self
                     .pins
                     .iter()
@@ -947,6 +965,7 @@ impl ClientApp {
                     self.authorities.0[i] = a;
                 } else {
                     self.pins.push(Pin {
+                        personal_seed: Some(false),
                         chat_kind: Some(chats::imported_kind(&a, self.session.identity_id())?),
                         name: name.into(),
                         space,
@@ -1011,6 +1030,8 @@ impl ClientApp {
                     .map(|(r, _)| history_reader::record_presentation_time(r))
                     .max()
                     .unwrap_or(0);
+                let request_secret = record::random_hex::<32>()?;
+                let request_key = crate::retention_access::public_key(&request_secret)?;
                 let r = a.prepare_chat(
                     ChatMessage {
                         v: 1,
@@ -1023,10 +1044,10 @@ impl ClientApp {
                         config_id: a.head_id().ok_or("head")?,
                         audience: vec![],
                         recipient_credentials: vec![],
-                        logical_time: highest
-                            .checked_add(1)
-                            .ok_or("logical time overflow")?
-                            .max(u64::try_from(time.as_millis())?),
+                        logical_time: record::next_message_time(
+                            highest,
+                            u64::try_from(time.as_millis())?,
+                        ),
                         created_at: field(&v, "created_at")?.into(),
                         parents: vec![],
                         payload: TextPayload {
@@ -1036,10 +1057,24 @@ impl ClientApp {
                             action: None,
                         },
                         locator: None,
+                        access: None,
                     },
                     self.session.signing_key(),
                 )?;
-                let chat = r.chat()?;
+                let mut chat = r.chat()?;
+                let direct_peer = a.direct_human_peer(&chat);
+                let accept_secret = direct_peer
+                    .map(|_| record::random_hex::<32>())
+                    .transpose()?;
+                let accept_key = accept_secret
+                    .as_deref()
+                    .map(crate::retention_access::public_key)
+                    .transpose()?;
+                chat.access = Some(record::MessageAccess {
+                    request_key: request_key.clone(),
+                    accept_secret,
+                });
+                let r = chat.sign(self.session.signing_key())?;
                 let recipients = chat
                     .recipient_credentials
                     .iter()
@@ -1050,8 +1085,8 @@ impl ClientApp {
                     .as_ref()
                     .map(|team| team.message_lifetime_seconds)
                     .unwrap_or(86_400);
-                let locator_nonce = record::random_hex::<16>()?;
-                let direct_peer = a.direct_human_peer(&chat);
+                let locator_nonce = chat.nonce.clone();
+                self.require_fresh_membership(a).await?;
                 let cipher = crypto::seal_chat(&r, &recipients)?;
                 let cipher = crate::erasure::wrap_subjects_with_retention(
                     cipher,
@@ -1063,6 +1098,8 @@ impl ClientApp {
                         record_id: r.id(),
                         lifetime_seconds,
                         direct_peer,
+                        request_key: request_key.clone(),
+                        accept_key,
                     }),
                 )?;
                 let body_object_id = crate::ids::ObjectId::of_ciphertext(&cipher);
@@ -1091,7 +1128,9 @@ impl ClientApp {
                             message_record_id: r.id(),
                             body_object_id,
                             locator_nonce: locator_nonce.clone(),
+                            request_secret,
                         }),
+                        access: None,
                     },
                     self.session.signing_key(),
                 )?;
@@ -1106,6 +1145,7 @@ impl ClientApp {
                         body_object_id,
                         record_id: r.id(),
                         lifetime_seconds,
+                        request_key,
                     }),
                 )?;
                 self.store
@@ -1165,7 +1205,11 @@ impl ClientApp {
                 let mut accepted = false;
                 for peer in &self.peers {
                     if peer
-                        .request_message(location.body_object_id, location.message_record_id)
+                        .request_message(
+                            location.body_object_id,
+                            location.message_record_id,
+                            &location.request_secret,
+                        )
                         .await
                         .is_ok()
                     {
@@ -1184,6 +1228,7 @@ impl ClientApp {
                 } else {
                     self.sync_invitations(true, false).await?
                 };
+                self.refresh_chat_devices().await?;
                 let sync = SyncClient {
                     store: &self.store,
                     identity: self.session.age_identity(),
@@ -1421,6 +1466,7 @@ impl ClientApp {
                         json!({"request_id":request.id(),"recipient":requested.issuer_identity,"selection":selection.iter().map(|r|json!({"id":r.id(),"text":r.body()["payload"]["text"]})).collect::<Vec<_>>()}),
                     );
                 }
+                self.require_fresh_membership(a).await?;
                 let cipher = history::seal(a, &grant)?;
                 let body: history::HistoryGrant = grant.decode()?;
                 let mut subjects = vec![body.recipient_identity];
@@ -1469,6 +1515,8 @@ impl ClientApp {
             }
             "file_share" => {
                 let i = self.authority_index(&v)?;
+                self.require_fresh_membership(&self.authorities.0[i])
+                    .await?;
                 let path = Path::new(field(&v, "path")?);
                 let bytes = Zeroizing::new(read_exchange(path, crate::files::MAX_FILE)?);
                 let file = crate::files::prepare(
@@ -1488,12 +1536,13 @@ impl ClientApp {
                 let a = &self.authorities.0[i];
                 let id: RecordId = field(&v, "record")?.parse()?;
                 let r = self.message_record(a, id).await?;
-                let share = crate::files::VerifiedFileShare::verify(
+                let recipient = crypto::history_recipient(
                     &r,
                     a,
-                    self.session.credential().id(),
-                    true,
+                    self.identity_id(),
+                    self.session.age_identity(),
                 )?;
+                let share = crate::files::VerifiedFileShare::verify(&r, a, recipient, true)?;
                 let object_id = share
                     .body()
                     .object_id
@@ -1531,13 +1580,8 @@ impl ClientApp {
                 let bytes = bytes.ok_or(
                     "unavailable: no reachable replica supplied the file in the bounded inventory",
                 )?;
-                let file = crate::files::open(
-                    &bytes,
-                    self.session.age_identity(),
-                    self.session.credential().id(),
-                    &share,
-                    a,
-                )?;
+                let file =
+                    crate::files::open(&bytes, self.session.age_identity(), recipient, &share, a)?;
                 // An explicit, fully verified download also retains its original
                 // ciphertext for offline reuse and repair of previously known copies.
                 self.store

@@ -12,10 +12,57 @@ pub struct CallAuthorityProof {
     pub genesis: String,
     pub credentials: Vec<String>,
     pub configs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 impl Authority {
+    /// Only the controller can issue a new checkpoint. Other members reuse the
+    /// ordinary proof; an absent controller key must never weaken verification.
+    pub fn call_proof_signed(&self, key: &SigningKey) -> Result<CallAuthorityProof> {
+        if self.controller().key() != &key.verifying_key() {
+            return self.call_proof();
+        }
+        self.checkpoint_proof(self.sign_checkpoint(key)?)
+    }
+
+    fn checkpoint_proof(&self, signed: SignedRecord) -> Result<CallAuthorityProof> {
+        let ids = self
+            .head()?
+            .members
+            .iter()
+            .flat_map(|m| m.credential_ids.iter().copied())
+            .chain([self.initial_controller().id(), self.controller().id()])
+            .collect::<BTreeSet<_>>();
+        let proof = CallAuthorityProof {
+            v: 2,
+            genesis: STANDARD.encode(self.genesis.bytes()),
+            credentials: ids
+                .into_iter()
+                .map(|id| {
+                    self.credential(id)
+                        .map(|c| STANDARD.encode(c.record().bytes()))
+                })
+                .collect::<Result<_>>()?,
+            configs: vec![
+                STANDARD.encode(
+                    self.config_record(self.head_id().ok_or(RecordError::Authority)?)?
+                        .bytes(),
+                ),
+            ],
+            checkpoint: Some(STANDARD.encode(signed.bytes())),
+        };
+        proof.check_size()?;
+        Ok(proof)
+    }
+
     pub fn call_proof(&self) -> Result<CallAuthorityProof> {
+        if let Some(checkpoint) = self.current_checkpoint() {
+            if self.is_forked() {
+                return Err(RecordError::Authority);
+            }
+            return self.checkpoint_proof(checkpoint.clone());
+        }
         if self.is_forked() {
             return Err(RecordError::Authority);
         }
@@ -23,6 +70,7 @@ impl Authority {
         configs.sort_by_key(|(record, config)| (config.sequence, record.id()));
         let proof = CallAuthorityProof {
             v: 1,
+            checkpoint: None,
             genesis: STANDARD.encode(self.genesis.bytes()),
             credentials: self
                 .credentials
@@ -41,21 +89,47 @@ impl Authority {
 
 impl CallAuthorityProof {
     fn check_size(&self) -> Result<()> {
-        if self.v != 1
+        if !matches!((self.v, self.checkpoint.is_some()), (1, false) | (2, true))
+            || (self.v == 2 && self.configs.len() != 1)
             || self.credentials.len() > 8192
             || self.configs.len() > 4096
             || self.configs.is_empty()
-            || self.genesis.len().saturating_add(
-                self.credentials
-                    .iter()
-                    .chain(&self.configs)
-                    .map(String::len)
-                    .sum::<usize>(),
-            ) > MAX_PROOF_BYTES
+            || self
+                .genesis
+                .len()
+                .saturating_add(self.checkpoint.as_ref().map_or(0, String::len))
+                .saturating_add(
+                    self.credentials
+                        .iter()
+                        .chain(&self.configs)
+                        .map(String::len)
+                        .sum::<usize>(),
+                )
+                > MAX_PROOF_BYTES
         {
             return Err(RecordError::Authority);
         }
         Ok(())
+    }
+
+    /// Verify only the named device before spending work on its config chain.
+    pub fn credential(&self, id: RecordId) -> Result<VerifiedCredential> {
+        self.check_size()?;
+        for encoded in &self.credentials {
+            let bytes = STANDARD.decode(encoded).map_err(|_| RecordError::Json)?;
+            if RecordId::of_record_bytes(&bytes) != id {
+                continue;
+            }
+            let signed = SignedRecord::parse(&bytes)?;
+            let root = VerifyingKey::from_bytes(&record::hex(
+                signed.body()["root_public_key"]
+                    .as_str()
+                    .ok_or(RecordError::Json)?,
+            )?)
+            .map_err(|_| RecordError::Signature)?;
+            return VerifiedCredential::verify(&bytes, &root);
+        }
+        Err(RecordError::Authority)
     }
 
     /// The Space ID is content-addressed. This proves its chain, not admission
@@ -94,6 +168,13 @@ impl CallAuthorityProof {
         let mut authority = Authority::new(genesis.bytes(), space, &root, controller, stream)?;
         for credential in credentials.into_values() {
             authority.add_credential(credential);
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            authority.load_checkpoint(
+                SignedRecord::parse(&decode(checkpoint)?)?,
+                SignedRecord::parse(&decode(&self.configs[0])?)?,
+            )?;
+            return Ok(authority);
         }
         for encoded in &self.configs {
             match authority.apply_config(SignedRecord::parse(&decode(encoded)?)?)? {

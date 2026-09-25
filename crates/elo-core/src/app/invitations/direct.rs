@@ -38,13 +38,30 @@ pub(super) struct ReceivedOffer {
     pub(super) dismissed: bool,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+// Bump when discovery can understand packets that older clients skipped.
+const DISCOVERY_FORMAT: u8 = 1;
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Cursor {
+    #[serde(default)]
+    format: u8,
     after: u64,
     generation: Option<String>,
     next: u64,
     failures: u8,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            format: DISCOVERY_FORMAT,
+            after: 0,
+            generation: None,
+            next: 0,
+            failures: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -110,6 +127,24 @@ impl ClientApp {
                             .insert(*id, credential.clone());
                     }
                 }
+            }
+        }
+        if let Some(address) = &self.call_host {
+            if let Some(general) =
+                self.authorities.0.iter().find(|a| {
+                    a.space() == address.scope.space && a.stream() == address.scope.stream
+                })
+            {
+                let active: BTreeSet<_> = general
+                    .head()?
+                    .members
+                    .iter()
+                    .flat_map(|m| m.credential_ids.iter().copied())
+                    .collect();
+                for credentials in people.values_mut() {
+                    credentials.retain(|id, _| active.contains(id));
+                }
+                people.retain(|_, credentials| !credentials.is_empty());
             }
         }
         people.retain(|id, _| !self.blocked.contains(*id));
@@ -407,14 +442,18 @@ impl ClientApp {
             }) {
                 continue;
             }
-            let packet = Packet::Grant {
-                reference: request.id(),
-                space: pin.space,
-                stream: pin.stream,
-                root: pin.root.clone(),
-                name: offer.name,
-                ciphertext: STANDARD.encode(authority.seal_snapshot(&credential.recipient())?),
-            };
+            let packet =
+                Packet::Grant {
+                    reference: request.id(),
+                    space: pin.space,
+                    stream: pin.stream,
+                    root: pin.root.clone(),
+                    name: offer.name,
+                    ciphertext: STANDARD.encode(authority.seal_snapshot_signed(
+                        &credential.recipient(),
+                        self.session.signing_key(),
+                    )?),
+                };
             updates.push((id.clone(), entry.packet.clone(), packet));
         }
         for (id, request, response) in updates {
@@ -597,7 +636,15 @@ impl ClientApp {
             // Reuse the authenticated transport and its connection pool. Rebuilding
             // it on every bounded pass spends the discovery budget on TLS setup.
             let key = format!("{}:{}", peer.id(), peer.mailbox());
-            let cursor = state.discovery.get(&key).cloned().unwrap_or_default();
+            let mut cursor = state.discovery.get(&key).cloned().unwrap_or_default();
+            if cursor.format < DISCOVERY_FORMAT {
+                // Revisit previously skipped envelopes once, using the normal
+                // bounded pages and signature/consent checks. Preserve all
+                // accepted or dismissed invitations and message sync cursors.
+                cursor = Cursor::default();
+            } else if cursor.format > DISCOVERY_FORMAT {
+                return Err("Unsupported discovery state version.".into());
+            }
             if force || cursor.next <= time {
                 peers.push((key, peer.clone(), cursor));
             }

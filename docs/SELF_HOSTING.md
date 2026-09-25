@@ -6,7 +6,7 @@ The examples use `chat.example.org` for the app API and media WebSocket, and `tu
 
 Debian 13 is the deployment path exercised by this project. Oracle Linux 10 follows the same service layout, but still requires its own end-to-end acceptance run, especially package availability, SELinux policy and media ports. Do not present an untested OEL10 installation as verified.
 
-For upgrades, see [API compatibility and application updates](API_COMPATIBILITY.md). That document describes next-release work; the published 1.0.0 server does not support its `client_policy` setting. The next security baseline is a clean cutover with matching app/server builds, without older-client support or existing-data migration. Prepare and test those builds before switching services; do not copy future configuration into an older server.
+For upgrades to an existing installation, read [API compatibility and application updates](API_COMPATIBILITY.md) first. The current security baseline is a clean cutover with matching clients and services, without older-client support or existing-data migration; this guide is not an in-place migration procedure. The optional `client_policy` field in `/etc/elo/host/config.json` controls platform minimums. Leave them disabled until the replacement app is available to users.
 
 ## 1. What runs where
 
@@ -85,6 +85,8 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
   "root": "/var/lib/elo/host",
   "public_url": "https://chat.example.org",
   "max_spaces_per_identity": 2,
+  "max_spaces": 1000,
+  "max_space_creations_per_day": 100,
   "mailbox_quota_bytes": 150000000,
   "call_admission_key": "/etc/elo/host/admission.key",
   "attachment_storage": {
@@ -94,7 +96,42 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
 }
 ```
 
-`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB.
+`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB. The deployment-wide limits also count new identities: at most 1,000 allocated Spaces and 100 new reservations per UTC day by default. Lower these values to fit the disk budget; 1,000 fully used Spaces require at least 200 GB before overhead. Retries of an existing reservation do not spend another daily slot. These caps bound resource consumption; they do not prove that two profiles belong to different people.
+
+The next-release baseline also requires a 20-bit SHA-256 proof of work tied to
+each signed Space-creation request. The client computes it locally on a worker;
+the host verifies it before signature checks and provisioning. This adds work
+only when creating a Space, with no extra request or proof on ordinary messages.
+The host additionally limits new reservations to 10 per UTC day per IPv4 address
+or IPv6 /64, across identities. The persisted daily budget survives restarts;
+deleting a Space does not refund that day's slot. Shared networks share this
+limit. The allocation index is rebuilt from durable reservations at startup,
+including interrupted reservations, rather than scanning every Space on each
+creation.
+
+Use `proxy_set_header X-Real-IP $remote_addr;` in the hosting proxy, as in the
+supplied Nginx examples. The backend trusts this header only from loopback and
+otherwise uses the TCP peer address. Keep the backend private; do not forward
+an untrusted incoming `X-Real-IP`. Daily network keys are SHA-256 hashes of the
+address/prefix, not an anonymity guarantee. Omitting the header behind a local
+proxy makes all its clients share one creation budget.
+
+Space administration is stored in `space-service.sqlite` inside the service
+profile. Rows are encrypted individually with XChaCha20-Poly1305 and an
+authenticated manifest detects row deletion or substitution. A transaction
+updates only changed rows. The database is bounded to 256 MiB and 32,768 data
+rows; each row retains an 8 MiB limit. Loading still validates the entire state.
+An old `space-service.age` is imported on first successful save and then removed;
+this storage conversion does not make older clients protocol-compatible.
+Back up the complete service profile while stopped, not just this file. Local
+encryption does not prevent an operator from restoring an entire older backup.
+
+Pending join requests have separate bounds: 256 per Space, 32 per invitation,
+four per identity, and a seven-day lifetime. Revoking/expiring the invitation
+also frees its pending requests. Uploads have 16 unfinished slots per identity
+and 4,096 metadata entries per Space; terminal metadata (deleted, expired or missing) is pruned as
+documented in the attachment implementation. These bounds are independent of
+the attachment byte quota.
 
 To use MEGA instead of the VPS disk, install [MEGAcmd](https://github.com/meganz/MEGAcmd) under a separate local user, log it into **your own** MEGA account without putting credentials in source or a process command line, create a dedicated folder, and expose that folder with MEGAcmd's [WebDAV command](https://github.com/meganz/MEGAcmd/blob/master/contrib/docs/WEBDAV.md). Keep WebDAV on loopback; never use `--public`. Replace only `attachment_storage` with:
 
@@ -144,10 +181,32 @@ max-port=49200
 cert=/etc/elo/turn/fullchain.pem
 pkey=/etc/elo/turn/privkey.pem
 no-multicast-peers
-no-loopback-peers
+# Keep allow-loopback-peers disabled.
+no-tcp-relay
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 ```
 
+The peer restrictions follow the [coturn configuration reference](https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf). They block relay access to private and link-local services, including common cloud metadata addresses. `no-tcp-relay` disables TCP connections to peers; clients can still connect to TURN over TCP/TLS. For the host's public addresses, restrict relay egress with a firewall to the media UDP ports that are actually needed. Do not deny those addresses wholesale when LiveKit or another TURN participant uses them: that would break valid calls. Keep administration services private and test a forced TURN connection from a different network before deploying these restrictions.
+
 If the VPS has NAT, configure coturn's external/public IP mapping as documented by [coturn](https://github.com/coturn/coturn/wiki/turnserver). Reload or restart coturn after TLS certificate renewal. TCP 5349 avoids colliding with Nginx's TCP 443 on one IP; test a forced-TURN call from another network, because a successful local call does not verify the relay.
+
+Run coturn under its packaged, unprivileged service account. For the unprivileged
+ports above, install `deploy/self-host/coturn-hardening.conf` as
+`/etc/systemd/system/coturn.service.d/elo-hardening.conf`, run
+`sudo systemctl daemon-reload`, and restart coturn during the rollout window.
+The drop-in removes Linux capabilities, prevents privilege escalation and makes
+system/home paths read-only or inaccessible. Check certificate/config ownership
+first and repeat forced-relay tests over UDP, TCP and TLS after applying it.
+Do not apply this unchanged to privileged listeners such as port 443.
 
 Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit pair and TURN secret. `wake` may be omitted until the wake service is ready:
 
@@ -196,6 +255,22 @@ For iOS **incoming call** delivery while the app is closed, create an APNs token
 ```
 
 Use `sandbox: true` only for development-signed iOS clients; App Store builds use production. Match `bundle_id` exactly to the signed iOS app. The APNs provider key is independent of Apple distribution-signing certificates. See [Apple's token-based APNs guide](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns).
+
+Enable App Attest for that App ID and regenerate the app's provisioning profile.
+The native client reads its token from PushKit and obtains an Apple-attested key;
+the relay challenges a fresh assertion bound to the route, account, endpoint and
+exact token. It checks the production Apple certificate chain, application identity,
+single-use challenge and increasing assertion counter. Enrollment attestation uses
+a native random nonce and is cached because Apple attests a key once; the first
+registration also requires a fresh server challenge assertion. No verification-only
+VoIP push is sent. Unsupported devices cannot enable iOS background incoming calls.
+If the signed app's App ID prefix differs from `team_id`, add `app_id_prefix` to
+the APNs JSON with that ten-character prefix; otherwise it defaults to `team_id`.
+The prefix, bundle ID and production App Attest entitlement must all agree.
+
+These source changes require coordinated deployment: older clients and unproved
+stored VoIP registrations cannot bypass ownership verification. Keep existing
+services running until compatible signed clients have passed device acceptance.
 
 Start the wake service with the same public origin as the host. The `--call-key` option enables its private call-delivery listener on loopback; `--apns-config` adds iOS VoIP delivery:
 
@@ -273,3 +348,11 @@ Before giving the service to users:
 4. Back up **the complete, stopped** `/var/lib/elo/host` tree and the attachment provider's objects together. Also protect wake state, call database, private service configs and keys. A live SQLite main file alone is not a consistent backup; use a coordinated stopped copy or SQLite's online-backup method. A restore of stale membership/deletion state is not safe to automate. Rehearse recovery on an isolated host before promising it to users.
 
 This guide defines a reproducible **configuration layout**, but is not evidence that a particular VPS or package was accepted. Debian 13, Oracle Linux 10, every chosen storage provider, provider credentials, DNS/TLS and final signed mobile apps require validation on the actual installation. The publisher's private deployment scripts, credentials and multi-server routing are deliberately not included.
+
+## Coordinated device-security upgrade
+
+Deploy matching clients, `elo-team` and Replica code when enabling access proofs v2. Old proofs and pairing links are rejected; upgrading only the server interrupts old clients. The hosted service derives its trusted public origin from `public_url`. For a standalone Replica behind TLS, pass `--public-origin https://your-replica.example` while retaining its loopback bind and `--allow-insecure-loopback`. Forward the original URI unchanged; do not derive origin from request headers.
+
+Back up the host root's `revoked-devices/` together with all Space state and Replica databases. The signed device tombstones are permanent and shared across Spaces, including subsequently created ones. Never prune them to free space or restore an older registry while retaining newer app state. A full registry refuses additional entries. The Replica nonce table is durable too; copying or restoring live database files outside the documented SQLite backup process is unsafe.
+
+Before production rollout, verify pairing with independent credentials, interrupted root-code recovery, revoked-device denial after server restart, private-chat recipient updates, and offline host retries. Existing devices that shared one credential must be linked again to receive independent credentials; the server cannot distinguish old copies of the same key. Keep the original controller available until private chats have adopted the new device, or use the explicit controller-recovery process.

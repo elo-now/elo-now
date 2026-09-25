@@ -650,12 +650,7 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
               >
                 {t("calls.decline")}
               </button>
-              <button
-                onClick={() => {
-                  const incoming = state.incoming!;
-                  void calls.start(incoming.chat, false, incoming.call);
-                }}
-              >
+              <button onClick={() => void calls.answer()}>
                 {t("calls.answer")}
               </button>
             </div>

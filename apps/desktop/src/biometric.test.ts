@@ -58,9 +58,13 @@ beforeEach(() => {
     setItem: (key: string, value: string) => preferences.set(key, value),
     removeItem: (key: string) => preferences.delete(key),
   });
-  vi.mocked(invoke).mockImplementation(async () => ({
-    saved_profiles: [{ ...selected, active: true }],
-  }));
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "profile_task") {
+      const request = (args as { request: { op: string; id: string } }).request;
+      return request.op === "biometric_enroll" ? { key: `AGE-SECRET-KEY-1${request.id}` } : {};
+    }
+    return { saved_profiles: [{ ...selected, active: true }] };
+  });
   vi.mocked(checkStatus).mockResolvedValue({
     isAvailable: true,
     biometryType: 2,
@@ -152,8 +156,9 @@ describe("profile-bound biometric unlock", () => {
     await expect(removeData(entry)).rejects.toThrow("scopeDenied");
   });
 
-  it("keeps passwords and enrollment offers separate when profiles switch", async () => {
+  it("keeps wrapping keys and enrollment offers separate when profiles switch", async () => {
     await enableBiometricUnlock("first password", undefined, first);
+    expect([...keychain.values()].join()).not.toContain("first password");
     markBiometricOfferHandled(first);
     selected = second;
     expect((await readBiometricState()).enabled).toBe(false);
@@ -161,12 +166,12 @@ describe("profile-bound biometric unlock", () => {
     await enableBiometricUnlock("second password", undefined, second);
     markBiometricOfferHandled(second);
     expect(await readBiometricCredential("Unlock", second)).toEqual({
-      password: "second password",
+      key: "AGE-SECRET-KEY-1profile-second",
     });
     selected = first;
     expect((await readBiometricState()).enabled).toBe(true);
     expect(await readBiometricCredential("Unlock", first)).toEqual({
-      password: "first password",
+      key: "AGE-SECRET-KEY-1profile",
     });
     expect(shouldOfferBiometricUnlock(first)).toBe(false);
     await disableBiometricUnlock();
@@ -174,7 +179,7 @@ describe("profile-bound biometric unlock", () => {
     selected = second;
     expect((await readBiometricState()).enabled).toBe(true);
     expect(await readBiometricCredential("Unlock", second)).toEqual({
-      password: "second password",
+      key: "AGE-SECRET-KEY-1profile-second",
     });
   });
 
@@ -184,11 +189,11 @@ describe("profile-bound biometric unlock", () => {
     expect((await readBiometricState()).enabled).toBe(false);
     await enableBiometricUnlock("recovery password", undefined, selected);
     expect(await readBiometricCredential("Unlock", selected)).toEqual({
-      password: "recovery password",
+      key: "AGE-SECRET-KEY-1profile-restored",
     });
     selected = first;
     expect(await readBiometricCredential("Unlock", first)).toEqual({
-      password: "original password",
+      key: "AGE-SECRET-KEY-1profile",
     });
   });
 
@@ -231,6 +236,8 @@ describe("profile-bound biometric unlock", () => {
       "raw password",
       "elo-biometry:v1:{}",
       "elo-biometry:v2:null",
+      "elo-biometry:v3:null",
+      "elo-biometry:v3:" + JSON.stringify({version: 3, ...second, key: "AGE-SECRET-KEY-1wrong"}),
       "elo-biometry:v2:" +
         JSON.stringify({ version: 2, ...second, password: "other password" }),
     ]) {

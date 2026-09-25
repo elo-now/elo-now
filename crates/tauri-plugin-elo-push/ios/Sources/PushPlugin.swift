@@ -7,7 +7,9 @@ import Tauri
 import UIKit
 import UserNotifications
 
+private struct VoipOwnershipArgs: Decodable { let identity: String; let nonce: String }
 private struct NativeMediaArgs: Decodable { let payload: String }
+private struct CallListenerArgs: Decodable { let channel: Channel }
 private struct CallConfigureArgs: Decodable { let enabled: Bool; let registration: String; let endpoint: String; let labels: [String:String]; let ringtone: String? }
 private struct CallActionArgs: Decodable { let action: String; let callId: String; let event:String? }
 private struct PushRegisterArgs: Decodable { let registration: String }
@@ -42,6 +44,13 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         DispatchQueue.main.async { [weak self] in
             NativeMedia.shared.webView = webview
             self?.configure()
+        }
+    }
+    @objc func voipOwnership(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(VoipOwnershipArgs.self)
+        Task { @MainActor in
+            do { invoke.resolve(try await VoipOwnership.proof(identity: args.identity, nonce: args.nonce)) }
+            catch { invoke.reject("Could not verify this device for incoming calls. Try again.") }
         }
     }
     @objc func nativeMedia(_ invoke: Invoke) throws {
@@ -174,13 +183,20 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
     @objc func callStatus(_ invoke: Invoke) {
         DispatchQueue.main.async { invoke.resolve(["incoming":IncomingCalls.shared.status() ?? [:]]) }
     }
+    @objc func callListener(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(CallListenerArgs.self)
+        DispatchQueue.main.async { IncomingCalls.shared.answerListener = args.channel; invoke.resolve() }
+    }
     @objc func callAction(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(CallActionArgs.self)
         DispatchQueue.main.async {
+            if args.action == "answer" { invoke.resolve(["handled": IncomingCalls.shared.answerFromApp(args.callId)]); return }
+            if args.action == "decline" { invoke.resolve(["handled": IncomingCalls.shared.declineFromApp(args.callId)]); return }
             if args.action == "answering" { IncomingCalls.shared.answering(args.callId) }
             if args.action == "connected" { IncomingCalls.shared.connected(args.callId) }
             if args.action == "ack" { IncomingCalls.shared.acknowledge(args.callId,event:args.event) }
             if args.action == "end" { IncomingCalls.shared.end(args.callId) }
+            if args.action == "unlock" { IncomingCalls.shared.requestUnlock(args.callId) }
             invoke.resolve()
         }
     }

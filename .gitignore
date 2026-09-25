@@ -25,6 +25,7 @@
 *.p12
 *.pfx
 *.pem
+!crates/elo-wake/src/relay/Apple_App_Attestation_Root_CA.pem
 *.key
 *.keystore
 *.jks

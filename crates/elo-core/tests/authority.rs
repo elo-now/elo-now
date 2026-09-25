@@ -147,6 +147,34 @@ fn chat(a: &Authority, p: &Person) -> SignedRecord {
     c.issuer_credential = p.c.id();
     a.prepare_chat(c, &p.key).unwrap()
 }
+
+#[test]
+fn early_acceptance_capability_requires_a_two_human_direct_configuration() {
+    use elo_core::{authority::ChatKind, record::MessageAccess, retention_access::public_key};
+    for kind in [ChatKind::Direct, ChatKind::Chat] {
+        let (owner, mut authority, mut config) = setup();
+        let peer = person(60);
+        authority.add_credential(peer.c.clone());
+        config
+            .members
+            .push(member(&peer, vec![Capability::Read, Capability::Post]));
+        config.members.sort_by_key(|member| member.identity_id);
+        config.chat_kind = Some(kind);
+        authority
+            .apply_config(config.sign(&owner.key).unwrap())
+            .unwrap();
+        let mut message = chat(&authority, &owner).chat().unwrap();
+        message.access = Some(MessageAccess {
+            request_key: public_key(&random_hex::<32>().unwrap()).unwrap(),
+            accept_secret: Some(random_hex::<32>().unwrap()),
+        });
+        let message = message.sign(&owner.key).unwrap();
+        assert_eq!(
+            authority.verify_historical(&message).is_ok(),
+            kind == ChatKind::Direct
+        );
+    }
+}
 #[test]
 fn unpinned_genesis_and_credential_without_membership_are_denied() {
     let (owner, mut a, c) = setup();
@@ -536,4 +564,61 @@ fn a_chat_accepts_1000_people_and_rejects_the_1001st_without_changing_its_head()
             .is_err()
     );
     assert_eq!(authority.head_id(), Some(signed.id()));
+}
+
+#[test]
+fn extreme_message_time_cannot_poison_admission_or_future_sends() {
+    use elo_core::record::{MAX_INTEGER, next_message_time, valid_message_time_at};
+    let (owner, mut authority, config) = setup();
+    authority
+        .apply_config(config.sign(&owner.key).unwrap())
+        .unwrap();
+    let mut body = chat(&authority, &owner).chat().unwrap();
+    body.logical_time = MAX_INTEGER;
+    let poisoned = body.sign(&owner.key).unwrap();
+    assert!(authority.verify_historical(&poisoned).is_err());
+    assert!(authority.admission(&poisoned, owner.c.id(), false).is_err());
+    assert!(authority.admission(&poisoned, owner.c.id(), true).is_err());
+    let now = 1_800_000_000_000;
+    assert_eq!(next_message_time(MAX_INTEGER, now), now);
+    assert_eq!(next_message_time(now + 5, now), now + 6);
+    assert!(valid_message_time_at(now - 365 * 86400 * 1000, now));
+    assert!(!valid_message_time_at(MAX_INTEGER, now));
+    assert!(
+        authority
+            .prepare_chat(chat(&authority, &owner).chat().unwrap(), &owner.key)
+            .is_ok()
+    );
+}
+
+#[test]
+fn config_rejects_duplicate_encryption_or_signing_keys() {
+    for duplicate_recipient in [true, false] {
+        let (owner, mut authority, mut config) = setup();
+        let other_key = SigningKey::from_bytes(&[93; 32]);
+        let other_age = age::x25519::Identity::generate();
+        let signing = if duplicate_recipient {
+            other_key.verifying_key()
+        } else {
+            owner.key.verifying_key()
+        };
+        let credential = DeviceCredential::issue(
+            &owner.root,
+            &signing,
+            &if duplicate_recipient {
+                owner.age.to_public()
+            } else {
+                other_age.to_public()
+            },
+        )
+        .unwrap();
+        config.members[0].credential_ids.push(credential.id());
+        config.members[0].credential_ids.sort();
+        authority.add_credential(credential);
+        assert!(
+            authority
+                .apply_config(config.sign(&owner.key).unwrap())
+                .is_err()
+        );
+    }
 }

@@ -206,7 +206,14 @@ async fn recognized_v1_migrates_but_unknown_schema_is_not_modified() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        7
+        9
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM access_nonces", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "upgrading a Replica initializes its persistent replay protection"
     );
     db.execute_batch("CREATE TABLE unexpected(id TEXT);")
         .unwrap();

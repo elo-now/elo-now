@@ -235,6 +235,9 @@ pub fn verify(
     let signed = decode_record(&request.record)?;
     signed.verify_signature(credential.key())?;
     let command: Command = signed.decode()?;
+    if credential.authorizing_device().is_some() {
+        return Err("Delete this account from your original device.".into());
+    }
     record::hex::<16>(&command.nonce)?;
     if command.v != 1
         || command.kind != "account.deletion"

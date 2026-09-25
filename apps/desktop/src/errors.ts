@@ -1,7 +1,111 @@
 import { errorText, t, type MessageKey } from "./i18n";
 import { en } from "./locales/en";
 
+// Resolve legacy English messages through keys so they follow the active locale.
+const sourceMessageKeys = new Map<string, MessageKey>(
+  (Object.keys(en) as MessageKey[])
+    .filter((key) => !/\{\w+\}/.test(en[key]))
+    .map((key) => [en[key], key]),
+);
+
 const known: Record<string, MessageKey> = {
+  profile_logout_notifications_pending: "profile.logoutNotificationsPending",
+  profile_logout_cleanup_pending: "profile.logoutCleanupPending",
+  updateRequired: "update.banner",
+  "Invalid management recovery request.": "control.error.request",
+  "Invalid management recovery file.": "control.error.file",
+  "The recovery file belongs to a different Space.": "control.error.file",
+  "Management recovery file is too large.": "control.error.size",
+  "Open the original Space before recovering this chat.": "control.error.space",
+  "checkpoint omits known local changes; obtain current proofs":
+    "control.error.stale",
+  "recovery belongs to the original controller owner": "control.error.owner",
+  "conflicting proof or wrong recovery owner": "control.error.owner",
+  "The recovery file changed. Review it again.": "control.error.changed",
+  "Review the members and confirm recovery first.": "control.error.changed",
+  "Review a recovery file first.": "control.error.changed",
+  "Confirm the recovery device first.": "control.error.changed",
+  "This profile cannot help recover management of this chat.":
+    "control.error.helper",
+  "a different recovery is already installed; load its current configuration":
+    "control.error.conflict",
+  "Space already has a newer or conflicting recovery; obtain its proof":
+    "control.error.conflict",
+  "Space has a newer or conflicting controller recovery":
+    "control.error.conflict",
+  "Chat permissions need to be refreshed.": "error.chatPermissionsStale",
+  "Chat devices have changed. The chat owner needs to update access.":
+    "error.chatDevicesChanged",
+  "Chat controller recovery is required.": "error.chatControllerRecovery",
+  "Space controller recovery is required.": "error.chatControllerRecovery",
+  "This device was revoked.": "error.deviceRevoked",
+  "Device management requires a hosted Space.": "error.deviceManagementHosted",
+  "Choose another device belonging to this profile.": "error.deviceSelection",
+  "Too many pending device changes.": "error.deviceChangesPending",
+
+  "Could not connect to this Space. Try again.": "error.replicaConnection",
+  "Could not update this Space. Try again.": "error.requestRejected",
+  "Could not create your Space. Try again to continue safely.":
+    "error.unknownOutcome",
+  "Space server unreachable.": "error.replicaConnection",
+  "Space server timed out.": "error.serverTimeout",
+  "Space server unavailable.": "error.serverUnavailable",
+  "Space request rejected.": "error.requestRejected",
+  "Space access denied.": "error.replicaAccess",
+  "Space endpoint unavailable.": "error.spaceUnavailable",
+  "Space hosting unavailable.": "error.hostingUnavailable",
+  "Space server is busy.": "error.serverBusy",
+  "Space is busy. Try again.": "error.serverBusy",
+  "Hosting capacity reached.": "error.hostingCapacity",
+  "Space hosting is currently at capacity. Try again later or join an existing Space.":
+    "error.hostingCapacity",
+  "Space response is too large.": "error.serverResponse",
+  "Space hosting response is too large.": "error.serverResponse",
+  "Invalid Space response.": "error.serverResponse",
+  "Unexpected Space hosting response.": "error.serverResponse",
+  "This Space has an unexpected signing key.": "error.verification",
+  "Space hosting response changed server.": "error.verification",
+  "Invalid Space response signature.": "error.verification",
+  "This response belongs to another Space request.": "error.verification",
+  "This Space invitation has expired or was revoked.":
+    "error.spaceInvitationExpired",
+  "Invitation not found.": "error.spaceInvitationMissing",
+  "Space roles have changed. Refresh and try again.": "error.spaceRolesChanged",
+  "Chat permissions have changed. Sync before trying again.":
+    "error.spaceRolesChanged",
+  "This request has already been handled.": "error.spaceRequestHandled",
+  "This role request has already been handled.": "error.spaceRequestHandled",
+  "Space request limit reached.": "error.spaceRequestLimit",
+  "Space member limit reached.": "error.spaceMemberLimit",
+  "Too many pending attachments. Finish or cancel an upload.": "error.attachmentPendingLimit",
+  "Attachment file limit reached. Remove old files.": "error.attachmentFileLimit",
+  "Invalid Space creation proof.": "error.verification",
+  "Space creation proof timed out.": "error.serverBusy",
+  "Revoke an unused invitation first.": "error.spaceInvitationLimit",
+  "Only the Space owner can manage invitations.": "error.notAllowed",
+  "Only a Space owner can change roles.": "error.notAllowed",
+  "Only the primary owner can confirm deleting this Space.": "error.notAllowed",
+  "You do not have permission to manage these attachments.": "error.notAllowed",
+  "Join this Space using an invitation first.": "error.joinSpaceFirst",
+  "Enter a Space name.": "error.spaceName",
+  "Join a Space first.": "error.spaceDisconnected",
+  "Space unavailable.": "error.spaceDisconnected",
+  "Space is unavailable.": "error.spaceDisconnected",
+  "Invalid exchange handle": "error.exchangeExpired",
+  "Invalid exchange file": "error.exchangeFile",
+  "Too many pending exchange files": "error.exchangeLimit",
+  "Attachment upload is incomplete.": "error.attachmentUpload",
+  "Attachment upload authorization expired.": "error.attachmentUpload",
+  "Attachment download authorization expired.": "error.attachmentDownload",
+  "Attachment is no longer available.": "error.attachmentUnavailable",
+  "Attachment is not available.": "error.attachmentUnavailable",
+  "Attachment was not found.": "error.attachmentUnavailable",
+  "transport request failed: Http(401)": "error.replicaAccess",
+  "transport request failed: Http(403)": "error.replicaAccess",
+  "transport request failed: Http(429)": "error.serverBusy",
+  "transport request failed: Http(502)": "error.serverUnavailable",
+  "transport request failed: Http(503)": "error.serverUnavailable",
+  "transport request failed: Http(504)": "error.serverTimeout",
   "Could not open your mail app": "requests.mailUnavailable",
   "Unblock this user before contacting them.": "blocking.contactBlocked",
   "You cannot block yourself.": "blocking.self",
@@ -90,6 +194,8 @@ const known: Record<string, MessageKey> = {
   "This code has already been used for another device":
     "recover.error.pairUsed",
   "Compare and confirm the code on both devices": "recover.error.pairCode",
+  "Device linking was interrupted. Create a new code.":
+    "recover.error.pairInterrupted",
   "Invalid device code or name": "recover.error.pairType",
   "Invalid device code": "recover.error.pairType",
   "Scan a device-linking code, not a public contact code":
@@ -107,8 +213,13 @@ const known: Record<string, MessageKey> = {
   "Remove an unused saved profile before adding another":
     "recover.error.profileLimit",
   "Saved profile not found": "recover.error.savedMissing",
-  "Confirm the device and enter your profile password":
-    "recover.error.pairPassword",
+  device_revocation_confirmation_required: "devices.error.confirmRevocation",
+  profile_password_required: "devices.error.passwordRequired",
+  recovery_code_required: "devices.error.recoveryRequired",
+  "Device linking was declined.": "devices.declined",
+  "Link another device from your original device.": "devices.originalRequired",
+  "Manage this Space from your original device.": "devices.manageOriginal",
+  "Delete this account from your original device.": "devices.deleteOriginal",
   "Choose a smaller PNG or JPEG image": "recover.imageTooLarge",
   "Choose a PNG or JPEG image": "recover.imageInvalid",
   "Invalid image": "recover.imageInvalid",
@@ -317,7 +428,8 @@ function explanation(
   reason: string,
   passwordBytes?: number,
 ): string | undefined {
-  if (Object.values(en).some((message) => message === reason)) return reason;
+  const sourceKey = sourceMessageKeys.get(reason);
+  if (sourceKey) return t(sourceKey);
   if (reason === "passphrase must contain 12..=1024 UTF-8 bytes")
     return t(
       passwordBytes !== undefined && passwordBytes < 12

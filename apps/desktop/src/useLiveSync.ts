@@ -1,3 +1,4 @@
+import { updateRequired, useUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -11,6 +12,7 @@ export function useLiveSync(
   onResult: (result: SyncResult) => void,
   suspended: () => boolean = () => false,
 ) {
+  const restricted = useUpdateRequired();
   const [progress, setProgress] = useState<SyncProgress>(null);
   const latest = useRef({ view, conversation, busy, onResult, suspended });
   latest.current = { view, conversation, busy, onResult, suspended };
@@ -34,13 +36,14 @@ export function useLiveSync(
   );
   useEffect(() => {
     setProgress(null);
-    if (!view) return;
+    if (!view || restricted) return;
     const identity = view.identity;
     const loop = startLiveSync(
       identity,
       () => ({
         conversation: latest.current.conversation,
-        busy: latest.current.busy || latest.current.suspended(),
+        busy:
+          updateRequired() || latest.current.busy || latest.current.suspended(),
         messages:
           !!latest.current.view?.replicas.length ||
           !!latest.current.view?.spaces?.some(
@@ -74,7 +77,7 @@ export function useLiveSync(
       loop.stop();
       worker.current = undefined;
     };
-  }, [view?.identity]);
+  }, [view?.identity, restricted]);
   useEffect(() => {
     worker.current?.changed();
   }, [

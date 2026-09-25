@@ -113,18 +113,29 @@ impl MegaWebDavStorage {
 
     async fn collection(&self, suffix: &str) -> Result<()> {
         let method = Method::from_bytes(b"MKCOL")?;
-        let response = self.client.request(method, self.url(suffix)).send().await?;
-        if response.status().is_success()
-            || response.status() == StatusCode::METHOD_NOT_ALLOWED
-            || response.status() == StatusCode::CONFLICT
-        {
-            return Ok(());
+        for attempt in 0..3 {
+            let response = self
+                .client
+                .request(method.clone(), self.url(suffix))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() || status == StatusCode::METHOD_NOT_ALLOWED {
+                return Ok(());
+            }
+            // A fresh WebDAV collection may not be visible immediately. A 409
+            // means its parent is missing, never successful creation. MKCOL is
+            // idempotent; the streaming PUT is deliberately not replayed here.
+            if attempt < 2 && matches!(status.as_u16(), 409 | 423 | 429 | 502 | 503 | 504) {
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
+                continue;
+            }
+            return Err(
+                format!("MEGA WebDAV could not create attachment storage ({status})").into(),
+            );
         }
-        Err(format!(
-            "MEGA WebDAV could not create attachment storage ({})",
-            response.status()
-        )
-        .into())
+        unreachable!()
     }
 }
 
@@ -475,6 +486,59 @@ impl AttachmentStorage for S3CompatibleStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn webdav_waits_for_new_collection_and_never_treats_conflict_as_success() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(move || {
+                    let count = counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if count == 0 {
+                            StatusCode::CONFLICT
+                        } else {
+                            StatusCode::CREATED
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let storage = MegaWebDavStorage::new(&address).unwrap();
+        storage.collection("spaces").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let storage =
+            MegaWebDavStorage::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { StatusCode::CONFLICT }),
+            )
+            .await
+            .unwrap();
+        });
+        assert!(
+            storage
+                .collection("spaces")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("409")
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn local_provider_streams_and_isolates_spaces() {

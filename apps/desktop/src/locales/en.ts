@@ -18,6 +18,130 @@ export const brandIntroFrames = [
 ] as const;
 
 export const en = {
+  "error.recoveryClipboard": "Could not copy the recovery code.",
+  "control.error.request": "Check the device request and paste it again.",
+  "control.error.file":
+    "This recovery file could not be verified for this profile.",
+  "control.error.size": "This recovery file is too large.",
+  "control.error.space": "Open the original Space before recovering this chat.",
+  "control.error.stale":
+    "This file omits known changes. Ask for a current recovery file.",
+  "control.error.owner": "Use the original chat owner’s recovered profile.",
+  "control.error.changed":
+    "Review the recovery file and confirm the members again.",
+  "control.error.helper":
+    "This profile cannot help recover management of this chat.",
+  "control.error.conflict":
+    "A different management change is already saved. Ask for its current configuration.",
+  "control.title": "Recover management",
+  "control.help":
+    "Use this if you lost the device that managed your chats. It restores permission to manage members, not your message history. Space ownership stays unchanged.",
+  "control.start": "Recover my chat management",
+  "control.startChoiceHelp":
+    "You restored your profile and need to manage your chats again. Ask someone still in the chat to help.",
+  "control.assist": "Help an owner recover",
+  "control.assistChoiceHelp":
+    "A chat owner asked for your help. Prepare a recovery file for them.",
+  "control.open": "Open recovery file",
+  "control.openChoiceHelp":
+    "Someone sent you a file to restore chat management or confirm a change of managing device.",
+  "control.requestHelp":
+    "First restore your profile using your recovery code and join the original Space. Send this request to someone still in the chat. Ask them to choose Recovery → ⋯ → Recover management → Help an owner recover. Open the recovery file they send back.",
+  "control.requestCode": "Device request",
+  "control.assistHelp":
+    "Paste the device request sent by the chat owner. This shares configuration only; it does not grant access or include messages.",
+  "control.find": "Find matching chats",
+  "control.compareDevice":
+    "Compare this device identifier with the owner using a separate, trusted conversation.",
+  "control.deviceConfirmed": "I checked the device identifier with the owner.",
+  "control.noChats": "No matching chats are available in this Space.",
+  "control.saveFor": "Save recovery file for {name}",
+  "control.saved": "File prepared. Send it to the intended recipient.",
+  "control.reviewHelp":
+    "Check this list with a current participant. The file may omit later changes. Recovery replaces the managing owner’s old devices; it does not restore missing messages.",
+  "control.adoptHelp":
+    "The owner is replacing their managing device. Verify this change and the member list with the owner before accepting.",
+  "control.unknownChat":
+    "This chat is not saved on this device. Verify the Space identifier with a trusted participant before continuing.",
+  "control.spaceId": "Space identifier",
+  "control.managingDevice": "New managing device",
+  "control.deviceId": "This device",
+  "control.members": "Members and permissions",
+  "control.deviceCount": "Devices: {count}",
+  "control.conflict":
+    "Conflicting configurations were found. Recovery is stopped.",
+  "control.confirm":
+    "I verified the change and approve the displayed members and permissions.",
+  "control.restore": "Recover management",
+  "control.accept": "Accept management change",
+  "control.restored": "Management recovered on this device.",
+  "control.accepted": "Management change accepted.",
+  "control.shareHelp":
+    "Send the updated file to the remaining participants. They must choose Recovery → ⋯ → Recover management → Open recovery file and accept the change. Repeat recovery for the other chats you managed.",
+  "control.share": "Share updated configuration",
+  "control.permission.read": "Read",
+  "control.permission.post": "Send messages",
+  "control.permission.history": "Share history",
+  "control.permission.manage": "Manage",
+  "control.permission.replicate": "Store copies",
+  "update.title": "Update required",
+  "update.banner": "Update required to go online.",
+  "update.required":
+    "Install the latest elo.now update to continue. Your profile stays on this device.",
+  "update.checking": "Checking for updates…",
+  "update.open": "Get update",
+  "update.retry": "Check again",
+  "update.openFailed": "Could not open the download page.",
+  "error.downloadProtection":
+    "Could not mark this download as untrusted. Choose another destination.",
+  "error.backupMemory":
+    "This backup needs too much memory. Export a new backup on its original device.",
+  "devices.registered": "Registered devices",
+  "devices.loading": "Loading devices…",
+  "devices.loadFailed": "Could not load devices. Try again.",
+  "devices.unavailable":
+    "Some Spaces are unreachable. The device list may be incomplete.",
+  "devices.pendingRevocation":
+    "Device removal is waiting for a server. Keep elo open to retry.",
+  "devices.none": "Connect to a Space to manage your devices.",
+  "devices.thisDevice": "This device",
+  "devices.deviceName": "Device {fingerprint}",
+  "devices.revoke": "Revoke access",
+  "devices.revokeTitle": "Delete this device?",
+  "devices.accept": "Accept",
+  "devices.accepted": "Accepted",
+  "devices.pending": "Waiting for acceptance",
+  "devices.delete": "Delete",
+  "devices.deleteRequestTitle": "Delete pairing request?",
+  "devices.deleteRequestHelp": "{name} will not be linked to your profile.",
+  "devices.requestFailed": "Could not check pairing. Create a new code.",
+  "devices.sendRequest": "Send pairing request",
+  "devices.requestSent":
+    "Pairing request sent. Accept it on your other device.",
+  "devices.finishing": "Connecting your device…",
+  "devices.finishFailed": "Could not finish linking. Try again.",
+  "devices.samePassword": "Use the same profile password on both devices.",
+  "devices.declined": "Pairing request declined.",
+  "devices.originalRequired": "Link another device from your original device.",
+  "devices.manageOriginal": "Manage this Space from your original device.",
+  "devices.deleteOriginal": "Delete this account from your original device.",
+  "devices.revokeHelp":
+    "This stops future access after the servers confirm removal. History already saved on the device stays there.",
+  "error.chatPermissionsStale":
+    "Chat access has changed. Refresh before sending.",
+  "error.chatDevicesChanged":
+    "Chat devices have changed. The chat owner needs to update access.",
+  "error.chatControllerRecovery": "Recover chat control before sending.",
+  "error.deviceRevoked":
+    "This device was revoked. Recover your profile on a new device.",
+  "error.deviceManagementHosted":
+    "Connect to a hosted Space to manage devices.",
+  "error.deviceSelection": "Choose another device belonging to this profile.",
+  "error.deviceChangesPending":
+    "Finish pending device changes before adding more.",
+
+  "devices.independentKeys":
+    "Use your recovery code to authorize this device with its own security keys.",
   ...native,
   ...desktop,
   "settings.callRingtone": "Call ringtone",
@@ -393,9 +517,9 @@ export const en = {
   "notifications.enable": "Enable",
   "notifications.notNow": "Not now",
   "notifications.error.registration":
-    "Couldn’t set up notifications. Check your connection and try again in Settings.",
+    "Notification setup failed. Open Settings to retry.",
   "notifications.error.connection":
-    "Couldn’t connect to the notification service. Check your connection and try again.",
+    "Can’t reach the notification service. Check your connection.",
   "notifications.error.update":
     "Notification setup hasn’t finished yet. Keep elo open; we’ll retry automatically.",
   "notifications.error.permission":
@@ -569,6 +693,8 @@ export const en = {
   "recover.error.pairUsed":
     "This device code has already been used. Create a new one.",
   "recover.error.pairCode": "Compare and confirm the code on both devices.",
+  "recover.error.pairInterrupted":
+    "Device linking was interrupted. Create a new code.",
   "recover.error.pairType": "Scan a device-linking QR from your other device.",
   "recover.error.pairSpace": "Connect to a Space before linking a device.",
   "recover.error.pairApproval":
@@ -582,8 +708,10 @@ export const en = {
   "recover.error.profileLimit":
     "Remove an unused saved profile before adding another.",
   "recover.error.savedMissing": "This saved profile could not be found.",
-  "recover.error.pairPassword":
-    "Confirm the device and enter your profile password.",
+  "devices.error.confirmRevocation":
+    "Confirm that you want to revoke this device.",
+  "devices.error.passwordRequired": "Enter your profile password.",
+  "devices.error.recoveryRequired": "Enter your recovery code.",
   "password.show": "Show password",
   "password.hide": "Hide password",
   "recover.title": "Recover",
@@ -670,7 +798,9 @@ export const en = {
   "recover.removeBackup": "Remove backup selection",
   "recover.saveBackup": "Save backup",
   "recover.settingsHelp":
-    "Enter the 24 words or recovery code you saved when creating this profile. The app does not keep a copy. You can then save a password-protected QR below.",
+    "Save your recovery code as a password-protected QR. Scan it to restore your profile on another device without typing the code. It does not include your messages.",
+  "recover.settingsCodeHelp":
+    "Paste the recovery code or 24 words you saved when creating your profile. You need them to save a QR or chat backup; elo does not keep a copy.",
   "recover.codePlaceholder": "Recovery code or 24 words",
   "recover.backupTitle": "Chat backup",
   "recover.backupMobileHelp":
@@ -681,10 +811,11 @@ export const en = {
     "To restore it, open Recover on the login screen, enter your recovery code or scan its QR, then choose the backup file.",
   "recover.removeDevice": "Remove from this device",
   "recover.removeHelp":
-    "This removes the selected profile and its local history from this device. Other saved profiles, exported backups, other devices and copies held by chat participants or Replicas remain. Save a backup first if you need this history.",
+    "Delete this profile and its saved messages from this device. Other devices, other profiles, exported backups and copies held by chat participants or servers stay unchanged. Save a backup first if you need this history.",
   "recover.removeConfirm":
     "I understand that this local profile and history will be removed.",
   "devices.title": "Devices",
+  "devices.back": "Back to devices",
   "devices.help":
     "Add a companion device with a copy of this encrypted profile and its history. Both devices can exchange messages. Administration is disabled in the new copy.",
   "devices.link": "Link device",
@@ -702,9 +833,9 @@ export const en = {
   "devices.approveHelp":
     "Approval shares this profile’s message keys and saved history with the selected device. Only approve a device you control.",
   "devices.companionHelp":
-    "This is a trusted copy with shared message keys, not an independently revocable device. Administration is disabled in this copy to avoid conflicting changes.",
+    "You can revoke this device separately in Devices. Revoking access does not erase history already copied to it. Administration is unavailable on the linked device.",
   "devices.codeHelp":
-    "On your other device, open elo.now and choose Recover → Use another device from the login menu, then tap Scan QR.\nKeep this screen open to approve the connection.",
+    "On your other device, choose Recover → Use another device from the login menu and scan this code. Then accept its request here.",
   "devices.qrLabel": "Temporary device-linking QR",
   "devices.copied": "Device code copied.",
   "devices.noRequests": "Waiting for your other device… {time}",
@@ -914,9 +1045,13 @@ export const en = {
   "message.dateUnavailable": "Date unavailable",
   "toast.dismiss": "Dismiss error",
   "toast.details": "Details",
+  "error.callDeviceVerification":
+    "Could not verify this device for incoming calls. Try again.",
   "error.passwordShort": "Use at least 12 characters.",
+  "error.exportPasswordWeak":
+    "Choose a less predictable password, such as four unrelated words.",
   "error.passwordLong": "Use a shorter password.",
-  "error.passwordCheck": "Check your password and try again.",
+  "error.passwordCheck": "Incorrect password. Try again.",
   "error.profileOpen":
     "Couldn’t open this profile. Check your password and try again.",
   "error.profileFile":
@@ -924,7 +1059,8 @@ export const en = {
   "error.profileLocked": "Open your profile to continue.",
   "error.profileExists":
     "A profile already exists here. Open it or choose another folder.",
-  "error.generic": "Couldn’t complete this action. Please try again.",
+  "error.generic":
+    "This action failed. If it keeps happening, contact support.",
   "error.profilePath": "Enter the full path to your profile folder.",
   "error.lockFirst": "Lock your current profile first.",
   "error.saveRecovery":
@@ -944,7 +1080,7 @@ export const en = {
   "error.damagedData":
     "The saved data failed its integrity check. Keep your profile and contact support.",
   "error.unknownOutcome":
-    "Confirmation was lost. Check whether the action completed; if you retry, use exactly the same information.",
+    "Confirmation was lost. Check whether the action completed before retrying.",
   "error.storageUnconfirmed":
     "Couldn’t confirm the save. Check local state and available storage before retrying.",
   "error.retryChanged":
@@ -952,28 +1088,61 @@ export const en = {
   "error.syncChanged":
     "Sync state changed. Check the current message status before retrying.",
   "error.replicaAccess": "Access to this Space was denied. Contact its owner.",
-  "error.replicaFull":
-    "This Space is full. Pending messages are saved on this device and will retry automatically. Contact the Space owner.",
+  "error.replicaFull": "Message storage is full. Contact the Space owner.",
   "spaces.storage.full":
     "Storage is full in: {names}. Pending messages are saved on this device and will retry automatically. Contact the Space owner.",
   "error.replicaConnection":
-    "Couldn’t connect to this Space. Try again or contact its owner.",
+    "Can’t reach the Space server. Check your connection.",
   "error.serverTimeout":
-    "The server took too long to respond. Check your connection and try again.",
-  "error.network":
-    "Couldn’t reach the server. Check your connection and try again.",
+    "The server didn’t respond in time. Try again shortly.",
+  "error.network": "Can’t reach the server. Check your connection.",
+  "error.serverBusy": "The server is busy. Try again shortly.",
+  "error.serverUnavailable":
+    "The server is temporarily unavailable. Try again later.",
+  "error.requestRejected":
+    "The server rejected this request. Refresh and try again.",
+  "error.serverResponse":
+    "The server sent an invalid response. Contact the Space owner.",
+  "error.spaceUnavailable":
+    "This Space is unavailable at this address. Check your invitation.",
+  "error.hostingCapacity":
+    "The hosting limit has been reached. Join an existing Space or try later.",
+  "error.hostingUnavailable":
+    "Space creation is unavailable on this server. Contact support.",
+  "error.spaceInvitationExpired":
+    "This invitation expired or was revoked. Ask the Space owner for a new one.",
+  "error.spaceInvitationMissing":
+    "This invitation is unavailable. Ask for a new one.",
+  "error.spaceRolesChanged":
+    "Space permissions changed. Refresh before continuing.",
+  "error.spaceRequestHandled":
+    "This request was already handled. Refresh the list.",
+  "error.spaceRequestLimit":
+    "This Space has too many pending requests. Contact its owner.",
+  "error.spaceMemberLimit": "This Space has reached its member limit.",
+  "error.attachmentPendingLimit": "Too many pending uploads. Finish or cancel one first.",
+  "error.attachmentFileLimit": "Attachment file limit reached. Remove old files.",
+  "error.spaceInvitationLimit":
+    "Too many invitations. Revoke an unused one first.",
+  "error.joinSpaceFirst": "Join this Space with an invitation first.",
+  "error.spaceName": "Enter a name for your Space.",
+  "error.spaceDisconnected": "Connect to this Space before continuing.",
+  "error.exchangeExpired":
+    "This file selection expired. Select the file again.",
+  "error.exchangeLimit":
+    "Too many files are open. Finish or cancel a transfer.",
   "error.storageUnavailable":
-    "Storage is unavailable right now. Check the service before retrying.",
+    "File storage is temporarily unavailable. Try again later.",
   "error.fileUnavailable":
-    "The requested data isn’t available right now. Try again when its source is online.",
+    "This file is unavailable. Ask the sender to share it again.",
   "error.attachmentTooLarge": "Choose a file no larger than 5 MB.",
   "error.attachmentFull":
-    "Attachment storage is full in this Space. Ask its owner to remove old server copies.",
+    "Attachment storage is full. Ask the Space owner to free space.",
   "error.attachmentDisabled": "Attachments are disabled in this Space.",
   "error.attachmentUpload":
-    "Couldn’t upload this attachment. Check your connection and try again.",
+    "Upload failed. Check your connection and resend the file.",
   "error.attachmentDownload":
-    "Couldn’t download this attachment. Check your connection and try again.",
+    "Download failed. Check your connection and download again.",
   "error.attachmentExpired": "This attachment’s server copy has expired.",
   "error.attachmentDeleted": "This attachment was removed from the server.",
   "error.attachmentUnavailable":
@@ -981,11 +1150,11 @@ export const en = {
   "error.attachmentIntegrity":
     "This attachment failed its integrity check and was not saved.",
   "error.conflictingData":
-    "This data conflicts with an existing copy. Check Details before continuing.",
+    "Conflicting data was received. Contact the Space owner.",
   "error.contentRecipients":
     "Couldn’t prepare this content. Check its size and recipients.",
   "error.encryption":
-    "Couldn’t encrypt this content. Check Details before trying again.",
+    "Couldn’t encrypt this content. Contact support if this repeats.",
   "error.decryption":
     "Couldn’t open or verify this content. Check your access with the sender.",
   "error.verification":
@@ -995,7 +1164,7 @@ export const en = {
   "error.unsupportedData":
     "This type or version of data isn’t supported by this app.",
   "error.notAllowed":
-    "You don’t have permission for this action. Check your access with the chat owner.",
+    "You don’t have permission for this action. Contact the owner.",
   "error.randomness":
     "The device couldn’t generate secure keys. Try again later.",
   "error.confirmIdentity":
@@ -1026,7 +1195,7 @@ export const en = {
   "error.exchangeFile":
     "Couldn’t use this file. Check its permissions and size.",
   "error.exchangeFolder":
-    "Couldn’t safely access the file exchange folder. Check Details.",
+    "Couldn’t safely access local files. Contact support.",
   "error.invalidExport":
     "This file isn’t ready to export. Prepare the export again.",
   "error.fileAccess":
@@ -1315,6 +1484,10 @@ export const en = {
     "Create a chat or import an approved configuration.",
   "profile.lock": "Log out",
   "profile.logoutTitle": "Log out on this device?",
+  "profile.logoutNotificationsPending":
+    "Logged out. Notification cleanup could not finish.",
+  "profile.logoutCleanupPending":
+    "Logged out. Some temporary files could not be cleared.",
   "profile.logoutHelp":
     "You’ll need your password or biometrics to open this profile again.",
   "channel.context": "Chat",

@@ -14,6 +14,28 @@ pub const MAX_RECORD: usize = 1024 * 1024;
 pub const MAX_CHAT_MEMBERS: usize = 1000;
 pub const MAX_CHAT_CREDENTIALS: usize = 2000;
 pub const MAX_INTEGER: u64 = (1 << 53) - 1;
+pub const MAX_MESSAGE_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Lamport ordering must not let a peer exhaust the wire integer range.
+pub fn valid_message_time_at(value: u64, now: u64) -> bool {
+    value <= MAX_INTEGER && value <= now.saturating_add(MAX_MESSAGE_CLOCK_SKEW_MS)
+}
+
+pub fn current_message_time_is_valid(value: u64) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    valid_message_time_at(value, now.as_millis() as u64)
+}
+
+pub fn next_message_time(highest: u64, now: u64) -> u64 {
+    let next = if valid_message_time_at(highest.saturating_add(1), now) {
+        highest.saturating_add(1)
+    } else {
+        now
+    };
+    next.max(now).min(MAX_INTEGER)
+}
 const SIGN_DOMAIN: &[u8] = b"elo.now/signed-record/v1\0";
 
 #[derive(Debug, Error)]
@@ -145,7 +167,13 @@ impl SignedRecord {
             return Err(RecordError::Framing);
         }
         let body = strict_json(&bytes[8..8 + length], maximum)?;
-        if body.get("v").and_then(Value::as_u64) != Some(1) {
+        if body.get("v").and_then(Value::as_u64) != Some(1)
+            && !(body.get("v").and_then(Value::as_u64) == Some(2)
+                && matches!(
+                    body.get("kind").and_then(Value::as_str),
+                    Some("device.credential" | "device.revoked")
+                ))
+        {
             return Err(RecordError::Unsupported);
         }
         Ok(Self {
@@ -259,7 +287,14 @@ pub fn valid_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 120
         && name.trim() == name
-        && !name.chars().any(char::is_control)
+        && !name.chars().any(unsafe_display_character)
+}
+
+/// Reject invisible direction changes and separators used to disguise names/extensions.
+pub fn unsafe_display_character(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -280,6 +315,15 @@ pub struct ChatMessage {
     pub payload: TextPayload,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<MessageLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<MessageAccess>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageAccess {
+    pub request_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_secret: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -287,6 +331,8 @@ pub struct MessageLocator {
     pub message_record_id: RecordId,
     pub body_object_id: ObjectId,
     pub locator_nonce: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_secret: String,
 }
 impl ChatMessage {
     pub fn validate(&self) -> Result<()> {
@@ -320,6 +366,8 @@ impl ChatMessage {
                         || self.payload.sender_name.is_some()
                         || self.payload.action.is_some()
                         || hex::<16>(&locator.locator_nonce).is_err()
+                        || (!locator.request_secret.is_empty()
+                            && hex::<32>(&locator.request_secret).is_err())
                 }
                 _ => true,
             }
@@ -330,6 +378,16 @@ impl ChatMessage {
                 .is_some_and(|name| !valid_display_name(name))
             || !valid_timestamp(&self.created_at)
         {
+            return Err(RecordError::Json);
+        }
+        if self.access.as_ref().is_some_and(|access| {
+            self.kind != "chat.message"
+                || !crate::retention_access::valid_key(&access.request_key)
+                || access
+                    .accept_secret
+                    .as_ref()
+                    .is_some_and(|seed| hex::<32>(seed).is_err() || self.audience.len() != 2)
+        }) {
             return Err(RecordError::Json);
         }
         Ok(())

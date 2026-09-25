@@ -1,5 +1,5 @@
 import { PasswordInput } from "./PasswordInput";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -191,12 +191,16 @@ export function CodeInput({
   mobile,
   code,
   onChange,
+  onCaptured,
   disabled = false,
+  children,
 }: {
   mobile: boolean;
   code: string;
   onChange: (code: string) => void;
+  onCaptured?: (code: string) => void;
   disabled?: boolean;
+  children?: ReactNode;
 }) {
   const { reportError } = useToast();
   const [scanning, setScanning] = useState(false);
@@ -222,6 +226,7 @@ export function CodeInput({
       if (live.current) {
         onChange(result.content);
         setCaptured(true);
+        onCaptured?.(result.content);
       }
     } catch (e) {
       if (live.current && !/cancel/i.test(String(e))) reportError(e);
@@ -248,6 +253,7 @@ export function CodeInput({
       if (live.current) {
         onChange(result.code);
         setCaptured(true);
+        onCaptured?.(result.code);
       }
     } catch (e) {
       if (live.current) reportError(e);
@@ -265,56 +271,64 @@ export function CodeInput({
         aria-label={t("recover.chooseImage")}
         onChange={(e) => void choose(e.currentTarget)}
       />
-      <div className="recovery-actions">
-        {mobile && (
-          <button
-            type="button"
-            className="ghost"
-            disabled={disabled || scanning}
-            onClick={() => void read()}
-          >
-            <Icon name="qr" />
-            {t("invite.scan")}
-          </button>
-        )}
-        <button
-          type="button"
-          className="ghost"
-          disabled={disabled || scanning}
-          onClick={() => gallery.current?.click()}
-        >
-          {t("recover.chooseImage")}
-        </button>
-      </div>
       {captured && code ? (
         <div className="recovery-captured">
-          <p>{t("recover.codeReady")}</p>
-          <button
-            type="button"
-            className="ghost"
-            disabled={disabled}
-            onClick={() => {
-              onChange("");
-              setCaptured(false);
-            }}
-          >
-            {t("recover.changeCode")}
-          </button>
+          <p role="status">{t("recover.codeReady")}</p>
         </div>
       ) : (
-        <label>
-          {t("recover.pasteCode")}
-          <textarea
-            rows={2}
-            maxLength={4096}
-            value={code}
-            onChange={(e) => onChange(e.target.value)}
-            autoCapitalize="none"
-            autoComplete="off"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </label>
+        <>
+          <div className="recovery-actions">
+            {mobile && (
+              <>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={disabled || scanning}
+                  onClick={() => void read()}
+                >
+                  <Icon name="qr" />
+                  {t("invite.scan")}
+                </button>
+                <p className="invitation-code-alternative">{t("invite.or")}</p>
+              </>
+            )}
+            <button
+              type="button"
+              className="secondary"
+              disabled={disabled || scanning}
+              onClick={() => gallery.current?.click()}
+            >
+              {t("recover.chooseImage")}
+            </button>
+          </div>
+          <label>
+            {t("recover.pasteCode")}
+            <textarea
+              rows={2}
+              maxLength={4096}
+              value={code}
+              onChange={(e) => onChange(e.target.value)}
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+          </label>
+        </>
+      )}
+      {children}
+      {captured && code && (
+        <button
+          type="button"
+          className="secondary recovery-change-code"
+          disabled={disabled}
+          onClick={() => {
+            onChange("");
+            setCaptured(false);
+          }}
+        >
+          {t("recover.changeCode")}
+        </button>
       )}
     </>
   );
@@ -344,10 +358,11 @@ export function ProfileRecovery({
     [repeat, setRepeat] = useState(""),
     [code, setCode] = useState("");
   const [qrPassword, setQrPassword] = useState(""),
-    [deviceName, setDeviceName] = useState("");
+    [pairFinishing, setPairFinishing] = useState(false);
   const [backup, setBackup] = useState(false),
-    [busy, setBusy] = useState(false),
-    [confirmed, setConfirmed] = useState(false);
+    [busy, setBusy] = useState(false);
+  const [pairFinishFailed, setPairFinishFailed] = useState(false);
+  const finishingPair = useRef(false);
   const [pair, setPair] = useState<PairStatus | null>(null);
   const [retry, setRetry] = useState(0);
   const [progress, setProgress] = useState<RecoveryStep | null>(null);
@@ -406,12 +421,46 @@ export function ProfileRecovery({
       else {
         await profileTask("cancel");
         setPair(null);
+        setPairFinishing(false);
+        setPairFinishFailed(false);
+        finishingPair.current = false;
         setBackup(false);
         setCode("");
         setPollFailed(false);
         setStep("choose");
       }
     });
+  const requestPair = (value: string) => {
+    if (busy) return;
+    void perform(async () => {
+      setPairFinishFailed(false);
+      finishingPair.current = false;
+      setPair(await profileTask<PairStatus>("pair_request", { code: value }));
+      setCode("");
+    });
+  };
+  const finishPair = async () => {
+    if (finishingPair.current) return;
+    finishingPair.current = true;
+    setPairFinishFailed(false);
+    setPairFinishing(true);
+    setBusy(true);
+    try {
+      const view = await profileTask<View>("pair_finish");
+      acceptLegal(view.identity);
+      onOpen(view, "");
+    } catch (error) {
+      setPairFinishFailed(true);
+      reportError(error);
+    } finally {
+      finishingPair.current = false;
+      setPairFinishing(false);
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (pair?.ready && step === "device") void finishPair();
+  }, [pair?.ready, step]);
   const newPassword = (
     <>
       <label>
@@ -440,11 +489,10 @@ export function ProfileRecovery({
       </label>
     </>
   );
-  const finish = async (op: "recover" | "pair_finish") => {
+  const finish = async () => {
     if (password !== repeat) throw t("onboarding.passwordMismatch");
     const recoveryName = name.trim();
-    if (op === "recover" && (!backup || recoveryName))
-      checkedProfileName(recoveryName);
+    if (!backup || recoveryName) checkedProfileName(recoveryName);
     const request = crypto.randomUUID();
     recoveryRequest.current = request;
     setPaused(false);
@@ -452,7 +500,7 @@ export function ProfileRecovery({
     let unlisten: (() => void) | undefined;
     let view: View;
     try {
-      if (op === "recover" && backup) {
+      if (backup) {
         setProgress({ request, stage: "unlocking", done: 0, total: 0 });
         unlisten = await listen<RecoveryStep>(
           "recovery-progress",
@@ -465,11 +513,9 @@ export function ProfileRecovery({
           },
         );
       }
-      view = await profileTask<View>(op, {
+      view = await profileTask<View>("recover", {
         password,
         name: recoveryName,
-        code: pair?.code,
-        confirmed,
         request_id: request,
       });
     } catch (error) {
@@ -660,22 +706,26 @@ export function ProfileRecovery({
             <CodeInput
               mobile={mobile}
               code={code}
-              onChange={setCode}
+              onChange={(value) => {
+                setCode(value);
+                setQrPassword("");
+              }}
               disabled={busy}
-            />
-            <label>
-              {t("unlock.password")}
-              <PasswordInput
-                required
-                value={qrPassword}
-                onChange={(e) => setQrPassword(e.target.value)}
-                minLength={12}
-                maxLength={1024}
-                autoComplete="off"
-              />
-            </label>
-            <p className="muted">{t("recover.qrPasswordHelp")}</p>
-            <button disabled={busy || !code}>{t("invite.continue")}</button>
+            >
+              <label>
+                {t("unlock.password")}
+                <PasswordInput
+                  required
+                  value={qrPassword}
+                  onChange={(e) => setQrPassword(e.target.value)}
+                  minLength={12}
+                  maxLength={1024}
+                  autoComplete="off"
+                />
+              </label>
+              <p className="muted">{t("recover.qrPasswordHelp")}</p>
+              <button disabled={busy || !code}>{t("invite.continue")}</button>
+            </CodeInput>
           </form>
         )}
         {step === "password" && (
@@ -683,7 +733,7 @@ export function ProfileRecovery({
             onInvalid={onInvalid}
             onSubmit={(e) => {
               e.preventDefault();
-              void perform(() => finish("recover"));
+              void perform(finish);
             }}
           >
             {!busy && !resuming && !paused && (
@@ -768,90 +818,57 @@ export function ProfileRecovery({
             </button>
           </form>
         )}
-        {step === "device" && (
-          <>
-            {!pair ? (
-              <form
-                onInvalid={onInvalid}
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void perform(async () => {
-                    setPair(
-                      await profileTask<PairStatus>("pair_request", {
-                        code,
-                        name: deviceName,
-                      }),
-                    );
-                    setCode("");
-                  });
-                }}
-              >
-                <p className="muted">{t("devices.scanHelp")}</p>
-                <CodeInput
-                  mobile={mobile}
-                  code={code}
-                  onChange={setCode}
-                  disabled={busy}
-                />
-                <label>
-                  {t("devices.name")}
-                  <input
-                    required
-                    value={deviceName}
-                    onChange={(e) => setDeviceName(e.target.value)}
-                    maxLength={120}
-                    autoComplete="off"
-                  />
-                </label>
-                <button disabled={busy || !code}>{t("devices.connect")}</button>
-              </form>
-            ) : (
-              <form
-                onInvalid={onInvalid}
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void perform(() => finish("pair_finish"));
-                }}
-              >
-                <p className="muted">{t("devices.compare")}</p>
-                <p className="pair-comparison">{pair.code}</p>
-                <p className="muted">
-                  {pair.ready ? t("devices.approved") : t("devices.waiting")}
-                </p>
-                {pollFailed && (
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => {
-                      setPollFailed(false);
-                      setRetry((v) => v + 1);
-                    }}
-                  >
-                    {t("devices.retry")}
-                  </button>
+        {step === "device" &&
+          (!pair ? (
+            <form
+              onInvalid={onInvalid}
+              onSubmit={(event) => {
+                event.preventDefault();
+                requestPair(code);
+              }}
+            >
+              <p className="muted">{t("devices.scanHelp")}</p>
+              <CodeInput
+                mobile={mobile}
+                code={code}
+                onChange={setCode}
+                onCaptured={requestPair}
+                disabled={busy}
+              />
+              <button disabled={busy || !code}>
+                {t(busy ? "sync.busy" : "devices.sendRequest")}
+              </button>
+            </form>
+          ) : (
+            <div className="pairing-status">
+              <p role="status">
+                {t(
+                  pairFinishing
+                    ? "devices.finishing"
+                    : pairFinishFailed
+                      ? "devices.finishFailed"
+                      : "devices.requestSent",
                 )}
-                {pair.ready && (
-                  <>
-                    {newPassword}
-                    <label className="check">
-                      <input
-                        type="checkbox"
-                        checked={confirmed}
-                        onChange={(e) => setConfirmed(e.target.checked)}
-                      />
-                      {t("devices.confirmCode")}
-                    </label>
-                    <p className="muted">{t("devices.companionHelp")}</p>
-                    <LegalNotice action={t("devices.connect")} />
-                    <button disabled={busy || !confirmed}>
-                      {busy ? t("sync.busy") : t("devices.connect")}
-                    </button>
-                  </>
-                )}
-              </form>
-            )}
-          </>
-        )}
+              </p>
+              <p className="muted">{t("devices.samePassword")}</p>
+              {pairFinishFailed && (
+                <button disabled={busy} onClick={() => void finishPair()}>
+                  {t("devices.retry")}
+                </button>
+              )}
+              {pollFailed && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPollFailed(false);
+                    setRetry((value) => value + 1);
+                  }}
+                >
+                  {t("devices.retry")}
+                </button>
+              )}
+            </div>
+          ))}
       </div>
     </main>
   );

@@ -106,6 +106,8 @@ async fn complete_backup_keeps_committed_history_profile_and_read_state_without_
     assert_eq!(before["identity"], after["identity"]);
     assert_eq!(before["name"], after["name"]);
     assert_eq!(before["groups"], after["groups"]);
+    assert_eq!(before["identity"], after["identity"]);
+    assert_ne!(before["credential"], after["credential"]);
     assert_eq!(before["streams"][0]["rows"], after["streams"][0]["rows"]);
     assert_eq!(after["streams"][0]["can_manage_members"], false);
     assert_eq!(
@@ -224,8 +226,10 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     let mailbox = store.create_mailbox(256 * 1024 * 1024).await.unwrap();
     let lose_ack = Arc::new(AtomicBool::new(false));
     let flag = lose_ack.clone();
-    let router = elo_core::http::router(store.clone()).layer(middleware::from_fn(
-        move |request: Request, next: Next| {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = elo_core::http::router(store.clone(), &format!("http://{address}")).layer(
+        middleware::from_fn(move |request: Request, next: Next| {
             let flag = flag.clone();
             async move {
                 let upload =
@@ -237,15 +241,15 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
                     response
                 }
             }
-        },
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+        }),
+    );
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
     let path = temp.path().join("source");
     let draft = ProfileDraft::new().unwrap();
+    let card: elo_core::vault::RecoveryCard =
+        serde_json::from_value(serde_json::to_value(draft.card()).unwrap()).unwrap();
     let source = draft
         .save_named(path.clone(), PASSWORD.into(), "Pair test", "Source")
         .await
@@ -273,6 +277,13 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     let packet = URL_SAFE_NO_PAD
         .decode(link.strip_prefix(PREFIX).unwrap())
         .unwrap();
+    let mut unpacked = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::ZlibDecoder::new(packet.as_slice()),
+        &mut unpacked,
+    )
+    .unwrap();
+    let packet = unpacked;
     let packet_text = std::str::from_utf8(&packet).unwrap();
     assert!(!packet_text.contains(&mailbox.read_token));
     assert!(!packet_text.contains(&mailbox.write_token));
@@ -280,18 +291,55 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     let mut expired: serde_json::Value = serde_json::from_slice(&packet).unwrap();
     assert_eq!(expired["expires"].as_u64(), Some(source.expires_at()));
     expired["expires"] = json!(0);
-    let expired_link = format!(
-        "{PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&expired).unwrap())
-    );
+    let expired_link = format!("{PREFIX}{}", {
+        let mut packed = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut packed, &serde_json::to_vec(&expired).unwrap()).unwrap();
+        URL_SAFE_NO_PAD.encode(packed.finish().unwrap())
+    });
     assert!(PairTarget::new(&expired_link, "Expired", true).is_err());
+    let mut target = PairTarget::new(&link, "Companion", true).unwrap();
+    let other = PairTarget::new(&link, "Unapproved", true).unwrap();
+    target.send().await.unwrap();
+    target.send().await.unwrap();
+    let initial = source.poll().await.unwrap();
+    assert_eq!(
+        initial["requests"].as_array().unwrap().len(),
+        1,
+        "an exact retry is one request"
+    );
+    other.send().await.unwrap();
+    let selected = &initial["requests"][0];
+    assert!(
+        source
+            .approve(
+                &app,
+                selected["id"].as_str().unwrap(),
+                selected["code"].as_str().unwrap(),
+                &card
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Device linking was interrupted")
+    );
+    assert!(
+        source.poll().await.is_err(),
+        "a contested code stays permanently invalid"
+    );
+    assert!(source.link().is_err());
+    assert_eq!(
+        target.poll().await.unwrap()["ready"],
+        false,
+        "no profile is released to either requester"
+    );
+
+    let mut source = PairSource::new(&app).await.unwrap();
+    let link = source.link().unwrap();
     let mut target = PairTarget::new(&link, "Companion", true).unwrap();
     let mut other = PairTarget::new(&link, "Unapproved", true).unwrap();
     target.send().await.unwrap();
-    target.send().await.unwrap();
-    other.send().await.unwrap();
     let pending = source.poll().await.unwrap();
-    assert_eq!(pending["requests"].as_array().unwrap().len(), 2);
+    assert_eq!(pending["requests"].as_array().unwrap().len(), 1);
     let request = pending["requests"]
         .as_array()
         .unwrap()
@@ -303,6 +351,12 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
         .unwrap()
         .to_string();
     assert_eq!(request["code"], comparison);
+    assert_eq!(comparison.split(' ').count(), 8);
+    assert!(
+        comparison
+            .split(' ')
+            .all(|part| part.len() == 4 && part.bytes().all(|b| b.is_ascii_hexdigit()))
+    );
     let destination = temp.path().join("linked");
     assert!(
         target
@@ -313,14 +367,14 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     assert!(!destination.exists());
     assert!(
         source
-            .approve(&app, request["id"].as_str().unwrap(), "wrong code")
+            .approve(&app, request["id"].as_str().unwrap(), "wrong code", &card)
             .await
             .is_err()
     );
     lose_ack.store(true, Ordering::SeqCst);
     assert!(
         source
-            .approve(&app, request["id"].as_str().unwrap(), &comparison)
+            .approve(&app, request["id"].as_str().unwrap(), &comparison, &card)
             .await
             .is_err()
     );
@@ -329,7 +383,7 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
         .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
         .unwrap();
     source
-        .approve(&app, request["id"].as_str().unwrap(), &comparison)
+        .approve(&app, request["id"].as_str().unwrap(), &comparison, &card)
         .await
         .unwrap();
     let objects_after: i64 = db
@@ -340,18 +394,14 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
         objects_before + 1,
         "retry reuses the committed backup ciphertext; only its manifest is new"
     );
-    let wrong = pending["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == "Unapproved")
-        .unwrap();
+    other.send().await.unwrap();
     assert!(
         source
             .approve(
                 &app,
-                wrong["id"].as_str().unwrap(),
-                wrong["code"].as_str().unwrap()
+                &"ff".repeat(32),
+                other.summary().unwrap()["code"].as_str().unwrap(),
+                &card
             )
             .await
             .is_err()
@@ -365,6 +415,8 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
         .await
         .unwrap();
     let after = linked.view().await.unwrap();
+    assert_eq!(before["identity"], after["identity"]);
+    assert_ne!(before["credential"], after["credential"]);
     assert_eq!(before["streams"][0]["rows"], after["streams"][0]["rows"]);
     assert_eq!(after["streams"][0]["can_manage_members"], false);
     assert!(

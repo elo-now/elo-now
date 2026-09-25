@@ -2,6 +2,89 @@
 use elo_core::app::ClientApp;
 use serde_json::{Value, json};
 
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
+fn obsolete_registration(bytes: &[u8], endpoint: &str) -> Result<bool, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| "Invalid notification settings".to_owned())?;
+    let version = value["v"].as_u64().ok_or("Invalid notification settings")?;
+    let saved_endpoint = value["route"]["endpoint"]
+        .as_str()
+        .ok_or("Invalid notification settings")?;
+    Ok(version != 2 || saved_endpoint != endpoint)
+}
+
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
+fn discard_obsolete_registration(
+    file: &std::path::Path,
+    bytes: &[u8],
+    endpoint: &str,
+    disable: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if !obsolete_registration(bytes, endpoint)? {
+        return Ok(false);
+    }
+    disable()?;
+    std::fs::remove_file(file).map_err(|_| "Could not remove notification settings")?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::{discard_obsolete_registration, obsolete_registration};
+
+    #[test]
+    fn only_matching_notification_registrations_are_reused() {
+        let endpoint = "https://notifications.example.test/wake/";
+        for (version, saved_endpoint, obsolete) in [
+            (2, endpoint, false),
+            (1, endpoint, true),
+            (2, "https://previous.example.test/wake/", true),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "v":version,"route":{"endpoint":saved_endpoint},
+                "legacy_field":"does not need migration"
+            }))
+            .unwrap();
+            assert_eq!(obsolete_registration(&bytes, endpoint).unwrap(), obsolete);
+        }
+        for bytes in [b"invalid".as_slice(), b"{}", b"{\"v\":2,\"route\":{}}"] {
+            assert!(obsolete_registration(bytes, endpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn obsolete_registration_is_removed_only_after_native_delivery_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("push-registration.json");
+        let endpoint = "https://notifications.example.test/";
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "v":1,"route":{"endpoint":endpoint}
+        }))
+        .unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        assert!(
+            discard_obsolete_registration(&file, &bytes, endpoint, || Err("unavailable".into()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert!(discard_obsolete_registration(&file, &bytes, endpoint, || Ok(())).unwrap());
+        assert!(!file.exists());
+
+        let current = serde_json::to_vec(&serde_json::json!({
+            "v":2,"route":{"endpoint":endpoint}
+        }))
+        .unwrap();
+        std::fs::write(&file, &current).unwrap();
+        assert!(
+            !discard_obsolete_registration(&file, &current, endpoint, || panic!(
+                "Current registration must stay enabled"
+            ))
+            .unwrap()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), current);
+    }
+}
+
 pub fn configure_client(client: &mut ClientApp) -> Result<(), String> {
     #[cfg(all(mobile, feature = "mobile-push"))]
     {
@@ -56,15 +139,16 @@ pub async fn changed(app: &tauri::AppHandle, client: &ClientApp) -> bool {
     }
 }
 pub async fn suspend(app: &tauri::AppHandle) -> Result<(), String> {
-    crate::native_media::shutdown(app).await?;
+    let media = crate::native_media::shutdown(app).await;
     #[cfg(all(mobile, feature = "mobile-push"))]
     {
-        return mobile::suspend(app).await;
+        let notifications = mobile::suspend(app).await;
+        return media.and(notifications);
     }
     #[cfg(not(all(mobile, feature = "mobile-push")))]
     {
         let _ = app;
-        Ok(())
+        media
     }
 }
 /// Called only after every account service durably accepted deletion.
@@ -181,6 +265,17 @@ mod mobile {
         let bytes = Zeroizing::new(
             vault::read_private(&file).map_err(|_| "Cannot read notification settings")?,
         );
+        if discard_obsolete_registration(&file, &bytes, url, || {
+            // Never send a saved capability to an endpoint from an old build.
+            // Stop local delivery before discarding an unusable registration;
+            // normal notification setup will obtain a fresh route and token.
+            app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+                .call("disable", json!({}))
+                .map(|_| ())
+                .map_err(|_| "Could not turn off notifications".to_owned())
+        })? {
+            return Ok(None);
+        }
         let device: Device =
             serde_json::from_slice(&bytes).map_err(|_| "Invalid notification settings")?;
         if device.v != 2
@@ -196,11 +291,13 @@ mod mobile {
         Ok(Some(device))
     }
     async fn request(
+        app: &tauri::AppHandle,
         device: &Device,
         suffix: &str,
         body: Option<Value>,
         method: reqwest::Method,
     ) -> Result<Value, String> {
+        crate::release_policy::require_online(app)?;
         let base = endpoint(&device.route.endpoint, cfg!(debug_assertions))
             .map_err(|_| "Invalid notification service")?;
         let url = base
@@ -255,6 +352,9 @@ mod mobile {
             .notification_policy(&device.route)
             .map_err(|_| "Could not read notification preferences")?;
         if policy != device.policy {
+            if elo_core::app::push::policy_requires_rotation(&device.policy, &policy) {
+                device.route.notify_key = random::<32>()?;
+            }
             device.policy = policy;
             device.revision = device
                 .revision
@@ -266,9 +366,13 @@ mod mobile {
         if device.active && device.acknowledged != device.revision {
             let mut body = device.policy.clone();
             body["revision"] = json!(device.revision);
-            request(device, "/policy", Some(body), reqwest::Method::PUT).await?;
+            body["notify_key"] = json!(device.route.notify_key);
+            request(app, device, "/policy", Some(body), reqwest::Method::PUT).await?;
             device.acknowledged = device.revision;
             save(app, device)?;
+            client
+                .advertise_wake_route(Some(device.route.clone()))
+                .map_err(|_| "Could not share notification availability")?;
         }
         call_policy(app, client, device).await?;
         Ok(())
@@ -305,8 +409,7 @@ mod mobile {
         } else {
             vec![]
         };
-        let mut semantic =
-            json!({"enabled":device.calls_enabled,"token":token,"subscriptions":subscriptions});
+        let mut semantic = json!({"ownership_version":1,"enabled":device.calls_enabled,"token":token,"subscriptions":subscriptions});
         if let Some(items) = semantic["subscriptions"].as_array_mut() {
             for item in items {
                 item.as_object_mut().unwrap().remove("target");
@@ -317,7 +420,42 @@ mod mobile {
         if digest == device.calls_policy && device.calls_updated + 86400 > time() {
             return Ok(());
         }
-        request(device,"/calls",Some(json!({"enabled":device.calls_enabled,"platform":if cfg!(target_os="ios"){"ios"}else{"android"},
+        #[cfg(target_os = "ios")]
+        if device.calls_enabled {
+            let challenge = request(
+                app,
+                device,
+                "/voip/challenge",
+                Some(json!({"token":token})),
+                reqwest::Method::POST,
+            )
+            .await?;
+            if challenge["verified"] != true {
+                if challenge["identity"] != json!(client.identity_id()) {
+                    return Err(
+                        "Could not verify this device for incoming calls. Try again.".into(),
+                    );
+                }
+                let proof = adapter.call(
+                    "voipOwnership",
+                    json!({"identity":client.identity_id(),"nonce":challenge["nonce"]}),
+                )?;
+                if proof["token"] != token {
+                    return Err(
+                        "Could not verify this device for incoming calls. Try again.".into(),
+                    );
+                }
+                request(
+                    app,
+                    device,
+                    "/voip/proof",
+                    Some(proof),
+                    reqwest::Method::POST,
+                )
+                .await?;
+            }
+        }
+        request(app, device,"/calls",Some(json!({"enabled":device.calls_enabled,"platform":if cfg!(target_os="ios"){"ios"}else{"android"},
             "token":token,"subscriptions":subscriptions})),reqwest::Method::PUT).await?;
         device.calls_policy = digest;
         device.calls_updated = time();
@@ -360,6 +498,7 @@ mod mobile {
                 .map(|r| &r.receipt)
                 .collect::<Vec<_>>();
             request(
+                app,
                 device,
                 "/read",
                 Some(json!({"events":receipts})),
@@ -393,15 +532,16 @@ mod mobile {
     pub(super) async fn suspend(app: &tauri::AppHandle) -> Result<(), String> {
         let url = env!("ELO_CONFIGURED_WAKE");
         let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
+        // Disable local delivery even if saved registration data cannot be read.
+        let disabled = adapter
+            .call("disable", json!({}))
+            .map_err(|_| "Could not turn off notifications".to_owned());
         if let Some(mut saved) = load(app, url)? {
             saved.enabled = false;
             saved.active = false;
             save(app, &saved)?;
             // Keep the owner capability for revocation retries after an offline logout.
-            let _: Value = adapter
-                .call("disable", json!({}))
-                .map_err(|_| "Could not turn off notifications")?;
-            if request(&saved, "", None, reqwest::Method::DELETE)
+            if request(app, &saved, "", None, reqwest::Method::DELETE)
                 .await
                 .is_ok()
             {
@@ -409,7 +549,7 @@ mod mobile {
                     .map_err(|_| "Could not save notification settings")?;
             }
         }
-        Ok(())
+        disabled.map(|_| ())
     }
     pub(super) fn forget(app: &tauri::AppHandle) -> Result<(), String> {
         let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
@@ -594,7 +734,7 @@ mod mobile {
                 && (saved.token != token || saved.generation != client.notification_generation())
             {
                 // Require acknowledgement before replacing the revocation capability.
-                request(saved, "", None, reqwest::Method::DELETE).await?;
+                request(&app, saved, "", None, reqwest::Method::DELETE).await?;
                 saved.route.id = random::<16>()?;
                 saved.route.notify_key = random::<32>()?;
                 saved.route.scope_key = random::<32>()?;
@@ -624,11 +764,16 @@ mod mobile {
                 saved.token = token.into();
                 saved.generation = client.notification_generation();
             }
+            // A lost policy acknowledgement may leave the server on the new
+            // notify key. Retry that durable revision before renewing the route.
+            if saved.active && saved.acknowledged != saved.revision {
+                policy(&app, client, saved).await?;
+            }
             if !saved.token.is_empty() && saved.next_attempt <= time() {
                 saved.next_attempt = time() + 15;
                 save(&app, saved)?;
                 let result = request(
-                    saved,
+                    &app, saved,
                     "",
                     Some(json!({"token":saved.token,"notify_key":saved.route.notify_key,"binding":client.account_route_binding(&saved.route.endpoint,&saved.route.id,&saved.token).map_err(|_|"Could not register notification identity")?})),
                     reqwest::Method::POST,
@@ -647,6 +792,7 @@ mod mobile {
                 && let Some(challenge) = native["challenge"].as_str()
             {
                 let result = request(
+                    &app,
                     saved,
                     "/confirm",
                     Some(json!({"challenge":challenge})),

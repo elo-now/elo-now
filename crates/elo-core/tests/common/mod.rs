@@ -57,9 +57,12 @@ pub async fn server(store: ReplicaStore) -> (String, tokio::task::JoinHandle<()>
         .unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(store))
-            .await
-            .unwrap();
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(store, &origin))
+        }
+        .await
+        .unwrap();
     });
     (format!("http://{address}"), task)
 }

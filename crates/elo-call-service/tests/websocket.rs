@@ -179,3 +179,132 @@ async fn signed_stream_membership_does_not_bypass_hosting_denial() {
     task.abort();
     let _ = task.await;
 }
+
+#[tokio::test]
+async fn later_subscriptions_receive_calls_but_staggering_never_bypasses_admission() {
+    use elo_core::{authority::Authority, ids::StreamId};
+    struct RecipientGate {
+        recipient: IdentityId,
+        enabled: AtomicBool,
+    }
+    impl Admission for RecipientGate {
+        fn allowed(&self, _: SpaceId, identity: IdentityId) -> AdmissionFuture<'_> {
+            Box::pin(async move {
+                Ok(identity != self.recipient || self.enabled.load(Ordering::SeqCst))
+            })
+        }
+    }
+    let mut f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let gate = Arc::new(RecipientGate {
+        recipient: f.peer.identity_id(),
+        enabled: AtomicBool::new(true),
+    });
+    let service = Service::new(engine, gate.clone(), 4);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
+    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let (mut peer, _) = connect_async(&url).await.unwrap();
+    let original = f.authority.clone();
+    let root_hex = f.owner.credential().record().body()["root_public_key"]
+        .as_str()
+        .unwrap();
+    let root_bytes =
+        std::array::from_fn(|i| u8::from_str_radix(&root_hex[i * 2..i * 2 + 2], 16).unwrap());
+    let root = ed25519_dalek::VerifyingKey::from_bytes(&root_bytes).unwrap();
+    for n in 1..=66 {
+        let stream = StreamId::from_bytes([n; 16]);
+        let mut authority = Authority::new(
+            original.genesis().bytes(),
+            original.space(),
+            &root,
+            f.owner.credential().clone(),
+            stream,
+        )
+        .unwrap();
+        let mut config = original.head().unwrap().clone();
+        for id in config
+            .members
+            .iter()
+            .flat_map(|member| &member.credential_ids)
+        {
+            authority.add_credential(original.credential(*id).unwrap().clone());
+        }
+        config.stream_id = stream;
+        authority
+            .apply_config(config.sign(f.owner.signing_key()).unwrap())
+            .unwrap();
+        f.authority = authority;
+        submit(
+            &mut peer,
+            f.request(&f.peer, Operation::Subscribe, now(), true),
+        )
+        .await;
+        assert!(receive(&mut peer, "result").await["call"].is_null());
+    }
+    let (mut owner, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut owner,
+        f.request(
+            &f.owner,
+            Operation::Start {
+                kind: CallKind::Group,
+                initial_media: InitialMedia::Audio,
+            },
+            now(),
+            true,
+        ),
+    )
+    .await;
+    let call = receive(&mut owner, "result").await["call"].clone();
+    assert_eq!(
+        receive(&mut peer, "presence").await["call"]["call_id"],
+        call["call_id"]
+    );
+    gate.enabled.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    submit(
+        &mut owner,
+        f.request(
+            &f.owner,
+            Operation::Media {
+                call_id: call["call_id"].as_str().unwrap().into(),
+                state: elo_core::calls::MediaState {
+                    audio_muted: false,
+                    video_published: true,
+                    screen_published: false,
+                },
+            },
+            now(),
+            false,
+        ),
+    )
+    .await;
+    receive(&mut owner, "result").await;
+    // The last chat is outside the first maintenance batch. Its next event
+    // must still recheck hosting before disclosing presence or signalling.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let value: Value =
+                serde_json::from_str(peer.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_ne!(value["type"], "presence");
+            assert_ne!(value["type"], "signal");
+            if value["type"] == "access_revoked"
+                && value["scope"]["conversation"]["stream_id"] == f.authority.stream().to_string()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+}

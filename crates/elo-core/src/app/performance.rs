@@ -47,6 +47,7 @@ pub(super) fn message(app: &ClientApp, index: usize, sequence: u64) -> SignedRec
                 action: None,
             },
             locator: None,
+            access: None,
         },
         app.session.signing_key(),
     )
@@ -78,7 +79,7 @@ async fn measure_recipient_crypto_and_loopback_transport() {
         .await
         .unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = crate::http::router(replica.clone());
+    let router = crate::http::router(replica.clone(), &url);
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

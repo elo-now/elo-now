@@ -221,6 +221,70 @@ fn credential_requires_pinned_root_and_exact_device_binding() {
     let r = SignedRecord::sign(&serde_json::to_vec(&body).unwrap(), &root).unwrap();
     assert!(VerifiedCredential::verify(r.bytes(), &root.verifying_key()).is_err());
 }
+#[test]
+fn companion_credentials_require_original_authority_and_reject_nested_or_forged_chains() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let root = SigningKey::from_bytes(&[23; 32]);
+    let original_key = SigningKey::from_bytes(&[24; 32]);
+    let companion_key = SigningKey::from_bytes(&[25; 32]);
+    let age = age::x25519::Identity::generate();
+    let original =
+        DeviceCredential::issue(&root, &original_key.verifying_key(), &age.to_public()).unwrap();
+    let companion = DeviceCredential::issue_companion(
+        &original,
+        &original_key,
+        &companion_key.verifying_key(),
+        &age.to_public(),
+    )
+    .unwrap();
+    assert_eq!(companion.identity(), original.identity());
+    assert_eq!(companion.authorizing_device(), Some(original.id()));
+    assert_ne!(companion.id(), original.id());
+    assert!(
+        VerifiedCredential::verify(companion.record().bytes(), &original_key.verifying_key())
+            .is_err()
+    );
+    assert!(
+        DeviceCredential::issue_companion(
+            &original,
+            &companion_key,
+            &companion_key.verifying_key(),
+            &age.to_public()
+        )
+        .is_err()
+    );
+    assert!(
+        DeviceCredential::issue_companion(
+            &companion,
+            &companion_key,
+            &original_key.verifying_key(),
+            &age.to_public()
+        )
+        .is_err()
+    );
+    for changed in [
+        json!({"signing_public_key": elo_core::record::encode_hex(root.verifying_key().as_bytes())}),
+        json!({"authorizing_device": STANDARD.encode(companion.record().bytes())}),
+        json!({"authorizing_device": "x".repeat(4097)}),
+    ] {
+        let mut body = companion.record().body().clone();
+        for (key, value) in changed.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        // An attacker may possess a companion key, but cannot mint original authority.
+        let forged =
+            SignedRecord::sign(&serde_json::to_vec(&body).unwrap(), &companion_key).unwrap();
+        assert!(VerifiedCredential::verify(forged.bytes(), &root.verifying_key()).is_err());
+    }
+    let tombstone = elo_core::identity::DeviceRevocation::issue(&root, &companion).unwrap();
+    assert_eq!(
+        elo_core::identity::DeviceRevocation::verify(&tombstone)
+            .unwrap()
+            .id(),
+        companion.id()
+    );
+}
+
 #[tokio::test]
 async fn exact_record_bytes_survive_storage_restart() {
     let dir = tempfile::TempDir::new().unwrap();

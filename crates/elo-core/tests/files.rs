@@ -118,9 +118,12 @@ async fn normal_sync_fetches_only_metadata_then_explicit_download_verifies_the_f
     let key = encode_hex(replica.key().as_bytes());
     let remote = replica.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(remote))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(remote, &origin))
+        }
+        .await
+        .unwrap()
     });
     let make = |read, write| {
         Peer::new(

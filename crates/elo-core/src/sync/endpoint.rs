@@ -79,8 +79,11 @@ mod tests {
         let other = ObjectId::of_ciphertext(b"other scope");
         // Deliberately expose the same store at two paths: capabilities alone
         // cannot protect against a proxy replaying a proof under another path.
-        let app =
-            http::space_router(store.clone(), id).merge(http::space_router(store.clone(), other));
+        let app = http::space_router(store.clone(), id, &origin).merge(http::space_router(
+            store.clone(),
+            other,
+            &origin,
+        ));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let descriptor = PeerDescriptor {
             url: format!("{origin}/spaces/{id}/replica/"),
@@ -106,18 +109,64 @@ mod tests {
             "/spaces/{id}/replica/v1/mailboxes/{}/inventory?after=0&limit=128",
             mailbox.mailbox_id
         );
-        let proof = Signer::new(&session).proof("GET", &path, false).unwrap();
+        let proof = Signer::new(&session)
+            .proof(&crate::sync::access::RequestContext {
+                origin: &origin,
+                replica: store.key(),
+                method: "GET",
+                path: &path,
+                body: &[],
+                transfer: "",
+                retention: "",
+            })
+            .unwrap();
         let response = reqwest::Client::new()
             .get(format!(
                 "{origin}{}",
                 path.replace(&id.to_string(), &other.to_string())
             ))
             .bearer_auth(&mailbox.read_token)
-            .header("x-elo-identity", proof)
+            .header("x-elo-identity", proof.clone())
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let http = reqwest::Client::new();
+        for status in [reqwest::StatusCode::OK, reqwest::StatusCode::FORBIDDEN] {
+            let response = http
+                .get(format!("{origin}{path}"))
+                .bearer_auth(&mailbox.read_token)
+                .header("x-elo-identity", &proof)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "a valid proof is single-use");
+        }
+        let wrong_origin = Signer::new(&session)
+            .proof(&crate::sync::access::RequestContext {
+                origin: "https://attacker.example",
+                replica: store.key(),
+                method: "GET",
+                path: &path,
+                body: &[],
+                transfer: "",
+                retention: "",
+            })
+            .unwrap();
+        let response = http
+            .get(format!("{origin}{path}"))
+            .header("host", "attacker.example")
+            .header("x-forwarded-host", "attacker.example")
+            .bearer_auth(&mailbox.read_token)
+            .header("x-elo-identity", wrong_origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "proxy headers cannot replace configured origin"
+        );
         let child = ChildMailbox {
             descriptor: MailboxDescriptor::random().unwrap(),
             quota_bytes: 1024,

@@ -2,8 +2,8 @@ use super::*;
 use crate::ids::IdentityId;
 
 impl ReplicaStore {
-    /// Fresh managed hosts reject unattributed message uploads instead of allowing
-    /// a writer to disable automatic erasure for every member of the Space.
+    /// Fresh managed hosts reject unattributed permanent uploads. Temporary
+    /// pairing data is attributed to its authenticated uploader at admission.
     pub async fn require_content_ownership(&self) -> Result<()> {
         self.call(|db| {
             db.connection.execute(
@@ -71,6 +71,68 @@ mod tests {
     use super::*;
     use crate::{crypto, erasure, vault::Session};
     #[tokio::test]
+    async fn temporary_pairing_bytes_require_and_retain_authenticated_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplicaStore::open(dir.path().join("replica"))
+            .await
+            .unwrap();
+        store.require_content_ownership().await.unwrap();
+        let root = store.create_mailbox(16 * 1024 * 1024).await.unwrap();
+        let child = ChildMailbox {
+            descriptor: MailboxDescriptor::random().unwrap(),
+            quota_bytes: 1024,
+            expires_at: now().unwrap() + 60_000,
+        };
+        store
+            .create_child(root.mailbox_id, root.write_token, child.clone())
+            .await
+            .unwrap();
+        let bytes = b"synthetic encrypted pairing chunk".to_vec();
+        let object = ObjectId::of_ciphertext(&bytes);
+        assert!(
+            store
+                .post(
+                    child.descriptor.mailbox_id,
+                    child.descriptor.write_token.clone(),
+                    object,
+                    bytes.clone(),
+                    TransferHint::Eager
+                )
+                .await
+                .is_err()
+        );
+        let session = Session::create().unwrap().0;
+        let identity = session.identity_id();
+        store
+            .post_authenticated(
+                child.descriptor.mailbox_id,
+                child.descriptor.write_token,
+                object,
+                bytes,
+                TransferHint::Eager,
+                false,
+                Some(session.credential().into()),
+            )
+            .await
+            .unwrap();
+        assert!(store.has_account_content(identity).await.unwrap());
+        store
+            .erase_account_content(root.mailbox_id, identity)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get(
+                    child.descriptor.mailbox_id,
+                    child.descriptor.read_token,
+                    object
+                )
+                .await
+                .is_err()
+        );
+        drop(store);
+    }
+    #[tokio::test]
     async fn erasure_removes_only_account_content_and_rejects_reupload_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replica");
@@ -87,6 +149,20 @@ mod tests {
                     unowned,
                     TransferHint::Eager,
                     true
+                )
+                .await
+                .is_err()
+        );
+        let unowned = b"unattributed retained control".to_vec();
+        assert!(
+            store
+                .post_classified(
+                    mailbox.mailbox_id,
+                    mailbox.write_token.clone(),
+                    ObjectId::of_ciphertext(&unowned),
+                    unowned,
+                    TransferHint::Eager,
+                    false
                 )
                 .await
                 .is_err()

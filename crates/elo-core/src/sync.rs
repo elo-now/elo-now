@@ -205,7 +205,11 @@ impl Peer {
             .as_ref()
             .map(|signer| {
                 signer
-                    .proof("*", self.url("")?.path(), true)
+                    .delegate(
+                        &self.base.origin().ascii_serialization(),
+                        &self.key,
+                        self.url("")?.path(),
+                    )
                     .map_err(|_| SyncError::Peer)
             })
             .transpose()
@@ -214,22 +218,43 @@ impl Peer {
         &self,
         method: reqwest::Method,
         url: reqwest::Url,
+        body: Vec<u8>,
+        transfer: &str,
+        retention: &str,
     ) -> Result<reqwest::RequestBuilder> {
         let path = match url.query() {
             Some(query) => format!("{}?{query}", url.path()),
             None => url.path().into(),
         };
-        let proof = self
-            .signer
-            .as_ref()
-            .map(|signer| {
-                signer
-                    .proof(method.as_str(), &path, false)
-                    .map_err(|_| SyncError::Peer)
-            })
-            .transpose()?
-            .or(self.delegated_access.clone());
-        let request = self.client.request(method, url);
+        let origin = url.origin().ascii_serialization();
+        let context = access::RequestContext {
+            origin: &origin,
+            replica: &self.key,
+            method: method.as_str(),
+            path: &path,
+            body: &body,
+            transfer,
+            retention,
+        };
+        let proof = if let Some(signer) = &self.signer {
+            Some(signer.proof(&context).map_err(|_| SyncError::Peer)?)
+        } else {
+            self.delegated_access
+                .as_ref()
+                .map(|grant| access::delegated_proof(grant, &context))
+                .transpose()
+                .map_err(|_| SyncError::Peer)?
+        };
+        let mut request = self.client.request(method, url);
+        if !body.is_empty() {
+            request = request.body(body);
+        }
+        if !transfer.is_empty() {
+            request = request.header("x-elo-transfer", transfer);
+        }
+        if !retention.is_empty() {
+            request = request.header("x-elo-retention", retention);
+        }
         Ok(if let Some(proof) = proof {
             request.header("x-elo-identity", proof)
         } else {
@@ -239,14 +264,20 @@ impl Peer {
 
     pub async fn create_child(&self, child: &replica::ChildMailbox) -> Result<()> {
         let response = self
-            .request(reqwest::Method::POST, self.url("children")?)?
+            .request(
+                reqwest::Method::POST,
+                self.url("children")?,
+                serde_json::to_vec(child).map_err(|_| SyncError::Peer)?,
+                "",
+                "",
+            )?
             .bearer_auth(
                 self.descriptor
                     .write_token
                     .as_ref()
                     .ok_or(SyncError::Peer)?,
             )
-            .json(child)
+            .header("content-type", "application/json")
             .send()
             .await
             .map_err(network_error)?;
@@ -313,7 +344,7 @@ impl Peer {
             .append_pair("after", &after.to_string())
             .append_pair("limit", "128");
         let response = self
-            .request(reqwest::Method::GET, url)?
+            .request(reqwest::Method::GET, url, vec![], "", "")?
             .bearer_auth(token)
             .send()
             .await
@@ -345,7 +376,13 @@ impl Peer {
             return Err(SyncError::Peer);
         }
         let response = self
-            .request(reqwest::Method::GET, self.url(&format!("objects/{id}"))?)?
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("objects/{id}"))?,
+                vec![],
+                "",
+                "",
+            )?
             .bearer_auth(self.descriptor.read_token.as_ref().ok_or(SyncError::Peer)?)
             .send()
             .await
@@ -356,22 +393,58 @@ impl Peer {
         }
         Ok(bytes)
     }
-    pub async fn request_message(&self, object: ObjectId, record: RecordId) -> Result<()> {
-        self.message_control("request", object, record).await
+    pub async fn request_message(
+        &self,
+        object: ObjectId,
+        record: RecordId,
+        secret: &str,
+    ) -> Result<()> {
+        self.message_control("request", object, record, secret)
+            .await
     }
-    pub async fn accept_message(&self, object: ObjectId, record: RecordId) -> Result<()> {
-        self.message_control("accept", object, record).await
+    pub async fn accept_message(
+        &self,
+        object: ObjectId,
+        record: RecordId,
+        secret: &str,
+    ) -> Result<()> {
+        self.message_control("accept", object, record, secret).await
     }
     async fn message_control(
         &self,
         action: &str,
         object: ObjectId,
         record: RecordId,
+        secret: &str,
     ) -> Result<()> {
+        use crate::retention_access::{Context, Control, Operation, Proof};
+        let context = Context {
+            operation: if action == "request" {
+                Operation::Request
+            } else {
+                Operation::Accept
+            },
+            replica: self.id(),
+            mailbox: self.mailbox(),
+            object,
+            record,
+            actor: self.signer.as_ref().ok_or(SyncError::Authority)?.actor,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SyncError::Peer)?
+            .as_millis() as u64;
+        let body = Control {
+            record_id: record,
+            proof: Proof::issue(secret, &context, now).map_err(|_| SyncError::Authority)?,
+        };
         let response = self
             .request(
                 reqwest::Method::POST,
                 self.url(&format!("messages/{object}/{action}"))?,
+                serde_json::to_vec(&body).map_err(|_| SyncError::Peer)?,
+                "",
+                "",
             )?
             .bearer_auth(
                 self.descriptor
@@ -379,7 +452,7 @@ impl Peer {
                     .as_ref()
                     .ok_or(SyncError::Peer)?,
             )
-            .json(&serde_json::json!({"record_id":record}))
+            .header("content-type", "application/json")
             .send()
             .await
             .map_err(network_error)?;
@@ -405,19 +478,19 @@ impl Peer {
     ) -> Result<(VerifiedReceipt, u16)> {
         let size = bytes.len();
         let response = self
-            .request(reqwest::Method::POST, self.url(&format!("objects/{id}"))?)?
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("objects/{id}"))?,
+                bytes,
+                hint.as_str(),
+                if message { "message" } else { "retain" },
+            )?
             .bearer_auth(
                 self.descriptor
                     .write_token
                     .as_ref()
                     .ok_or(SyncError::Peer)?,
             )
-            .header("x-elo-transfer", hint.as_str())
-            .header(
-                "x-elo-retention",
-                if message { "message" } else { "retain" },
-            )
-            .body(bytes)
             .send()
             .await
             .map_err(network_error)?;
@@ -512,7 +585,7 @@ impl SyncReport {
 }
 pub struct SyncClient<'a> {
     pub store: &'a ClientStore,
-    pub identity: &'a age::x25519::Identity,
+    pub identity: &'a dyn crate::crypto::DecryptionIdentity,
     pub credential: RecordId,
     pub authority: &'a dyn ChatAuthority,
     pub peers: &'a [Peer],
@@ -746,12 +819,23 @@ impl SyncClient<'_> {
                     self.store.finish_file_share(item, *verified, now).await?;
                 }
                 Some(ChatDecision::Accepted(verified)) => {
-                    let acceptance = (verified.chat().kind == "chat.message"
-                        && verified.chat().audience.len() == 2)
-                        .then_some((item.peer, item.mailbox, item.object, verified.record().id()));
+                    let acceptance = verified
+                        .chat()
+                        .access
+                        .as_ref()
+                        .and_then(|access| access.accept_secret.clone())
+                        .map(|secret| {
+                            (
+                                item.peer,
+                                item.mailbox,
+                                item.object,
+                                verified.record().id(),
+                                secret,
+                            )
+                        });
                     report.accepted += 1;
                     self.store.finish_inbox(item, Some(*verified), now).await?;
-                    if let Some((peer_id, mailbox, object, record)) = acceptance
+                    if let Some((peer_id, mailbox, object, record, secret)) = acceptance
                         && let Some(peer) = self
                             .peers
                             .iter()
@@ -759,7 +843,7 @@ impl SyncClient<'_> {
                     {
                         // Only a fully admitted and durably committed direct message
                         // can be acknowledged for early server-body deletion.
-                        let _ = peer.accept_message(object, record).await;
+                        let _ = peer.accept_message(object, record, &secret).await;
                     }
                     if let Some(id) = new_message {
                         report.received_messages.push(id);

@@ -244,7 +244,7 @@ export function DesktopSidebar({
               {activeSpace ? memberCountLabel : t("spaces.noCurrent")}
             </small>
           </span>
-          <Icon name="down" />
+          <Icon name="more" />
         </button>
         {menuOpen && (
           <div
@@ -293,7 +293,6 @@ export function DesktopSidebar({
               </button>
             </div>
             <div className="desktop-menu-separator" />
-            <p>{t("profile.yourProfile")}</p>
             <div className="desktop-workspace-profile">
               <ProfileAvatar name={name} avatar={view.avatar ?? null} />
               <strong>{name}</strong>
@@ -339,7 +338,6 @@ export function DesktopSidebar({
               onClick={() => act(() => onSettings("blocked-users"))}
             />
             <div className="desktop-menu-separator" />
-            <p>{t("settings.title")}</p>
             <MenuButton
               icon="palette"
               label={t("settings.appearance")}

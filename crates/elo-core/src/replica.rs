@@ -32,6 +32,9 @@ const MIGRATION: &str = include_str!("../../../migrations/001_replica.sql");
 const DELEGATION_MIGRATION: &str =
     include_str!("../../../migrations/002_replica_mailbox_delegation.sql");
 const ACCESS_MIGRATION: &str = include_str!("../../../migrations/003_replica_space_access.sql");
+const NONCE_MIGRATION: &str = include_str!("../../../migrations/008_replica_request_nonces.sql");
+const MESSAGE_ACCESS_MIGRATION: &str =
+    include_str!("../../../migrations/009_replica_message_access.sql");
 pub const MAX_CHILD_MAILBOXES: u64 = 256;
 pub const MAX_MAILBOX_LIFETIME_MS: u64 = 37 * 86_400_000;
 #[derive(Debug, Error)]
@@ -199,20 +202,68 @@ struct Db {
 }
 #[derive(Clone)]
 pub struct ReplicaStore {
+    admitted_devices: Arc<Mutex<std::collections::BTreeSet<crate::ids::RecordId>>>,
+    revocations: crate::identity::revocations::Revocations,
     db: Arc<Mutex<Db>>,
     key: VerifyingKey,
 }
 impl ReplicaStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let registry_path = path.join("revoked-devices");
         let db = tokio::task::spawn_blocking(move || open_db(path))
             .await
             .map_err(|_| ReplicaError::Storage)??;
         let key = db.key.verifying_key();
         Ok(Self {
+            admitted_devices: Arc::new(Mutex::new(Default::default())),
+            revocations: crate::identity::revocations::Revocations::open(registry_path)
+                .map_err(|_| ReplicaError::Storage)?,
             db: Arc::new(Mutex::new(db)),
             key,
         })
+    }
+    pub fn with_revocations(mut self, registry: crate::identity::revocations::Revocations) -> Self {
+        self.revocations = registry;
+        self
+    }
+    pub fn revocations(&self) -> &crate::identity::revocations::Revocations {
+        &self.revocations
+    }
+    pub fn require_active_device(&self, credential: crate::ids::RecordId) -> Result<()> {
+        if self
+            .revocations
+            .get(credential)
+            .map_err(|_| ReplicaError::Storage)?
+            .is_some()
+        {
+            return Err(ReplicaError::Unauthorized);
+        }
+        Ok(())
+    }
+    /// Loaded from the host's verified, durable General configuration at startup
+    /// and after enrollment changes. No network request may add entries here.
+    pub fn set_admitted_devices(&self, devices: Vec<crate::ids::RecordId>) -> Result<()> {
+        *self
+            .admitted_devices
+            .lock()
+            .map_err(|_| ReplicaError::Storage)? = devices.into_iter().collect();
+        Ok(())
+    }
+    pub(crate) fn require_admitted_companion(
+        &self,
+        credential: crate::ids::RecordId,
+    ) -> Result<()> {
+        if self
+            .admitted_devices
+            .lock()
+            .map_err(|_| ReplicaError::Storage)?
+            .contains(&credential)
+        {
+            Ok(())
+        } else {
+            Err(ReplicaError::Unauthorized)
+        }
     }
     pub fn key(&self) -> &VerifyingKey {
         &self.key
@@ -356,6 +407,50 @@ impl ReplicaStore {
         self.call(move |db| authorize(&db.connection, mailbox, &token, write))
             .await
     }
+    pub(crate) async fn consume_access(
+        &self,
+        access: crate::sync::access::VerifiedAccess,
+    ) -> Result<()> {
+        self.call(move |db| {
+            let time = now()?;
+            if access.expires < time {
+                return Err(ReplicaError::Unauthorized);
+            }
+            let tx = db
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM access_nonces WHERE expires_at<?1",
+                [time as i64],
+            )?;
+            let credential = access.credential.to_string();
+            let used: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM access_nonces WHERE credential_id=?1 AND nonce=?2)",
+                params![credential, access.nonce],
+                |r| r.get(0),
+            )?;
+            if used {
+                return Err(ReplicaError::Unauthorized);
+            }
+            let total: i64 =
+                tx.query_row("SELECT COUNT(*) FROM access_nonces", [], |r| r.get(0))?;
+            let own: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM access_nonces WHERE credential_id=?1",
+                [&credential],
+                |r| r.get(0),
+            )?;
+            if total >= 65_536 || own >= 4096 {
+                return Err(ReplicaError::Quota);
+            }
+            tx.execute(
+                "INSERT INTO access_nonces VALUES(?1,?2,?3)",
+                params![credential, access.nonce, access.expires as i64],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
     /// Idempotent allocation using client-generated capabilities saved before upload.
     /// Every descendant shares its ancestors' byte and mailbox-count budgets.
     pub async fn create_child(
@@ -378,6 +473,18 @@ impl ReplicaStore {
         self.call(move |db| {
             let tx = db.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             authorize(&tx, parent, &token, true)?;
+            // Expiry ends the capability and releases its subtree's count and bytes.
+            let expired = {
+                let mut q = tx.prepare("WITH RECURSIVE expired(id) AS (SELECT mailbox_id FROM mailbox_delegations WHERE expires_at<=?1 UNION SELECT d.mailbox_id FROM mailbox_delegations d JOIN expired e ON d.parent_id=e.id) SELECT id FROM expired")?;
+                q.query_map([time as i64], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in &expired { tx.execute("DELETE FROM deliveries WHERE mailbox_id=?1", [id])?; }
+            for id in &expired { tx.execute("DELETE FROM mailbox_delegations WHERE mailbox_id=?1", [id])?; }
+            for id in &expired { tx.execute("DELETE FROM mailboxes WHERE mailbox_id=?1", [id])?; }
+            if !expired.is_empty() {
+                tx.execute("DELETE FROM objects WHERE NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.object_id=objects.object_id)", [])?;
+            }
+
             let ancestors = ancestors(&tx, parent)?;
             if ancestors.len() > 2 { return Err(ReplicaError::Invalid); }
             let id = child.descriptor.mailbox_id.to_string();
@@ -434,9 +541,9 @@ impl ReplicaStore {
         bytes: Vec<u8>,
         hint: TransferHint,
         message: bool,
-        identity: Option<IdentityId>,
+        actor: Option<crate::retention_access::Actor>,
     ) -> Result<(bool, Vec<u8>)> {
-        self.post_inner(mailbox, token, id, bytes, hint, message, identity)
+        self.post_inner(mailbox, token, id, bytes, hint, message, actor)
             .await
     }
     async fn post_inner(
@@ -447,21 +554,31 @@ impl ReplicaStore {
         bytes: Vec<u8>,
         hint: TransferHint,
         message: bool,
-        identity: Option<IdentityId>,
+        actor: Option<crate::retention_access::Actor>,
     ) -> Result<(bool, Vec<u8>)> {
+        let revocations = self.revocations.clone();
         self.call(move|db|{
    authorize(&db.connection,mailbox,&token,true)?;
+   let identity = actor.map(|actor| actor.identity);
+   if let Some(actor) = actor { retention::authorize_actor(&db.connection, &revocations, mailbox, actor)?; }
    if bytes.is_empty()||bytes.len()>MAX_CIPHERTEXT||ObjectId::of_ciphertext(&bytes)!=id{return Err(ReplicaError::Invalid);}
    let time=now()?;
    retention::sweep(&db.connection,time)?;
    retention::check_pruned(db,mailbox,id)?;
    let content = crate::erasure::inspect(&bytes).map_err(|_| ReplicaError::Invalid)?;
    let retention = retention::classify(content.as_ref(), message);
-   retention::check_upload(&db.connection,mailbox,id,&retention,identity,time)?;
-   let subjects = content.as_ref().map(|value| value.subjects.clone()).unwrap_or_default();
-   if message && subjects.is_empty() {
+   retention::check_upload(&db.connection,&revocations,mailbox,id,&retention,identity,time)?;
+   let mut subjects = content.as_ref().map(|value| value.subjects.clone()).unwrap_or_default();
+   if subjects.is_empty() {
     let required: bool = db.connection.query_row("SELECT EXISTS(SELECT 1 FROM node_meta WHERE key='require_content_owner' AND value='yes')", [], |row|row.get(0))?;
-    if required { return Err(ReplicaError::Invalid); }
+    if required {
+     // Pairing chunks use a temporary delegated mailbox and cannot be wrapped
+     // without changing their content-addressed protocol. Attribute them to the
+     // authenticated account instead; permanent mailboxes still require a claim.
+     let temporary: bool = db.connection.query_row("SELECT EXISTS(SELECT 1 FROM mailbox_delegations WHERE mailbox_id=?1)", [mailbox.to_string()], |row|row.get(0))?;
+     if !temporary { return Err(ReplicaError::Invalid); }
+     subjects.push(identity.ok_or(ReplicaError::Unauthorized)?);
+    }
    }
    for identity in &subjects {
     let erased: bool = db.connection.query_row("SELECT EXISTS(SELECT 1 FROM erased_identities WHERE identity_id=?1)",[identity.to_string()],|row|row.get(0))?;
@@ -527,6 +644,7 @@ impl ReplicaStore {
         if after > MAX_INTEGER || !(1..=128).contains(&limit) {
             return Err(ReplicaError::Invalid);
         }
+        let revocations = self.revocations.clone();
         self.call(move|db|{
    authorize(&db.connection,mailbox,&token,false)?;
    let time=now()?;
@@ -535,7 +653,7 @@ impl ReplicaStore {
    let mut q=db.connection.prepare("SELECT d.arrival_seq,d.object_id,COALESCE(o.wire_size_bytes,o.size_bytes),d.transfer_hint FROM deliveries d JOIN objects o USING(object_id) WHERE d.mailbox_id=?1 AND d.arrival_seq>?2 ORDER BY d.arrival_seq LIMIT ?3")?;
    let rows=q.query_map(params![mailbox.to_string(),after as i64,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?;
    let mut entries=Vec::new();for row in rows{let (arrival,id,size,hint)=row?;entries.push(InventoryEntry{arrival_seq:arrival as u64,object_id:id.parse().map_err(|_|ReplicaError::Storage)?,size_bytes:size as u64,transfer_hint:match hint.as_str(){"eager"=>TransferHint::Eager,"lazy"=>TransferHint::Lazy,_=>return Err(ReplicaError::Storage)}});}
-   let requested_messages=retention::active_requests(&db.connection,mailbox,time)?;
+   let requested_messages=retention::active_requests(&db.connection,&revocations,mailbox,time)?;
    Ok(Inventory{storage_generation:db.generation.clone(),head:head as u64,entries,requested_messages})
   }).await
     }
@@ -631,7 +749,7 @@ fn open_db(path: PathBuf) -> Result<Db> {
     )?;
     if version == 0 && count == 0 {
         c.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-    } else if !(1..=7).contains(&version) {
+    } else if !(1..=9).contains(&version) {
         return Err(ReplicaError::Directory);
     }
     c.pragma_update(None, "journal_mode", "WAL")?;
@@ -665,6 +783,12 @@ fn open_db(path: PathBuf) -> Result<Db> {
     if version >= 7 {
         reference.execute_batch(MESSAGE_LIFETIME_MIGRATION)?;
     }
+    if version >= 8 {
+        reference.execute_batch(NONCE_MIGRATION)?;
+    }
+    if version >= 9 {
+        reference.execute_batch(MESSAGE_ACCESS_MIGRATION)?;
+    }
     if schema(&c)? != schema(&reference)? {
         return Err(ReplicaError::Directory);
     }
@@ -685,6 +809,12 @@ fn open_db(path: PathBuf) -> Result<Db> {
     }
     if version < 7 {
         c.execute_batch(MESSAGE_LIFETIME_MIGRATION)?;
+    }
+    if version < 8 {
+        c.execute_batch(NONCE_MIGRATION)?;
+    }
+    if version < 9 {
+        c.execute_batch(MESSAGE_ACCESS_MIGRATION)?;
     }
     c.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
     let pragmas:(String,i64,i64)=c.query_row("SELECT (SELECT journal_mode FROM pragma_journal_mode),(SELECT synchronous FROM pragma_synchronous),(SELECT foreign_keys FROM pragma_foreign_keys)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;

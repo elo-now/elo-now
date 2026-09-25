@@ -263,9 +263,12 @@ async fn real_http_enforces_auth_retries_hash_and_limit() {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(store))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(store, &origin))
+        }
+        .await
+        .unwrap()
     });
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -370,4 +373,74 @@ async fn real_http_enforces_auth_retries_hash_and_limit() {
         StatusCode::NOT_FOUND
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn expired_child_allocation_reclaims_count_and_unreferenced_ciphertext() {
+    use elo_core::replica::{ChildMailbox, MailboxDescriptor};
+    let dir = tempfile::tempdir().unwrap();
+    let store = ReplicaStore::open(dir.path()).await.unwrap();
+    let parent = store.create_mailbox(4096).await.unwrap();
+    let child = MailboxDescriptor::random().unwrap();
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .create_child(
+            parent.mailbox_id,
+            parent.write_token.clone(),
+            ChildMailbox {
+                descriptor: child.clone(),
+                quota_bytes: 4096,
+                expires_at: time + 60000,
+            },
+        )
+        .await
+        .unwrap();
+    let bytes = b"expired child ciphertext".to_vec();
+    let object = ObjectId::of_ciphertext(&bytes);
+    store
+        .post(
+            child.mailbox_id,
+            child.write_token.clone(),
+            object,
+            bytes,
+            TransferHint::Eager,
+        )
+        .await
+        .unwrap();
+    let db = Connection::open(dir.path().join("replica.sqlite")).unwrap();
+    db.execute("UPDATE mailbox_delegations SET expires_at=1", [])
+        .unwrap();
+    let next = MailboxDescriptor::random().unwrap();
+    store
+        .create_child(
+            parent.mailbox_id,
+            parent.write_token,
+            ChildMailbox {
+                descriptor: next,
+                quota_bytes: 4096,
+                expires_at: time + 60000,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM mailbox_delegations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM objects", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        store
+            .authorize(child.mailbox_id, child.read_token, false)
+            .await
+            .is_err()
+    );
 }

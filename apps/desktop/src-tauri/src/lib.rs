@@ -6,18 +6,27 @@ mod android_files;
 #[cfg(target_os = "android")]
 mod android_tls;
 mod background_history;
+#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
+mod call_lease;
+mod control_recovery;
 #[cfg(debug_assertions)]
 mod demo;
 #[cfg(desktop)]
 mod desktop_activity;
+mod download_protection;
 mod exchange;
+#[cfg(all(target_os = "ios", feature = "mobile-push"))]
+mod incoming_answer;
+#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
+mod incoming_call;
 mod mail;
 mod native_media;
-#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
-mod call_lease;
 mod profiles;
 mod push;
+mod recovery_clipboard;
 mod recovery_progress;
+mod release_policy;
+mod sensitive_request;
 #[cfg(test)]
 #[path = "../service_endpoints.rs"]
 mod service_endpoints;
@@ -32,9 +41,18 @@ struct Runtime {
     pair_source: Option<elo_core::app::pairing::PairSource>,
     pair_target: Option<elo_core::app::pairing::PairTarget>,
     recovery_qr: Option<String>,
+    control_recovery: Option<serde_json::Value>,
     view_revision: u64,
 }
 type State = Mutex<Runtime>;
+
+impl Runtime {
+    fn detach_profile(&mut self) -> Option<ClientApp> {
+        let old = std::mem::take(self);
+        self.view_revision = old.view_revision.wrapping_add(1);
+        old.client
+    }
+}
 
 #[derive(Default)]
 struct AttachmentTransfers(
@@ -222,11 +240,27 @@ async fn unlock(
     directory: String,
     password: String,
     allow_insecure_loopback: bool,
+    biometric_key: Option<String>,
+    biometric_profile: Option<String>,
+    biometric_identity: Option<String>,
 ) -> Result<serde_json::Value, String> {
     #[cfg(debug_assertions)]
     let timing = std::time::Instant::now();
-    let secret: age::secrecy::SecretString = password.into();
+    let mut secret: age::secrecy::SecretString = password.into();
     let mut state = state.lock().await;
+    if let Some(key) = biometric_key {
+        secret = profiles::biometric_password(
+            &app,
+            biometric_profile
+                .as_deref()
+                .ok_or("dataNeedsReenrollment")?,
+            biometric_identity
+                .as_deref()
+                .ok_or("dataNeedsReenrollment")?,
+            key.into(),
+        )
+        .map_err(|e| e.to_string())?;
+    }
     #[cfg(debug_assertions)]
     let queued = timing.elapsed();
     if state.client.is_some() {
@@ -282,24 +316,79 @@ async fn lock(app: tauri::AppHandle, state: tauri::State<'_, State>) -> Result<(
     app.state::<background_history::BackgroundHistory>()
         .suspend();
     let mut state = state.lock().await;
-    push::suspend(&app).await?;
-    state.draft = None;
-    state.demo_names = None;
-    state.recovery = None;
-    state.backup = None;
-    state.pair_source = None;
-    state.pair_target = None;
-    state.recovery_qr = None;
-    if let Some(client) = state.client.take() {
-        #[cfg(desktop)]
-        desktop_activity::clear(&app);
-        client
-            .advertise_wake_route(None)
-            .map_err(|e| e.to_string())?;
-        client.close().await.map_err(|e| e.to_string())?;
+    // Revoke local access before fallible cleanup. Keep the mutex until stores
+    // close so a concurrent unlock cannot race the previous session's shutdown.
+    let client = state.detach_profile();
+    #[cfg(desktop)]
+    desktop_activity::clear(&app);
+    let notifications = push::suspend(&app).await;
+    let profile = close_locked_profile(client).await;
+    let files = exchange::clear(&app);
+    notifications
+        .map_err(|_| "profile_logout_notifications_pending".to_owned())
+        .and(profile.map_err(|_| "profile_logout_cleanup_pending".to_owned()))
+        .and(files.map_err(|_| "profile_logout_cleanup_pending".to_owned()))
+}
+
+async fn close_locked_profile(client: Option<ClientApp>) -> Result<(), String> {
+    let Some(client) = client else { return Ok(()) };
+    let route = client.advertise_wake_route(None).map_err(|e| e.to_string());
+    let close = client.close().await.map_err(|e| e.to_string());
+    route.and(close)
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn broken_notification_state_does_not_keep_the_profile_or_store_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile");
+        let password: age::secrecy::SecretString = "synthetic logout password".into();
+        let client = ProfileDraft::new()
+            .unwrap()
+            .save(profile.clone(), password.clone(), "Test")
+            .await
+            .unwrap();
+        let identity = client.identity_id();
+        let mut runtime = Runtime {
+            client: Some(client),
+            draft: Some(ProfileDraft::new().unwrap()),
+            recovery: Some(ProfileDraft::new().unwrap()),
+            backup: Some(zeroize::Zeroizing::new(vec![1, 2, 3])),
+            recovery_qr: Some("synthetic recovery data".into()),
+            control_recovery: Some(serde_json::json!({"test": true})),
+            view_revision: 4,
+            ..Default::default()
+        };
+        elo_core::vault::write_private(
+            &profile.join("invitations.age"),
+            b"invalid synthetic state",
+            true,
+        )
+        .unwrap();
+        let detached = runtime.detach_profile();
+        assert!(runtime.client.is_none());
+        assert!(runtime.draft.is_none());
+        assert!(runtime.recovery.is_none());
+        assert!(runtime.backup.is_none());
+        assert!(runtime.recovery_qr.is_none());
+        assert!(runtime.control_recovery.is_none());
+        assert_eq!(runtime.view_revision, 5);
+        assert!(close_locked_profile(detached).await.is_err());
+        // A cleanup error must not leave the database worker or its file lock
+        // alive. A new session still requires the correct profile password.
+        std::fs::remove_file(profile.join("invitations.age")).unwrap();
+        assert!(
+            ClientApp::open(profile.clone(), "wrong".into(), false)
+                .await
+                .is_err()
+        );
+        let reopened = ClientApp::open(profile, password, false).await.unwrap();
+        assert_eq!(reopened.identity_id(), identity);
+        reopened.close().await.unwrap();
     }
-    exchange::clear(&app).map_err(|e| e.to_string())?;
-    Ok(())
 }
 #[tauri::command]
 async fn verify_password(state: tauri::State<'_, State>, password: String) -> Result<(), String> {
@@ -322,28 +411,34 @@ async fn attachment_transfer(
     app: tauri::AppHandle,
     state: tauri::State<'_, State>,
     transfers: tauri::State<'_, AttachmentTransfers>,
-    request: serde_json::Value,
+    mut request: serde_json::Value,
     transfer_id: String,
 ) -> Result<serde_json::Value, String> {
+    release_policy::require_online(&app)?;
     let cancellation = transfers.begin(&transfer_id)?;
     let progress_app = app.clone();
     let progress_id = transfer_id.clone();
     let result = {
         let mut state = state.lock().await;
         let outcome = match state.client.as_mut() {
-            Some(client) => client
-                .operate_attachment_transfer(request, cancellation, move |received, total| {
-                    let _ = progress_app.emit(
-                        "attachment-transfer-progress",
-                        AttachmentTransferProgress {
-                            transfer_id: progress_id.clone(),
-                            received,
-                            total,
-                        },
-                    );
-                })
-                .await
-                .map_err(|error| error.to_string()),
+            Some(client) => match release_policy::require_online(&app)
+                .and_then(|()| exchange::resolve_transfer(&app, &mut request))
+            {
+                Err(error) => Err(error),
+                Ok(()) => client
+                    .operate_attachment_transfer(request, cancellation, move |received, total| {
+                        let _ = progress_app.emit(
+                            "attachment-transfer-progress",
+                            AttachmentTransferProgress {
+                                transfer_id: progress_id.clone(),
+                                received,
+                                total,
+                            },
+                        );
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+            },
             None => Err("The profile is locked".into()),
         };
         outcome.map(|mut result| {
@@ -370,35 +465,88 @@ fn cancel_attachment_transfer(
 ) {
     transfers.cancel(&transfer_id);
 }
+fn application_operation(op: &str) -> bool {
+    matches!(
+        op,
+        "view"
+            | "history_page"
+            | "set_profile_name"
+            | "set_profile_details"
+            | "create_chat"
+            | "create_group"
+            | "set_chat_group"
+            | "set_chat_muted"
+            | "set_user_blocked"
+            | "message_debug"
+            | "send"
+            | "request_message"
+            | "sync"
+            | "sync_live"
+            | "remove_member"
+            | "message_action"
+            | "remind"
+            | "reminder_remove"
+            | "mark_read"
+            | "mark_unread"
+            | "call_endpoint"
+            | "call_authorization"
+            | "call_encrypt_signal"
+            | "call_open_signal"
+            | "space_join_demo"
+            | "space_list"
+            | "space_refresh"
+            | "space_create"
+            | "space_setup_done"
+            | "space_select"
+            | "space_disconnect"
+            | "space_preview"
+            | "space_join"
+            | "space_manage"
+            | "space_invite"
+            | "space_revoke"
+            | "space_decide"
+            | "space_role_change"
+            | "space_role_decide"
+            | "space_contact"
+            | "space_contact_update"
+            | "space_delete"
+            | "space_storage"
+            | "space_storage_prune"
+            | "space_attachment_settings"
+            | "space_attachment_retention"
+            | "space_attachment_cleanup_preview"
+            | "space_attachment_cleanup"
+            | "contact_add_members"
+            | "contact_create_chat"
+            | "contact_preview"
+            | "contact_add"
+            | "create_dm"
+            | "contact_open"
+            | "invitation_ignore"
+            | "invitation_sync"
+            | "invitation_activity"
+            | "invitation_notifications_seen"
+            | "invitation_dismiss"
+            | "invitation_create"
+            | "invitation_list"
+            | "invitation_disable"
+            | "contact_create"
+            | "invitation_preview"
+            | "invitation_request"
+            | "invitation_receive"
+            | "invitation_decline"
+            | "invitation_approve"
+            | "invitation_join"
+    )
+}
 #[tauri::command]
 async fn operate(
     app: tauri::AppHandle,
     state: tauri::State<'_, State>,
     mut request: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    // Manual configuration exchange belongs to protocol tooling, not the app.
-    // Spaces, recovery backups and explicit device linking own these changes.
-    if matches!(
-        request["op"].as_str(),
-        Some(
-            "add_peer"
-                | "import_stream"
-                | "config_preview"
-                | "device_export"
-                | "export_config"
-                | "recovery_export"
-                | "controller_recover"
-                | "recovery_preview"
-                | "invite_create"
-                | "invite_request"
-                | "invite_approve"
-                | "history_request"
-                | "history_preview"
-                | "history_approve"
-                | "history_import"
-                | "file_download"
-        )
-    ) {
+    // New core/CLI operations require an explicit native capability review.
+    if !application_operation(request["op"].as_str().unwrap_or_default()) {
         return Err("Unsupported application operation.".into());
     }
     #[cfg(debug_assertions)]
@@ -439,6 +587,7 @@ async fn operate(
     } else {
         state.lock().await
     };
+    release_policy::require_operation(&app, &request)?;
     #[cfg(desktop)]
     if request["_desktop_background"] == true && !desktop_activity::hidden(&app) {
         return Ok(serde_json::json!({}));
@@ -450,9 +599,6 @@ async fn operate(
         || request["op"] == "space_disconnect"
         || request["op"] == "space_delete";
     let read_request = (request["op"] == "mark_read").then(|| request.clone());
-    let trace_space_creation = request["op"] == "space_create"
-        && std::env::var("ELO_SPACE_CREATE_DIAGNOSTICS").as_deref() == Ok("1");
-    let space_creation_started = trace_space_creation.then(std::time::Instant::now);
     let revision = state.view_revision;
     let client = state.client.as_mut().ok_or("The profile is locked")?;
     // Invitation discovery also waits on the network while holding the runtime.
@@ -477,18 +623,6 @@ async fn operate(
         serde_json::json!({"view":client.view().await.map_err(|e|e.to_string())?})
     } else {
         let outcome = client.operate(request).await.map_err(|e| e.to_string());
-        if let Some(started) = space_creation_started {
-            match &outcome {
-                Ok(_) => eprintln!(
-                    "space_create completed in {} ms",
-                    started.elapsed().as_millis()
-                ),
-                Err(error) => eprintln!(
-                    "space_create failed after {} ms: {error}",
-                    started.elapsed().as_millis()
-                ),
-            }
-        }
         if outcome.is_err() && preferences_changed {
             // A durable safety preference may have committed before a later
             // local cleanup failed. Still propagate its restrictive policy.
@@ -602,10 +736,18 @@ fn annotate_result(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(tauri_plugin_elo_privacy::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_files::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(recovery_clipboard::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(release_policy::init());
     #[cfg(desktop)]
     let builder = builder.manage(desktop_activity::Activity::default());
+    #[cfg(desktop)]
+    let builder = builder.manage(recovery_clipboard::ClipboardState::default());
     #[cfg(mobile)]
     let builder = builder
         .plugin(tauri_plugin_biometry::init())
@@ -619,8 +761,10 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(State::default())
+        .manage(release_policy::Checks::default())
         .manage(native_media::MediaGate::default())
         .manage(AttachmentTransfers::default())
+        .manage(exchange::ExchangeFiles::default())
         .manage(background_history::BackgroundHistory::default())
         .manage(recovery_progress::RecoveryJobs::default())
         .setup(|app| {
@@ -628,6 +772,9 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_decorations(false)?;
             }
+            release_policy::setup(app.handle());
+            #[cfg(all(target_os = "ios", feature = "mobile-push"))]
+            incoming_answer::setup(app.handle());
             exchange::clear(app.handle()).map_err(std::io::Error::other)?;
             #[cfg(desktop)]
             desktop_activity::setup(app.handle());
@@ -654,7 +801,12 @@ pub fn run() {
             exchange::prepare_export,
             exchange::save_export,
             mail::open_mail_draft,
-            exchange::invitation_qr
+            exchange::invitation_qr,
+            recovery_clipboard::copy_recovery_code,
+            control_recovery::control_task,
+            release_policy::release_policy,
+            release_policy::check_release_policy,
+            release_policy::open_update
         ])
         .build(tauri::generate_context!())
         .expect("application runtime failed")
@@ -679,6 +831,29 @@ pub fn run() {
 #[cfg(test)]
 mod result_metadata_tests {
     use super::*;
+    #[test]
+    fn renderer_cannot_call_filesystem_or_future_core_operations() {
+        for op in [
+            "file_share",
+            "file_download",
+            "attachment_upload",
+            "attachment_download",
+            "history_import",
+            "recovery_export",
+            "unknown_future_operation",
+        ] {
+            assert!(!application_operation(op), "{op}");
+        }
+        for op in [
+            "send",
+            "space_join",
+            "history_page",
+            "call_endpoint",
+            "call_authorization",
+        ] {
+            assert!(application_operation(op), "{op}");
+        }
+    }
     #[test]
     fn idle_demo_sync_keeps_the_absent_view_and_still_carries_its_identity() {
         let identity = elo_core::ids::IdentityId::from_bytes([1; 32]);

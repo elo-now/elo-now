@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-copy-recovery-code"
+description = "Enables the copy_recovery_code command without any pre-configured scope."
+commands.allow = ["copy_recovery_code"]
+
+[[permission]]
+identifier = "deny-copy-recovery-code"
+description = "Denies the copy_recovery_code command without any pre-configured scope."
+commands.deny = ["copy_recovery_code"]

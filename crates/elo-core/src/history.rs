@@ -276,7 +276,7 @@ pub struct VerifiedBundle {
 impl VerifiedBundle {
     pub fn open(
         ciphertext: &[u8],
-        identity: &age::x25519::Identity,
+        identity: &dyn crate::crypto::DecryptionIdentity,
         own_credential: RecordId,
         a: &Authority,
         request: &SignedRecord,

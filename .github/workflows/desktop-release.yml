@@ -34,10 +34,10 @@ jobs:
       TAURI_ELO_WAKE_URL: ${{ vars.ELO_RELEASE_WAKE_URL }}
       CARGO_BUILD_JOBS: 3
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
           cache: npm
@@ -50,22 +50,54 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: '1.98.1'
           targets: ${{ matrix.target }}
       - name: Install frontend dependencies
-        run: npm --prefix apps/desktop ci
+        run: npm --prefix apps/desktop ci --ignore-scripts
       - name: Check frontend
         run: npm --prefix apps/desktop test
+      - name: Verify GLib security backport on Linux
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p glib --lib variant_iter::tests
+      - name: Verify Windows downloaded-file protection
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p elo-desktop --lib download_protection::windows_tests
       - name: Build desktop installer
-        run: npm --prefix apps/desktop run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci
-      - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS'
+        run: npm --prefix apps/desktop run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --ci -- --locked
+      - name: Build macOS installer with an ad hoc bundle signature
+        if: runner.os == 'macOS'
+        run: >-
+          npm --prefix apps/desktop run tauri -- build --target ${{ matrix.target }}
+          --bundles ${{ matrix.bundles }} --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
+          --ci -- --locked
+      - name: Verify macOS bundle integrity
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict "target/${{ matrix.target }}/release/bundle/macos/elo.now.app"
+      - name: Stage installers and checksums
+        run: python tools/stage_desktop_release.py target/${{ matrix.target }}/release/bundle dist/desktop-release/${{ matrix.name }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: elo-now-${{ matrix.name }}
-          path: |
-            target/${{ matrix.target }}/release/bundle/**/*.dmg
-            target/${{ matrix.target }}/release/bundle/**/*.exe
-            target/${{ matrix.target }}/release/bundle/**/*.deb
-            target/${{ matrix.target }}/release/bundle/**/*.AppImage
+          path: dist/desktop-release/${{ matrix.name }}/*
           if-no-files-found: error
+  attest:
+    name: Attest final installers
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # Build scripts and dependencies never run in the job with signing rights.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: elo-now-*
+          path: installers
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: 'installers/**/*'

@@ -99,6 +99,7 @@ import WebRTC
             return [:]
         }
         if op == "start" {
+            if let callId = request["call_id"] as? String, !IncomingCalls.shared.isAnswering(callId) { throw NativePeer.MediaError.ended }
             guard peer == nil, let servers = request["ice_servers"] as? [[String: Any]], servers.count <= 16 else { throw NativePeer.MediaError.invalid }
             peer = try NativePeer(id: id, servers: servers)
             return [:]
@@ -106,6 +107,7 @@ import WebRTC
         guard let peer = peer, peer.id == id else { throw NativePeer.MediaError.ended }
         switch op {
         case "poll": return peer.poll()
+        case "snapshot": return peer.poll(drain: false)
         case "offer": try await peer.offer(restart: request["restart"] as? Bool == true)
         case "signal":
             guard let signal = request["signal"] as? [String: Any] else { throw NativePeer.MediaError.invalid }

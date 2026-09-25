@@ -9,6 +9,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod call_proof;
+mod checkpoint;
 mod recovery;
 pub use call_proof::CallAuthorityProof;
 pub use recovery::ControllerRecovery;
@@ -116,6 +117,8 @@ pub struct Authority {
     head: Option<RecordId>,
     forked: bool,
     persisted_snapshot: Option<crate::ids::ObjectId>,
+    checkpoint_evidence: Option<checkpoint::CheckpointEvidence>,
+    cached_checkpoint: Option<SignedRecord>,
 }
 impl Authority {
     pub fn new(
@@ -179,6 +182,8 @@ impl Authority {
             head: None,
             forked: false,
             persisted_snapshot: None,
+            checkpoint_evidence: None,
+            cached_checkpoint: None,
         })
     }
     pub fn genesis(&self) -> &SignedRecord {
@@ -237,6 +242,10 @@ impl Authority {
         })
     }
     pub fn apply_config(&mut self, record: SignedRecord) -> Result<ConfigAdmission> {
+        // A compact proof cannot mutate history or become a local recovery source.
+        if self.checkpoint_evidence.is_some() {
+            return Err(RecordError::Authority);
+        }
         if self.configs.contains_key(&record.id()) {
             return Ok(ConfigAdmission::AlreadyPresent);
         }
@@ -290,6 +299,7 @@ impl Authority {
                 "invite.approved",
                 "member.removed",
                 "device.removed",
+                "device.updated",
                 "controller.recovered",
             ]
             .contains(&c.action.operation.as_str())
@@ -304,6 +314,8 @@ impl Authority {
             return Err(RecordError::Authority);
         }
         let mut all = BTreeSet::new();
+        let mut signing_keys = BTreeSet::new();
+        let mut recipients = BTreeSet::new();
         for member in &c.members {
             if !["HUMAN", "SERVICE", "DEVICE"].contains(&member.identity_type.as_str())
                 || !record::sorted_unique(&member.credential_ids, 1, 32)
@@ -322,6 +334,8 @@ impl Authority {
                 if credential.identity() != member.identity_id
                     || credential.record().body()["root_public_key"] != member.root_public_key
                     || !all.insert(*id)
+                    || !signing_keys.insert(credential.key().to_bytes())
+                    || !recipients.insert(credential.recipient().to_string())
                 {
                     return Err(RecordError::Authority);
                 }
@@ -397,6 +411,17 @@ impl Authority {
     }
     pub fn verify_historical(&self, r: &SignedRecord) -> Result<ChatMessage> {
         let chat = r.chat()?;
+        if chat
+            .access
+            .as_ref()
+            .is_some_and(|access| access.accept_secret.is_some())
+            && self.direct_human_peer(&chat).is_none()
+        {
+            return Err(RecordError::Authority);
+        }
+        if !record::current_message_time_is_valid(chat.logical_time) {
+            return Err(RecordError::Authority);
+        }
         if chat.space_id != self.space() || chat.stream_id != self.stream {
             return Err(RecordError::Authority);
         }
@@ -535,14 +560,39 @@ struct AuthorityProofs {
     genesis: String,
     credentials: Vec<String>,
     configs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
 }
 impl Authority {
+    pub fn seal_snapshot_signed(
+        &self,
+        recipient: &age::x25519::Recipient,
+        key: &SigningKey,
+    ) -> Result<Vec<u8>> {
+        let mut next = self.clone();
+        if self.controller().key() == &key.verifying_key() {
+            next.cached_checkpoint = Some(self.sign_checkpoint(key)?);
+        }
+        next.seal_snapshot(recipient)
+    }
     pub fn seal_snapshot(&self, recipient: &age::x25519::Recipient) -> Result<Vec<u8>> {
+        self.seal_snapshot_for_recipients(std::slice::from_ref(recipient))
+    }
+    pub fn seal_snapshot_for_recipients(
+        &self,
+        recipients: &[age::x25519::Recipient],
+    ) -> Result<Vec<u8>> {
         use base64::{Engine, engine::general_purpose::STANDARD};
+        if self.checkpoint_evidence.is_some() {
+            return Err(RecordError::Authority);
+        }
         let mut configs = self.configs.values().collect::<Vec<_>>();
         configs.sort_by_key(|(r, c)| (c.sequence, r.id()));
         let proofs = AuthorityProofs {
             v: 1,
+            checkpoint: self
+                .current_checkpoint()
+                .map(|r| STANDARD.encode(r.bytes())),
             genesis: STANDARD.encode(self.genesis.bytes()),
             credentials: self
                 .credentials
@@ -555,12 +605,12 @@ impl Authority {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&proofs).map_err(|_| RecordError::Json)?;
-        crate::crypto::seal_bytes(&bytes, std::slice::from_ref(recipient), 8 * 1024 * 1024)
+        crate::crypto::seal_bytes(&bytes, recipients, 8 * 1024 * 1024)
             .map_err(|_| RecordError::Authority)
     }
     pub fn open_snapshot(
         bytes: &[u8],
-        identity: &age::x25519::Identity,
+        identity: &dyn crate::crypto::DecryptionIdentity,
         pinned_space: SpaceId,
         pinned_root: &VerifyingKey,
         stream: StreamId,
@@ -607,6 +657,10 @@ impl Authority {
                 return Err(RecordError::Authority);
             }
         }
+        if let Some(encoded) = &p.checkpoint {
+            let checkpoint = SignedRecord::parse(&decode(encoded)?)?;
+            authority.accept_cached_checkpoint(checkpoint)?;
+        }
         authority.persisted_snapshot = Some(snapshot_id);
         Ok(authority)
     }
@@ -614,7 +668,7 @@ impl Authority {
         &mut self,
         store: &crate::store::ClientStore,
         record: SignedRecord,
-        own_identity: &age::x25519::Identity,
+        own_identity: &dyn crate::crypto::DecryptionIdentity,
         now: crate::store::LocalTime,
     ) -> std::result::Result<ConfigAdmission, crate::store::StoreError> {
         self.commit_update_inner(store, record, own_identity, now, None)
@@ -624,7 +678,7 @@ impl Authority {
         &mut self,
         store: &crate::store::ClientStore,
         record: SignedRecord,
-        own_identity: &age::x25519::Identity,
+        own_identity: &dyn crate::crypto::DecryptionIdentity,
         now: crate::store::LocalTime,
         invite: (RecordId, RecordId),
     ) -> std::result::Result<ConfigAdmission, crate::store::StoreError> {
@@ -635,7 +689,7 @@ impl Authority {
         &mut self,
         store: &crate::store::ClientStore,
         record: SignedRecord,
-        own_identity: &age::x25519::Identity,
+        own_identity: &dyn crate::crypto::DecryptionIdentity,
         now: crate::store::LocalTime,
         invite: Option<(RecordId, RecordId)>,
     ) -> std::result::Result<ConfigAdmission, crate::store::StoreError> {
@@ -707,9 +761,16 @@ impl Authority {
         &self,
         existing: Option<&Self>,
         store: &crate::store::ClientStore,
-        own: &age::x25519::Identity,
+        own: &dyn crate::crypto::DecryptionIdentity,
         now: crate::store::LocalTime,
     ) -> std::result::Result<Self, crate::store::StoreError> {
+        if self.checkpoint_evidence.is_some()
+            || existing.is_some_and(|a| a.checkpoint_evidence.is_some())
+        {
+            return Err(crate::store::StoreError::InvalidInput(
+                "checkpoint lacks historical proofs",
+            ));
+        }
         if existing.is_some_and(|old| {
             old.genesis.bytes() != self.genesis.bytes() || old.stream != self.stream
         }) {
@@ -727,6 +788,10 @@ impl Authority {
         });
         for c in self.credentials.values() {
             target.add_credential(c.clone());
+        }
+        if let Some(checkpoint) = self.current_checkpoint() {
+            // Included in the same durable snapshot when the merge reaches this head.
+            target.cached_checkpoint = Some(checkpoint.clone());
         }
         let mut configs = self.configs.values().collect::<Vec<_>>();
         configs.sort_by_key(|(r, c)| (c.sequence, r.id()));

@@ -15,20 +15,20 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.0.1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
-			<key>CFBundleURLName</key>
-			<string>now.elo</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>elo</string>
 			</array>
+			<key>CFBundleURLName</key>
+			<string>elo</string>
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>1082</string>
+	<string>1084</string>
 	<key>FirebaseAnalyticsCollectionEnabled</key>
 	<false/>
 	<key>FirebaseMessagingAutoInitEnabled</key>
@@ -66,5 +66,22 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>TaoScene</string>
+					<key>UISceneDelegateClassName</key>
+					<string>TaoSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 </dict>
 </plist>

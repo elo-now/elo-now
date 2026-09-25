@@ -1,3 +1,4 @@
+import { updateRequired, subscribeUpdateRequired } from "../releasePolicy";
 import type { Stream, View } from "../model";
 import {
   Control,
@@ -22,6 +23,8 @@ import {
   NativePeer,
   nativeMediaPermission,
   usesNativePeer,
+  takeIncomingControl,
+  nativeIncomingAction,
 } from "./nativePeer";
 export class Calls {
   snapshot: Snapshot = {
@@ -34,9 +37,13 @@ export class Calls {
   private connections = new Map<string, Control>();
   private endpoints = new Map<string, string>();
   private subscribed = new Map<string, string>();
+  private subscriptionCursor = 0;
+  private subscriptionRetry?: ReturnType<typeof setTimeout>;
+  private subscriptionBackoff = new Map<string, number>();
   private listeners = new Set<() => void>();
   private capture?: MediaStream;
   private nativeDirect = false;
+  private managedIncoming?: string;
   private mediaStopping: Promise<void> = Promise.resolve();
   private speakerMuted = false;
   private screen?: MediaStream;
@@ -54,8 +61,28 @@ export class Calls {
   private reconnectExpiry?: ReturnType<typeof setTimeout>;
   private reconnectRetry?: ReturnType<typeof setTimeout>;
   private ticking = false;
+  private unsubscribePolicy?: () => void;
+  private policyChanged = () => {
+    if (!updateRequired()) {
+      void this.subscribeChats();
+      return;
+    }
+    const activeEndpoint =
+      this.snapshot.active && this.snapshot.chat
+        ? this.endpoints.get(this.snapshot.chat.space_context!)
+        : undefined;
+    for (const [endpoint, control] of this.connections) {
+      if (endpoint === activeEndpoint) continue;
+      control.close();
+      this.connections.delete(endpoint);
+    }
+    this.subscribed.clear();
+    this.change({ available: {}, incoming: undefined });
+  };
   activate() {
     this.disposed = false;
+    this.unsubscribePolicy ??= subscribeUpdateRequired(this.policyChanged);
+    this.policyChanged();
     this.timer ??= setInterval(() => void this.tick(), 10000);
   }
   private generation = 0;
@@ -87,6 +114,10 @@ export class Calls {
       this.connections.forEach((c) => c.close());
       this.connections.clear();
       this.subscribed.clear();
+      this.subscriptionBackoff.clear();
+      this.subscriptionCursor = 0;
+      clearTimeout(this.subscriptionRetry);
+      this.subscriptionRetry = undefined;
       this.endpoints.clear();
       this.change({ available: {}, incoming: undefined, error: undefined });
     }
@@ -139,6 +170,7 @@ export class Calls {
   }
   private canRing(call: ActiveCall, chat: Stream) {
     return (
+      !updateRequired() &&
       call.kind === "direct" &&
       call.ringing &&
       !chat.muted &&
@@ -210,25 +242,72 @@ export class Calls {
     );
   }
   private async subscribeChats() {
-    if (this.busy || this.disposed) return;
+    if (
+      updateRequired() ||
+      this.busy ||
+      this.disposed ||
+      this.subscriptionRetry
+    )
+      return;
     this.busy = true;
+    const identity = this.view?.identity;
     try {
-      for (const chat of this.chats().slice(0, 32)) {
+      const chats = this.chats();
+      const start = this.subscriptionCursor % Math.max(1, chats.length);
+      let attempts = 0;
+      for (let offset = 0; offset < chats.length && attempts < 16; offset++) {
+        if (this.disposed || this.view?.identity !== identity) return;
+        const index = (start + offset) % chats.length;
+        const chat = chats[index];
+        this.subscriptionCursor = (index + 1) % chats.length;
         const key = scopeKey(chat);
-        if (this.subscribed.get(key) === chat.head) continue;
+        if (
+          this.subscribed.get(key) === chat.head ||
+          (this.subscriptionBackoff.get(key) ?? 0) > Date.now()
+        )
+          continue;
+        attempts++;
         try {
           const result = await this.command(chat, { type: "subscribe" });
+          if (this.disposed || this.view?.identity !== identity) return;
+          if (
+            !this.chats().some(
+              (current) =>
+                scopeKey(current) === key && current.head === chat.head,
+            )
+          )
+            continue;
           this.subscribed.set(key, chat.head);
+          this.subscriptionBackoff.delete(key);
           if (result.call) await this.presence(result.call);
         } catch (error) {
+          if (this.disposed || this.view?.identity !== identity) return;
+          this.subscriptionBackoff.set(key, Date.now() + 10000);
           const reason = callErrorCode(error);
           // A rejected chat must not prevent other chats from receiving calls.
           // Transport failures still stop this pass to avoid repeated timeouts.
-          if (reason !== "unauthorized" && reason !== "invalid") break;
+          if (reason !== "unauthorized" && reason !== "invalid") return;
         }
+      }
+      // One signed command at a time; reserve the socket for interactive calls
+      // between batches and stay below the server's command-rate budget.
+      if (
+        attempts === 16 &&
+        this.chats().some(
+          (chat) =>
+            this.subscribed.get(scopeKey(chat)) !== chat.head &&
+            (this.subscriptionBackoff.get(scopeKey(chat)) ?? 0) <= Date.now(),
+        )
+      ) {
+        this.subscriptionRetry = setTimeout(() => {
+          this.subscriptionRetry = undefined;
+          void this.subscribeChats();
+        }, 3000);
       }
     } finally {
       this.busy = false;
+      if (!this.disposed && this.view?.identity !== identity)
+        void this.subscribeChats();
     }
   }
   private validate(call: ActiveCall) {
@@ -331,6 +410,7 @@ export class Calls {
     )
       return this.leave("participant_removed");
     this.change({ active: call, chat });
+    if (this.managedIncoming) return; // Rust owns the peer and its signaling.
     if (this.epoch === call.key_epoch) return;
     const stopping = this.stopMedia();
     const generation = this.mediaGeneration;
@@ -464,6 +544,7 @@ export class Calls {
     });
   }
   private async signal(event: Result) {
+    if (this.managedIncoming) return;
     const generation = this.mediaGeneration;
     const { active, chat } = this.snapshot;
     if (
@@ -617,6 +698,10 @@ export class Calls {
   async start(chat: Stream, video = false, existing?: ActiveCall) {
     if (this.snapshot.active || this.snapshot.phase !== "idle" || !this.view)
       return;
+    if (updateRequired()) {
+      this.change({ error: "updateRequired", incoming: undefined });
+      return;
+    }
     const joined = existing?.participants[this.view.identity];
     if (joined && joined.credential_id !== this.view.credential) {
       this.change({ error: "already_joined", incoming: undefined });
@@ -718,9 +803,49 @@ export class Calls {
       }
     }
   }
+  async answer() {
+    const incoming = this.snapshot.incoming;
+    if (
+      !incoming ||
+      !this.view ||
+      this.snapshot.nativeAnswer ||
+      this.snapshot.phase !== "idle"
+    )
+      return;
+    const identity = this.view.identity;
+    if (usesNativePeer()) {
+      this.setNativeAnswer({
+        id: incoming.call.call_id,
+        cancel: () => {
+          void this.decline();
+        },
+      });
+      try {
+        if (
+          await nativeIncomingAction(identity, incoming.call.call_id, "answer")
+        )
+          return;
+      } catch (error) {
+        this.setNativeAnswer(undefined);
+        this.change({ error: callErrorCode(error) });
+        return;
+      }
+      this.setNativeAnswer(undefined);
+    }
+    if (
+      this.view?.identity === identity &&
+      this.snapshot.incoming?.call.call_id === incoming.call.call_id
+    )
+      await this.start(incoming.chat, false, incoming.call);
+  }
   async decline() {
     const incoming = this.snapshot.incoming;
-    this.change({ incoming: undefined });
+    const id = incoming?.call.call_id ?? this.snapshot.nativeAnswer?.id;
+    this.change({ incoming: undefined, nativeAnswer: undefined });
+    if (id && this.view && usesNativePeer())
+      await nativeIncomingAction(this.view.identity, id, "decline").catch(
+        () => {},
+      );
     if (incoming)
       await this.command(incoming.chat, {
         type: "decline",
@@ -887,6 +1012,134 @@ export class Calls {
   isNativeDirect() {
     return this.nativeDirect;
   }
+  /** Attach the UI to a call already admitted/connected by native CallKit Answer. */
+  async adoptIncoming(
+    value: {
+      id: string;
+      call_id: string;
+      phase: "connecting" | "connected";
+      call?: ActiveCall | null;
+    },
+    cancel: () => void,
+  ) {
+    if (!this.view || !usesNativePeer() || this.disposed) return;
+    if (this.snapshot.active && this.snapshot.active.call_id !== value.call_id)
+      return;
+    if (!value.call) {
+      this.managedIncoming = value.id;
+      this.change({
+        incoming: undefined,
+        nativeAnswer: { id: value.call_id, cancel },
+      });
+      return;
+    }
+    const call = value.call;
+    const chat = this.chats().find((item) => scopeKey(item) === callKey(call));
+    if (
+      !chat ||
+      !this.validate(call) ||
+      call.participants[this.view.identity]?.credential_id !==
+        this.view.credential
+    )
+      return;
+    if (this.adapter && this.managedIncoming === value.id) {
+      this.change({
+        active: call,
+        phase: value.phase,
+        media: call.participants[this.view.identity].media,
+      });
+      await this.takeIncomingControl(value.id, call, chat, value.phase);
+      return;
+    }
+    const identity = this.view.identity;
+    const stopping = this.stopMedia();
+    const generation = this.mediaGeneration;
+    await stopping;
+    if (
+      !this.view ||
+      this.view.identity !== identity ||
+      generation !== this.mediaGeneration ||
+      this.disposed
+    )
+      return;
+    this.managedIncoming = value.id;
+    this.nativeDirect = true;
+    this.epoch = call.key_epoch;
+    this.capture = new MediaStream();
+    const remote = Object.values(call.participants).find(
+      (p) => p.credential_id !== this.view!.credential,
+    );
+    if (!remote) return;
+    this.change({
+      active: call,
+      chat,
+      phase: value.phase,
+      incoming: undefined,
+      nativeAnswer: undefined,
+      available: { ...this.snapshot.available, [callKey(call)]: call },
+      media: call.participants[this.view.identity].media,
+    });
+    this.adapter = new NativePeer(
+      {
+        provider: "p2p",
+        url: "",
+        token: "",
+        epoch: call.key_epoch,
+        ice_servers: [],
+      },
+      this.view.credential,
+      remote.credential_id,
+      this.view.identity,
+      (payload) => this.sendSignal(remote.credential_id, payload, generation),
+      (tiles) => {
+        if (generation === this.mediaGeneration) this.change({ tiles });
+      },
+      () => {
+        if (generation === this.mediaGeneration)
+          this.managedIncoming
+            ? this.fail("unavailable")
+            : this.beginReconnect();
+      },
+      () => {
+        if (generation === this.mediaGeneration) this.mediaConnected();
+      },
+      undefined,
+      undefined,
+      value.id,
+    );
+    await this.takeIncomingControl(value.id, call, chat, value.phase);
+  }
+  private async takeIncomingControl(
+    id: string,
+    call: ActiveCall,
+    chat: Stream,
+    phase: string,
+  ) {
+    if (phase !== "connected" || !this.view || this.managedIncoming !== id)
+      return;
+    try {
+      // Authenticate the foreground socket before relinquishing the native one.
+      const current = await this.command(chat, {
+        type: "heartbeat",
+        call_id: call.call_id,
+      });
+      if (
+        !current.call ||
+        current.call.call_id !== call.call_id ||
+        !this.validate(current.call) ||
+        !this.view ||
+        this.managedIncoming !== id
+      )
+        return;
+      await takeIncomingControl(this.view.identity, id);
+      if (this.managedIncoming === id) this.managedIncoming = undefined;
+    } catch {
+      /* Keep the native owner if the foreground connection is not ready. */
+    }
+  }
+  async finishManagedIncoming() {
+    if (this.managedIncoming) await this.leave("native_end");
+  }
   setSpeakerMuted(muted: boolean) {
     this.speakerMuted = muted;
     void this.adapter?.setSpeakerMuted?.(muted).catch(() => {
@@ -925,6 +1178,7 @@ export class Calls {
     this.key = undefined;
     this.speakerMuted = false;
     this.nativeDirect = false;
+    this.managedIncoming = undefined;
     this.nonces.clear();
     this.change({
       active: undefined,
@@ -941,6 +1195,7 @@ export class Calls {
         type: "leave",
         call_id: active.call_id,
       }).catch(() => {});
+    if (updateRequired()) this.policyChanged();
   }
   private fail(code: string) {
     void this.leave("failure");
@@ -958,6 +1213,7 @@ export class Calls {
   }
   private beginReconnect() {
     if (!this.snapshot.active || this.disposed) return;
+    if (this.managedIncoming) return; // The native control transport owns this lease.
     if (!this.reconnectExpiry) {
       const generation = this.generation;
       // Stop media until fresh signed admission is confirmed. Keep capture only
@@ -1003,9 +1259,14 @@ export class Calls {
     }
   }
   dispose() {
+    this.unsubscribePolicy?.();
+    this.unsubscribePolicy = undefined;
     this.disposed = true;
     clearInterval(this.timer);
     this.timer = undefined;
+    clearTimeout(this.subscriptionRetry);
+    this.subscriptionRetry = undefined;
+    this.subscriptionBackoff.clear();
     void this.leave("disposed");
     this.connections.forEach((c) => c.close());
     this.connections.clear();

@@ -4,6 +4,8 @@ import type { View } from "../model";
 import type { Calls } from "./controller";
 import { callRinger, type Ringtone } from "./ringtone";
 import { NativeCallSession, type NativeCall } from "./native";
+import { usesNativePeer } from "./nativePeer";
+import type { ActiveCall } from "./types";
 
 /** Native Answer uses the open profile; a cold start waits for normal unlock. */
 export function useNativeCalls(
@@ -29,6 +31,34 @@ export function useNativeCalls(
       running = true;
       const epoch = visibilityEpoch;
       try {
+        if (usesNativePeer()) {
+          const native = await invoke<{
+            incoming?: {
+              id: string;
+              call_id: string;
+              phase: "connecting" | "connected";
+              call?: ActiveCall;
+            };
+          }>("native_call_media", {
+            identity,
+            request: { op: "incoming_status" },
+          });
+          if (stopped || epoch !== visibilityEpoch) return;
+          if (native.incoming) {
+            const incoming = native.incoming;
+            nativeRinging.current = true;
+            callRinger.stop();
+            await calls.adoptIncoming(incoming, () => {
+              void invoke("native_call_media", {
+                identity,
+                request: { op: "stop", id: incoming.id },
+              });
+              calls.setNativeAnswer(undefined);
+            });
+            return;
+          }
+          await calls.finishManagedIncoming();
+        }
         const { incoming } = await invoke<{ incoming?: NativeCall }>(
           "push_task",
           { op: "calls_status", expectedIdentity: identity },

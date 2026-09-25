@@ -23,18 +23,18 @@ does not authorize membership, replace key pins or supply arbitrary executable
 download URLs. Clients ignore additional fields but reject an unknown schema.
 
 The hosting configuration accepts an optional `client_policy` object. Omitting
-it keeps required updates **off**. Example:
+it keeps required updates **off**. The versions below are illustrative, not the current published release:
 
 ```json
 {
   "client_policy": {
     "v": 1,
     "platforms": {
-      "ios": { "latest": { "version": "1.0.0", "build": 1082 }, "minimum": null },
-      "android": { "latest": { "version": "1.0.0", "build": 1082 }, "minimum": null },
-      "macos": { "latest": { "version": "1.0.0", "build": 1082 }, "minimum": null },
-      "windows": { "latest": { "version": "1.0.0", "build": 0 }, "minimum": null },
-      "linux": { "latest": { "version": "1.0.0", "build": 0 }, "minimum": null }
+      "ios": { "latest": { "version": "1.2.0", "build": 1200 }, "minimum": null },
+      "android": { "latest": { "version": "1.2.0", "build": 1200 }, "minimum": null },
+      "macos": { "latest": { "version": "1.2.0", "build": 1200 }, "minimum": null },
+      "windows": { "latest": { "version": "1.2.0", "build": 0 }, "minimum": null },
+      "linux": { "latest": { "version": "1.2.0", "build": 0 }, "minimum": null }
     }
   }
 }
@@ -49,21 +49,30 @@ than `latest`. Versions compare numerically, followed by the build number.
 For Windows/Linux use build 0 and increment the semantic version for a release.
 Reset `minimum` to null to roll back a requirement without deleting app data.
 
-The new native client checks this endpoint once before opening a profile. The
-request has a three-second timeout, no redirects and no per-message polling.
-An absent endpoint or outage does not invent a requirement; a previously
-confirmed requirement is retained locally until a valid replacement policy is
-received. The app shows an Update required screen with Get update and Check
-again. It does not end an already running call or install software silently.
-The destination is compiled into the app: Apple App Store, Google Play or the
-publisher's latest GitHub desktop release. Mac App Store builds must set
-`ELO_DISTRIBUTION_CHANNEL=mac-app-store`; ordinary Mac builds use GitHub.
+The native client opens local profiles and chats immediately. Release discovery
+runs independently in the background, at most once every five minutes, including
+when returning to the foreground. Requests have a three-second timeout and no
+redirects; there is no per-message version request. A cached policy is loaded
+before native background work begins, and scheduled activation is reevaluated
+locally. An absent endpoint or outage does not invent a requirement. A confirmed
+requirement survives restart and outages until an eligible app is installed or a
+valid replacement policy rolls it back.
 
-This is an app startup gate, **not a security boundary**. Authorization, device
-revocation and replay protection remain server enforced regardless of a claimed
-client version. Google Play's optional in-app-update SDK is not integrated; the
-button opens the app listing. Older installed releases do not contain this gate
-and cannot acquire it without an app update.
+When an update is required, a compact orange banner below the screen header reads
+**Update required to go online.** It is centered, stays on one line, and has no
+button or dismiss action. Users update through their store or the published
+desktop release. Local history, search, profile unlock, Space selection, private
+preferences and local backups remain available. Native entry points reject new
+server work and shared edits, including sending/queuing messages, attachments,
+synchronization, device linking and new calls. Background sync and call discovery
+pause. Already admitted operations can finish; an existing call can continue and
+end normally. The policy check itself remains available while restricted.
+
+This client restriction is **not a server security boundary**. Authorization,
+device revocation and replay protection remain server enforced regardless of a
+claimed client version. The app neither installs updates silently nor uses a
+store in-app-update SDK. Older releases cannot acquire this mechanism without an
+app update.
 
 ## Current security baseline: clean cutover
 
@@ -81,7 +90,7 @@ instructions when switching it on. Preserve signing credentials, service secrets
 and original cryptographic test fixtures: none of these are obsolete runtime
 data. A reset does not replace authorization, replay-protection or device tests.
 
-Older installed apps without the update gate cannot display a new update screen
+Older installed apps without the update gate cannot display a new update notice
 remotely. They must be replaced by the new app. Minimum-version policy governs
 subsequent releases that already contain that mechanism.
 
@@ -104,15 +113,26 @@ require an app update rather than preserving a vulnerable protocol indefinitely.
 
 ## Current implementation boundary
 
-The release policy and its startup gate are new source changes, not a capability
+The release policy and its local-access restriction are new source changes, not a capability
 of the existing 1.0.0 store builds. The security work changes mailbox request
-proofs to v2, retention authorization, linked-device keys and iOS VoIP registration.
+proofs to v2, retention authorization, linked-device keys, compact authority checkpoints and iOS VoIP registration. The call-service fence now persists a root-recovery generation in its `recovery` column; the clean cutover requires a fresh call-service database rather than an in-place old-schema start.
 Those changes are **not compatible with the previous installed clients** merely
 because several resource URLs still contain `/v1`. Discovery exposes their
 separate security capabilities. This incompatibility is deliberate for the clean
 cutover above; support for those previous clients is outside its scope, rather
 than an unfinished release requirement. Native signing, physical-device tests
 and coordinated deployment remain necessary.
+
+The baseline advertises `security.space_creation_work: 1`. The JSON body for
+`POST /spaces/v1/create` includes a required unsigned 64-bit `work` nonce beside
+`record` and `credential`. SHA-256 of the concatenation of
+`elo.space.create.work.v1\0`, SHA-256(record UTF-8), SHA-256(credential UTF-8),
+and the nonce as eight big-endian bytes must begin with 20 zero bits. The proof
+is bound to the signed request and its credential. Verification precedes
+provisioning; identity/network/deployment quotas still apply. It does not add a
+challenge round trip and is never required for sending a message. A later change
+to this work contract requires its own advertised version and coordinated
+client support; changing the difficulty silently is not compatible.
 
 For future releases, retain a versioned contract test fixture from each supported
 client release. Tests of a new client against its own new server do not prove

@@ -151,6 +151,7 @@ impl ClientApp {
             .commit_update(&self.store, record, self.session.age_identity(), now()?)
             .await?;
         self.pins.push(Pin {
+            personal_seed: Some(false),
             chat_kind: Some(kind),
             name: name.into(),
             space,

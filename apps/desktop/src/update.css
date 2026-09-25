@@ -1,0 +1,45 @@
+/* One short, persistent notice; never covers the content or captures input. */
+.update-banner {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 8px;
+  background: #f5b45b;
+  color: #442608;
+  font: 500 min(var(--elo-type-label), 14px)/1.35 var(--elo-font);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.screen-header:has(> .update-banner) {
+  grid-template-rows: minmax(44px, auto) auto;
+  padding-bottom: 0;
+  row-gap: 3px;
+}
+.screen-header > .update-banner {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.shell[data-mobile="false"] .screen-header:has(> .update-banner) {
+  height: auto;
+  grid-template-rows: var(--desktop-header-height) auto;
+  row-gap: 0;
+}
+.unlock > .update-banner {
+  margin-bottom: 12px;
+}
+.dialog.call-dialog:has(> .update-banner) {
+  display: flex;
+  flex-direction: column;
+}
+.dialog.message-action-dialog.call-dialog > .update-banner {
+  display: block;
+  height: auto;
+}
+.dialog.call-dialog:has(> .update-banner) > div:not(.update-banner) {
+  flex: 1;
+  height: auto;
+}

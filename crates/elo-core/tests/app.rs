@@ -57,9 +57,12 @@ async fn real_profiles_join_sync_explicit_history_files_revoke_and_restart() {
     let peer = d.path().join("peer.json");
     vault::write_private(&peer, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, elo_core::http::router(replica))
-            .await
-            .unwrap()
+        {
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            axum::serve(listener, elo_core::http::router(replica, &origin))
+        }
+        .await
+        .unwrap()
     });
     let mut owner = ClientApp::open(owner_dir.clone(), PASSWORD.into(), true)
         .await

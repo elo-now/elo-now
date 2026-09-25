@@ -21,10 +21,24 @@ pub fn sender_tag(route: &str, identity: IdentityId) -> String {
     hash.update(identity.as_bytes());
     record::encode_hex(&hash.finalize())
 }
+pub fn credential_tag(route: &str, credential: RecordId) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"elo.now/wake-credential/v1\0");
+    hash.update(route.as_bytes());
+    hash.update(credential.as_bytes());
+    record::encode_hex(&hash.finalize())
+}
+pub struct Sender {
+    pub identity: IdentityId,
+    pub credential: RecordId,
+}
 pub fn verify(route: &str, request: &Value, time: u64) -> Result<String> {
     Ok(sender_tag(route, verify_identity(route, request, time)?))
 }
 pub fn verify_identity(route: &str, request: &Value, time: u64) -> Result<IdentityId> {
+    Ok(verify_sender(route, request, time)?.identity)
+}
+pub fn verify_sender(route: &str, request: &Value, time: u64) -> Result<Sender> {
     let auth = &request["sender"];
     let decode = |field_name: &str| -> Result<Vec<u8>> {
         let encoded = field(auth, field_name)?;
@@ -55,7 +69,10 @@ pub fn verify_identity(route: &str, request: &Value, time: u64) -> Result<Identi
     {
         return Err("Invalid notification sender.".into());
     }
-    Ok(credential.identity())
+    Ok(Sender {
+        identity: credential.identity(),
+        credential: credential.id(),
+    })
 }
 pub fn sign(session: &Session, route: &str, request: &mut Value) -> Result<()> {
     let proof = Proof {
@@ -85,6 +102,8 @@ mod tests {
         let time = now().unwrap().as_millis() as u64 / 1000;
         let tag = verify(&route, &body, time).unwrap();
         assert_eq!(tag, sender_tag(&route, session.identity_id()));
+        let credential = verify_sender(&route, &body, time).unwrap().credential;
+        assert_eq!(credential, session.credential().id());
         assert!(verify(&"d".repeat(32), &body, time).is_err());
         for field in ["event", "scope", "target"] {
             let mut forged = body.clone();
@@ -101,5 +120,16 @@ mod tests {
         let recovered = Session::recover(&card, session.identity_id()).unwrap();
         sign(&recovered, &route, &mut body).unwrap();
         assert_eq!(verify(&route, &body, time).unwrap(), tag);
+        assert_ne!(
+            credential_tag(&route, credential),
+            credential_tag(
+                &route,
+                verify_sender(&route, &body, time).unwrap().credential
+            )
+        );
+        assert_ne!(
+            credential_tag(&route, credential),
+            credential_tag(&"e".repeat(32), credential)
+        );
     }
 }

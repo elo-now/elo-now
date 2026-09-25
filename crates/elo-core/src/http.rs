@@ -50,9 +50,9 @@ fn bearer(headers: &HeaderMap) -> Result<String, ReplicaError> {
     Ok(token.to_owned())
 }
 #[derive(Clone, Copy)]
-struct AuthenticatedIdentity(Option<crate::ids::IdentityId>);
+struct AuthenticatedIdentity(Option<crate::retention_access::Actor>);
 async fn authorize(
-    State(store): State<ReplicaStore>,
+    State((store, origin)): State<(ReplicaStore, String)>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -60,39 +60,88 @@ async fn authorize(
     let mailbox = parts.get(3).and_then(|s| s.parse().ok());
     let result = match (mailbox, bearer(request.headers())) {
         (Some(id), Ok(token)) => {
-            let identity = request
+            // Reject random callers before parsing or verifying a public-key proof.
+            if let Err(error) = store
+                .authorize(id, token, request.method() == Method::POST)
+                .await
+            {
+                return error.into_response();
+            }
+            let (parts, body) = request.into_parts();
+            let bytes = match axum::body::to_bytes(body, MAX_CIPHERTEXT).await {
+                Ok(bytes) => bytes,
+                Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            };
+            request = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+            let verified = request
                 .headers()
                 .get("x-elo-identity")
                 .map(|header| {
-                    header.to_str().map_err(|_| ()).and_then(|value| {
-                        crate::sync::access::verify(
-                            value,
-                            request.method().as_str(),
-                            request
-                                .extensions()
-                                .get::<OriginalUri>()
-                                .map(|original| &original.0)
-                                .unwrap_or_else(|| request.uri())
-                                .path_and_query()
-                                .map(|p| p.as_str())
-                                .unwrap_or(""),
-                        )
-                    })
+                    let value = header.to_str().map_err(|_| ())?;
+                    let context = crate::sync::access::RequestContext {
+                        origin: &origin,
+                        replica: store.key(),
+                        method: request.method().as_str(),
+                        path: request
+                            .extensions()
+                            .get::<OriginalUri>()
+                            .map(|original| &original.0)
+                            .unwrap_or_else(|| request.uri())
+                            .path_and_query()
+                            .map(|p| p.as_str())
+                            .unwrap_or(""),
+                        body: &bytes,
+                        transfer: request
+                            .headers()
+                            .get("x-elo-transfer")
+                            .map(|h| h.to_str())
+                            .transpose()
+                            .map_err(|_| ())?
+                            .unwrap_or(""),
+                        retention: request
+                            .headers()
+                            .get("x-elo-retention")
+                            .map(|h| h.to_str())
+                            .transpose()
+                            .map_err(|_| ())?
+                            .unwrap_or(""),
+                    };
+                    crate::sync::access::verify(value, &context)
                 })
                 .transpose();
-            let identity = match identity {
-                Ok(identity) => identity,
+            let verified = match verified {
+                Ok(verified) => verified,
                 Err(()) => return ReplicaError::Unauthorized.into_response(),
             };
+            let actor = verified
+                .as_ref()
+                .map(|access| crate::retention_access::Actor {
+                    identity: access.identity,
+                    credential: access.credential,
+                });
+            let identity = actor.map(|actor| actor.identity);
+            if let Some(access) = &verified {
+                if access.companion {
+                    if let Err(error) = store.require_admitted_companion(access.credential) {
+                        return error.into_response();
+                    }
+                }
+                if let Err(error) = store.require_active_device(access.credential) {
+                    return error.into_response();
+                }
+            }
             if let Err(error) = store.authorize_identity(id, identity).await {
                 return error.into_response();
             }
+            if let Some(access) = verified {
+                if let Err(error) = store.consume_access(access).await {
+                    return error.into_response();
+                }
+            }
             request
                 .extensions_mut()
-                .insert(AuthenticatedIdentity(identity));
-            store
-                .authorize(id, token, request.method() == Method::POST)
-                .await
+                .insert(AuthenticatedIdentity(actor));
+            Ok(())
         }
         _ => Err(ReplicaError::Unauthorized),
     };
@@ -110,7 +159,12 @@ async fn bounded(State(slots): State<Arc<Semaphore>>, request: Request, next: Ne
         Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
     }
 }
-pub fn router(store: ReplicaStore) -> Router {
+/// The origin is operator configuration, never a Host or Forwarded header.
+pub fn router(store: ReplicaStore, public_origin: &str) -> Router {
+    let origin = reqwest::Url::parse(public_origin)
+        .expect("validated replica public origin")
+        .origin()
+        .ascii_serialization();
     let mailbox = Router::new()
         .route(
             "/v1/mailboxes/{mailbox}/objects/{object}",
@@ -129,7 +183,10 @@ pub fn router(store: ReplicaStore) -> Router {
             "/v1/mailboxes/{mailbox}/children",
             post(create_child).layer(DefaultBodyLimit::max(4096)),
         )
-        .route_layer(middleware::from_fn_with_state(store.clone(), authorize));
+        .route_layer(middleware::from_fn_with_state(
+            (store.clone(), origin),
+            authorize,
+        ));
     Router::new()
         .merge(mailbox)
         .route("/v1/health", get(|| async { "ok" }))
@@ -143,8 +200,15 @@ pub fn router(store: ReplicaStore) -> Router {
 
 /// A stable per-Space namespace, including signed request paths. Nesting must
 /// preserve OriginalUri so access proofs cannot be replayed in another Space.
-pub fn space_router(store: ReplicaStore, reservation: crate::ids::ObjectId) -> Router {
-    Router::new().nest(&format!("/spaces/{reservation}/replica"), router(store))
+pub fn space_router(
+    store: ReplicaStore,
+    reservation: crate::ids::ObjectId,
+    public_origin: &str,
+) -> Router {
+    Router::new().nest(
+        &format!("/spaces/{reservation}/replica"),
+        router(store, public_origin),
+    )
 }
 async fn create_child(
     State(store): State<ReplicaStore>,
@@ -200,11 +264,7 @@ async fn upload(
     )
         .into_response())
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessageControl {
-    record_id: crate::ids::RecordId,
-}
+use crate::retention_access::Control as MessageControl;
 async fn request_message(
     State(store): State<ReplicaStore>,
     Path((mailbox, object)): Path<(String, String)>,
@@ -217,6 +277,7 @@ async fn request_message(
             identity.0.ok_or(ReplicaError::Unauthorized)?,
             object.parse().map_err(|_| ReplicaError::Invalid)?,
             body.record_id,
+            body.proof,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -233,6 +294,7 @@ async fn accept_message(
             identity.0.ok_or(ReplicaError::Unauthorized)?,
             object.parse().map_err(|_| ReplicaError::Invalid)?,
             body.record_id,
+            body.proof,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -292,9 +354,25 @@ pub async fn serve(
     store: ReplicaStore,
     address: SocketAddr,
     allow_insecure_loopback: bool,
+    public_origin: Option<String>,
 ) -> Result<(), ReplicaError> {
     let listener = local_listener(address, allow_insecure_loopback).await?;
-    axum::serve(listener, router(store))
+    let origin = public_origin.unwrap_or(format!("http://{}", listener.local_addr()?));
+    let parsed = reqwest::Url::parse(&origin).map_err(|_| ReplicaError::Invalid)?;
+    if parsed.cannot_be_a_base()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+        || !(parsed.scheme() == "https"
+            || allow_insecure_loopback
+                && parsed.scheme() == "http"
+                && matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]" | "localhost")))
+    {
+        return Err(ReplicaError::Invalid);
+    }
+    axum::serve(listener, router(store, &origin))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

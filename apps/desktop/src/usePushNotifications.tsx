@@ -1,3 +1,4 @@
+import { updateRequired, subscribeUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { View } from "./model";
@@ -235,7 +236,8 @@ export function usePushNotifications(
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       clearTimeout(timer);
-      if (!active || document.visibilityState !== "visible") return;
+      if (!active || updateRequired() || document.visibilityState !== "visible")
+        return;
       if (
         !running.current &&
         !latest.current.busy &&
@@ -287,7 +289,7 @@ export function usePushNotifications(
         );
     };
     const hint = async () => {
-      if (document.visibilityState !== "visible") return;
+      if (updateRequired() || document.visibilityState !== "visible") return;
       const serial = ++hintSerial.current;
       try {
         const pending = await invoke<{ opened?: string | null }>("push_task", {
@@ -308,16 +310,19 @@ export function usePushNotifications(
       }
     };
     const wake = () => {
-      if (document.visibilityState === "visible") opening.current = true;
+      if (!updateRequired() && document.visibilityState === "visible")
+        opening.current = true;
       void hint();
       void tick();
     };
+    const unsubscribePolicy = subscribeUpdateRequired(wake);
     refresh.current = () => void tick();
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("online", wake);
     wake();
     return () => {
       active = false;
+      unsubscribePolicy();
       hintSerial.current++;
       clearTimeout(timer);
       document.removeEventListener("visibilitychange", wake);
