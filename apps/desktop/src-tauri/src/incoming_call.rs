@@ -16,6 +16,9 @@ type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type Result<T> = std::result::Result<T, &'static str>;
 pub(crate) trait Driver: Send {
+    fn cancellation(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
+    }
     fn operation(&mut self, op: &str, fields: Value) -> impl Future<Output = Result<Value>> + Send;
     fn media(&mut self, request: Value) -> impl Future<Output = Result<Value>> + Send;
     fn changed(&mut self, call: &Value, connected: bool)
@@ -187,7 +190,19 @@ pub(crate) async fn run(driver: &mut impl Driver, target: &Target) -> Result<()>
         socket,
         pending: VecDeque::new(),
     };
-    let result = answer(driver, target, &mut control, signed).await;
+    let mut cancellation = driver.cancellation();
+    let result = tokio::select! {
+        biased;
+        _ = async {
+            let Some(cancelled) = cancellation.as_mut() else {
+                return std::future::pending::<()>().await;
+            };
+            while !*cancelled.borrow_and_update() {
+                if cancelled.changed().await.is_err() { return; }
+            }
+        } => Ok(()),
+        result = answer(driver, target, &mut control, signed) => result,
+    };
     // A local stop must also remove the participant when WebKit cannot run.
     let _ = tokio::time::timeout(
         Duration::from_secs(3),
@@ -444,8 +459,12 @@ mod tests {
         locked: bool,
         media: Vec<Value>,
         connected: bool,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     }
     impl Driver for TestDriver {
+        fn cancellation(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+            self.cancellation.clone()
+        }
         async fn operation(&mut self, op: &str, fields: Value) -> Result<Value> {
             if self.locked {
                 return Err("unauthorized");
@@ -475,6 +494,7 @@ mod tests {
             locked: true,
             media: vec![],
             connected: false,
+            cancellation: None,
         };
         assert_eq!(run(&mut driver, &target()).await, Err("unauthorized"));
         assert!(driver.media.is_empty());
@@ -507,6 +527,7 @@ mod tests {
             locked: false,
             media: vec![],
             connected: false,
+            cancellation: None,
         };
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(3), run(&mut driver, &target))
@@ -564,6 +585,7 @@ mod tests {
             locked: false,
             media: vec![],
             connected: false,
+            cancellation: None,
         };
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(10), run(&mut driver, &target))
@@ -577,6 +599,53 @@ mod tests {
         assert!(driver.media.iter().any(|m| m["op"] == "update"
             && m["state"]["audio_muted"] == false
             && m["state"]["video_published"] == false));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_hangup_interrupts_pending_media_admission_and_sends_signed_leave() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut target = target();
+        target.url = format!("ws://{}", listener.local_addr().unwrap());
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for expected in ["subscribe", "join", "media", "connect_media", "leave"] {
+                let request: Value = serde_json::from_str(
+                    &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["command"]["type"], expected);
+                assert_eq!(request["proof"], "verified");
+                if expected == "connect_media" {
+                    // No response: system End must preempt the 12-second wait.
+                    cancel.send(true).unwrap();
+                    continue;
+                }
+                socket
+                    .send(Message::Text(
+                        json!({"type":"result","call":call(expected != "subscribe")})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut driver = TestDriver {
+            locked: false,
+            media: vec![],
+            connected: false,
+            cancellation: Some(cancellation),
+        };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), run(&mut driver, &target))
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert!(!driver.media.iter().any(|m| m["op"] == "start"));
         server.await.unwrap();
     }
 }

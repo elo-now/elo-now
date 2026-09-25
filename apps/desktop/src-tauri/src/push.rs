@@ -2,6 +2,24 @@
 use elo_core::app::ClientApp;
 use serde_json::{Value, json};
 
+#[cfg(all(mobile, feature = "mobile-push"))]
+pub fn setup(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = app.clone();
+        // A content-free hint wakes the verified status flow. Native tokens and
+        // unverified notification targets never enter the web view.
+        let channel = tauri::ipc::Channel::<Value>::new(move |_| {
+            let _ = target.emit("push-changed", ());
+            Ok(())
+        });
+        let _ = app
+            .state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+            .call("statusListener", json!({"channel":channel}));
+    });
+}
+
 #[cfg(any(all(mobile, feature = "mobile-push"), test))]
 fn obsolete_registration(bytes: &[u8], endpoint: &str) -> Result<bool, String> {
     let value: Value =

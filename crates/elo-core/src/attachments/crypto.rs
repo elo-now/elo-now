@@ -115,7 +115,6 @@ pub fn encrypt_file(
         progress(done);
         index += 1;
     }
-    drop(write_hashed);
     writer.sync_all()?;
     if done != plan.plaintext_size {
         return Err("The selected attachment changed while it was encrypted.".into());
@@ -136,12 +135,11 @@ pub fn decrypt_file(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut key = Zeroizing::new([0u8; 32]);
     let decoded = Zeroizing::new(STANDARD.decode(key_b64)?);
-    key.copy_from_slice(
-        decoded
-            .as_slice()
-            .try_into()
-            .map_err(|_| "Invalid attachment key.")?,
-    );
+    let key_bytes: &[u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid attachment key.")?;
+    key.copy_from_slice(key_bytes);
     let prefix: [u8; 16] = STANDARD
         .decode(nonce_prefix_b64)?
         .try_into()
@@ -216,6 +214,26 @@ mod tests {
     fn accepts_five_mebibytes_and_rejects_one_byte_more() {
         assert!(plan(MAX_ATTACHMENT_FILE_SIZE).is_ok());
         assert!(plan(MAX_ATTACHMENT_FILE_SIZE + 1).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_key_lengths_before_opening_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("missing-input");
+        let output = directory.path().join("output");
+        for length in [0, 1, 31, 33, 64] {
+            let error = decrypt_file(
+                &input,
+                &output,
+                &STANDARD.encode(vec![0u8; length]),
+                &STANDARD.encode([0u8; 16]),
+                0,
+                "",
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "Invalid attachment key.");
+            assert!(!output.exists());
+        }
     }
 
     #[test]

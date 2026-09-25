@@ -5,8 +5,11 @@ import {usePushNotifications} from '/src/usePushNotifications.tsx';
 import '/src/style.css';
 import '/src/mobile.css';
 let status = {available:true, enabled:false, pending:false, callsEnabled:false, callsPending:false};
-const qa=window.notificationSettingsQA={operations:[], hold:false, release:null, ready:()=>{status={...status,pending:false};}};
-window.__TAURI_INTERNALS__={invoke:async(command,{op})=>{
+const callbacks=new Map();let callbackId=0;
+const qa=window.notificationSettingsQA={operations:[], hold:false, release:null, ready:()=>{status={...status,pending:false};}, push:()=>{for(const callback of callbacks.values())callback({event:'push-changed',id:1,payload:null});}};
+window.__TAURI_INTERNALS__={transformCallback:callback=>{callbacks.set(++callbackId,callback);return callbackId;},unregisterCallback:id=>callbacks.delete(id),invoke:async(command,{op,handler})=>{
+  if(command==='plugin:event|listen')return handler;
+  if(command==='plugin:event|unlisten')return;
   if(command!=='push_task')throw Error('Unexpected command');
   qa.operations.push(op);
   if(op==='hint')return {};

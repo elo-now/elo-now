@@ -32,6 +32,7 @@ export type LiveContext = {
   busy: boolean;
   messages: boolean;
   invitations: boolean;
+  pendingSpaces?: readonly string[];
 };
 
 /** One foreground worker for both delivery loops. Native code owns durable
@@ -54,6 +55,7 @@ export function startLiveSync(
   let nextInvitation = 0;
   let messageFailures = 0;
   let invitationFailures = 0;
+  let pendingSpaces = new Set(context().pendingSpaces ?? []);
   let requests = 0;
   let invitationRequests = 0;
   let forceInvitation = false;
@@ -242,6 +244,16 @@ export function startLiveSync(
       if (!running) schedule(100);
     },
     changed() {
+      const nextPending = new Set(context().pendingSpaces ?? []);
+      if ([...nextPending].some((id) => !pendingSpaces.has(id))) {
+        // A newly submitted join must not inherit backoff from unreachable
+        // Spaces. Coalesce the wake and retain the normal polling cadence.
+        invitationFailures = 0;
+        nextInvitation = 0;
+        invitationRequests++;
+        forceInvitation = true;
+      }
+      pendingSpaces = nextPending;
       if (context().conversation)
         nextMessage = Math.min(nextMessage, Date.now() + 4_000);
       if (!running) schedule(100);

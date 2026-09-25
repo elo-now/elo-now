@@ -6,17 +6,20 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.appcompat.app.AppCompatActivity
 import android.content.pm.PackageManager
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
+import app.tauri.plugin.Channel
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import com.google.firebase.FirebaseApp
@@ -33,19 +36,36 @@ class RegisterArgs { var registration: String = "" }
 class AckArgs { var opened: String? = null; var wake: String? = null }
 
 @InvokeArg
+class StatusListenerArgs { lateinit var channel: Channel }
+
+@InvokeArg
 class CallConfigureArgs { var enabled:Boolean=false;var registration:String="";var endpoint:String="";var labels:Map<String,String> = emptyMap();var ringtone:String?=null }
 @InvokeArg
 class CallActionArgs { var action:String="";var callId:String="";var event:String?=null }
 
 @TauriPlugin
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
+    @Command
+    fun deviceModel(invoke: Invoke) {
+        val result = JSObject()
+        result.put("model", Build.MODEL)
+        invoke.resolve(result)
+    }
+
     private val prefs get() = activity.getSharedPreferences("elo-push", Context.MODE_PRIVATE)
     private var tokenDeletion: Task<Void>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var statusChannel: Channel? = null
+    private val statusChanged = SharedPreferences.OnSharedPreferenceChangeListener { values, key ->
+        if (key in listOf("wake", "opened", "challenge") && values.getString(key, null) != null) {
+            statusChannel?.send(JSObject())
+        }
+    }
     private fun available() = FirebaseApp.getApps(activity).isNotEmpty() &&
         GoogleApiAvailabilityLight.getInstance().isGooglePlayServicesAvailable(activity) == ConnectionResult.SUCCESS
     override fun load(webView: WebView) {
         super.load(webView)
+        prefs.registerOnSharedPreferenceChangeListener(statusChanged)
         if (Build.VERSION.SDK_INT >= 26) {
             val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(NotificationChannel("elo_messages", "Messages", NotificationManager.IMPORTANCE_DEFAULT))
@@ -53,6 +73,16 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         onIntent(activity.intent)
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); onIntent(intent) }
+    override fun onDestroy(activity: AppCompatActivity) {
+        prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
+        statusChannel = null
+        super.onDestroy(activity)
+    }
+    @Command
+    fun statusListener(invoke: Invoke) {
+        statusChannel = invoke.parseArgs(StatusListenerArgs::class.java).channel
+        invoke.resolve()
+    }
     private fun onIntent(intent: Intent?) {
         val target = intent?.getStringExtra("elo_target") ?: return
         if (prefs.getBoolean("enabled", false) && intent.getStringExtra("elo_registration") == prefs.getString("registration", null)

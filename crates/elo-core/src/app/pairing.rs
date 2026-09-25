@@ -6,7 +6,7 @@ use crate::{
     replica::{ChildMailbox, MailboxDescriptor, TransferHint},
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 pub const PREFIX: &str = "elo-pair:3:";
 const LIFETIME: u64 = 10 * 60 * 1000;
@@ -158,8 +158,10 @@ fn code(offer: &Offer, request: &Request) -> Result<String> {
     // Full 128-bit comparison prevents an observer from grinding a matching
     // requester-controlled nonce as they could with a six-digit code.
     Ok(hash[..16]
-        .chunks_exact(2)
-        .map(record::encode_hex)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| record::encode_hex(chunk))
         .collect::<Vec<_>>()
         .join(" ")
         .to_uppercase())
@@ -193,10 +195,16 @@ impl PairSource {
             quota_bytes: 128 * 1024 * 1024,
             expires_at: expires,
         };
-        Peer::new(parent.clone(), app.allow_loopback)?
-            .with_identity(&transport.session)
-            .create_child(&child)
-            .await?;
+        let parent_peer = transport
+            .peers
+            .iter()
+            .find(|peer| peer.matches_descriptor(&parent))
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| Peer::new(parent.clone(), app.allow_loopback))?
+            .with_identity(&transport.session);
+        parent_peer.create_child(&child).await?;
+        let peer = parent_peer.child_mailbox(&child.descriptor);
         let mailbox = PeerDescriptor {
             mailbox_id: child.descriptor.mailbox_id,
             read_token: Some(child.descriptor.read_token),
@@ -211,8 +219,7 @@ impl PairSource {
             identity: app.identity_id(),
             recipient: key.to_public().to_string(),
             auth_key: record::random_hex::<32>()?,
-            access: Peer::new(mailbox.clone(), app.allow_loopback)?
-                .with_identity(&transport.session)
+            access: peer
                 .pairing_access()?
                 .map(|encoded| -> Result<String> {
                     Ok(String::from_utf8(URL_SAFE_NO_PAD.decode(encoded)?)?)
@@ -221,8 +228,7 @@ impl PairSource {
             mailbox,
         };
         Ok(Self {
-            peer: Peer::new(offer.mailbox.clone(), app.allow_loopback)?
-                .with_identity(&transport.session),
+            peer,
             offer,
             key,
             cursor: 0,

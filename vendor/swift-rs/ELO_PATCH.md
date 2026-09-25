@@ -1,6 +1,6 @@
 # Local build integration
 
-This copy retains the upstream license. elo's build bridge handles Xcode 27
+Based on upstream swift-rs 1.0.8; this copy retains the upstream license. elo's build bridge handles Xcode 27
 cross-compilation with an explicit Swift target triple, clamps the iOS deployment
 target to the supported minimum, locates the actual output archive, and preserves
 the C bridge symbols required by Rust/Tauri.

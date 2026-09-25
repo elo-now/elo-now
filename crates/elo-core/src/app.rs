@@ -874,6 +874,7 @@ impl ClientApp {
                 return Err("Space controller transition incomplete or conflicting".into());
             }
         }
+        let mut sent = None;
         match field(&v, "op")? {
             "set_profile_name" => {
                 self.set_profile_name(field(&v, "name")?)?;
@@ -1179,6 +1180,7 @@ impl ClientApp {
                         time,
                     )?)
                     .await?;
+                sent = Some(json!({"id":r.id(),"logical_time":r.body()["logical_time"]}));
             }
             "add_peer" => {
                 let p: PeerDescriptor =
@@ -1643,7 +1645,11 @@ impl ClientApp {
         } else {
             self.view().await?
         };
-        Ok(json!({"view":view,"result":{"status":"completed"}}))
+        let mut response = json!({"view":view,"result":{"status":"completed"}});
+        if let Some(sent) = sent {
+            response["sent"] = sent;
+        }
+        Ok(response)
     }
     fn require_controller(&self, a: &Authority) -> Result<()> {
         if !self.session.can_control(a.space())

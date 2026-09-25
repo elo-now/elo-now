@@ -5,3 +5,7 @@
 *.bin binary
 /.private export-ignore
 /.private/** export-ignore
+/AGENTS.md export-ignore
+/MEMORY.md export-ignore
+/docs/IMPLEMENTATION_STATUS.md export-ignore
+/docs/START_HERE.md export-ignore

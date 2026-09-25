@@ -73,31 +73,53 @@ export function MessageContent({
             )}
           </span>
           {context}
-          {row.body.kind !== "deleted" && (onStatus || more) && (
+          {row.local_echo ? (
             <span className="message-controls">
-              {onStatus && (
-                <MessageStatusButton
-                  state={row.state}
-                  onOpen={() =>
-                    onStatus({
-                      state: row.state,
-                      id: row.id,
-                      sender: row.body.issuer_identity,
-                      createdAt,
-                    })
-                  }
-                />
-              )}
-              {onStatus && chat && (
-                <MessageReactionButton chat={chat} row={row} />
-              )}
-              {more ??
-                (onStatus && chat && <MessageMore chat={chat} row={row} />)}
+              <span
+                className="message-status"
+                role="status"
+                aria-label={t(
+                  row.local_echo === "saving"
+                    ? "messageStatus.saving"
+                    : "messageStatus.pending",
+                )}
+                title={t(
+                  row.local_echo === "saving"
+                    ? "messageStatus.saving"
+                    : "messageStatus.pending",
+                )}
+              >
+                <Icon name="syncPending" />
+              </span>
             </span>
+          ) : (
+            row.body.kind !== "deleted" &&
+            (onStatus || more) && (
+              <span className="message-controls">
+                {onStatus && (
+                  <MessageStatusButton
+                    state={row.state}
+                    onOpen={() =>
+                      onStatus({
+                        state: row.state,
+                        id: row.id,
+                        sender: row.body.issuer_identity,
+                        createdAt,
+                      })
+                    }
+                  />
+                )}
+                {onStatus && chat && (
+                  <MessageReactionButton chat={chat} row={row} />
+                )}
+                {more ??
+                  (onStatus && chat && <MessageMore chat={chat} row={row} />)}
+              </span>
+            )
           )}
         </div>
         {children}
-        {chat && row.body.kind !== "deleted" && (
+        {chat && !row.local_echo && row.body.kind !== "deleted" && (
           <MessageReactions chat={chat} row={row} />
         )}
       </div>

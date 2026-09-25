@@ -3,7 +3,7 @@ members = ["crates/elo-core", "crates/elo-cli", "crates/elo-wake", "crates/elo-t
 resolver = "3"
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-only"
@@ -13,7 +13,7 @@ publish = false
 elo-core = { path = "crates/elo-core" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "serialize"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "net", "signal"] }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 fs2 = "0.4.3"
 clap = { version = "4.5", features = ["derive"] }
@@ -27,18 +27,19 @@ getrandom = "0.4"
 
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "original-uri"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2"
 zeroize = "1"
 async-trait = "0.1"
 bytes = "1"
-chacha20poly1305 = "0.10"
+# Since 0.11, key zeroization must be enabled explicitly (it was unconditional).
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 futures-util = "0.3"
-hmac = "0.12"
+hmac = "0.13"
 tokio-util = { version = "0.7", features = ["io"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
+bip39 = { version = "3", default-features = false, features = ["std", "zeroize"] }
 
 rpassword = "7"
 

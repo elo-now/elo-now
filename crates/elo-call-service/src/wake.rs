@@ -237,14 +237,11 @@ impl Delivery {
                 .json(&notice)
                 .send()
                 .await
+                && (response.status().is_success() || response.status().is_client_error())
+                && let Some(current) = self.pending.lock().await.get_mut(&id)
+                && current.terminal == item.terminal
             {
-                if response.status().is_success() || response.status().is_client_error() {
-                    if let Some(current) = self.pending.lock().await.get_mut(&id)
-                        && current.terminal == item.terminal
-                    {
-                        current.sent = true;
-                    }
-                }
+                current.sent = true;
             }
         }
     }

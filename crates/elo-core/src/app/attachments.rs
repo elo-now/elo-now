@@ -219,7 +219,7 @@ impl ClientApp {
             object_id: object,
             encryption: AttachmentEncryption {
                 algorithm: "xchacha20-poly1305-chunks-v1".into(),
-                key: STANDARD.encode(&*plan.key),
+                key: STANDARD.encode(plan.key.as_slice()),
                 nonce_prefix: STANDARD.encode(plan.nonce_prefix),
                 chunk_bytes: crate::attachments::ATTACHMENT_CHUNK_BYTES,
                 ciphertext_sha256: encrypted.ciphertext_sha256,

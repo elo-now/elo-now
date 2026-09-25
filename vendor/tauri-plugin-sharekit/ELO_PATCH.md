@@ -9,3 +9,7 @@ file to that existing private directory. Do not broaden FileProvider to the
 entire cache, which also contains private exchange and profile data.
 
 The Rust and iOS code is otherwise unchanged from 0.3.1.
+
+The Android build uses Kotlin 2.4's `compilerOptions` and includes the consumer
+ProGuard file declared by upstream but missing from its source package. AGP 9
+requires that file to exist; Tauri supplies the plugin retention rules.

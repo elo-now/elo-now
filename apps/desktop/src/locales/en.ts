@@ -96,11 +96,8 @@ export const en = {
     "Could not mark this download as untrusted. Choose another destination.",
   "error.backupMemory":
     "This backup needs too much memory. Export a new backup on its original device.",
-  "devices.registered": "Registered devices",
   "devices.loading": "Loading devices…",
   "devices.loadFailed": "Could not load devices. Try again.",
-  "devices.unavailable":
-    "Some Spaces are unreachable. The device list may be incomplete.",
   "devices.pendingRevocation":
     "Device removal is waiting for a server. Keep elo open to retry.",
   "devices.none": "Connect to a Space to manage your devices.",
@@ -109,6 +106,9 @@ export const en = {
   "devices.revoke": "Revoke access",
   "devices.revokeTitle": "Delete this device?",
   "devices.accept": "Accept",
+  "devices.acceptTitle": "Accept this device?",
+  "devices.acceptHelp":
+    "{name} will have access to your profile and messages. Only accept a device you control.",
   "devices.accepted": "Accepted",
   "devices.pending": "Waiting for acceptance",
   "devices.delete": "Delete",
@@ -1120,8 +1120,10 @@ export const en = {
   "error.spaceRequestLimit":
     "This Space has too many pending requests. Contact its owner.",
   "error.spaceMemberLimit": "This Space has reached its member limit.",
-  "error.attachmentPendingLimit": "Too many pending uploads. Finish or cancel one first.",
-  "error.attachmentFileLimit": "Attachment file limit reached. Remove old files.",
+  "error.attachmentPendingLimit":
+    "Too many pending uploads. Finish or cancel one first.",
+  "error.attachmentFileLimit":
+    "Attachment file limit reached. Remove old files.",
   "error.spaceInvitationLimit":
     "Too many invitations. Revoke an unused one first.",
   "error.joinSpaceFirst": "Join this Space with an invitation first.",
@@ -1558,6 +1560,7 @@ export const en = {
   "messageStatus.title": "Message status",
   "messageStatus.show": "Message status: {status}",
   "messageStatus.queued": "Queued",
+  "messageStatus.saving": "Sending…",
   "messageStatus.synced": "Synced",
   "messageStatus.pending": "Sync pending",
   "messageStatus.issue": "Sync issue",

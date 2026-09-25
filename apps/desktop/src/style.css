@@ -1550,6 +1550,10 @@ summary {
   min-width: 44px;
   min-height: 44px;
 }
+.screen-header .device-link-action:active {
+  background: transparent;
+  color: var(--elo-text);
+}
 .scrim {
   z-index: 10;
 }
@@ -2792,6 +2796,10 @@ button {
 }
 .devices-page > * {
   flex-shrink: 0;
+}
+.device-list-loading {
+  width: 100%;
+  text-align: center;
 }
 .device-link-help,
 .device-link-waiting {

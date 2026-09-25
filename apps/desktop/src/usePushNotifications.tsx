@@ -1,6 +1,7 @@
 import { updateRequired, subscribeUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { View } from "./model";
 import { invitationCount, notificationCount } from "./model";
 import type { StreamEntry } from "./streamFeed";
@@ -185,7 +186,6 @@ export function usePushNotifications(
     onOpen,
     onError,
   };
-  const running = useRef(false);
   const settingsRevision = useRef(0);
   const refresh = useRef<() => void>(() => {});
   const acknowledged = useRef<string | undefined>(undefined);
@@ -233,17 +233,20 @@ export function usePushNotifications(
     if (!view) return;
     const identity = view.identity;
     let active = true;
+    let running = false;
+    let refreshQueued = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       clearTimeout(timer);
       if (!active || updateRequired() || document.visibilityState !== "visible")
         return;
-      if (
-        !running.current &&
-        !latest.current.busy &&
-        !latest.current.changing
-      ) {
-        running.current = true;
+      if (running) {
+        refreshQueued = true;
+        return;
+      }
+      if (!latest.current.busy && !latest.current.changing) {
+        running = true;
+        refreshQueued = false;
         const revision = settingsRevision.current;
         const current = () => active && revision === settingsRevision.current;
         try {
@@ -277,15 +280,20 @@ export function usePushNotifications(
               old.available ? { ...old, pending: true } : old,
             );
         } finally {
-          running.current = false;
+          running = false;
         }
       }
       if (active)
         timer = setTimeout(
           () => void tick(),
-          latest.current.status.pending || latest.current.status.callsPending
-            ? 1000
-            : 8000,
+          refreshQueued
+            ? latest.current.busy || latest.current.changing
+              ? 500
+              : 100
+            : latest.current.status.pending ||
+                latest.current.status.callsPending
+              ? 1000
+              : 8000,
         );
     };
     const hint = async () => {
@@ -310,13 +318,20 @@ export function usePushNotifications(
       }
     };
     const wake = () => {
+      refreshQueued = true;
       if (!updateRequired() && document.visibilityState === "visible")
         opening.current = true;
       void hint();
       void tick();
     };
     const unsubscribePolicy = subscribeUpdateRequired(wake);
-    refresh.current = () => void tick();
+    refresh.current = () => {
+      refreshQueued = true;
+      void tick();
+    };
+    const listener = listen("push-changed", () => {
+      if (active) wake();
+    }).catch(() => undefined);
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("online", wake);
     wake();
@@ -325,6 +340,7 @@ export function usePushNotifications(
       unsubscribePolicy();
       hintSerial.current++;
       clearTimeout(timer);
+      void listener.then((unlisten) => unlisten?.());
       document.removeEventListener("visibilitychange", wake);
       window.removeEventListener("online", wake);
     };
@@ -333,8 +349,8 @@ export function usePushNotifications(
     if (!changing) refresh.current();
   }, [changing]);
   // A membership edit or mute must update the recipient's server-side policy.
-  const scopes = view?.streams
-    .map((s) => `${s.stream}:${s.head}:${!!s.muted}`)
+  const scopes = (view?.all_streams ?? view?.streams)
+    ?.map((s) => `${s.stream}:${s.head}:${!!s.muted}`)
     .join("|");
   useEffect(() => refresh.current(), [scopes]);
   useEffect(() => {

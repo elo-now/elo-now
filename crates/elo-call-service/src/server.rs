@@ -119,8 +119,7 @@ impl HostingAdmission {
                         response = Some(reply);
                         break;
                     }
-                    Ok(reply)
-                        if attempt == 0 && matches!(reply.status().as_u16(), 502 | 503 | 504) => {}
+                    Ok(reply) if attempt == 0 && matches!(reply.status().as_u16(), 502..=504) => {}
                     Err(error) if attempt == 0 && (error.is_connect() || error.is_timeout()) => {}
                     _ => return Err(CallError::Unavailable),
                 }
@@ -157,67 +156,6 @@ impl Admission for HostingAdmission {
         head: RecordId,
     ) -> AdmissionFuture<'_> {
         self.check(space, identity, Some((device, scope, head)))
-    }
-}
-
-#[cfg(test)]
-mod admission_retry_tests {
-    use super::*;
-    use axum::response::IntoResponse;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[tokio::test]
-    async fn transient_read_retries_once_but_denial_and_bad_auth_do_not() {
-        for initial in [503u16, 403, 200] {
-            let count = Arc::new(AtomicUsize::new(0));
-            let seen = count.clone();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!(
-                "http://{}/internal/calls/admission",
-                listener.local_addr().unwrap()
-            );
-            let task = tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    axum::Router::new().fallback(move || {
-                        let attempt = seen.fetch_add(1, Ordering::SeqCst);
-                        async move {
-                            if attempt == 0 && initial != 200 {
-                                axum::http::StatusCode::from_u16(initial)
-                                    .unwrap()
-                                    .into_response()
-                            } else {
-                                axum::Json(json!({"allowed": initial != 200})).into_response()
-                            }
-                        }
-                    }),
-                )
-                .await
-                .unwrap();
-            });
-            let admission = HostingAdmission::new(&url, Zeroizing::new("11".repeat(32))).unwrap();
-            let result = admission
-                .allowed(
-                    SpaceId::from_bytes([1; 32]),
-                    IdentityId::from_bytes([2; 32]),
-                )
-                .await;
-            match initial {
-                503 => {
-                    assert!(result.unwrap());
-                    assert_eq!(count.load(Ordering::SeqCst), 2);
-                }
-                403 => {
-                    assert!(result.is_err());
-                    assert_eq!(count.load(Ordering::SeqCst), 1);
-                }
-                _ => {
-                    assert!(!result.unwrap());
-                    assert_eq!(count.load(Ordering::SeqCst), 1);
-                }
-            }
-            task.abort();
-        }
     }
 }
 
@@ -549,4 +487,65 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
     // Keep the short participant lease so a transient socket reconnect can
     // recover the same device session. Heartbeat expiry eventually ends it.
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Close(None))).await;
+}
+
+#[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn transient_read_retries_once_but_denial_and_bad_auth_do_not() {
+        for initial in [503u16, 403, 200] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = count.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/internal/calls/admission",
+                listener.local_addr().unwrap()
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(move || {
+                        let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if attempt == 0 && initial != 200 {
+                                axum::http::StatusCode::from_u16(initial)
+                                    .unwrap()
+                                    .into_response()
+                            } else {
+                                axum::Json(json!({"allowed": initial != 200})).into_response()
+                            }
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            });
+            let admission = HostingAdmission::new(&url, Zeroizing::new("11".repeat(32))).unwrap();
+            let result = admission
+                .allowed(
+                    SpaceId::from_bytes([1; 32]),
+                    IdentityId::from_bytes([2; 32]),
+                )
+                .await;
+            match initial {
+                503 => {
+                    assert!(result.unwrap());
+                    assert_eq!(count.load(Ordering::SeqCst), 2);
+                }
+                403 => {
+                    assert!(result.is_err());
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                }
+                _ => {
+                    assert!(!result.unwrap());
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                }
+            }
+            task.abort();
+        }
+    }
 }

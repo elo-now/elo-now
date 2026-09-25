@@ -1,4 +1,5 @@
 import ObjectiveC
+import Darwin
 import WebKit
 import GoogleUtilities_NSData
 import FirebaseCore
@@ -25,9 +26,21 @@ private struct PushStatus: Encodable {
 }
 
 final class EloPushPlugin: Plugin, MessagingDelegate {
+    @objc func deviceModel(_ invoke: Invoke) {
+        var hardware = utsname()
+        uname(&hardware)
+        let identifier = Mirror(reflecting: hardware.machine).children.reduce(into: "") { result, item in
+            guard let byte = item.value as? Int8, byte != 0 else { return }
+            result.append(Character(UnicodeScalar(UInt8(bitPattern: byte))))
+        }
+        let model = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] ?? identifier
+        invoke.resolve(["model": model, "fallback": UIDevice.current.model])
+    }
+
     private let prefs = UserDefaults.standard
     private var waiting: Invoke?
     private var observers: [NSObjectProtocol] = []
+    private var statusChannel: Channel?
 
     override init() {
         super.init()
@@ -106,7 +119,12 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
                   target.count <= 2048, target.range(of: "^[A-Za-z0-9_-]{64,}$", options: .regularExpression) != nil {
             prefs.set(target, forKey: "elo.push.wake")
             if opened { prefs.set(target, forKey: "elo.push.opened") }
-        }
+        } else { return }
+        try? statusChannel?.send([:] as [String: Bool])
+    }
+    @objc func statusListener(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(CallListenerArgs.self)
+        DispatchQueue.main.async { self.statusChannel = args.channel; invoke.resolve() }
     }
     @objc func register(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PushRegisterArgs.self)

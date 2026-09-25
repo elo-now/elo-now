@@ -4,7 +4,7 @@ import { ControlRecovery } from "./ControlRecovery";
 import { LinkedDevices } from "./LinkedDevices";
 import { cancelProfileReminders } from "./reminders";
 import { PasswordInput } from "./PasswordInput";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { shareText } from "@choochmeque/tauri-plugin-sharekit-api";
 import { invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n";
@@ -14,6 +14,7 @@ import { disableBiometricUnlock } from "./biometric";
 import { profileTask, RecoveryQr } from "./ProfileRecovery";
 import { RecoveryCodePanel } from "./RecoveryCodePanel";
 import { parseRecoveryCode, recoveryCode } from "./recoveryCode";
+import { pauseBackgroundSync } from "./backgroundSyncPause";
 
 type Request = { id: string; name: string };
 type AcceptedDevice = {
@@ -26,9 +27,12 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
   const [screen, setScreen] = useState<"list" | "qr" | "done">("list");
   const [svg, setSvg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const startRevision = useRef(0);
   const [requests, setRequests] = useState<Request[]>([]);
   const [accepted, setAccepted] = useState<AcceptedDevice | null>(null);
   const [removing, setRemoving] = useState<Request | null>(null);
+  const [accepting, setAccepting] = useState<Request | null>(null);
   const [expires, setExpires] = useState<number | null>(null);
   const [clock, setClock] = useState(Date.now);
   const [pollFailed, setPollFailed] = useState(false);
@@ -51,27 +55,46 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
     }
   };
   const start = async () => {
-    const result = await profileTask<{ svg: string; expires: number }>(
-      "pair_start",
-    );
-    setSvg(result.svg);
-    setExpires(result.expires);
-    setClock(Date.now());
+    const revision = ++startRevision.current;
+    setPreparing(true);
+    setSvg("");
+    setExpires(null);
     setRequests([]);
     setAccepted(null);
     setPollFailed(false);
     setScreen("qr");
+    try {
+      const result = await profileTask<{ svg: string; expires: number }>(
+        "pair_start",
+      );
+      if (revision !== startRevision.current) return;
+      setSvg(result.svg);
+      setExpires(result.expires);
+      setClock(Date.now());
+    } catch (error) {
+      if (revision !== startRevision.current) return;
+      setScreen("list");
+      throw error;
+    } finally {
+      if (revision === startRevision.current) setPreparing(false);
+    }
   };
   const close = async () => {
-    await profileTask("cancel");
+    ++startRevision.current;
+    setPreparing(false);
     setSvg("");
     setExpires(null);
     setRequests([]);
     setPollFailed(false);
     setScreen("list");
+    await profileTask("cancel");
   };
+  useEffect(() => {
+    if (preparing) return pauseBackgroundSync();
+  }, [preparing]);
   useEffect(
     () => () => {
+      ++startRevision.current;
       void profileTask("cancel").catch(() => {});
     },
     [],
@@ -113,13 +136,15 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
       <ScreenHeader
         title={t(screen === "qr" ? "devices.link" : "devices.title")}
         desktopRoot={screen === "list"}
-        onBack={screen === "list" ? onBack : () => setScreen("list")}
+        onBack={
+          screen === "list" ? onBack : () => void close().catch(reportError)
+        }
         backLabel={t(screen === "list" ? "settings.back" : "devices.back")}
         actions={
           screen === "list" && canLink && requests.length === 0 ? (
             <button
               type="button"
-              className="icon"
+              className="icon device-link-action"
               aria-label={t("devices.link")}
               disabled={busy}
               onClick={() => (svg ? setScreen("qr") : void perform(start))}
@@ -152,35 +177,24 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
                   </span>
                   <div className="linked-device-actions">
                     <button
+                      type="button"
+                      className="icon"
+                      aria-label={t("devices.accept")}
+                      title={t("devices.accept")}
                       disabled={busy || expired}
-                      onClick={() =>
-                        void perform(async () => {
-                          await profileTask("pair_approve", { id: request.id });
-                          const result = await profileTask<{
-                            credential: string;
-                            device_id: string;
-                          }>("pair_poll");
-                          setAccepted({
-                            id: result.device_id,
-                            credential: result.credential,
-                            name: request.name,
-                            current: false,
-                          });
-                          setRequests([]);
-                          setSvg("");
-                          setExpires(null);
-                          setScreen("done");
-                        })
-                      }
+                      onClick={() => setAccepting(request)}
                     >
-                      {t(busy ? "sync.busy" : "devices.accept")}
+                      <Icon name="check" />
                     </button>
                     <button
-                      className="secondary danger"
+                      type="button"
+                      className="icon"
+                      aria-label={t("devices.delete")}
+                      title={t("devices.delete")}
                       disabled={busy}
                       onClick={() => setRemoving(request)}
                     >
-                      {t("devices.delete")}
+                      <Icon name="delete" />
                     </button>
                   </div>
                 </div>
@@ -198,7 +212,11 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
           </>
         )}
         {screen === "qr" &&
-          (svg && (expired || pollFailed) ? (
+          (preparing ? (
+            <p className="page-description device-list-loading" role="status">
+              {t("devices.preparing")}
+            </p>
+          ) : svg && (expired || pollFailed) ? (
             <>
               <p className="error device-link-help" role="status">
                 {t(expired ? "devices.expired" : "devices.requestFailed")}
@@ -232,6 +250,49 @@ export function DevicesSettings({ onBack }: { onBack: () => void }) {
               </button>
             </>
           ) : null)}
+        {accepting && (
+          <ActionDialog
+            title={t("devices.acceptTitle")}
+            onClose={() => !busy && setAccepting(null)}
+          >
+            <p>{t("devices.acceptHelp", { name: accepting.name })}</p>
+            {expired && <p className="error">{t("devices.expired")}</p>}
+            <div className="space-choice">
+              <button
+                className="secondary"
+                disabled={busy}
+                onClick={() => setAccepting(null)}
+              >
+                {t("dialog.cancel")}
+              </button>
+              <button
+                disabled={busy || expired}
+                onClick={() =>
+                  void perform(async () => {
+                    await profileTask("pair_approve", { id: accepting.id });
+                    const result = await profileTask<{
+                      credential: string;
+                      device_id: string;
+                    }>("pair_poll");
+                    setAccepted({
+                      id: result.device_id,
+                      credential: result.credential,
+                      name: accepting.name,
+                      current: false,
+                    });
+                    setAccepting(null);
+                    setRequests([]);
+                    setSvg("");
+                    setExpires(null);
+                    setScreen("done");
+                  })
+                }
+              >
+                {t(busy ? "sync.busy" : "devices.accept")}
+              </button>
+            </div>
+          </ActionDialog>
+        )}
         {removing && (
           <ActionDialog
             title={t("devices.deleteRequestTitle")}

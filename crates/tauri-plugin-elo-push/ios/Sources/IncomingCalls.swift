@@ -145,6 +145,8 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
     }
     private func reject(_ id:String) {
         guard let call=pending,call["id"] as? String == id else { return }
+        // Interrupt native answer/SDP work even while WebKit is suspended.
+        try? answerListener?.send(["ended": id] as [String: String])
         event(call,action:"decline")
         if let endpoint=prefs.string(forKey:"elo.call.endpoint"),let registration=call["registration"] as? String,
            let ticket=call["ticket"] as? String,let url=URL(string:endpoint+"v1/routes/\(registration)/calls/\(id)"),url.scheme=="https" {

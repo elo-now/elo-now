@@ -256,15 +256,17 @@ pub(super) fn bytes_in_state(state: &ServiceState) -> (u64, u64) {
         .values()
         .fold((0, 0), |(used, reserved), attachment| {
             (
-                used + attachment
-                    .counts_as_used()
-                    .then_some(attachment.encrypted_size)
-                    .unwrap_or(0),
+                used + if attachment.counts_as_used() {
+                    attachment.encrypted_size
+                } else {
+                    0
+                },
                 reserved
-                    + attachment
-                        .counts_as_reserved()
-                        .then_some(attachment.encrypted_size)
-                        .unwrap_or(0),
+                    + if attachment.counts_as_reserved() {
+                        attachment.encrypted_size
+                    } else {
+                        0
+                    },
             )
         })
 }
@@ -331,13 +333,13 @@ impl ClientApp {
                     .and_then(|value| value.parse().map_err(Into::into))
                 {
                     Ok(value) => value,
-                    Err(error) => return Some(Err(error.into())),
+                    Err(error) => return Some(Err(error)),
                 };
                 let object_id: AttachmentObjectId = match field(&command.body, "object_id")
                     .and_then(|value| value.parse().map_err(Into::into))
                 {
                     Ok(value) => value,
-                    Err(error) => return Some(Err(error.into())),
+                    Err(error) => return Some(Err(error)),
                 };
                 let plaintext_size = command.body["plaintext_size"].as_u64().unwrap_or(u64::MAX);
                 let encrypted_size = command.body["encrypted_size"].as_u64().unwrap_or(u64::MAX);

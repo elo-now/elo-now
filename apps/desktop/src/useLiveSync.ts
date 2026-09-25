@@ -14,8 +14,29 @@ export function useLiveSync(
 ) {
   const restricted = useUpdateRequired();
   const [progress, setProgress] = useState<SyncProgress>(null);
-  const latest = useRef({ view, conversation, busy, onResult, suspended });
-  latest.current = { view, conversation, busy, onResult, suspended };
+  const pendingSpaces =
+    view?.spaces
+      ?.filter(
+        (space) => space.status === "pending" || space.status === "checking",
+      )
+      .map((space) => space.id) ?? [];
+  const pendingSpaceKey = pendingSpaces.join(",");
+  const latest = useRef({
+    view,
+    conversation,
+    busy,
+    onResult,
+    suspended,
+    pendingSpaces,
+  });
+  latest.current = {
+    view,
+    conversation,
+    busy,
+    onResult,
+    suspended,
+    pendingSpaces,
+  };
   useEffect(() => {
     if (!view) return;
     let active = true;
@@ -52,6 +73,7 @@ export function useLiveSync(
         invitations:
           !!latest.current.view?.invitations?.enabled ||
           !!latest.current.view?.spaces?.length,
+        pendingSpaces: latest.current.pendingSpaces,
       }),
       (op, force = false, receiveOnly = false) =>
         invoke<SyncResult>("operate", {
@@ -85,6 +107,7 @@ export function useLiveSync(
     view?.replicas.length,
     view?.invitations?.enabled,
     view?.spaces?.length,
+    pendingSpaceKey,
   ]);
   // This also covers reactions/pins committed through shared message actions.
   const pending = useRef(view?.counts.pending ?? 0);

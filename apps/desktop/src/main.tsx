@@ -17,6 +17,7 @@ import {
   senderName,
   isNewMessage,
   messageCreatedAt,
+  messageLogicalTime,
   beginsNewMessageSection,
   markVisibleMessagesRead,
   type View,
@@ -72,6 +73,8 @@ import { WindowChrome } from "./WindowChrome";
 import { AddPeople } from "./AddPeople";
 import { InvitationFlow, type InvitationRoute } from "./InvitationFlow";
 import { useMessageHistory } from "./useMessageHistory";
+import { useOutgoingMessages } from "./useOutgoingMessages";
+import type { SendReceipt } from "./outgoingMessages";
 import type { HistoryPage } from "./messageHistory";
 import { useLiveSync } from "./useLiveSync";
 import { usePushNotifications } from "./usePushNotifications";
@@ -714,6 +717,15 @@ function App() {
     streamSummary?.space,
     streamSummary?.stream,
   ]);
+  const currentConversationScope = useRef(conversationScope);
+  currentConversationScope.current = conversationScope;
+  const postingMessage = useRef(false);
+  const outgoing = useOutgoingMessages(
+    JSON.stringify([view?.identity, view?.credential]),
+    conversationScope,
+    history.rows,
+    threadHistory.rows,
+  );
   const messageScope = JSON.stringify([
     view?.identity,
     view?.active_space,
@@ -723,18 +735,17 @@ function App() {
     threadActive ? threadRoot : undefined,
   ]);
   const arrival = newMessage?.scope === messageScope ? newMessage : undefined;
-  const stream =
-    streamSummary && history.enabled
-      ? {
-          ...streamSummary,
-          rows: history.rows.filter(
-            (row) =>
-              !view?.blocked_users?.some(
-                (p) => p.identity === row.body.issuer_identity,
-              ),
-          ),
-        }
-      : streamSummary;
+  const stream = streamSummary
+    ? {
+        ...streamSummary,
+        rows: outgoing.rows.filter(
+          (row) =>
+            !view?.blocked_users?.some(
+              (p) => p.identity === row.body.issuer_identity,
+            ),
+        ),
+      }
+    : streamSummary;
   const calls = useCalls(view, preferences.callRingtone);
   const personalDM =
     stream?.chat_kind === "direct" && stream.members.length === 2;
@@ -747,7 +758,7 @@ function App() {
   const selectedThread =
     threadRoot && stream
       ? findThread(
-          threadHistory.rows.filter(
+          outgoing.replies.filter(
             (row) =>
               !view?.blocked_users?.some(
                 (person) => person.identity === row.body.issuer_identity,
@@ -788,16 +799,18 @@ function App() {
     }
   };
   const call = async (request: Record<string, unknown>) => {
-    const r = await invoke<{ view?: View; result?: unknown; stream?: string }>(
-      "operate",
-      {
-        request: {
-          ...request,
-          expected_identity: view?.identity,
-          expected_space: view?.active_space,
-        },
+    const r = await invoke<{
+      view?: View;
+      result?: unknown;
+      stream?: string;
+      sent?: SendReceipt;
+    }>("operate", {
+      request: {
+        ...request,
+        expected_identity: view?.identity,
+        expected_space: view?.active_space,
       },
-    );
+    });
     if (request.op === "sync" || request.op === "sync_live")
       receiveSync(r as SyncResult);
     else if (r.view) setView(r.view);
@@ -807,7 +820,12 @@ function App() {
       request.op === "attachment_upload"
     )
       requestSync();
-    if (request.op === "remove_member") requestSync(true);
+    if (
+      request.op === "remove_member" ||
+      request.op === "contact_open" ||
+      request.op === "contact_create_chat"
+    )
+      requestSync(true);
     if (request.op === "set_user_blocked") {
       // A push/search target may now be hidden. Reopen the visible history
       // instead of repeatedly requesting a page around the blocked record.
@@ -819,6 +837,38 @@ function App() {
       requestSync(true);
     }
     return r;
+  };
+  const sendText = (value: string, thread?: string) => {
+    if (!view || !stream)
+      return Promise.reject(new Error("The profile is locked"));
+    const createdAt = recordTimestamp();
+    const logicalTime =
+      [...stream.rows, ...threadHistory.rows].reduce(
+        (highest, row) => Math.max(highest, messageLogicalTime(row)),
+        Date.now(),
+      ) + 1;
+    return outgoing.send(
+      {
+        scope: conversationScope,
+        identity: view.identity,
+        credential: view.credential,
+        text: value,
+        createdAt,
+        logicalTime,
+        thread,
+      },
+      async () => {
+        const result = await call({
+          op: "send",
+          space: stream.space,
+          stream: stream.stream,
+          text: value,
+          created_at: createdAt,
+          ...(thread ? { reply_to: thread } : {}),
+        });
+        return result.sent!;
+      },
+    );
   };
   const chooseAttachment = () =>
     void perform(async () => {
@@ -1568,12 +1618,18 @@ function App() {
             mobile={mobile}
             busy={busy}
             draft={threadDrafts[threadDraftKey] ?? ""}
-            onDraft={(value) =>
+            onDraft={(value) => {
+              if (
+                currentView.current?.identity !== view.identity ||
+                currentView.current?.credential !== view.credential ||
+                currentView.current?.active_space !== view.active_space
+              )
+                return;
               setThreadDrafts((current) => ({
                 ...current,
                 [threadDraftKey]: value,
-              }))
-            }
+              }));
+            }}
             onBack={closeThread}
             onRefresh={refresh}
             onRead={markVisibleRead}
@@ -1604,14 +1660,7 @@ function App() {
             onSend={async (text) => {
               let sent = false;
               await perform(async () => {
-                await call({
-                  op: "send",
-                  space: stream.space,
-                  stream: stream.stream,
-                  reply_to: selectedThread.rootId,
-                  text,
-                  created_at: recordTimestamp(),
-                });
+                await sendText(text, selectedThread.rootId);
                 sent = true;
               });
               return sent;
@@ -2080,7 +2129,11 @@ function App() {
                             key={`${view.identity}:${stream?.stream}:${r.id}`}
                             text={r.body.payload?.text ?? ""}
                             thread={entry.thread}
-                            canReply={!!stream?.can_post && !stream.forked}
+                            canReply={
+                              !r.local_echo &&
+                              !!stream?.can_post &&
+                              !stream.forked
+                            }
                             onOpen={() => openThread(r, !entry.thread)}
                           />
                         ) : (
@@ -2181,21 +2234,31 @@ function App() {
             className="composer"
             onSubmit={(e) => {
               e.preventDefault();
-              if (stream && !awaitingDirect && (text || pendingAttachment))
+              if (
+                stream &&
+                !busy &&
+                !postingMessage.current &&
+                stream.can_post &&
+                !stream.forked &&
+                !awaitingDirect &&
+                (text || pendingAttachment)
+              ) {
+                postingMessage.current = true;
                 void perform(async () => {
                   let committed = false;
                   if (text) {
-                    await call({
-                      op: "send",
-                      space: stream.space,
-                      stream: stream.stream,
-                      text,
-                      created_at: recordTimestamp(),
-                    });
-                    // The text message has committed even if a subsequent
-                    // attachment upload fails. Clear it now to prevent a retry
-                    // from sending the same text twice.
                     setText("");
+                    setMessageTarget(undefined);
+                    setOwnSendRevision((revision) => revision + 1);
+                    try {
+                      await sendText(text);
+                    } catch (error) {
+                      if (
+                        currentConversationScope.current === conversationScope
+                      )
+                        setText((current) => current || text);
+                      throw error;
+                    }
                     committed = true;
                   }
                   if (pendingAttachment) {
@@ -2252,12 +2315,14 @@ function App() {
                     }
                     if (cancelled && !committed) return;
                   }
-                  setText("");
                   if (committed) {
                     setMessageTarget(undefined);
                     setOwnSendRevision((revision) => revision + 1);
                   }
+                }).finally(() => {
+                  postingMessage.current = false;
                 });
+              }
             }}
           >
             <input

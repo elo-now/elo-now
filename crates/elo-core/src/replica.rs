@@ -533,6 +533,10 @@ impl ReplicaStore {
         self.post_inner(mailbox, token, id, bytes, hint, message, None)
             .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the authenticated upload API aligned with post_classified, adding only its verified actor"
+    )]
     pub async fn post_authenticated(
         &self,
         mailbox: MailboxId,
@@ -546,6 +550,10 @@ impl ReplicaStore {
         self.post_inner(mailbox, token, id, bytes, hint, message, actor)
             .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Shared upload implementation retains the explicit request fields and verified actor"
+    )]
     async fn post_inner(
         &self,
         mailbox: MailboxId,

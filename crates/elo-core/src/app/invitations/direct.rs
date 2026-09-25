@@ -129,23 +129,22 @@ impl ClientApp {
                 }
             }
         }
-        if let Some(address) = &self.call_host {
-            if let Some(general) =
+        if let Some(address) = &self.call_host
+            && let Some(general) =
                 self.authorities.0.iter().find(|a| {
                     a.space() == address.scope.space && a.stream() == address.scope.stream
                 })
-            {
-                let active: BTreeSet<_> = general
-                    .head()?
-                    .members
-                    .iter()
-                    .flat_map(|m| m.credential_ids.iter().copied())
-                    .collect();
-                for credentials in people.values_mut() {
-                    credentials.retain(|id, _| active.contains(id));
-                }
-                people.retain(|_, credentials| !credentials.is_empty());
+        {
+            let active: BTreeSet<_> = general
+                .head()?
+                .members
+                .iter()
+                .flat_map(|m| m.credential_ids.iter().copied())
+                .collect();
+            for credentials in people.values_mut() {
+                credentials.retain(|id, _| active.contains(id));
             }
+            people.retain(|_, credentials| !credentials.is_empty());
         }
         people.retain(|id, _| !self.blocked.contains(*id));
         Ok(people)

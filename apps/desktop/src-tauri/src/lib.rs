@@ -13,6 +13,8 @@ mod control_recovery;
 mod demo;
 #[cfg(desktop)]
 mod desktop_activity;
+mod device_list_load;
+mod device_name;
 mod download_protection;
 mod exchange;
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
@@ -234,6 +236,10 @@ async fn create_profile(
     Ok(view)
 }
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tauri command fields are the existing frontend IPC contract"
+)]
 async fn unlock(
     app: tauri::AppHandle,
     state: tauri::State<'_, State>,
@@ -766,6 +772,7 @@ pub fn run() {
         .manage(AttachmentTransfers::default())
         .manage(exchange::ExchangeFiles::default())
         .manage(background_history::BackgroundHistory::default())
+        .manage(device_list_load::DeviceListLoads::default())
         .manage(recovery_progress::RecoveryJobs::default())
         .setup(|app| {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -773,6 +780,8 @@ pub fn run() {
                 window.set_decorations(false)?;
             }
             release_policy::setup(app.handle());
+            #[cfg(all(mobile, feature = "mobile-push"))]
+            push::setup(app.handle());
             #[cfg(all(target_os = "ios", feature = "mobile-push"))]
             incoming_answer::setup(app.handle());
             exchange::clear(app.handle()).map_err(std::io::Error::other)?;

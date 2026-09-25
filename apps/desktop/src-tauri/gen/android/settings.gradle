@@ -1,3 +1,20 @@
 include ':app'
 
 apply from: 'tauri.settings.gradle'
+
+// Kotlin 2.4 compatibility: reviewed Android-only copies, not registry mutations.
+def cargoPackages = file("../../../../../Cargo.lock").text.split(/\[\[package\]\]/)
+[
+    "tauri-android": ["tauri", "2.11.6"],
+    "tauri-plugin-barcode-scanner": ["tauri-plugin-barcode-scanner", "2.4.6"],
+    "tauri-plugin-deep-link": ["tauri-plugin-deep-link", "2.4.10"],
+    "tauri-plugin-dialog": ["tauri-plugin-dialog", "2.7.3"],
+    "tauri-plugin-fs": ["tauri-plugin-fs", "2.5.2"],
+].each { module, source ->
+    def (crate, version) = source
+    def locked = cargoPackages.findAll { it.contains('\nname = "' + crate + '"\n') }
+    if (locked.size() != 1 || !locked[0].contains('\nversion = "' + version + '"\n')) {
+        throw new GradleException("Review vendor/android/${crate} after changing its Cargo.lock version (expected ${version}).")
+    }
+    project(":${module}").projectDir = file("../../../../../vendor/android/${crate}")
+}

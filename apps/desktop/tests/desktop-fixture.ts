@@ -418,6 +418,7 @@ mockIPC(
         row.reactions = [];
       }
       let result: object = {};
+      let sent: { id: string; logical_time: number } | undefined;
       let created: string | undefined;
       if (request.op === "mark_read" && stream) {
         for (const row of stream.rows)
@@ -431,17 +432,20 @@ mockIPC(
         );
       }
       if (request.op === "contact_open") created = "dm-maya";
-      if (request.op === "send" && stream)
+      if (request.op === "send" && stream) {
+        sent = { id: `sent-${sequence++}`, logical_time: Date.now() };
         stream.rows.push({
-          id: `sent-${sequence++}`,
+          id: sent.id,
           state: "LOCAL",
           body: {
             kind: "chat.message",
+            logical_time: sent.logical_time,
             issuer_identity: "alex",
             created_at: new Date().toISOString(),
-            payload: { text: request.text },
+            payload: { text: request.text, thread_root: request.reply_to },
           },
         });
+      }
       if (request.op === "set_profile_details") {
         view.name = request.name;
         view.avatar = request.avatar;
@@ -488,6 +492,7 @@ mockIPC(
       return structuredClone({
         view,
         stream: created,
+        sent,
         result,
         received: [],
         incoming: [],

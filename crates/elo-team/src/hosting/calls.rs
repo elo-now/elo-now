@@ -49,15 +49,14 @@ pub(super) async fn admit(
     if !bool::from(key.as_slice().ct_eq(presented.as_bytes())) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    if let Some((credential, _, _)) = request.device {
-        if host
+    if let Some((credential, _, _)) = request.device
+        && host
             .revocations
             .get(credential)
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
             .is_some()
-        {
-            return Ok(Json(json!({"allowed":false})));
-        }
+    {
+        return Ok(Json(json!({"allowed":false})));
     }
     let entry = host
         .spaces

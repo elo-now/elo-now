@@ -206,14 +206,7 @@ export class Calls {
       control = new Control(
         endpoint,
         this.view.identity,
-        (event) => {
-          this.events = this.events
-            .catch(() => {})
-            .then(() => this.event(event))
-            .catch(() => {
-              this.fail("unavailable");
-            });
-        },
+        (event) => this.receiveEvent(event),
         () => {
           const incoming = this.snapshot.incoming;
           if (
@@ -345,7 +338,10 @@ export class Calls {
         scope.conversation.space_id === eventScope?.conversation?.space_id &&
         scope.conversation.stream_id === eventScope?.conversation?.stream_id;
       const matches = (call: ActiveCall) =>
-        call.call_id === event.call_id || matchesScope(call.scope);
+        event.type === "access_revoked"
+          ? matchesScope(call.scope)
+          : call.call_id === event.call_id &&
+            (!eventScope || matchesScope(call.scope));
       if (event.type === "access_revoked") {
         for (const chat of this.chats()) {
           const scope = {
@@ -367,10 +363,31 @@ export class Calls {
         await this.leave(event.type);
     } else if (event.type === "signal") await this.signal(event);
   }
+  private receiveEvent(event: Result) {
+    const generation = this.generation;
+    const handle = async () => {
+      if (this.disposed || generation !== this.generation) return;
+      try {
+        await this.event(event);
+      } catch (error) {
+        // Teardown can reject outstanding SDP/ICE work after a normal hangup.
+        if (generation === this.generation)
+          this.fail(callErrorCode(error) === "ended" ? "ended" : "unavailable");
+      }
+    };
+    if (event.type === "ended" || event.type === "access_revoked") {
+      // Hangup must not wait for an SDP handshake or a signed media command.
+      void handle();
+      if (generation !== this.generation) this.events = Promise.resolve();
+    } else this.events = this.events.catch(() => {}).then(handle);
+  }
   private presence(call: ActiveCall): Promise<void> {
+    const generation = this.generation;
     const task = this.presenceQueue
       .catch(() => {})
-      .then(() => this.applyPresence(call));
+      .then(() => {
+        if (generation === this.generation) return this.applyPresence(call);
+      });
     this.presenceQueue = task;
     return task;
   }
@@ -787,13 +804,16 @@ export class Calls {
       capture?.getTracks().forEach((t) => t.stop());
       if (generation !== this.generation) return;
       await this.leave("start_failed");
+      if (generation + 1 !== this.generation) return;
       this.change({
         error:
-          error instanceof DOMException
-            ? error.name
-            : error instanceof Error
-              ? error.message
-              : "unavailable",
+          callErrorCode(error) === "ended"
+            ? undefined
+            : error instanceof DOMException
+              ? error.name
+              : error instanceof Error
+                ? error.message
+                : "unavailable",
       });
       if (existing && error instanceof Error && error.message === "ended") {
         const available = { ...this.snapshot.available };
@@ -1189,17 +1209,20 @@ export class Calls {
       media: { ...muted },
       tiles: [],
     });
-    await this.stopMedia();
-    if (active && chat && !this.disposed)
-      await this.command(chat, {
-        type: "leave",
-        call_id: active.call_id,
-      }).catch(() => {});
+    const stopping = this.stopMedia();
+    const leaving =
+      active && chat && !this.disposed
+        ? this.command(chat, {
+            type: "leave",
+            call_id: active.call_id,
+          }).catch(() => {})
+        : undefined;
+    await Promise.all([stopping, leaving]);
     if (updateRequired()) this.policyChanged();
   }
   private fail(code: string) {
     void this.leave("failure");
-    this.change({ error: code });
+    this.change({ error: code === "ended" ? undefined : code });
   }
   private clearReconnect() {
     clearTimeout(this.reconnectExpiry);

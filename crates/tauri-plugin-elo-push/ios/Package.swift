@@ -7,7 +7,7 @@ let package = Package(
     products: [.library(name: "tauri-plugin-elo-push", type: .static, targets: ["EloPush"])],
     dependencies: [
         .package(name: "Tauri", path: "../.tauri/tauri-api"),
-        .package(url: "https://github.com/firebase/firebase-ios-sdk.git", exact: "12.18.0"),
+        .package(url: "https://github.com/firebase/firebase-ios-sdk.git", exact: "12.19.2"),
         .package(url: "https://github.com/google/GoogleUtilities.git", exact: "8.1.3"),
         .package(url: "https://github.com/stasel/WebRTC.git", exact: "153.0.0")
     ],

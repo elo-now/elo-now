@@ -96,12 +96,12 @@ export function ThreadView({
   const submit = async () => {
     if (posting.current || busy || !canReply || !draft.trim()) return;
     posting.current = true;
+    const submitted = draft;
+    onDraft("");
+    setScrollTarget(undefined);
+    setOwnSendRevision((value) => value + 1);
     try {
-      if (await onSend(draft)) {
-        onDraft("");
-        setScrollTarget(undefined);
-        setOwnSendRevision((value) => value + 1);
-      }
+      if (!(await onSend(submitted))) onDraft(submitted);
     } finally {
       posting.current = false;
     }

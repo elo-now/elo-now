@@ -202,7 +202,8 @@ pub(super) fn check_upload(
             if request_key.is_empty() {
                 return Err(ReplicaError::Invalid);
             }
-            let previous: Option<(String, String, i64, String, Option<String>, Option<i64>)> = c
+            type StoredMessageBody = (String, String, i64, String, Option<String>, Option<i64>);
+            let previous: Option<StoredMessageBody> = c
                 .query_row(
                     "SELECT locator_nonce,record_id,lifetime_seconds,originating_issuer,direct_peer,expired_local_ms FROM message_bodies WHERE root_mailbox_id=?1 AND object_id=?2",
                     params![root, object.to_string()],

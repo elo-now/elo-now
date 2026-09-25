@@ -304,7 +304,7 @@ mod tests {
             .unwrap();
         let other = IdentityId::from_bytes([99; 32]);
         let foreign = deletion(&original, other);
-        assert!(!Projection::new(&[foreign.clone()]).is_deleted(&original));
+        assert!(!Projection::new(std::slice::from_ref(&foreign)).is_deleted(&original));
         let own = deletion(&original, author);
         // A deletion can arrive before the original and cannot be undone by a replay.
         for events in [

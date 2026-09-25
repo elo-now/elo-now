@@ -79,6 +79,10 @@ try {
     assert.equal(await page.locator('input[type=password]').count(), 0, 'Pair acceptance must not require another password form');
     if (accept) {
       await page.getByRole('button', { name: 'Accept', exact: true }).click();
+      const done = page.getByRole('button', { name: 'Done', exact: true });
+      await done.waitFor();
+      assert.ok(await done.evaluate(node => !node.classList.contains('secondary') && !node.classList.contains('ghost')));
+      await done.click();
       await page.getByText('Accepted', { exact: true }).waitFor();
       assert.equal(await page.locator('.private-qr').count(), 0);
       await page.getByRole('button', { name: 'Delete', exact: true }).click();

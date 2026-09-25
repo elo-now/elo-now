@@ -121,10 +121,10 @@ async fn authorize(
                 });
             let identity = actor.map(|actor| actor.identity);
             if let Some(access) = &verified {
-                if access.companion {
-                    if let Err(error) = store.require_admitted_companion(access.credential) {
-                        return error.into_response();
-                    }
+                if access.companion
+                    && let Err(error) = store.require_admitted_companion(access.credential)
+                {
+                    return error.into_response();
                 }
                 if let Err(error) = store.require_active_device(access.credential) {
                     return error.into_response();
@@ -133,10 +133,10 @@ async fn authorize(
             if let Err(error) = store.authorize_identity(id, identity).await {
                 return error.into_response();
             }
-            if let Some(access) = verified {
-                if let Err(error) = store.consume_access(access).await {
-                    return error.into_response();
-                }
+            if let Some(access) = verified
+                && let Err(error) = store.consume_access(access).await
+            {
+                return error.into_response();
             }
             request
                 .extensions_mut()

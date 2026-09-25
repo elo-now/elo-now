@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust and Cargo via rustup. `rust-toolchain.toml` pins the toolchain used by this source tree.
-- Node.js 22 or later and npm. Keep the supplied `package-lock.json` and `Cargo.lock`.
+- Node.js 24 LTS (recommended, also used by CI) or Node.js 26+ and npm. Keep the supplied `package-lock.json` and `Cargo.lock`.
 - The native build dependencies required by Tauri for your platform. On macOS install Xcode and its command-line tools; on Windows use the MSVC toolchain and WebView2; on Linux install the WebKitGTK 4.1 development packages and the other Tauri system dependencies.
 - Mobile builds additionally need Xcode with an iOS SDK (macOS only), or an Android SDK/NDK and JDK. Install the appropriate Rust targets for your simulator/device. Xcode 27 iOS builds with `mobile-push` also require rustup's `llvm-tools` component (`rustup component add llvm-tools`) so the build can export the Swift package bridge symbols.
 
@@ -57,6 +57,25 @@ npm run tauri -- ios init
 # or
 npm run tauri -- android init
 ```
+
+The Android project uses Gradle 9.8.0, AGP 9.4.1 and Kotlin 2.4.20 with JDK 17
+and Android SDK Platform 37.0 (`platforms;android-37.0`).
+Use the released API 37 baseline; do not adopt QPR preview SDKs for production builds.
+The application target remains API 36 and the minimum remains API 24.
+Android-only copies of Tauri modules under [vendor/android](../vendor/android/README.md)
+migrate the removed `kotlinOptions.jvmTarget` DSL to `compilerOptions`. Java and
+Kotlin target JVM 11 for current AndroidX; the application minimum remains API 24.
+External Kotlin and the legacy Android DSL are explicitly selected for these
+modules. Keep Firebase resource generation enabled (`buildFeatures.resValues`)
+and apply the generated Tauri script through `file("tauri.build.gradle.kts")` to
+avoid the Android Lint Kotlin-script resolver crash. The vendored share plugin
+also includes its declared consumer ProGuard file. Keep `settings.gradle` and
+the `ExecOperations` build task when regenerating: the settings overrides check their upstream versions against
+`Cargo.lock` and stop the build when the copies need review.
+
+The Android TLS verifier shim is versioned from `Cargo.lock`. Its Maven repository
+is pinned to a reviewed upstream commit in `app/build.gradle.kts`; update that
+commit together with the Rust verifier when a new shim version is needed.
 
 Review the resulting diff before building: retain the checked-in camera/biometry permissions, notification integration, TLS verifier integration, launch resources and native source customizations. The iOS `project.yml` is the source for the Xcode project. Its app target uses `TARGETED_DEVICE_FAMILY: "1"` (iPhone only); preserve this setting when regenerating the Xcode project. Set your own Apple development team locally; use your own identifiers if distributing a fork. Android release signing is supplied separately.
 

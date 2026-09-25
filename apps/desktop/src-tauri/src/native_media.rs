@@ -15,6 +15,7 @@ pub(crate) struct MediaSession {
     pub(crate) lease: Option<tokio::task::AbortHandle>,
     pub(crate) incoming: Option<Value>,
     pub(crate) incoming_context: Option<Value>,
+    pub(crate) incoming_cancel: Option<tokio::sync::watch::Sender<bool>>,
 }
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
 impl MediaSession {
@@ -216,6 +217,7 @@ pub(crate) async fn native_call_media(
                     lease: None,
                     incoming: None,
                     incoming_context: None,
+                    incoming_cancel: None,
                 });
             }
             let result = dispatch(app.clone(), request.clone()).await;

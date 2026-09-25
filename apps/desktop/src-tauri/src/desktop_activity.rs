@@ -214,18 +214,18 @@ pub(crate) fn resume(app: &tauri::AppHandle) {
         // on restore even if the next sync has no new transport changes.
         let state = app.state::<crate::State>();
         let state = state.lock().await;
-        if let Some(client) = &state.client {
-            if let Ok(view) = client.view().await {
-                let mut result = json!({"view":view});
-                crate::annotate_result(
-                    &mut result,
-                    Some(client.identity_id()),
-                    state.view_revision,
-                    state.demo_names.as_ref(),
-                );
-                update(&app, &result);
-                let _ = app.emit("desktop-sync", result);
-            }
+        if let Some(client) = &state.client
+            && let Ok(view) = client.view().await
+        {
+            let mut result = json!({"view":view});
+            crate::annotate_result(
+                &mut result,
+                Some(client.identity_id()),
+                state.view_revision,
+                state.demo_names.as_ref(),
+            );
+            update(&app, &result);
+            let _ = app.emit("desktop-sync", result);
         }
     });
 }
@@ -421,7 +421,7 @@ mod tests {
         for value in ["1", "99", "99+"] {
             let icon = badge_icon(value);
             assert_eq!(icon.rgba().len(), 32 * 32 * 4);
-            assert!(icon.rgba().chunks_exact(4).any(|p| p == [255; 4]));
+            assert!(icon.rgba().as_chunks::<4>().0.contains(&[255; 4]));
         }
     }
     #[test]

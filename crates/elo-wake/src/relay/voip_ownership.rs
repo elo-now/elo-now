@@ -28,7 +28,7 @@ pub(super) fn schema(db: &Connection) -> rusqlite::Result<()> {
 }
 fn valid_token(token: &str) -> bool {
     (32..=512).contains(&token.len())
-        && token.len() % 2 == 0
+        && token.len().is_multiple_of(2)
         && token
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())

@@ -1,6 +1,7 @@
 //! Scoped local profile lifecycle. Recovery reserves a new directory and never
 //! overwrites an existing profile; only an explicit confirmed removal deletes one.
 use crate::State;
+use crate::device_name::current as device_name;
 use age::secrecy::SecretString;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use elo_core::app::{
@@ -19,16 +20,6 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::{FsExt, OpenOptions};
 use zeroize::Zeroizing;
 type Result<T> = elo_core::app::Result<T>;
-fn device_name() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "Mac",
-        "ios" => "iPhone or iPad",
-        "android" => "Android",
-        "windows" => "Windows",
-        "linux" => "Linux",
-        _ => "Computer",
-    }
-}
 
 fn confirm_device_removal(request: &Value) -> Result<()> {
     if request["confirmed"] != true {
@@ -426,9 +417,21 @@ pub async fn profile_task(
     state: tauri::State<'_, State>,
     request: Value,
 ) -> std::result::Result<Value, String> {
-    run(&app, state, request).await.map_err(|e| e.to_string())
+    let loads = app.state::<crate::device_list_load::DeviceListLoads>();
+    if request["op"] == "pair_start" {
+        loads.interrupt();
+    }
+    let device_load = (request["op"] == "device_list").then(|| loads.subscribe());
+    run(&app, state, request, device_load)
+        .await
+        .map_err(|e| e.to_string())
 }
-async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -> Result<Value> {
+async fn run(
+    app: &tauri::AppHandle,
+    state: tauri::State<'_, State>,
+    v: Value,
+    device_load: Option<tokio::sync::watch::Receiver<()>>,
+) -> Result<Value> {
     let v = crate::sensitive_request::SensitiveRequest(v);
     let op = text(&v, "op")?;
     if op == "pause_recovery" {
@@ -726,12 +729,14 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             );
         }
         "device_list" => {
-            return state
-                .client
-                .as_ref()
-                .ok_or("The profile is locked")?
-                .linked_devices()
-                .await;
+            let client = state.client.as_ref().ok_or("The profile is locked")?;
+            client.name_current_device(device_name(app))?;
+            return crate::device_list_load::load(
+                device_load.ok_or("Device list loading was cancelled.")?,
+                client.linked_devices(),
+            )
+            .await
+            .ok_or("Device list loading was cancelled.")?;
         }
         "device_revoke" => {
             let client = state.client.as_ref().ok_or("The profile is locked")?;
@@ -740,7 +745,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
         }
         "pair_start" => {
             let client = state.client.as_ref().ok_or("The profile is locked")?;
-            client.name_current_device(device_name())?;
+            client.name_current_device(device_name(app))?;
             let source =
                 PairSource::new(state.client.as_ref().ok_or("The profile is locked")?).await?;
             let link = source.link()?;
@@ -783,7 +788,7 @@ async fn run(app: &tauri::AppHandle, state: tauri::State<'_, State>, v: Value) -
             if state.client.is_some() {
                 return Err("Log out before linking this device".into());
             }
-            let target = PairTarget::new(text(&v, "code")?, device_name(), false)?;
+            let target = PairTarget::new(text(&v, "code")?, device_name(app), false)?;
             target.send().await?;
             let summary = target.summary()?;
             state.pair_target = Some(target);

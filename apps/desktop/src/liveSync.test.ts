@@ -521,6 +521,33 @@ test("a failed Space yields to remaining Spaces before retry backoff", async () 
   expect(deliver).toHaveBeenCalledTimes(2);
 });
 
+test("a new pending Space bypasses old discovery backoff without repeated polling wakes", async () => {
+  context.invitations = true;
+  context.messages = false;
+  const deliver = vi
+    .fn()
+    .mockResolvedValueOnce({ identity: "alice", delivery: { retry: 1 } })
+    .mockResolvedValue({ identity: "alice", delivery: { retry: 0 } });
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  expect(deliver).toHaveBeenCalledTimes(1);
+
+  context.pendingSpaces = ["new-space"];
+  worker.changed();
+  await vi.advanceTimersByTimeAsync(100);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  expect(deliver).toHaveBeenLastCalledWith("invitation_sync", true);
+
+  // New view objects and ordinary navigation must not repeatedly hit the server.
+  context.pendingSpaces = ["new-space"];
+  worker.changed();
+  await vi.advanceTimersByTimeAsync(1_000);
+  context.pendingSpaces = [];
+  worker.changed();
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(deliver).toHaveBeenCalledTimes(2);
+});
+
 test("an explicit membership wake overrides polling delay and survives an in-flight pass", async () => {
   context.invitations = true;
   context.messages = false;

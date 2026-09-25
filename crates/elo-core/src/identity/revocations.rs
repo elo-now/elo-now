@@ -52,10 +52,10 @@ impl Revocations {
             return Err("Device revocation registry is full.".into());
         }
         let path = self.0.join(format!("{}.record", credential.id()));
-        if let Err(error) = crate::vault::write_private(&path, record.bytes(), false) {
-            if self.get(credential.id())?.is_none() {
-                return Err(error.into());
-            }
+        if let Err(error) = crate::vault::write_private(&path, record.bytes(), false)
+            && self.get(credential.id())?.is_none()
+        {
+            return Err(error.into());
         }
         Ok(())
     }

@@ -15,22 +15,19 @@ impl ClientApp {
                     let body = record.body();
                     if body["space_id"] == json!(authority.space())
                         && body["stream_id"] == json!(authority.stream())
-                    {
-                        if let (Some(issuer), Some(config)) = (
+                        && let (Some(issuer), Some(config)) = (
                             body["issuer_credential"]
                                 .as_str()
                                 .and_then(|id| id.parse().ok()),
                             body["config_id"].as_str().and_then(|id| id.parse().ok()),
-                        ) {
-                            if authority.config(config).is_err()
-                                && authority
-                                    .credential(issuer)
-                                    .is_ok_and(|c| record.verify_signature(c.key()).is_ok())
-                            {
-                                self.invalidate_membership_checks().await;
-                                return Err("Chat permissions need to be refreshed.".into());
-                            }
-                        }
+                        )
+                        && authority.config(config).is_err()
+                        && authority
+                            .credential(issuer)
+                            .is_ok_and(|c| record.verify_signature(c.key()).is_ok())
+                    {
+                        self.invalidate_membership_checks().await;
+                        return Err("Chat permissions need to be refreshed.".into());
                     }
                 }
             }

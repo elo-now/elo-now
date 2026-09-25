@@ -155,10 +155,9 @@ impl ClientApp {
             .pins
             .iter()
             .find(|pin| pin.space == p.space && pin.stream == p.stream)
+            && pin.root != p.root
         {
-            if pin.root != p.root {
-                return Err("The recovery file belongs to a different Space.".into());
-            }
+            return Err("The recovery file belongs to a different Space.".into());
         }
         Ok(
             json!({"space":p.space,"stream":p.stream,"root":p.root,"name":p.name,"ciphertext":p.ciphertext,"kind":p.kind}),

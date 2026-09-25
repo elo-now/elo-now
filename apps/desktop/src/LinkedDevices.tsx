@@ -3,6 +3,7 @@ import { ActionDialog } from "./ActionDialog";
 import { profileTask } from "./ProfileRecovery";
 import { useToast } from "./Toast";
 import { t } from "./i18n";
+import { Icon } from "./Icon";
 
 type Device = {
   id: string;
@@ -81,9 +82,8 @@ export function LinkedDevices({
   };
   return (
     <section className="linked-devices">
-      <h3>{t("devices.registered")}</h3>
       {!data && !failed && (
-        <p className="empty" role="status">
+        <p className="page-description device-list-loading" role="status">
           {t("devices.loading")}
         </p>
       )}
@@ -105,11 +105,6 @@ export function LinkedDevices({
       )}
       {data && (
         <>
-          {data.unavailable > 0 && (
-            <p className="error" role="status">
-              {t("devices.unavailable")}
-            </p>
-          )}
           {data.pending > 0 && (
             <p className="error" role="status">
               {t("devices.pendingRevocation")}
@@ -122,27 +117,25 @@ export function LinkedDevices({
             <div className="linked-device-row" key={device.id}>
               <span title={device.id}>
                 {device.name ||
-                  (device.current
-                    ? t("devices.thisDevice")
-                    : t("devices.deviceName", {
-                        fingerprint: device.id.slice(0, 16),
-                      }))}
-                {(device.name || !device.current) && (
-                  <small>
-                    {t(
-                      device.current
-                        ? "devices.thisDevice"
-                        : "devices.accepted",
-                    )}
-                  </small>
-                )}
+                  t("devices.deviceName", {
+                    fingerprint: device.id.slice(0, 16),
+                  })}
+                <small>
+                  {t(
+                    device.current ? "devices.thisDevice" : "devices.accepted",
+                  )}
+                </small>
               </span>
               {!device.current && (
                 <button
-                  className="secondary danger"
+                  type="button"
+                  className="icon"
+                  disabled={busy}
+                  aria-label={t("devices.delete")}
+                  title={t("devices.delete")}
                   onClick={() => setSelected(device)}
                 >
-                  {t("devices.delete")}
+                  <Icon name="delete" />
                 </button>
               )}
             </div>

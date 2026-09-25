@@ -92,6 +92,15 @@ impl ClientApp {
     pub async fn linked_devices(&self) -> Result<Value> {
         let mut devices = BTreeMap::<RecordId, Value>::new();
         let names = self.device_names()?;
+        // The unlocked local device is known even without a reachable Space.
+        // Listing it does not grant or imply remote membership.
+        let current = self.session.credential();
+        devices.insert(current.id(), json!({
+            "id":current.id(),
+            "credential":STANDARD.encode(current.record().bytes()),
+            "name":names.get(&current.id()),
+            "current":true
+        }));
         let mut unavailable = 0;
         let addresses = self.device_addresses();
         for chunk in addresses.chunks(4) {

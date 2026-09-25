@@ -173,7 +173,7 @@ impl ChatAuthority for FixedDemoAuthority {
         Ok(VerifiedChat::new(record.clone(), chat))
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerDescriptor {
     pub url: String,
@@ -192,6 +192,20 @@ pub struct Peer {
     delegated_access: Option<String>,
 }
 impl Peer {
+    pub(crate) fn matches_descriptor(&self, descriptor: &PeerDescriptor) -> bool {
+        &self.descriptor == descriptor
+    }
+    /// Keep the validated server and connection pool, changing only the mailbox.
+    pub(crate) fn child_mailbox(&self, child: &replica::MailboxDescriptor) -> Self {
+        let mut peer = self.clone();
+        peer.descriptor.mailbox_id = child.mailbox_id;
+        peer.descriptor.read_token = Some(child.read_token.clone());
+        peer.descriptor.write_token = Some(child.write_token.clone());
+        // A delegated proof is scoped to its original mailbox. The source uses
+        // its own signer to authorize the new mailbox and derive its QR proof.
+        peer.delegated_access = None;
+        peer
+    }
     pub fn with_identity(mut self, session: &crate::vault::Session) -> Self {
         self.signer = Some(access::Signer::new(session));
         self

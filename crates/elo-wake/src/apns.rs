@@ -164,7 +164,7 @@ impl Apns {
     pub async fn incoming(&self, token: &str, payload: &serde_json::Value) -> Result<(), Error> {
         if token.len() < 32
             || token.len() > 512
-            || token.len() % 2 != 0
+            || !token.len().is_multiple_of(2)
             || !token.bytes().all(|c| c.is_ascii_hexdigit())
             || payload.to_string().len() > 4096
         {

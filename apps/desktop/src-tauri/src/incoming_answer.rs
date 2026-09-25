@@ -23,7 +23,29 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let target = app.clone();
-        let channel = tauri::ipc::Channel::<Value>::new(move |_| {
+        let channel = tauri::ipc::Channel::<Value>::new(move |event| {
+            let Ok(event) = event.deserialize::<Value>() else {
+                return Ok(());
+            };
+            if let Some(call_id) = event["ended"].as_str() {
+                let gate = target.state::<MediaGate>();
+                if let Ok(current) = gate.current.lock() {
+                    if let Some(session) = current.as_ref().filter(|session| {
+                        session
+                            .incoming
+                            .as_ref()
+                            .is_some_and(|call| call["call_id"] == call_id)
+                    }) {
+                        if let Some(cancel) = &session.incoming_cancel {
+                            let _ = cancel.send(true);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if event["answer"] != true {
+                return Ok(());
+            }
             let app = target.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = begin(&app, None).await;
@@ -163,6 +185,7 @@ async fn begin(app: &tauri::AppHandle, expected: Option<&str>) -> Result<(), Str
         &hex[16..20],
         &hex[20..]
     );
+    let (cancel, cancellation) = tokio::sync::watch::channel(false);
     {
         let gate = app.state::<MediaGate>();
         let mut current = gate.current.lock().map_err(|_| "unavailable")?;
@@ -175,6 +198,7 @@ async fn begin(app: &tauri::AppHandle, expected: Option<&str>) -> Result<(), Str
             lease: None,
             incoming: Some(json!({"id":id,"call_id":call_id,"phase":"connecting","call":null})),
             incoming_context: Some(context.clone()),
+            incoming_cancel: Some(cancel),
         });
     }
     let target = incoming_call::Target {
@@ -189,6 +213,7 @@ async fn begin(app: &tauri::AppHandle, expected: Option<&str>) -> Result<(), Str
         call_id,
         context,
         connected: false,
+        cancellation,
     };
     // Keep the profile lock until the task is registered: Log out cancels it
     // atomically with removing the in-memory session.
@@ -212,6 +237,7 @@ struct AnswerDriver {
     call_id: String,
     context: Value,
     connected: bool,
+    cancellation: tokio::sync::watch::Receiver<bool>,
 }
 impl AnswerDriver {
     async fn finish(&self) {
@@ -237,6 +263,9 @@ impl AnswerDriver {
     }
 }
 impl incoming_call::Driver for AnswerDriver {
+    fn cancellation(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        Some(self.cancellation.clone())
+    }
     fn live(&self) -> bool {
         self.app
             .state::<MediaGate>()

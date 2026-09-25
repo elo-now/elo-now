@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Stream, View } from "../model";
 import type { ActiveCall, MediaState } from "./types";
+const controls = vi.hoisted(() => ({
+  events: [] as ((event: Record<string, unknown>) => void)[],
+}));
 vi.mock("livekit-client", () => ({ isE2EESupported: () => true }));
 vi.mock("./control", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./control")>()),
@@ -10,9 +13,11 @@ vi.mock("./control", async (importOriginal) => ({
     constructor(
       _endpoint: string,
       _identity: string,
-      _event: unknown,
+      event: (event: Record<string, unknown>) => void,
       public networkClosed: () => void,
-    ) {}
+    ) {
+      controls.events.push(event);
+    }
     command = vi.fn(async () => ({ type: "result" }));
     close() {}
   },
@@ -52,6 +57,7 @@ function pendingCapture() {
   return { resolve: () => resolve(stream), stop };
 }
 afterEach(() => {
+  controls.events = [];
   setUpdateRequired(false);
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -319,6 +325,73 @@ function screenCall() {
   };
   return { calls, update, command, capture };
 }
+
+it("processes remote hangup before pending signaling and ignores its late failure", async () => {
+  const { calls } = screenCall();
+  let reject!: (error: Error) => void;
+  const signal = vi.fn(
+    () =>
+      new Promise<void>((_resolve, fail) => {
+        reject = fail;
+      }),
+  );
+  Object.assign(calls, { signal });
+  await (calls as any).connection(chat);
+  const event = controls.events.at(-1)!;
+  event({ type: "signal", call_id: "test" });
+  await vi.waitFor(() => expect(signal).toHaveBeenCalledOnce());
+  const signaling = (calls as any).events;
+  event({ type: "ended", call_id: "test" });
+  await vi.waitFor(() => expect(calls.snapshot.phase).toBe("idle"));
+  reject(new Error("ended"));
+  await signaling;
+  expect(calls.snapshot.error).toBeUndefined();
+  calls.dispose();
+});
+
+it("does not let an old hangup end a new call in the same chat", async () => {
+  const { calls } = screenCall();
+  const scope = {
+    hosting_space_id: "host",
+    conversation: { space_id: "space", stream_id: "chat" },
+  };
+  calls.snapshot.active = { ...calls.snapshot.active!, scope };
+  await (calls as any).event({ type: "ended", call_id: "old-call", scope });
+  expect(calls.snapshot.active?.call_id).toBe("test");
+  expect(calls.snapshot.phase).toBe("connected");
+  calls.dispose();
+});
+
+it("treats an ended heartbeat as a normal hangup without an error dialog", async () => {
+  const { calls, command } = screenCall();
+  command.mockRejectedValueOnce(new Error("ended"));
+  await (calls as any).tick();
+  expect(calls.snapshot.phase).toBe("idle");
+  expect(calls.snapshot.error).toBeUndefined();
+  calls.dispose();
+});
+
+it("sends hangup without waiting for media teardown", async () => {
+  const { calls, command } = screenCall();
+  let stopped!: () => void;
+  Object.assign(calls, {
+    adapter: {
+      stop: () =>
+        new Promise<void>((resolve) => {
+          stopped = resolve;
+        }),
+    },
+  });
+  const leaving = calls.leave();
+  expect(calls.snapshot.phase).toBe("idle");
+  expect(command).toHaveBeenCalledWith(chat, {
+    type: "leave",
+    call_id: "test",
+  });
+  stopped();
+  await leaving;
+  calls.dispose();
+});
 
 it("keeps a transient control outage recoverable but releases capture at the deadline", async () => {
   vi.useFakeTimers();

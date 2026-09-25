@@ -1,3 +1,4 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.util.Properties
 import java.io.File
 import groovy.json.JsonSlurper
@@ -33,7 +34,8 @@ val releaseCredentials = signingPath?.let {
 }
 
 // Resolve the matching Kotlin verifier from Cargo.lock's Android dependency.
-// Its AAR is shipped with the crate; no independently versioned TLS shim.
+// The Android 0.2 shim moved from the crate to upstream's Maven archive.
+// Keep the version Cargo-synchronized and the archive pinned to reviewed bytes.
 val verifierMetadata = providers.exec {
     commandLine("cargo", "metadata", "--locked", "--offline", "--format-version", "1",
         "--filter-platform", "aarch64-linux-android", "--manifest-path",
@@ -42,22 +44,21 @@ val verifierMetadata = providers.exec {
 val verifierPackages = (JsonSlurper().parseText(verifierMetadata) as Map<*, *>)["packages"] as List<*>
 val verifierPackage = verifierPackages.map { it as Map<*, *> }
     .single { it["name"] == "rustls-platform-verifier-android" }
-val verifierMaven = file(verifierPackage["manifest_path"] as String).parentFile.resolve("maven")
 
 repositories {
     exclusiveContent {
         forRepository {
             maven {
-                url = uri(verifierMaven)
+                url = uri("https://raw.githubusercontent.com/rustls/rustls-platform-verifier/1aa691352a5e0c215210dfc9a3c2f2078639dc91/android-release-support/maven/")
                 metadataSources { mavenPom(); artifact() }
             }
         }
-        filter { includeModule("rustls", "rustls-platform-verifier") }
+        filter { includeModule("org.rustls", "rustls-platform-verifier") }
     }
 }
 
 android {
-    compileSdk = 36
+    compileSdk { version = release(37) }
     namespace = "now.elo"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -117,11 +118,17 @@ android {
             )
         }
     }
-    kotlinOptions {
-        jvmTarget = "1.8"
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    kotlin {
+        compilerOptions { jvmTarget = JvmTarget.JVM_11 }
     }
     buildFeatures {
         buildConfig = true
+        // Firebase client configuration is supplied through generated resources.
+        resValues = true
     }
 }
 
@@ -130,15 +137,15 @@ rust {
 }
 
 dependencies {
-    implementation("rustls:rustls-platform-verifier:${verifierPackage["version"]}")
-    implementation("androidx.webkit:webkit:1.14.0")
-    implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("androidx.activity:activity-ktx:1.10.1")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    implementation("org.rustls:rustls-platform-verifier:${verifierPackage["version"]}")
+    implementation("androidx.webkit:webkit:1.17.1")
+    implementation("androidx.appcompat:appcompat:1.8.0")
+    implementation("androidx.activity:activity-ktx:1.13.0")
+    implementation("com.google.android.material:material:1.14.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
     testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.4")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
 }
 
-apply(from = "tauri.build.gradle.kts")
+apply(from = file("tauri.build.gradle.kts"))

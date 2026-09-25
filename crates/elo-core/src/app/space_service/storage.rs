@@ -56,7 +56,7 @@ fn connection(path: &Path) -> Result<Connection> {
 
 fn cipher(app: &ClientApp) -> XChaCha20Poly1305 {
     let secret = Zeroizing::new(app.session.signing_key().to_bytes());
-    let mut kdf = <Hmac<Sha256> as Mac>::new_from_slice(&*secret).expect("HMAC key");
+    let mut kdf = <Hmac<Sha256> as KeyInit>::new_from_slice(&*secret).expect("HMAC key");
     kdf.update(b"elo.space-service.storage.v1");
     let key = Zeroizing::new(<[u8; 32]>::from(kdf.finalize().into_bytes()));
     XChaCha20Poly1305::new_from_slice(&*key).expect("storage key")
@@ -79,7 +79,7 @@ fn crypt(
         output.extend(
             cipher
                 .encrypt(
-                    XNonce::from_slice(&nonce),
+                    &XNonce::from(nonce),
                     Payload {
                         msg: bytes,
                         aad: &aad,
@@ -94,7 +94,7 @@ fn crypt(
         }
         cipher
             .decrypt(
-                XNonce::from_slice(&bytes[..24]),
+                <&XNonce>::try_from(&bytes[..24])?,
                 Payload {
                     msg: &bytes[24..],
                     aad: &aad,

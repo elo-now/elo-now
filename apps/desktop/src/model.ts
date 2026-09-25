@@ -86,6 +86,8 @@ export type Stream = {
     credential_ids: string[];
   }[];
   rows: {
+    /** Renderer-only echo; never persisted or accepted as a signed record. */
+    local_echo?: "saving" | "saved";
     reply_count?: number;
     id: string;
     state: string;
