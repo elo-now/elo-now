@@ -1,0 +1,92 @@
+name: Publish desktop installers
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Desktop release workflow run
+        required: true
+        type: string
+      notes:
+        description: Public release notes
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_RUN_ID: ${{ inputs.run_id }}
+      RELEASE_NOTES: ${{ inputs.notes }}
+    steps:
+      - name: Validate completed build
+        id: build
+        shell: bash
+        run: |
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/actions/runs/$RELEASE_RUN_ID" > run.json
+          python3 - <<'PY'
+          import json, os, re
+          run = json.load(open('run.json'))
+          assert run['conclusion'] == 'success' and run['status'] == 'completed'
+          assert run['path'] == '.github/workflows/desktop-release.yml'
+          assert run['event'] == 'workflow_dispatch' and run['head_branch'] == 'main'
+          assert run['head_repository']['full_name'] == os.environ['GH_REPO']
+          assert re.fullmatch('[0-9a-f]{40}', run['head_sha'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sha=' + run['head_sha'] + '\n')
+          PY
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: elo-now-*
+          path: installers
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify and publish final installers
+        env:
+          RELEASE_SHA: ${{ steps.build.outputs.sha }}
+        shell: bash
+        run: |
+          gh api "repos/$GH_REPO/contents/apps/desktop/src-tauri/tauri.conf.json?ref=$RELEASE_SHA" > config-response.json
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, shutil
+          config = json.loads(base64.b64decode(json.load(open('config-response.json'))['content']))
+          version = config['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+          root = pathlib.Path('installers')
+          expected = {'elo-now-macos-arm64', 'elo-now-macos-x64', 'elo-now-linux-x64', 'elo-now-windows-x64'}
+          assert {p.name for p in root.iterdir()} == expected
+          output = pathlib.Path('release'); output.mkdir()
+          entries = []
+          for folder in root.iterdir():
+              manifest = folder / 'SHA256SUMS'
+              names = set()
+              for line in manifest.read_text().splitlines():
+                  digest, name = line.split(maxsplit=1)
+                  assert pathlib.Path(name).name == name and '/' not in name and '\\' not in name
+                  assert pathlib.Path(name).suffix in {'.dmg', '.exe', '.deb', '.AppImage'}
+                  assert '_' + version + '_' in name
+                  source = folder / name
+                  assert source.is_file() and not source.is_symlink()
+                  assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+                  assert not (output / name).exists()
+                  shutil.copyfile(source, output / name)
+                  entries.append(digest + '  ' + name + '\n'); names.add(name)
+              assert {p.name for p in folder.iterdir()} == names | {'SHA256SUMS'}
+          assert len(entries) == 5
+          (output / 'SHA256SUMS.txt').write_text(''.join(sorted(entries)))
+          pathlib.Path('notes.md').write_text(os.environ['RELEASE_NOTES'])
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RELEASE_TAG=v' + version + '\n')
+              env.write('RELEASE_NAME=elo.now ' + version + '\n')
+          PY
+          gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_NAME" --notes-file notes.md --draft
+          gh release upload "$RELEASE_TAG" release/*
+          gh release edit "$RELEASE_TAG" --draft=false --latest
