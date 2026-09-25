@@ -60,7 +60,12 @@ jobs:
         run: npm --prefix apps/desktop test
       - name: Verify GLib security backport on Linux
         if: runner.os == 'Linux'
-        run: cargo test --locked -p glib --lib variant_iter::tests
+        run: |
+          # A patched dependency is not a workspace member, so test its unchanged
+          # source in an isolated package. Installer dependencies stay locked.
+          cp -R vendor/glib "$RUNNER_TEMP/elo-glib-test"
+          printf '\n[workspace]\n' >> "$RUNNER_TEMP/elo-glib-test/Cargo.toml"
+          cargo test --manifest-path "$RUNNER_TEMP/elo-glib-test/Cargo.toml" --lib variant_iter::tests
       - name: Verify Windows downloaded-file protection
         if: runner.os == 'Windows'
         run: cargo test --locked -p elo-desktop --lib download_protection::windows_tests
