@@ -83,10 +83,10 @@ jobs:
           assert len(entries) == 5
           (output / 'SHA256SUMS.txt').write_text(''.join(sorted(entries)))
           pathlib.Path('notes.md').write_text(os.environ['RELEASE_NOTES'])
-          with open(os.environ['GITHUB_ENV'], 'a') as env:
-              env.write('RELEASE_TAG=v' + version + '\n')
-              env.write('RELEASE_NAME=elo.now ' + version + '\n')
+          pathlib.Path('release-tag.txt').write_text('v' + version + '\n')
           PY
+          IFS= read -r RELEASE_TAG < release-tag.txt
+          RELEASE_NAME="elo.now ${RELEASE_TAG#v}"
           gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_NAME" --notes-file notes.md --draft
           gh release upload "$RELEASE_TAG" release/*
           gh release edit "$RELEASE_TAG" --draft=false --latest
