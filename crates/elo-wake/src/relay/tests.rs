@@ -1360,3 +1360,51 @@ fn a_full_shared_ledger_preserves_other_routes_and_counters_survive_restart() {
     .unwrap();
     assert!(!event_capacity(&db, "quiet").unwrap());
 }
+
+#[tokio::test]
+async fn invitation_category_is_signed_persisted_and_cannot_be_replaced_by_the_transport() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Fake::default());
+    let path = temp.path().join("db");
+    let relay = Relay::open(&path, provider.clone()).unwrap();
+    let (id, owner, key, scope) = setup(&relay, &provider).await;
+    allow(&relay, &id, &owner, &scope, 1, true).await;
+    let mut body = serde_json::to_value(signed_wake(test_sender(), &id, 101, &scope)).unwrap();
+    body["category"] = json!("invitation");
+    let forged: Wake = serde_json::from_value(body.clone()).unwrap();
+    assert!(
+        wake(
+            State(relay.clone()),
+            Path(id.clone()),
+            headers(&key),
+            Json(forged)
+        )
+        .await
+        .is_err()
+    );
+    elo_core::app::push_sender::sign(test_sender(), &id, &mut body).unwrap();
+    wake(
+        State(relay.clone()),
+        Path(id.clone()),
+        headers(&key),
+        Json(serde_json::from_value(body).unwrap()),
+    )
+    .await
+    .unwrap();
+    drop(relay);
+    let relay = Relay::open(&path, provider.clone()).unwrap();
+    due(&relay);
+    assert!(relay.deliver_due().await.unwrap());
+    let sent = provider.sent.lock().unwrap();
+    let notice = sent.last().unwrap();
+    assert!(
+        matches!(notice, Notice::Wake { category, event, .. } if category == "invitation" && event == &format!("{:064x}",101))
+    );
+    let payload = crate::fcm::payload("synthetic", notice);
+    assert_eq!(
+        payload["message"]["apns"]["payload"]["aps"]["alert"]["body"],
+        "New invitation"
+    );
+    assert_eq!(payload["message"]["apns"]["payload"]["aps"]["badge"], 1);
+    assert!(payload["message"]["android"].get("collapse_key").is_none());
+}

@@ -2,7 +2,7 @@
     <color name="elo_launch_background">#F7F9F6</color>
     <color name="elo_launch_star">#6F8F7B</color>
     <style name="Base.Theme.elo_desktop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="android:windowBackground">@color/elo_launch_background</item>
+        <item name="android:windowBackground">@drawable/elo_launch_background</item>
     </style>
     <style name="Theme.elo_desktop" parent="Base.Theme.elo_desktop" />
 </resources>

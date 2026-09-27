@@ -58,10 +58,6 @@ func makeNotificationContent(_ notification: Notification) throws -> UNNotificat
     content.threadIdentifier = threadIdentifier
   }
 
-  if let summaryArgument = notification.summary {
-    content.summaryArgument = summaryArgument
-  }
-
   if let sound = notification.sound {
     content.sound = UNNotificationSound(named: UNNotificationSoundName(sound))
   }

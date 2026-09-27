@@ -68,13 +68,15 @@ pub enum Notice {
     Wake {
         registration: String,
         scope: String,
+        event: String,
+        category: String,
         target: String,
         quiet: bool,
     },
 }
 
 /// The provider never receives chat text, account IDs, mailbox capabilities or record IDs.
-pub fn payload(token: &str, notice: &Notice) -> Value {
+pub fn payload(installation_id: &str, notice: &Notice) -> Value {
     let message = match notice {
         Notice::Call {
             registration,
@@ -85,7 +87,7 @@ pub fn payload(token: &str, notice: &Notice) -> Value {
             video,
             ticket,
         } => json!({
-            "token": token,
+            "fid": installation_id,
             "data": {"elo_call":"1", "elo_registration":registration, "elo_call_id":call_id,
                 "elo_scope":scope, "elo_target":target, "elo_ticket":ticket, "elo_expires":expires.to_string(),
                 "elo_video": if *video { "1" } else { "0" }},
@@ -95,7 +97,7 @@ pub fn payload(token: &str, notice: &Notice) -> Value {
             registration,
             challenge,
         } => json!({
-            "token": token,
+            "fid": installation_id,
             "data": {"elo_registration":registration, "elo_challenge":challenge},
             "android":{"priority":"HIGH", "ttl":"60s"},
             "apns":{"headers":{"apns-push-type":"alert","apns-priority":"10"},
@@ -104,18 +106,29 @@ pub fn payload(token: &str, notice: &Notice) -> Value {
         Notice::Wake {
             registration,
             scope,
+            event,
+            category,
             target,
             quiet,
         } => {
-            let mut aps = json!({"thread-id":scope,"interruption-level":if *quiet {"passive"} else {"active"},
-                "alert":{"title":"elo.now","body":"New messages"}});
+            let copy: Value = serde_json::from_str(include_str!(
+                "../../../apps/desktop/src/locales/native.en.json"
+            ))
+            .expect("notification catalog");
+            let key = match category.as_str() {
+                "invitation" => "notifications.nativeInvitation",
+                "membership" => "notifications.nativeActivity",
+                _ => "notifications.nativeMessage",
+            };
+            let mut aps = json!({"badge":1,"thread-id":scope,"interruption-level":if *quiet {"passive"} else {"active"},
+                "alert":{"title":"elo.now","body":copy[key]}});
             if !quiet {
                 aps["sound"] = json!("default");
             }
             json!({
-            "token":token,
-            "data":{"elo_wake":"1", "elo_registration":registration, "elo_scope":scope, "elo_target":target, "elo_quiet":if *quiet {"1"} else {"0"}},
-            "android":{"priority":"HIGH", "ttl":"86400s", "collapse_key":"elo-wake"},
+            "fid":installation_id,
+            "data":{"elo_wake":"1", "elo_registration":registration, "elo_scope":scope, "elo_event":event, "elo_category":category, "elo_target":target, "elo_quiet":if *quiet {"1"} else {"0"}},
+            "android":{"priority":"HIGH", "ttl":"86400s"},
             "apns":{"headers":{"apns-push-type":"alert","apns-priority":"10","apns-collapse-id":scope},
                 "payload":{"aps":aps}}})
         }
@@ -253,7 +266,7 @@ impl Fcm {
         self.access_token().await.map(|_| ())
     }
 
-    pub async fn send(&self, token: &str, notice: &Notice) -> Result<(), Error> {
+    pub async fn send(&self, installation_id: &str, notice: &Notice) -> Result<(), Error> {
         let access = self.access_token().await?;
         let response = self
             .client
@@ -262,7 +275,7 @@ impl Fcm {
                 self.project
             ))
             .bearer_auth(access.as_str())
-            .json(&payload(token, notice))
+            .json(&payload(installation_id, notice))
             .send()
             .await
             .map_err(|_| Error::Delivery)?;
@@ -300,10 +313,47 @@ async fn bounded(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
 mod tests {
     use super::*;
     #[test]
+    fn every_notification_targets_a_registered_installation_not_a_legacy_token() {
+        let id = "cSyntheticFID_123456789";
+        let notices = [
+            Notice::Challenge {
+                registration: "route".into(),
+                challenge: "challenge".into(),
+            },
+            Notice::Wake {
+                registration: "route".into(),
+                scope: "scope".into(),
+                event: "event".into(),
+                category: "message".into(),
+                target: "ciphertext".into(),
+                quiet: false,
+            },
+            Notice::Call {
+                registration: "route".into(),
+                call_id: "call".into(),
+                scope: "scope".into(),
+                target: "ciphertext".into(),
+                expires: 42,
+                video: false,
+                ticket: "ticket".into(),
+            },
+        ];
+        for notice in notices {
+            let value = payload(id, &notice);
+            assert_eq!(value["message"]["fid"], id);
+            assert!(value["message"].get("token").is_none());
+            assert!(value["message"].get("topic").is_none());
+            assert!(value["message"].get("condition").is_none());
+        }
+    }
+
+    #[test]
     fn unread_updates_are_passive_and_keep_the_same_system_notification() {
         let notice = |quiet| Notice::Wake {
             registration: "route".into(),
             scope: "scope".into(),
+            event: "event".into(),
+            category: "message".into(),
             target: "ciphertext".into(),
             quiet,
         };
@@ -329,19 +379,46 @@ mod tests {
         );
     }
     #[test]
+    fn quiet_invitations_stay_visible_without_a_sound_or_private_content() {
+        let value = payload(
+            "synthetic-installation",
+            &Notice::Wake {
+                registration: "route".into(),
+                scope: "scope".into(),
+                event: "event".into(),
+                category: "invitation".into(),
+                target: "encrypted-target".into(),
+                quiet: true,
+            },
+        );
+        let message = &value["message"];
+        let aps = &message["apns"]["payload"]["aps"];
+        assert_eq!(aps["alert"]["body"], "New invitation");
+        assert_eq!(aps["badge"], 1);
+        assert_eq!(aps["interruption-level"], "passive");
+        assert!(aps.get("sound").is_none());
+        assert_eq!(message["data"]["elo_category"], "invitation");
+        assert_eq!(message["data"]["elo_quiet"], "1");
+        assert_eq!(message["data"]["elo_target"], "encrypted-target");
+        assert!(!aps.to_string().contains("encrypted-target"));
+    }
+
+    #[test]
     fn wake_payload_has_no_caller_supplied_content() {
         let value = payload(
             "synthetic-device-token",
             &Notice::Wake {
                 registration: "opaque-route".into(),
                 scope: "opaque-scope".into(),
+                event: "opaque-event".into(),
+                category: "message".into(),
                 target: "encrypted-target".into(),
                 quiet: false,
             },
         );
         assert_eq!(
             value["message"]["data"],
-            json!({"elo_wake":"1", "elo_registration":"opaque-route", "elo_scope":"opaque-scope", "elo_target":"encrypted-target", "elo_quiet":"0"})
+            json!({"elo_wake":"1", "elo_registration":"opaque-route", "elo_scope":"opaque-scope", "elo_event":"opaque-event", "elo_category":"message", "elo_target":"encrypted-target", "elo_quiet":"0"})
         );
         assert_eq!(
             value["message"]["apns"]["payload"]["aps"]["alert"]["body"],

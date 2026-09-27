@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "tauri-plugin-elo-push",
-    platforms: [.iOS(.v15), .macOS(.v10_15)],
+    platforms: [.iOS(.v16), .macOS(.v10_15)],
     products: [.library(name: "tauri-plugin-elo-push", type: .static, targets: ["EloPush"])],
     dependencies: [
         .package(name: "Tauri", path: "../.tauri/tauri-api"),
@@ -14,6 +14,7 @@ let package = Package(
     targets: [.target(name: "EloPush", dependencies: [
         .byName(name: "Tauri"),
         .product(name: "FirebaseMessaging", package: "firebase-ios-sdk"),
+        .product(name: "FirebaseInstallations", package: "firebase-ios-sdk"),
         .product(name: "GULNSData", package: "GoogleUtilities"),
         .product(name: "WebRTC", package: "WebRTC")
     ], path: "Sources")]

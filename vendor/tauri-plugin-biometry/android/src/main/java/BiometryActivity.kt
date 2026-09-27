@@ -6,11 +6,11 @@ import android.app.Activity
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
-import android.hardware.biometrics.BiometricManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import androidx.appcompat.app.AppCompatActivity
+import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import java.util.concurrent.Executor
 
@@ -52,16 +52,12 @@ class BiometryActivity : AppCompatActivity() {
         }
 
         builder.setTitle(title).setSubtitle(subtitle).setDescription(description)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            var authenticators = BiometricManager.Authenticators.BIOMETRIC_WEAK
-            if (allowDeviceCredential) {
-                authenticators = authenticators or BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            }
-            builder.setAllowedAuthenticators(authenticators)
-        } else {
-            @Suppress("DEPRECATION")
-            builder.setDeviceCredentialAllowed(allowDeviceCredential)
+        // Match the previous non-crypto prompt's default on every supported API.
+        var authenticators = BiometricManager.Authenticators.BIOMETRIC_WEAK
+        if (allowDeviceCredential) {
+            authenticators = authenticators or BiometricManager.Authenticators.DEVICE_CREDENTIAL
         }
+        builder.setAllowedAuthenticators(authenticators)
 
         // From the Android docs:
         //  You can't call setNegativeButtonText() and setAllowedAuthenticators(... or DEVICE_CREDENTIAL)

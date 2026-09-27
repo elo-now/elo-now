@@ -578,6 +578,8 @@ pub struct SyncReport {
     pub repaired: u64,
     pub repair_downloaded: u64,
     pub repair_deferred: u64,
+    /// Missing copies intentionally removed by the server's retention policy.
+    pub repair_expired: u64,
     pub repair_pending: u64,
 }
 impl SyncReport {
@@ -594,6 +596,7 @@ impl SyncReport {
             || self.generation_changes > 0
             || self.repaired > 0
             || self.repair_downloaded > 0
+            || self.repair_expired > 0
             || self.repair_pending > 0
     }
 }
@@ -1056,6 +1059,7 @@ impl SyncClient<'_> {
                     Err(error) => {
                         if matches!(error, SyncError::Transport(TransportFailure::Http(409))) {
                             self.store.suspend_expired_copy(attempt).await?;
+                            report.repair_expired += 1;
                             continue;
                         }
                         if matches!(error, SyncError::Transport(TransportFailure::Http(507))) {

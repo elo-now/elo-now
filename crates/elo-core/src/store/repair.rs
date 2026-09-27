@@ -141,7 +141,7 @@ impl ClientStore {
             }
             for entry in &page.entries {
                 remember_copy(&tx,peer,mailbox,entry)?;
-                tx.execute("UPDATE replica_copies SET seen_round=?4,missing=0 WHERE peer_id=?1 AND mailbox_id=?2 AND object_id=?3",
+                tx.execute("UPDATE replica_copies SET seen_round=?4,missing=0,retention_expired=0 WHERE peer_id=?1 AND mailbox_id=?2 AND object_id=?3",
                     params![peer.to_string(),mailbox.to_string(),entry.object_id.to_string(),expected.round])?;
             }
             let after=page.entries.last().map_or(expected.after,|e|e.arrival_seq);
@@ -265,7 +265,7 @@ impl ClientStore {
         }
         self.call(move |c| {
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let changed=tx.execute("UPDATE replica_copies SET missing=0,receipt_record=?4 WHERE peer_id=?1 AND mailbox_id=?2 AND object_id=?3 AND missing=1 AND pruned_record IS NULL AND attempts=?5 AND EXISTS(SELECT 1 FROM replica_scans s WHERE s.peer_id=?1 AND s.mailbox_id=?2 AND s.storage_generation=?6)",
+            let changed=tx.execute("UPDATE replica_copies SET missing=0,retention_expired=0,receipt_record=?4 WHERE peer_id=?1 AND mailbox_id=?2 AND object_id=?3 AND missing=1 AND pruned_record IS NULL AND attempts=?5 AND EXISTS(SELECT 1 FROM replica_scans s WHERE s.peer_id=?1 AND s.mailbox_id=?2 AND s.storage_generation=?6)",
                 params![attempt.target.peer_id.to_string(),attempt.target.mailbox_id.to_string(),attempt.object.to_string(),receipt.bytes(),attempt.number,attempt.generation])?;
             if changed!=1 { return Err(StoreError::StaleAttempt); }
             tx.execute("UPDATE outbox SET receipt_record=?4 WHERE peer_id=?1 AND mailbox_id=?2 AND object_id=?3 AND state='STORED'",
@@ -279,7 +279,7 @@ impl ClientStore {
     pub async fn missing_copies(&self) -> Result<u64> {
         self.call(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM replica_copies WHERE missing=1 AND pruned_record IS NULL",
+                "SELECT count(*) FROM replica_copies WHERE missing=1 AND retention_expired=0 AND pruned_record IS NULL",
                 [],
                 |r| read_count(r, 0),
             )?)
@@ -313,6 +313,203 @@ mod tests {
     fn time(n: u64) -> LocalTime {
         LocalTime::from_millis(n).unwrap()
     }
+
+    #[tokio::test]
+    async fn expired_server_copy_is_not_pending_but_requested_or_lost_live_copy_is() {
+        let remote = tempfile::tempdir().unwrap();
+        let replica = crate::replica::ReplicaStore::open(remote.path())
+            .await
+            .unwrap();
+        let mailbox = replica.create_mailbox(4096).await.unwrap();
+        let bytes = b"PUBLIC RETENTION STATUS FIXTURE".to_vec();
+        let object = ObjectId::of_ciphertext(&bytes);
+        let record = RecordId::from_bytes([4; 32]);
+        let space = crate::ids::SpaceId::from_bytes([5; 32]);
+        let stream = crate::ids::StreamId::from_bytes([6; 16]);
+        let target = DeliveryTarget {
+            peer_id: replica.peer_id(),
+            mailbox_id: mailbox.mailbox_id,
+        };
+        let (_, signed_receipt) = replica
+            .post(
+                mailbox.mailbox_id,
+                mailbox.write_token,
+                object,
+                bytes.clone(),
+                TransferHint::Eager,
+            )
+            .await
+            .unwrap();
+        let receipt = VerifiedReceipt::verify(
+            &signed_receipt,
+            replica.key(),
+            mailbox.mailbox_id,
+            object,
+            bytes.len(),
+        )
+        .unwrap();
+        let generation = receipt.body().storage_generation.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ClientStore::open(dir.path()).await.unwrap();
+        store
+            .commit_local_record_with_outbox(
+                PreparedLocalRecord::new(
+                    record,
+                    bytes.clone(),
+                    RecordMetadata::new("chat.message", Some(space), Some(stream), None).unwrap(),
+                    vec![target],
+                    time(1),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivery = store.claim_next(time(2)).await.unwrap().unwrap();
+        store.confirm_stored(delivery, receipt).await.unwrap();
+
+        let empty = Inventory {
+            storage_generation: generation.clone(),
+            head: 0,
+            entries: vec![],
+            requested_messages: vec![],
+        };
+        let cursor = store
+            .begin_scan(
+                target.peer_id,
+                target.mailbox_id,
+                None,
+                generation.clone(),
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_scan_page(target.peer_id, target.mailbox_id, cursor, empty.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.missing_copies().await.unwrap(), 1);
+        assert_eq!(
+            store.display_sources(space, stream).await.unwrap()[0].status,
+            "REPAIR_PENDING"
+        );
+        let attempt = store
+            .claim_repair(target, time(100), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        store.suspend_expired_copy(attempt).await.unwrap();
+        store.close().await.unwrap();
+
+        // Intentional server retention survives restart without changing the
+        // historical storage receipt or removing encrypted local history.
+        let store = ClientStore::open(dir.path()).await.unwrap();
+        assert_eq!(store.missing_copies().await.unwrap(), 0);
+        assert!(
+            store
+                .claim_repair(target, time(10_000), 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.display_sources(space, stream).await.unwrap()[0].status,
+            "STORED"
+        );
+        assert_eq!(
+            store
+                .message_sources_page(space, stream, None, 20, false)
+                .await
+                .unwrap()
+                .0[0]
+                .status,
+            "STORED"
+        );
+        assert_eq!(
+            store
+                .message_sources_by_ids(space, stream, vec![record])
+                .await
+                .unwrap()[0]
+                .status,
+            "STORED"
+        );
+        assert_eq!(store.get_object(object).await.unwrap(), Some(bytes.clone()));
+        assert_eq!(store.stats().await.unwrap().stored, 1);
+
+        // A recipient's refill request makes the absent body actionable again.
+        store
+            .resume_requested_copies(target.peer_id, target.mailbox_id, vec![object])
+            .await
+            .unwrap();
+        assert_eq!(store.missing_copies().await.unwrap(), 1);
+        assert_eq!(
+            store.display_sources(space, stream).await.unwrap()[0].status,
+            "REPAIR_PENDING"
+        );
+        let attempt = store
+            .claim_repair(target, time(20_000), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        store.suspend_expired_copy(attempt).await.unwrap();
+
+        // Another device may refill it. Seeing the live object must clear the
+        // old retention exemption so genuine subsequent loss is still repaired.
+        let current = store
+            .scan_cursor(target.peer_id, target.mailbox_id)
+            .await
+            .unwrap();
+        let cursor = store
+            .begin_scan(
+                target.peer_id,
+                target.mailbox_id,
+                current,
+                generation.clone(),
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_scan_page(
+                target.peer_id,
+                target.mailbox_id,
+                cursor,
+                Inventory {
+                    storage_generation: generation.clone(),
+                    head: 1,
+                    entries: vec![InventoryEntry {
+                        arrival_seq: 1,
+                        object_id: object,
+                        size_bytes: bytes.len() as u64,
+                        transfer_hint: TransferHint::Eager,
+                    }],
+                    requested_messages: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let current = store
+            .scan_cursor(target.peer_id, target.mailbox_id)
+            .await
+            .unwrap();
+        let cursor = store
+            .begin_scan(target.peer_id, target.mailbox_id, current, generation, 0)
+            .await
+            .unwrap();
+        store
+            .finish_scan_page(target.peer_id, target.mailbox_id, cursor, empty)
+            .await
+            .unwrap();
+        assert_eq!(store.missing_copies().await.unwrap(), 1);
+        assert!(
+            store
+                .claim_repair(target, time(30_000), 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        store.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn failed_scan_commit_is_atomic_and_retry_schedule_survives_restart() {
         let dir = tempfile::tempdir().unwrap();

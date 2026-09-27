@@ -222,7 +222,7 @@ impl ClientApp {
                 key: STANDARD.encode(plan.key.as_slice()),
                 nonce_prefix: STANDARD.encode(plan.nonce_prefix),
                 chunk_bytes: crate::attachments::ATTACHMENT_CHUNK_BYTES,
-                ciphertext_sha256: encrypted.ciphertext_sha256,
+                ciphertext_sha256: encrypted.ciphertext_sha256.clone(),
             },
         };
         descriptor.validate()?;
@@ -264,6 +264,8 @@ impl ClientApp {
         self.store
             .commit_attachment_share(prepared, self.targets(), now()?)
             .await?;
+        // Cache failure must not turn an already committed send into a retry.
+        let _ = crate::attachments::cache::store(&self.directory, &temporary.0, &encrypted.ciphertext_sha256);
         Ok(json!({"record":message,"attachment_id":attachment}))
         }.await;
         if result.is_err() && cancellation.is_cancelled() {
@@ -281,6 +283,47 @@ impl ClientApp {
             .await;
         }
         result
+    }
+
+    async fn attachment_descriptor(&self, request: &Value) -> Result<AttachmentDescriptor> {
+        let index = self.authority_index(request)?;
+        let authority = &self.authorities.0[index];
+        let record_id: RecordId = field(request, "record")?.parse()?;
+        let record = self.message_record(authority, record_id).await?;
+        if message_actions::Projection::new(&self.originals(authority).await?).is_deleted(&record) {
+            return Err("This message was deleted.".into());
+        }
+        let recipient = crypto::history_recipient(
+            &record,
+            authority,
+            self.identity_id(),
+            self.session.age_identity(),
+        )?;
+        let share = crate::files::VerifiedFileShare::verify(&record, authority, recipient, true)?;
+        let descriptor = share
+            .attachment()
+            .ok_or("This file uses the older attachment format.")?
+            .clone();
+        Ok(descriptor)
+    }
+
+    /// Read only an authenticated local attachment; never contact its server.
+    pub async fn cached_attachment(
+        &self,
+        request: &Value,
+        output: &std::path::Path,
+    ) -> Result<Option<AttachmentDescriptor>> {
+        if field(request, "expected_identity")? != self.identity_id().to_string()
+            || Some(field(request, "expected_space")?) != self.active_space_id()
+        {
+            return Err("The selected Space has changed. Try again.".into());
+        }
+        let client = self.selected_space_client()?;
+        let descriptor = client.attachment_descriptor(request).await?;
+        Ok(
+            crate::attachments::cache::restore(&client.directory, &descriptor, output)
+                .then_some(descriptor),
+        )
     }
 
     pub(super) async fn download_attachment(
@@ -310,24 +353,7 @@ impl ClientApp {
         if cancellation.is_cancelled() {
             return Err("Attachment transfer cancelled.".into());
         }
-        let index = self.authority_index(request)?;
-        let authority = &self.authorities.0[index];
-        let record_id: RecordId = field(request, "record")?.parse()?;
-        let record = self.message_record(authority, record_id).await?;
-        if message_actions::Projection::new(&self.originals(authority).await?).is_deleted(&record) {
-            return Err("This message was deleted.".into());
-        }
-        let recipient = crypto::history_recipient(
-            &record,
-            authority,
-            self.identity_id(),
-            self.session.age_identity(),
-        )?;
-        let share = crate::files::VerifiedFileShare::verify(&record, authority, recipient, true)?;
-        let descriptor = share
-            .attachment()
-            .ok_or("This file uses the older attachment format.")?
-            .clone();
+        let descriptor = self.attachment_descriptor(request).await?;
         let authorization = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
@@ -346,12 +372,7 @@ impl ClientApp {
             .into());
         }
         let token = field(&authorization, "download_token")?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(4))
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?;
+        let client = crate::attachments::download::client(reqwest::Client::builder().no_proxy())?;
         let endpoint = self.attachment_endpoint(address, "download")?;
         progress(0, descriptor.encrypted_size);
         let mut response = None;
@@ -436,6 +457,11 @@ impl ClientApp {
             let _ = std::fs::remove_file(&destination);
             return Err(error);
         }
+        let _ = crate::attachments::cache::store(
+            &self.directory,
+            &temporary.0,
+            &descriptor.encryption.ciphertext_sha256,
+        );
         Ok(json!({"filename":descriptor.name,"size_bytes":descriptor.plaintext_size}))
     }
 }

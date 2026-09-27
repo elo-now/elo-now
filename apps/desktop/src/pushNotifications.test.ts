@@ -1,4 +1,5 @@
 import { expect, test, vi } from "vitest";
+import { invitationSeenRequest } from "./invitationAttention";
 import {
   markNotificationOfferHandled,
   notificationOfferHandled,
@@ -8,6 +9,8 @@ import {
   notificationEntry,
   notificationCatchUpRequest,
   notificationPage,
+  notificationSpace,
+  notificationChat,
   resolveNotificationEntry,
 } from "./usePushNotifications";
 import type { HistoryPage } from "./messageHistory";
@@ -44,6 +47,7 @@ test("a tapped known chat receives first in its joined Space; unknown authority 
   };
   expect(notificationCatchUpRequest(spaces, target)).toEqual({
     op: "sync_live",
+    foreground: true,
     receive_only: true,
     target_space: "company-b",
     expected_identity: "me",
@@ -51,10 +55,14 @@ test("a tapped known chat receives first in its joined Space; unknown authority 
   });
   const discovery = {
     op: "invitation_sync",
+    foreground: true,
     force: true,
     expected_identity: "me",
   };
-  expect(notificationCatchUpRequest(spaces, target, true)).toEqual(discovery);
+  expect(notificationCatchUpRequest(spaces, target, true)).toEqual({
+    ...discovery,
+    target_space: "company-b",
+  });
   expect(
     notificationCatchUpRequest({ ...spaces, all_streams: [] }, target),
   ).toEqual(discovery);
@@ -62,6 +70,44 @@ test("a tapped known chat receives first in its joined Space; unknown authority 
     notificationCatchUpRequest(spaces, { ...target, identity: "other" }),
   ).toBeUndefined();
   expect(notificationCatchUpRequest(spaces, null)).toBeUndefined();
+});
+test("a new chat push discovers only its locally joined Space without scanning stale Spaces", () => {
+  const current = {
+    ...view,
+    active_space: "other-space",
+    spaces: [
+      { id: "joined-space", status: "joined" },
+      { id: "pending-space", status: "pending" },
+    ],
+  } as View;
+  const target = {
+    identity: "me",
+    category: "invitation",
+    space: "joined-space",
+    chat: { space: "new-space", stream: "new-chat", invitation: "proof" },
+  };
+  const discovery = {
+    op: "invitation_sync",
+    foreground: true,
+    force: true,
+    expected_identity: "me",
+  };
+  expect(notificationCatchUpRequest(current, target)).toEqual({
+    ...discovery,
+    target_space: "joined-space",
+    receive_only: true,
+  });
+  expect(
+    notificationCatchUpRequest(current, { ...target, category: "membership" }),
+  ).toEqual({ ...discovery, target_space: "joined-space" });
+  for (const space of ["pending-space", "unknown-space", null]) {
+    expect(notificationCatchUpRequest(current, { ...target, space })).toEqual(
+      discovery,
+    );
+  }
+  expect(
+    notificationCatchUpRequest(current, { ...target, identity: "other" }),
+  ).toBeUndefined();
 });
 test("notification consent waits for authenticated setup and is not repeated after a decision", () => {
   const stored = new Map<string, string>();
@@ -302,4 +348,154 @@ test("old invitation pushes never open an empty Invitations screen or cross prof
     notificationPage(pending, { ...target, identity: "other" }),
   ).toBeUndefined();
   expect(notificationPage(pending, null)).toBeUndefined();
+});
+
+test("membership invitation taps open only a locally joined chat, including empty chats", () => {
+  const chat = {
+    ...view.streams[0],
+    space_context: "joined-space",
+    rows: [],
+    members: [
+      {
+        identity_id: "me",
+        capabilities: ["READ"],
+        external: true,
+        credential_ids: ["credential"],
+      },
+    ],
+  } as View["streams"][number];
+  const current = {
+    ...view,
+    all_streams: [chat],
+    all_invitations: { actionable: 1 },
+  } as View;
+  const target = {
+    identity: "me",
+    category: "invitation",
+    chat: { space: "space", stream: "chat", invitation: "proof" },
+  };
+  expect(notificationChat(current, target)).toBe(chat);
+  expect(notificationSpace(current, target)).toBe("joined-space");
+  expect(notificationPage(current, target)).toBeUndefined();
+  expect(
+    notificationChat(current, { ...target, identity: "other" }),
+  ).toBeUndefined();
+  expect(
+    notificationChat(current, { ...target, category: "message" }),
+  ).toBeUndefined();
+  for (const members of [
+    [],
+    [{ identity_id: "other", capabilities: ["READ"] }],
+    [{ identity_id: "me", capabilities: [] }],
+  ]) {
+    expect(
+      notificationChat(
+        { ...current, all_streams: [{ ...chat, members } as typeof chat] },
+        target,
+      ),
+    ).toBeUndefined();
+  }
+  const pending = { ...current, all_streams: [] };
+  expect(notificationChat(pending, target)).toBeUndefined();
+  expect(notificationPage(pending, target)).toBe("activity");
+  expect(notificationCatchUpRequest(pending, target)?.op).toBe(
+    "invitation_sync",
+  );
+});
+
+test("invitation taps select only a joined Space owned by the unlocked profile", () => {
+  const scoped = {
+    ...view,
+    active_space: "a",
+    spaces: [
+      { id: "a", status: "joined" },
+      { id: "b", status: "joined" },
+      { id: "c", status: "pending" },
+    ],
+  } as View;
+  const target = { identity: "me", category: "invitation", space: "b" };
+  expect(notificationSpace(scoped, target)).toBe("b");
+  expect(
+    notificationSpace(scoped, { ...target, identity: "other" }),
+  ).toBeUndefined();
+  expect(notificationSpace(scoped, { ...target, space: "c" })).toBeUndefined();
+  expect(
+    notificationSpace(scoped, { ...target, space: "unknown" }),
+  ).toBeUndefined();
+  expect(
+    notificationSpace(scoped, { ...target, record: "message" }),
+  ).toBeUndefined();
+});
+
+test("a seen pending invitation still opens Invitations until explicitly accepted", () => {
+  const target = {
+    identity: "me",
+    category: "invitation",
+    space: "joined-space",
+    chat: { space: "new-space", stream: "new-chat", invitation: "proof" },
+  };
+  const pending = {
+    ...view,
+    active_space: "other-space",
+    spaces: [{ id: "joined-space", status: "joined", activity: 1 }],
+    all_streams: [],
+    all_invitations: { actionable: 1, unseen: 0 },
+  } as unknown as View;
+  expect(notificationSpace(pending, target)).toBe("joined-space");
+  expect(notificationPage(pending, target)).toBe("activity");
+  expect(notificationChat(pending, target)).toBeUndefined();
+
+  const handled = {
+    ...pending,
+    spaces: [{ ...pending.spaces![0], activity: 0 }],
+    all_invitations: { actionable: 0, unseen: 0 },
+  } as View;
+  expect(notificationPage(handled, target)).toBeUndefined();
+  expect(notificationChat(handled, target)).toBeUndefined();
+
+  const chat = {
+    ...view.streams[0],
+    space: "new-space",
+    stream: "new-chat",
+    space_context: "joined-space",
+    rows: [],
+    members: [
+      {
+        identity_id: "me",
+        capabilities: ["READ"],
+        external: true,
+        credential_ids: ["credential"],
+      },
+    ],
+  } as View["streams"][number];
+  const accepted = { ...handled, all_streams: [chat] };
+  expect(notificationPage(accepted, target)).toBeUndefined();
+  expect(notificationChat(accepted, target)).toBe(chat);
+  expect(notificationSpace(accepted, target)).toBe("joined-space");
+});
+
+test("viewing Invitations never marks hidden notices or a future approval as seen", () => {
+  const activity = {
+    received: [{ id: "invite" }],
+    incoming: [{ id: "request" }],
+    outgoing: [
+      { id: "waiting", status: "waiting" },
+      { id: "ready", status: "approved" },
+      { id: "declined", status: "declined", seen: false },
+    ],
+    notices: [
+      { id: "removal", seen: false },
+      { id: "old", seen: true },
+    ],
+  };
+  expect(invitationSeenRequest("activity", activity)).toEqual({
+    op: "invitation_activity_seen",
+    ids: ["invitation:invite", "request:request", "approved:ready"],
+  });
+  expect(invitationSeenRequest("notifications", activity)).toEqual({
+    op: "invitation_notifications_seen",
+    ids: ["removal", "declined"],
+  });
+  expect(invitationSeenRequest("invite", activity)).toBeUndefined();
+  expect(invitationSeenRequest("activity", {})).toBeUndefined();
 });

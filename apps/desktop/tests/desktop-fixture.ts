@@ -2,6 +2,7 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import type { View, Stream } from "../src/model";
+import { clearAttachmentPreviews } from "../src/attachmentPreview";
 const params = new URLSearchParams(location.search);
 mockWindows("main");
 localStorage.clear();
@@ -170,12 +171,17 @@ const management = {
   }[],
 };
 const calls: { command: string; request?: Record<string, any> }[] = [];
-const latency: Record<string, number> = {};
+const latency: Record<string, number> = {
+  profile_environment: Number(params.get("profile-delay")) || 0,
+  "plugin:biometry|remove_data": Number(params.get("cleanup-delay")) || 0,
+};
 const failures: Record<string, string> = {};
+if (params.has("profile-error")) failures.profile_environment = "Local profile unavailable";
 const pairing = {
   request: null as null | { id: string; name: string },
   accepted: false,
 };
+const downloadedImages = new Set<string>();
 const transfers = new Map<
   string,
   { resolve: () => void; reject: (error: Error) => void }
@@ -186,6 +192,7 @@ Object.assign(window, {
     latency,
     failures,
     pairing,
+    clearAttachmentPreviews,
     async transferProgress(received: number, total = 1048576) {
       for (const transfer_id of transfers.keys())
         await emit("attachment-transfer-progress", {
@@ -208,7 +215,7 @@ Object.assign(window, {
           issuer_identity: view.identity,
           created_at: new Date().toISOString(),
           ...(kind === "file.shared"
-            ? { filename: "sample.pdf", size_bytes: 2048 }
+            ? { filename: params.has("inline-images") ? "photo.jpg" : "sample.pdf", size_bytes: 2048 }
             : { payload: { text: "Own deletion fixture" } }),
         },
       });
@@ -259,17 +266,30 @@ mockIPC(
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     if (command === "prepare_export") return "/fixture/download";
     if (command === "save_export") return false;
+    if (command === "attachment_preview") {
+      if (!params.has("inline-images") || !downloadedImages.has(args.request?.record)) return null;
+      const canvas = document.createElement("canvas");
+      canvas.width = 640; canvas.height = 480;
+      const context = canvas.getContext("2d")!;
+      context.fillStyle = "#bbdac9"; context.fillRect(0, 0, 640, 480);
+      context.fillStyle = "#2d493d"; context.fillRect(130, 100, 380, 280);
+      return canvas.toDataURL("image/png");
+    }
+    if (command === "share_cached_attachment") return null;
     if (command === "choose_attachment")
       return {
         path: "/fixture/attachment",
-        name: "Redmi attachment test.txt",
+        name: params.get("attachment-name") ?? "Redmi attachment test.txt",
         size_bytes: 4194304,
       };
     if (command === "attachment_transfer") {
       await new Promise<void>((resolve, reject) =>
         transfers.set(args.transferId!, { resolve, reject }),
       );
-      if (args.request?.op !== "attachment_upload") return { result: {} };
+      if (args.request?.op !== "attachment_upload") {
+        downloadedImages.add(args.request!.record);
+        return { result: {} };
+      }
       const chat = view.streams.find(
         (chat) => chat.stream === args.request!.stream,
       )!;
@@ -299,7 +319,7 @@ mockIPC(
       return {
         mobile: params.has("mobile"),
         platform: params.get("platform") ?? undefined,
-        has_profile: true,
+        has_profile: !params.has("new-profile"),
         directory: "fixture",
         demo_helpers: false,
         saved_profiles: [],

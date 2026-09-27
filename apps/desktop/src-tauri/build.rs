@@ -45,6 +45,8 @@ fn main() {
             "discard_exchange",
             "prepare_export",
             "save_export",
+            "attachment_preview",
+            "share_cached_attachment",
             "open_mail_draft",
             "invitation_qr",
             "copy_recovery_code",

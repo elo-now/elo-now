@@ -1,12 +1,50 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import type { Stream, View } from "./model";
 import {
   mergeHistory,
   sameHistoryScope,
+  watchHistoryResume,
   type HistoryPage,
 } from "./messageHistory";
 import { acceptView } from "./liveSync";
 import { chatTimeline } from "./messageThreads";
+
+test("resuming an unchanged conversation rereads local history once, including offline", async () => {
+  vi.useFakeTimers();
+  const page = Object.assign(new EventTarget(), { visibilityState: "hidden" });
+  vi.stubGlobal("document", page);
+  vi.stubGlobal("window", new EventTarget());
+  vi.stubGlobal("navigator", { onLine: false });
+  let displayed = ["older"];
+  const stored = ["older", "received while hidden"];
+  const refresh = vi.fn(() => {
+    displayed = [...stored];
+  });
+  const stop = watchHistoryResume(refresh);
+  try {
+    window.dispatchEvent(new Event("focus"));
+    await vi.runAllTimersAsync();
+    expect(displayed).toEqual(["older"]);
+    page.visibilityState = "visible";
+    page.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("pageshow"));
+    window.dispatchEvent(new Event("focus"));
+    await vi.runAllTimersAsync();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(displayed).toEqual(stored);
+    window.dispatchEvent(new Event("focus"));
+    stop();
+    await vi.runAllTimersAsync();
+    window.dispatchEvent(new Event("focus"));
+    await vi.runAllTimersAsync();
+    expect(refresh).toHaveBeenCalledTimes(1);
+  } finally {
+    stop();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
 const row = (id: string, time: number): Stream["rows"][number] => ({
   id,
   state: "LOCAL",

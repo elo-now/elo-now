@@ -18,6 +18,156 @@ use zeroize::Zeroizing;
 const MAX_EXCHANGE: usize = 12 * 1024 * 1024;
 const MAX_ATTACHMENT: usize = 5 * 1024 * 1024;
 
+#[cfg(mobile)]
+struct StagedShareDirectory(PathBuf);
+#[cfg(mobile)]
+impl Drop for StagedShareDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+struct StagedAttachment(PathBuf);
+impl Drop for StagedAttachment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn image_preview(bytes: &[u8]) -> Option<String> {
+    use image::ImageDecoder;
+    if bytes.len() > MAX_ATTACHMENT {
+        return None;
+    }
+    let format = image::guess_format(bytes).ok()?;
+    if !matches!(
+        format,
+        image::ImageFormat::Jpeg
+            | image::ImageFormat::Png
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+    ) {
+        return None;
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    let image = image.thumbnail(640, 640);
+    let mut output = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut output, image::ImageFormat::Png).ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(output.into_inner())
+    ))
+}
+
+static PREVIEW_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Only locally cached, authenticated records are decoded. No network or path
+/// supplied by the renderer is used, and original metadata is not embedded.
+#[tauri::command]
+pub async fn attachment_preview(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+    request: serde_json::Value,
+) -> Result<Option<String>, String> {
+    // Limit decoded bitmap memory even when many visible rows request previews.
+    let _permit = PREVIEW_WORKERS
+        .acquire()
+        .await
+        .map_err(|_| "file_export_failed")?;
+    let guard = state.lock().await;
+    let client = guard.client.as_ref().ok_or("The profile is locked")?;
+    let file = StagedAttachment(new_path(&app, "bin")?);
+    if client
+        .cached_attachment(&request, &file.0)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let bytes = Zeroizing::new(std::fs::read(&file.0).map_err(|e| e.to_string())?);
+    drop(file);
+    drop(guard);
+    tauri::async_runtime::spawn_blocking(move || image_preview(&bytes))
+        .await
+        .map_err(|_| "file_export_failed".to_owned())
+}
+
+#[tauri::command]
+pub async fn share_cached_attachment(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+    request: serde_json::Value,
+) -> Result<(), String> {
+    let guard = state.lock().await;
+    let client = guard.client.as_ref().ok_or("The profile is locked")?;
+    let file = StagedAttachment(new_path(&app, "bin")?);
+    let descriptor = client
+        .cached_attachment(&request, &file.0)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Attachment object is missing.")?;
+    #[cfg(mobile)]
+    {
+        // Give the system a correctly named original, not the chat thumbnail.
+        if descriptor.name.is_empty()
+            || descriptor.name.len() > 255
+            || descriptor.name == "."
+            || descriptor.name == ".."
+            || descriptor
+                .name
+                .chars()
+                .any(|c| c == '/' || c == '\\' || elo_core::record::unsafe_display_character(c))
+        {
+            return Err("file_export_failed".into());
+        }
+        let directory = StagedShareDirectory(new_path(&app, "share")?);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&directory.0)
+            .map_err(|_| "file_export_failed")?;
+        let named = directory.0.join(&descriptor.name);
+        std::fs::rename(&file.0, &named).map_err(|_| "file_export_failed")?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let result = share_generated_file(&app, named, &descriptor.mime, &descriptor.name);
+            drop(directory);
+            match result {
+                Err(error) if error.contains("Share cancelled") => Ok(()),
+                other => other,
+            }
+        })
+        .await
+        .map_err(|_| "file_export_failed".to_owned())?;
+    }
+    #[cfg(not(mobile))]
+    {
+        let handle = app
+            .state::<ExchangeFiles>()
+            .issue(file.0.clone(), Purpose::Download)?;
+        drop(guard);
+        let result = save_export(app.clone(), state, handle.clone(), Some(descriptor.name)).await;
+        app.state::<ExchangeFiles>()
+            .0
+            .lock()
+            .map_err(|_| "Exchange is unavailable")?
+            .remove(&handle);
+        result.map(|_| ())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Purpose {
     Upload,
@@ -196,6 +346,24 @@ fn uniform_qr_codes(contents: &[String]) -> Result<Vec<qrcode::QrCode>, String> 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn attachment_preview_is_bounded_and_never_interprets_svg_as_active_content() {
+        assert!(
+            super::image_preview(b"<svg xmlns='http://www.w3.org/2000/svg'><script/></svg>")
+                .is_none()
+        );
+        let image = image::DynamicImage::new_rgb8(1600, 1200);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let data = super::image_preview(&png.into_inner()).unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        let thumbnail = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (640, 480));
+        assert!(super::image_preview(&vec![0; super::MAX_ATTACHMENT + 1]).is_none());
+    }
+    #[test]
     fn opaque_handles_reject_paths_wrong_purpose_and_old_sessions() {
         let files = super::ExchangeFiles::default();
         let path = std::path::PathBuf::from("/tmp/native-selected-file");
@@ -313,7 +481,11 @@ pub fn clear(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error + S
     for item in std::fs::read_dir(directory(app)?)? {
         let item = item?;
         // Only files created by this module; never recurse into other folders.
-        if item.file_name().to_string_lossy().starts_with("elo-") && !item.file_type()?.is_dir() {
+        let name = item.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("elo-") && name.ends_with(".share") && item.file_type()?.is_dir() {
+            std::fs::remove_dir_all(item.path())?;
+        } else if name.starts_with("elo-") && !item.file_type()?.is_dir() {
             std::fs::remove_file(item.path())?;
         }
     }
@@ -575,36 +747,54 @@ pub async fn save_export(
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "elo-export.bin".into())
         });
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_file_name(name)
-        .save_file(move |file| {
-            let _ = tx.send(file);
-        });
-    let Some(file) = rx.await.map_err(|_| "File picker closed unexpectedly")? else {
-        return Ok(false);
-    };
-    let destination_path = file.clone().into_path().ok();
-    let mut destination = app
-        .fs()
-        .open(
-            file,
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .clone(),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut source = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    std::io::copy(&mut source, &mut destination).map_err(|e| e.to_string())?;
-    destination.sync_all().map_err(|e| e.to_string())?;
-    if let Some(path) = destination_path {
-        crate::download_protection::mark(&path).map_err(
-            |_| "Could not mark this download as untrusted. Choose another destination.",
-        )?;
+    #[cfg(target_os = "ios")]
+    {
+        use tauri_plugin_sharekit::ShareExt;
+        let url = tauri::Url::from_file_path(&path).map_err(|_| "file_export_failed")?;
+        // The iOS picker exports the complete file itself. Dialog's generic
+        // save_file adapter collapses native errors into cancellation and
+        // exports an empty placeholder before Rust can write its contents.
+        return tauri::async_runtime::spawn_blocking(move || {
+            app.share()
+                .export_file(url.to_string(), name)
+                .map_err(|_| "file_export_failed".to_owned())
+        })
+        .await
+        .map_err(|_| "file_export_failed".to_owned())?;
     }
-    // Keep the private source until lock, including after uncertain provider writes.
-    Ok(true)
+    #[cfg(not(target_os = "ios"))]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .set_file_name(name)
+            .save_file(move |file| {
+                let _ = tx.send(file);
+            });
+        let Some(file) = rx.await.map_err(|_| "File picker closed unexpectedly")? else {
+            return Ok(false);
+        };
+        let destination_path = file.clone().into_path().ok();
+        let mut destination = app
+            .fs()
+            .open(
+                file,
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .clone(),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut source = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut source, &mut destination).map_err(|e| e.to_string())?;
+        destination.sync_all().map_err(|e| e.to_string())?;
+        if let Some(path) = destination_path {
+            crate::download_protection::mark(&path).map_err(
+                |_| "Could not mark this download as untrusted. Choose another destination.",
+            )?;
+        }
+        // Keep the private source until lock, including after uncertain provider writes.
+        Ok(true)
+    }
 }

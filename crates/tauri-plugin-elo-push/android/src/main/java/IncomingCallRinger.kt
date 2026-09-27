@@ -6,7 +6,6 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
-import android.os.Build
 import android.os.PowerManager
 
 /** Owns a bounded call's sound; notification repetition differs between vendors. */
@@ -27,8 +26,7 @@ internal class IncomingCallRinger(private val context: Context) {
             current = key
             interrupted = false
         }
-        val channelEnabled = Build.VERSION.SDK_INT < 26 ||
-            (notifications.getNotificationChannel(channel)?.importance ?: 0) >= NotificationManager.IMPORTANCE_DEFAULT
+        val channelEnabled = (notifications.getNotificationChannel(channel)?.importance ?: 0) >= NotificationManager.IMPORTANCE_DEFAULT
         if (key == null || tone == "silent" || interrupted || !channelEnabled ||
             !notifications.areNotificationsEnabled() ||
             notifications.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL ||
@@ -39,9 +37,9 @@ internal class IncomingCallRinger(private val context: Context) {
         if (player != null) return
         val resource = context.resources.getIdentifier("elo_ring_$tone", "raw", context.packageName)
         if (resource == 0) return
-        // Telecom owns focus for this self-managed Connection. A second request
-        // competes with Telecom itself and cuts off the ringtone on Android 10.
-        // ConnectionService focus loss and Connection.onSilence stop this loop.
+        // Core-Telecom owns audio focus. A second request competes with it and
+        // cuts off the ringtone on Android 10. The service stops sound on answer,
+        // disconnect, expiry, silence, or a change in the system sound policy.
         val next = MediaPlayer()
         try {
             next.setAudioAttributes(attributes)

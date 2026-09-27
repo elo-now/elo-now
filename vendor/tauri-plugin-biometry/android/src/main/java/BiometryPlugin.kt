@@ -190,12 +190,7 @@ class BiometryPlugin(private val activity: Activity): Plugin(activity) {
     @Command
     fun status(invoke: Invoke) {
         val manager = BiometricManager.from(activity)
-        val biometryResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
-        } else {
-            @Suppress("DEPRECATION")
-            manager.canAuthenticate()
-        }
+        val biometryResult = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
         val ret = JSObject()
 
         val available = biometryResult == BiometricManager.BIOMETRIC_SUCCESS

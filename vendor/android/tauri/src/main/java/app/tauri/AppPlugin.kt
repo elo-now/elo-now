@@ -24,6 +24,11 @@ class AppPlugin(private val activity: Activity): Plugin(activity) {
     this.webView = webView
   }
 
+  override fun onWebViewDestroyed() {
+    webView = null
+    super.onWebViewDestroyed()
+  }
+
   init {
     val callback = object : OnBackPressedCallback(true) {
       override fun handleOnBackPressed() {
@@ -32,8 +37,11 @@ class AppPlugin(private val activity: Activity): Plugin(activity) {
             this@AppPlugin.webView!!.goBack()
           } else {
             this.isEnabled = false
-            this@AppPlugin.activity.onBackPressed()
-            this.isEnabled = true
+            try {
+              (this@AppPlugin.activity as AppCompatActivity).onBackPressedDispatcher.onBackPressed()
+            } finally {
+              this.isEnabled = true
+            }
           }
         } else {
           val data = JSObject().apply {

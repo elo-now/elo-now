@@ -732,3 +732,62 @@ async fn invitation_duration_is_signed_defaults_to_24_hours_and_rejects_invalid_
         assert_eq!(owner.view().await.unwrap(), original_view);
     }
 }
+
+#[tokio::test]
+async fn seeing_an_invitation_clears_attention_without_accepting_or_hiding_it() {
+    let d = TempDir::new().unwrap();
+    let mut owner = profile(d.path(), "owner").await;
+    let mut alice = profile(d.path(), "alice").await;
+    let link = offer(&mut owner, true).await;
+    let request_link = request(&mut alice, &link, "Alice").await;
+    let received = owner
+        .operate(json!({"op":"invitation_receive","link":request_link}))
+        .await
+        .unwrap();
+    let event = format!("request:{}", received["id"].as_str().unwrap());
+    let route = elo_core::app::push::Route {
+        endpoint: "https://notifications.example/".into(),
+        id: "a".repeat(32),
+        notify_key: "b".repeat(64),
+        scope_key: "c".repeat(64),
+        since: 1,
+    };
+    let read = json!({"op":"invitation_activity_seen","ids":[event]});
+    let before = owner.view().await.unwrap();
+    assert_eq!(before["invitations"]["unseen"], 1);
+    assert!(
+        owner
+            .notification_read_receipts(&route, &read)
+            .unwrap()
+            .is_empty()
+    );
+    owner
+        .operate(json!({"op":"invitation_activity_seen","ids":["request:unknown"]}))
+        .await
+        .unwrap();
+    assert_eq!(owner.view().await.unwrap()["invitations"]["unseen"], 1);
+    let seen = owner.operate(read.clone()).await.unwrap();
+    assert_eq!(seen["view"]["invitations"]["unseen"], 0);
+    assert_eq!(seen["view"]["invitations"]["actionable"], 1);
+    let receipts = owner.notification_read_receipts(&route, &read).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert!(
+        !serde_json::to_string(&receipts)
+            .unwrap()
+            .contains(received["id"].as_str().unwrap())
+    );
+    let activity = owner
+        .operate(json!({"op":"invitation_activity"}))
+        .await
+        .unwrap();
+    assert_eq!(activity["incoming"].as_array().unwrap().len(), 1);
+    owner.close().await.unwrap();
+    let owner = ClientApp::open(d.path().join("owner"), PASSWORD.into(), false)
+        .await
+        .unwrap();
+    assert_eq!(owner.view().await.unwrap()["invitations"]["unseen"], 0);
+    assert_eq!(
+        owner.notification_read_receipts(&route, &read).unwrap(),
+        receipts
+    );
+}

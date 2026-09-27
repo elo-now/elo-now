@@ -70,7 +70,7 @@ fn sources_for_ids(c: &Connection, ids: &[String]) -> Result<Vec<DisplaySource>>
     let mut q=c.prepare("SELECT r.record_id,s.object_id,s.source_index, CASE
       WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state='REJECTED' AND COALESCE(o.last_error_code,'')!='REMOTE_PRUNED') THEN 'REJECTED'
       WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state='HELD_STALE_CONFIG') THEN 'HELD_STALE_CONFIG'
-      WHEN EXISTS(SELECT 1 FROM replica_copies c JOIN outbox o USING(peer_id,mailbox_id,object_id) WHERE o.record_id=r.record_id AND c.missing=1 AND c.pruned_record IS NULL) THEN 'REPAIR_PENDING'
+      WHEN EXISTS(SELECT 1 FROM replica_copies c JOIN outbox o USING(peer_id,mailbox_id,object_id) WHERE o.record_id=r.record_id AND c.missing=1 AND c.retention_expired=0 AND c.pruned_record IS NULL) THEN 'REPAIR_PENDING'
       WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state IN ('PENDING','INFLIGHT')) THEN 'QUEUED'
       WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id) AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state!='STORED') THEN 'STORED'
       ELSE r.status END FROM records r JOIN record_sources s USING(record_id) WHERE r.record_id IN (SELECT value FROM json_each(?1)) ORDER BY r.first_seen_local_ms DESC,r.record_id DESC,s.source_index")?;

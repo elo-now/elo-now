@@ -1,7 +1,7 @@
 package now.elo
 
 import android.app.Activity
-import android.net.Uri
+import androidx.core.net.toUri
 import android.provider.OpenableColumns
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -18,7 +18,7 @@ class AttachmentInfoPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun displayName(invoke: Invoke) {
         val args = invoke.parseArgs(DocumentInfoArgs::class.java)
-        val uri = Uri.parse(args.uri)
+        val uri = args.uri.toUri()
         if (uri.scheme != "content") {
             invoke.reject("Invalid document URI.")
             return

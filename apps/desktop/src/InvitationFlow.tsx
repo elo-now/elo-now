@@ -1,3 +1,4 @@
+import { invitationSeenRequest } from "./invitationAttention";
 import { RefreshButton } from "./RefreshButton";
 import { SpaceRoleRequests } from "./SpaceRoles";
 import { useEffect, useRef, useState } from "react";
@@ -193,24 +194,11 @@ export function InvitationFlow({
     }
   };
   const loadActivity = async () => {
+    const context = listContext.current;
     const r = await call({ op: "invitation_activity" });
-    if (mounted.current) {
+    if (mounted.current && listContext.current === context) {
       setActivity(r);
       setLoadedPage(page);
-      if (page === "notifications") {
-        const ids = [
-          ...(r.notices ?? [])
-            .filter((entry) => !entry.seen)
-            .map((entry) => entry.id),
-          ...(r.outgoing ?? [])
-            .filter(
-              (entry) => entry.status === "declined" && entry.seen === false,
-            )
-            .map((entry) => entry.id),
-        ];
-        if (ids.length)
-          await call({ op: "invitation_notifications_seen", ids });
-      }
     }
   };
   const refresh = async () => {
@@ -251,13 +239,60 @@ export function InvitationFlow({
       if (mobile) void cancel().catch(() => {});
     };
   }, [mobile]);
+  const listContext = useRef("");
+  const lastSeen = useRef("");
   useEffect(() => {
     if (!active) return;
-    setLoadedPage(null);
+    const context = `${view.identity}:${view.active_space}:${page}:${stream?.stream}`;
+    if (listContext.current !== context) {
+      listContext.current = context;
+      setLoadedPage(null);
+    }
     if (page === "requests" || page === "invitations") void perform(load);
     if (page === "activity" || page === "notifications")
       void perform(loadActivity);
-  }, [page, stream?.stream, view.identity, view.active_space, active]);
+  }, [
+    page,
+    stream?.stream,
+    view.identity,
+    view.active_space,
+    active,
+    view.invitations?.actionable,
+    view.invitations?.responses,
+    view.invitations?.notifications,
+  ]);
+  useEffect(() => {
+    if (!active || loadedPage !== page || preview || selected || output) return;
+    const request = invitationSeenRequest(page, activity);
+    if (!request) return;
+    const key = JSON.stringify([view.identity, view.active_space, request]);
+    const seen = () => {
+      if (document.visibilityState !== "visible" || lastSeen.current === key)
+        return;
+      lastSeen.current = key;
+      void call(request).catch((error) => {
+        lastSeen.current = "";
+        reportError(error);
+      });
+    };
+    // Wait until the list is actually rendered. Loading it in a hidden tab is not a read.
+    const frame = requestAnimationFrame(seen);
+    document.addEventListener("visibilitychange", seen);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", seen);
+    };
+  }, [
+    page,
+    loadedPage,
+    activity,
+    active,
+    preview,
+    selected,
+    output,
+    view.identity,
+    view.active_space,
+  ]);
   useEffect(() => {
     if (route.link) void perform(() => inspect(route.link!));
   }, [route.link]);

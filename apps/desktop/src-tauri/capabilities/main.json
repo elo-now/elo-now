@@ -57,6 +57,8 @@
     "allow-discard-exchange",
     "allow-prepare-export",
     "allow-save-export",
+    "allow-attachment-preview",
+    "allow-share-cached-attachment",
     "allow-open-mail-draft",
     "allow-invitation-qr",
     "allow-copy-recovery-code",

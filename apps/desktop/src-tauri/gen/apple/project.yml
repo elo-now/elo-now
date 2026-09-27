@@ -2,7 +2,7 @@ name: elo-desktop
 options:
   bundleIdPrefix: now.elo
   deploymentTarget:
-    iOS: 15.0
+    iOS: 16.0
 fileGroups: [../../src]
 packages:
   WebRTC:
@@ -49,11 +49,12 @@ targets:
       path: elo-desktop_iOS/Info.plist
       properties:
         FirebaseMessagingAutoInitEnabled: false
+        FirebaseMessagingInstallationIdEnabled: true
         FirebaseAnalyticsCollectionEnabled: false
         UIBackgroundModes: [remote-notification, voip, audio]
         NSFaceIDUsageDescription: Use Face ID to unlock your encrypted elo profile on this device.
         NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.
-        NSPhotoLibraryAddUsageDescription: Save your password-protected recovery QR image to Photos.
+        NSPhotoLibraryAddUsageDescription: Save images from your conversations or your password-protected recovery QR image to Photos.
         NSCameraUsageDescription: Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
         NSMicrophoneUsageDescription: Use your microphone during audio and video calls.
         UIApplicationSceneManifest:
@@ -69,8 +70,8 @@ targets:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
-        CFBundleShortVersionString: 1.0.2
-        CFBundleVersion: "1093"
+        CFBundleShortVersionString: 1.0.3
+        CFBundleVersion: "1103"
         CFBundleURLTypes:
           - CFBundleURLName: now.elo
             CFBundleURLSchemes: [elo]

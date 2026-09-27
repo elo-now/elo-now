@@ -23,6 +23,7 @@ mod incoming_answer;
 mod incoming_call;
 mod mail;
 mod native_media;
+mod notification_counts;
 mod profiles;
 mod push;
 mod recovery_clipboard;
@@ -132,6 +133,7 @@ async fn open_demo(
         state.client = Some(client);
         app.state::<background_history::BackgroundHistory>()
             .resume();
+        push::update(&app, &view);
         #[cfg(desktop)]
         desktop_activity::update(&app, &view);
         Ok(view)
@@ -231,6 +233,7 @@ async fn create_profile(
     state.client = Some(client);
     app.state::<background_history::BackgroundHistory>()
         .resume();
+    push::update(&app, &view);
     #[cfg(desktop)]
     desktop_activity::update(&app, &view);
     Ok(view)
@@ -313,6 +316,7 @@ async fn unlock(
     state.client = Some(client);
     app.state::<background_history::BackgroundHistory>()
         .resume();
+    push::update(&app, &view);
     #[cfg(desktop)]
     desktop_activity::update(&app, &view);
     Ok(view)
@@ -327,7 +331,7 @@ async fn lock(app: tauri::AppHandle, state: tauri::State<'_, State>) -> Result<(
     let client = state.detach_profile();
     #[cfg(desktop)]
     desktop_activity::clear(&app);
-    let notifications = push::suspend(&app).await;
+    let notifications = push::suspend(&app, client.as_ref()).await;
     let profile = close_locked_profile(client).await;
     let files = exchange::clear(&app);
     notifications
@@ -420,30 +424,28 @@ async fn attachment_transfer(
     mut request: serde_json::Value,
     transfer_id: String,
 ) -> Result<serde_json::Value, String> {
-    release_policy::require_online(&app)?;
     let cancellation = transfers.begin(&transfer_id)?;
     let progress_app = app.clone();
     let progress_id = transfer_id.clone();
     let result = {
         let mut state = state.lock().await;
         let outcome = match state.client.as_mut() {
-            Some(client) => match release_policy::require_online(&app)
-                .and_then(|()| exchange::resolve_transfer(&app, &mut request))
-            {
-                Err(error) => Err(error),
-                Ok(()) => client
-                    .operate_attachment_transfer(request, cancellation, move |received, total| {
-                        let _ = progress_app.emit(
-                            "attachment-transfer-progress",
-                            AttachmentTransferProgress {
-                                transfer_id: progress_id.clone(),
-                                received,
-                                total,
-                            },
-                        );
-                    })
-                    .await
-                    .map_err(|error| error.to_string()),
+            Some(client) => {
+                async {
+                    exchange::resolve_transfer(&app, &mut request)?;
+                    if request["op"] == "attachment_download" {
+                        let output = std::path::Path::new(request["output"].as_str().ok_or("Invalid exchange handle")?);
+                        if let Some(file) = client.cached_attachment(&request, output).await.map_err(|e| e.to_string())? {
+                            return Ok(serde_json::json!({"result":{"filename":file.name,"size_bytes":file.plaintext_size,"cached":true}}));
+                        }
+                    }
+                    release_policy::require_online(&app)?;
+                    client.operate_attachment_transfer(request, cancellation, move |received, total| {
+                        let _ = progress_app.emit("attachment-transfer-progress", AttachmentTransferProgress {
+                            transfer_id: progress_id.clone(), received, total,
+                        });
+                    }).await.map_err(|error| error.to_string())
+                }.await
             },
             None => Err("The profile is locked".into()),
         };
@@ -455,6 +457,7 @@ async fn attachment_transfer(
                 state.view_revision,
                 state.demo_names.as_ref(),
             );
+            push::update(&app, &result);
             #[cfg(desktop)]
             desktop_activity::update(&app, &result);
             result
@@ -531,6 +534,7 @@ fn application_operation(op: &str) -> bool {
             | "invitation_ignore"
             | "invitation_sync"
             | "invitation_activity"
+            | "invitation_activity_seen"
             | "invitation_notifications_seen"
             | "invitation_dismiss"
             | "invitation_create"
@@ -604,7 +608,11 @@ async fn operate(
         || request["op"] == "set_chat_muted"
         || request["op"] == "space_disconnect"
         || request["op"] == "space_delete";
-    let read_request = (request["op"] == "mark_read").then(|| request.clone());
+    let read_request = matches!(
+        request["op"].as_str(),
+        Some("mark_read" | "invitation_activity_seen" | "invitation_notifications_seen")
+    )
+    .then(|| request.clone());
     let revision = state.view_revision;
     let client = state.client.as_mut().ok_or("The profile is locked")?;
     // Invitation discovery also waits on the network while holding the runtime.
@@ -668,7 +676,7 @@ async fn operate(
         && let Some(client) = state.client.as_ref()
     {
         // Persist opaque receipts locally; network retries run in push maintenance.
-        push::messages_read(&app, client, &request)?;
+        let _ = push::messages_read(&app, client, &request);
     }
     state.view_revision = state.view_revision.saturating_add(1);
     annotate_result(
@@ -677,6 +685,7 @@ async fn operate(
         state.view_revision,
         state.demo_names.as_ref(),
     );
+    push::update(&app, &result);
     #[cfg(desktop)]
     desktop_activity::update(&app, &result);
     #[cfg(debug_assertions)]
@@ -809,6 +818,8 @@ pub fn run() {
             exchange::discard_exchange,
             exchange::prepare_export,
             exchange::save_export,
+            exchange::attachment_preview,
+            exchange::share_cached_attachment,
             mail::open_mail_draft,
             exchange::invitation_qr,
             recovery_clipboard::copy_recovery_code,
@@ -859,6 +870,9 @@ mod result_metadata_tests {
             "history_page",
             "call_endpoint",
             "call_authorization",
+            "invitation_activity_seen",
+            "invitation_notifications_seen",
+            "space_select",
         ] {
             assert!(application_operation(op), "{op}");
         }

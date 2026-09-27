@@ -23,6 +23,7 @@ import android.os.UserManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.RemoteInput
+import androidx.core.content.IntentCompat
 import app.tauri.Logger
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.PluginManager
@@ -477,14 +478,11 @@ class TimedNotificationPublisher : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     val notificationManager =
       context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    val notification = if (SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-      intent.getParcelableExtra(
-        NOTIFICATION_KEY,
-        android.app.Notification::class.java
-      )
-    } else {
-      getParcelableExtraLegacy(intent, NOTIFICATION_KEY)
-    }
+    val notification = IntentCompat.getParcelableExtra(
+      intent,
+      NOTIFICATION_KEY,
+      android.app.Notification::class.java
+    )
     notification?.`when` = System.currentTimeMillis()
     val id = intent.getIntExtra(NOTIFICATION_INTENT_KEY, Int.MIN_VALUE)
     if (id == Int.MIN_VALUE) {
@@ -501,11 +499,6 @@ class TimedNotificationPublisher : BroadcastReceiver() {
     if (!rescheduleNotificationIfNeeded(context, intent, id)) {
       storage.deleteNotification(id.toString())
     }
-  }
-
-  @Suppress("DEPRECATION")
-  private fun getParcelableExtraLegacy(intent: Intent, string: String): android.app.Notification? {
-    return intent.getParcelableExtra(string)
   }
 
   @SuppressLint("MissingPermission", "SimpleDateFormat")

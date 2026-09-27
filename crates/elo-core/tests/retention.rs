@@ -280,8 +280,9 @@ async fn direct_peer_acceptance_removes_only_the_body() {
         },
     );
     let locator_id = ObjectId::of_ciphertext(&locator);
-    for (id, bytes) in [(locator_id, locator.clone()), (body_id, body)] {
-        replica
+    let mut body_receipt = None;
+    for (id, bytes) in [(locator_id, locator.clone()), (body_id, body.clone())] {
+        let (_, receipt) = replica
             .post_authenticated(
                 mailbox.mailbox_id,
                 mailbox.write_token.clone(),
@@ -293,6 +294,9 @@ async fn direct_peer_acceptance_removes_only_the_body() {
             )
             .await
             .unwrap();
+        if id == body_id {
+            body_receipt = Some(receipt);
+        }
     }
     assert!(matches!(
         replica
@@ -324,11 +328,78 @@ async fn direct_peer_acceptance_removes_only_the_body() {
     ));
     assert_eq!(
         replica
-            .get(mailbox.mailbox_id, mailbox.read_token, locator_id)
+            .get(mailbox.mailbox_id, mailbox.read_token.clone(), locator_id)
             .await
             .unwrap(),
         locator
     );
+
+    // The sender keeps its history and receipt, but the HTTP 409 retention
+    // response must clear pending repair and publish the changed UI status.
+    let local = tempfile::tempdir().unwrap();
+    let store = ClientStore::open(local.path()).await.unwrap();
+    let auth = authority(&[]);
+    store
+        .commit_local_record_with_outbox(
+            PreparedLocalRecord::new(
+                record,
+                body.clone(),
+                RecordMetadata::new(
+                    "chat.message",
+                    Some(auth.space),
+                    Some(auth.stream),
+                    Some(auth.config),
+                )
+                .unwrap(),
+                vec![DeliveryTarget {
+                    peer_id: replica.peer_id(),
+                    mailbox_id: mailbox.mailbox_id,
+                }],
+                time(1),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let attempt = store.claim_next(time(2)).await.unwrap().unwrap();
+    let receipt = elo_core::replica::VerifiedReceipt::verify(
+        &body_receipt.unwrap(),
+        replica.key(),
+        mailbox.mailbox_id,
+        body_id,
+        body.len(),
+    )
+    .unwrap();
+    store.confirm_stored(attempt, receipt).await.unwrap();
+    let (url, server) = server(replica.clone()).await;
+    let peers = [peer(&url, &replica, &mailbox, true, true).with_identity(&alice)];
+    let sync = SyncClient {
+        store: &store,
+        identity: alice.age_identity(),
+        credential: alice.credential().id(),
+        authority: &auth,
+        peers: &peers,
+    };
+    let report = sync.once(time(100)).await.unwrap();
+    assert_eq!(report.repair_expired, 1, "{report:?}");
+    assert_eq!(report.repair_pending, 0);
+    assert!(report.changes_view());
+    assert_eq!(
+        store
+            .display_sources(auth.space, auth.stream)
+            .await
+            .unwrap()[0]
+            .status,
+        "STORED"
+    );
+    assert_eq!(store.get_object(body_id).await.unwrap(), Some(body));
+    let settled = sync.once(time(100_000)).await.unwrap();
+    assert_eq!(settled.repair_expired, 0);
+    assert_eq!(settled.repair_pending, 0);
+    assert!(!settled.changes_view());
+    store.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

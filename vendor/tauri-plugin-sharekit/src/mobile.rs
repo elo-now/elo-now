@@ -1,7 +1,7 @@
 use serde::de::DeserializeOwned;
 use tauri::{
-    plugin::{PluginApi, PluginHandle},
     AppHandle, Runtime, WebviewWindow,
+    plugin::{PluginApi, PluginHandle},
 };
 
 use crate::models::*;
@@ -28,6 +28,23 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct ShareKit<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> ShareKit<R> {
+    /// Export an existing native file. Cancellation is distinct from failure.
+    /// This method is deliberately not exposed as a renderer command.
+    #[cfg(target_os = "ios")]
+    pub fn export_file(&self, url: String, filename: String) -> crate::Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct ExportResult {
+            saved: bool,
+        }
+        self.0
+            .run_mobile_plugin::<ExportResult>(
+                "exportFile",
+                serde_json::json!({ "url": url, "filename": filename }),
+            )
+            .map(|result| result.saved)
+            .map_err(Into::into)
+    }
+
     pub fn share_text(
         &self,
         _window: WebviewWindow<R>,

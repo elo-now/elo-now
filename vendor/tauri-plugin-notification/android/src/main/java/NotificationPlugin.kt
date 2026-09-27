@@ -77,7 +77,6 @@ class RemoveActiveArgs {
   ]
 )
 class NotificationPlugin(private val activity: Activity): Plugin(activity) {
-  private var webView: WebView? = null
   private lateinit var manager: TauriNotificationManager
   private lateinit var notificationManager: NotificationManager
   private lateinit var notificationStorage: NotificationStorage
@@ -95,7 +94,6 @@ class NotificationPlugin(private val activity: Activity): Plugin(activity) {
     instance = this
 
     super.load(webView)
-    this.webView = webView
     notificationStorage = NotificationStorage(activity, jsonMapper())
     
     val manager = TauriNotificationManager(

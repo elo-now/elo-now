@@ -8,7 +8,7 @@ import {
   useEffect,
   useLayoutEffect,
   type ReactNode,
-  type FormEvent,
+  type InvalidEvent,
   type RefObject,
 } from "react";
 import { errorText, t } from "./i18n";
@@ -41,7 +41,7 @@ export function useToastHost(ref: RefObject<HTMLElement | null>) {
 export function useToast() {
   const { showError, showNotice, showMessage, clearMessages } =
     useContext(ToastContext);
-  const onInvalid = (event: FormEvent<HTMLFormElement>) => {
+  const onInvalid = (event: InvalidEvent<HTMLFormElement>) => {
     // Keep native constraint checks and focus behavior, but suppress their bubbles.
     event.preventDefault();
     const field = event.target as HTMLInputElement;

@@ -1,4 +1,29 @@
 import { messageLogicalTime, type Stream } from "./model";
+
+/** A resumed WebView may retain an older page after native sync already saved
+ * the message. Refresh local history even if the next server pass has no delta. */
+export function watchHistoryResume(refresh: () => void) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const resume = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    if (document.visibilityState !== "visible") return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (document.visibilityState === "visible") refresh();
+    }, 0);
+  };
+  document.addEventListener("visibilitychange", resume);
+  window.addEventListener("pageshow", resume);
+  window.addEventListener("focus", resume);
+  return () => {
+    clearTimeout(timer);
+    document.removeEventListener("visibilitychange", resume);
+    window.removeEventListener("pageshow", resume);
+    window.removeEventListener("focus", resume);
+  };
+}
+
 export type HistoryPage = {
   identity: string;
   space_context?: string | null;

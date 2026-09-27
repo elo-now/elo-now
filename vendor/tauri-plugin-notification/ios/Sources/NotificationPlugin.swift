@@ -257,9 +257,8 @@ class NotificationPlugin: Plugin {
       invoke.resolve()
     } catch {
       UNUserNotificationCenter.current().removeAllDeliveredNotifications()
-      DispatchQueue.main.async(execute: {
-        UIApplication.shared.applicationIconBadgeNumber = 0
-      })
+      UNUserNotificationCenter.current().setBadgeCount(0, withCompletionHandler: nil)
+
       invoke.resolve()
     }
   }

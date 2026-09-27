@@ -26,8 +26,35 @@ struct ShareFileOptions: Decodable {
 
 class SharePlugin: Plugin {
   var webview: WKWebView!
+  private var fileExporter: FileExporter?
   public override func load(webview: WKWebView) {
     self.webview = webview
+  }
+
+  @objc func exportFile(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(ExportFileOptions.self)
+    DispatchQueue.main.async {
+      guard let source = URL(string: args.url), source.isFileURL,
+            !args.filename.isEmpty, args.filename != ".", args.filename != "..",
+            !args.filename.contains("/"), !args.filename.contains("\\"),
+            self.fileExporter == nil,
+            let presenter = self.manager.viewController,
+            presenter.viewIfLoaded?.window?.windowScene?.activationState == .foregroundActive,
+            presenter.presentedViewController == nil else {
+        invoke.reject("file_export_failed")
+        return
+      }
+      do {
+        let exporter = try FileExporter(source: source, filename: args.filename) { [weak self] saved in
+          self?.fileExporter = nil
+          invoke.resolve(["saved": saved])
+        }
+        self.fileExporter = exporter
+        presenter.present(exporter.picker, animated: true)
+      } catch {
+        invoke.reject("file_export_failed")
+      }
+    }
   }
 
   @objc func shareText(_ invoke: Invoke) throws {
@@ -66,19 +93,18 @@ class SharePlugin: Plugin {
     
     DispatchQueue.main.async {
       // Convert URL string to URL object
-      guard let fileUrl = URL(string: args.url) else {
-        invoke.reject("Invalid file URL")
+      guard let fileUrl = URL(string: args.url), fileUrl.isFileURL,
+            let presenter = self.manager.viewController,
+            presenter.viewIfLoaded?.window?.windowScene?.activationState == .foregroundActive,
+            presenter.presentedViewController == nil else {
+        invoke.reject("file_export_failed")
         return
       }
 
-      let fileManager = FileManager.default
-      let tempDirectory = fileManager.temporaryDirectory
-      let tempPath = tempDirectory.path + "/" + fileUrl.lastPathComponent
-      let tempURL = URL(fileURLWithPath: tempPath)
-      try? fileManager.copyItem(atPath:fileUrl.path , toPath: tempPath)
+      // The native caller retains this private file until completion. Avoid
+      // leaving another plaintext copy in the root of the app's temp folder.
+      let activityItems: [Any] = [fileUrl]
 
-      var activityItems: [Any] = [tempURL]
-      
       let activityViewController = UIActivityViewController(
         activityItems: activityItems,
         applicationActivities: nil
@@ -105,7 +131,7 @@ class SharePlugin: Plugin {
         }
       }
 
-      self.manager.viewController?.present(activityViewController, animated: true, completion: nil)
+      presenter.present(activityViewController, animated: true, completion: nil)
     }
   }
 }

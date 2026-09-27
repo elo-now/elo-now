@@ -2,6 +2,7 @@
 //! Discovery uses existing configured mailboxes; access still requires the normal
 //! signed request, controller review and explicit Join. No public directory exists.
 use super::*;
+use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -723,22 +724,42 @@ impl ClientApp {
         let mut known = self.known_people()?;
         let own = self.session.identity_id();
         let time = now()?.as_millis() as u64;
-        let mut fetched = 0;
-        for object in page.entries {
+        let downloadable = |object: &crate::replica::InventoryEntry| {
+            object.transfer_hint == crate::replica::TransferHint::Lazy
+                && object.size_bytes <= (MAX_PACKET + 64 * 1024) as u64
+        };
+        let entries = page.entries.into_iter().scan(0, |fetched, object| {
+            if downloadable(&object) {
+                if *fetched >= 8 {
+                    return None;
+                }
+                *fetched += 1;
+            }
+            Some(object)
+        });
+        // Overlap only transport, with at most two bounded ciphertexts in memory.
+        // Ordered results preserve membership/revocation dependencies and never
+        // advance the cursor past a failed or unfinished download.
+        let downloads = stream::iter(entries.map(|object| async move {
+            let bytes = if downloadable(&object) {
+                Some(if tokio::time::Instant::now() >= deadline {
+                    Ok(None)
+                } else {
+                    discovery_request(deadline, peer.get(object.object_id, object.size_bytes)).await
+                })
+            } else {
+                None
+            };
+            (object, bytes)
+        }))
+        .buffered(2);
+        futures_util::pin_mut!(downloads);
+        while let Some((object, bytes)) = downloads.next().await {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            if object.transfer_hint == crate::replica::TransferHint::Lazy
-                && object.size_bytes <= (MAX_PACKET + 64 * 1024) as u64
-            {
-                if fetched >= 8 {
-                    break;
-                }
-                fetched += 1;
-                let Some(bytes) =
-                    discovery_request(deadline, peer.get(object.object_id, object.size_bytes))
-                        .await?
-                else {
+            if let Some(bytes) = bytes {
+                let Some(bytes) = bytes? else {
                     return Ok(true);
                 };
                 // Ordinary chat objects and envelopes addressed to other devices

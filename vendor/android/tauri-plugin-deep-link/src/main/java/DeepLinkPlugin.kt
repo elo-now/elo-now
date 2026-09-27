@@ -40,8 +40,7 @@ class PluginConfig {
 @TauriPlugin
 class DeepLinkPlugin(private val activity: Activity): Plugin(activity) {
     //private val implementation = Example()
-    private var webView: WebView? = null
-    private var currentUrl: String? = null
+      private var currentUrl: String? = null
     private var channel: Channel? = null
     private var config: PluginConfig? = null
     companion object {
@@ -73,7 +72,6 @@ class DeepLinkPlugin(private val activity: Activity): Plugin(activity) {
         config = getConfig(PluginConfig::class.java)
 
         super.load(webView)
-        this.webView = webView
 
         val intent = activity.intent
 
@@ -103,7 +101,7 @@ class DeepLinkPlugin(private val activity: Activity): Plugin(activity) {
 
     private fun isDeepLink(url: String): Boolean {
         val config = this.config ?: return false
-        
+
         if (config.mobile.isEmpty()) {
             return false
         }
@@ -159,7 +157,7 @@ class DeepLinkPlugin(private val activity: Activity): Plugin(activity) {
                     path.endsWith(suffix)
                 } -> true
                 // If no path constraints, any path is allowed
-                domain.path.isEmpty() && domain.pathPattern.isEmpty() && 
+                domain.path.isEmpty() && domain.pathPattern.isEmpty() &&
                 domain.pathPrefix.isEmpty() && domain.pathSuffix.isEmpty() -> true
                 else -> false
             }

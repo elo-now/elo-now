@@ -7,7 +7,6 @@ import java.nio.file.LinkOption
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("rust")
 }
 
@@ -63,7 +62,9 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "now.elo"
-        minSdk = 24
+        minSdk = 27
+        // Target 37 changes background audio/LAN access and large-screen
+        // orientation policy; migrate those behaviors together, not to silence Lint.
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
@@ -111,6 +112,7 @@ android {
         getByName("release") {
             signingConfig = signingConfigs.findByName("teamRelease")
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
@@ -121,9 +123,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
-    }
-    kotlin {
-        compilerOptions { jvmTarget = JvmTarget.JVM_11 }
     }
     buildFeatures {
         buildConfig = true
@@ -149,3 +148,7 @@ dependencies {
 }
 
 apply(from = file("tauri.build.gradle.kts"))
+
+kotlin {
+    compilerOptions { jvmTarget = JvmTarget.JVM_11 }
+}

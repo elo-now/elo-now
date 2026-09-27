@@ -4,7 +4,6 @@ import android.app.*
 import android.content.*
 import android.net.Uri
 import android.os.*
-import android.telecom.*
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import org.json.JSONObject
@@ -16,7 +15,6 @@ object IncomingCalls {
     fun prefs(c: Context) = c.getSharedPreferences("elo-push", Context.MODE_PRIVATE)
     fun current(c: Context): JSONObject? = try { JSONObject(prefs(c).getString("call", "") ?: "") } catch (_: Exception) { null }
     fun label(c: Context, key: String) = prefs(c).getString("call-label-$key", "elo.now") ?: "elo.now"
-    fun account(c: Context) = PhoneAccountHandle(ComponentName(c, EloConnectionService::class.java), "elo-calls")
     fun save(c: Context, call: JSONObject) { prefs(c).edit().putString("call",call.toString()).commit() }
     fun receive(c: Context, data: Map<String,String>) {
         val p=prefs(c)
@@ -33,19 +31,14 @@ object IncomingCalls {
         val call=JSONObject().put("id",id).put("target",target).put("expires",expires).put("ticket",ticket)
             .put("registration",data["elo_registration"]).put("action","ring").put("connected",false)
         save(c,call)
-        try {
-            val telecom=c.getSystemService(TelecomManager::class.java)
-            telecom.registerPhoneAccount(PhoneAccount.builder(account(c),"elo.now").setCapabilities(PhoneAccount.CAPABILITY_SELF_MANAGED).build())
-            telecom.addNewIncomingCall(account(c),Bundle())
-        } catch (_: Exception) { finish(c,id) }
+        TelecomCalls.incoming(c, id)
     }
     fun finish(c: Context,id: String) {
         if (current(c)?.optString("id")!=id) return
         prefs(c).edit().remove("call").putString("call-last",id).commit()
         c.getSystemService(NotificationManager::class.java).cancel(71002)
         c.stopService(Intent(c,IncomingCallService::class.java))
-        EloConnectionService.connection?.let { it.setDisconnected(DisconnectCause(DisconnectCause.LOCAL)); it.destroy() }
-        EloConnectionService.connection=null
+        TelecomCalls.end(c, id)
     }
     fun event(c:Context, call:JSONObject, action:String, muted:Boolean?=null) {
         val value=JSONObject(call.toString()).put("action",action).put("event",java.util.UUID.randomUUID().toString())
@@ -81,50 +74,11 @@ object IncomingCalls {
     fun connected(c: Context,id: String) {
         val call=current(c)?.takeIf { it.optString("id")==id } ?: return
         call.put("connected",true).put("action","connected");save(c,call)
-        EloConnectionService.connection?.setActive()
+        TelecomCalls.connected(c, id)
         refresh(c)
     }
     fun silence(c:Context) {
         current(c)?.let { call -> call.put("silenced",true);save(c,call);refresh(c) }
-    }
-}
-
-class EloConnectionService: ConnectionService() {
-    companion object { var connection: Connection?=null }
-    override fun onCreateIncomingConnection(manager: PhoneAccountHandle?, request: ConnectionRequest?): Connection {
-        val call=IncomingCalls.current(this) ?: return Connection.createFailedConnection(DisconnectCause(DisconnectCause.ERROR))
-        val id=call.optString("id")
-        val result=object:Connection() {
-            private var lastMuted=false
-            override fun onShowIncomingCallUi() {
-                val intent=Intent(this@EloConnectionService,IncomingCallService::class.java)
-                if(Build.VERSION.SDK_INT>=26) startForegroundService(intent) else startService(intent)
-            }
-            override fun onReject() { IncomingCalls.reject(this@EloConnectionService,id) }
-            override fun onDisconnect() { IncomingCalls.reject(this@EloConnectionService,id) }
-            override fun onAnswer() { IncomingCalls.open(this@EloConnectionService,id) }
-            override fun onAnswer(videoState:Int) { onAnswer() }
-            override fun onSilence() { IncomingCalls.silence(this@EloConnectionService) }
-            override fun onCallAudioStateChanged(state:CallAudioState) {
-                if(lastMuted==state.isMuted) return
-                lastMuted=state.isMuted
-                IncomingCalls.current(this@EloConnectionService)?.takeIf { it.optBoolean("connected") }?.let {
-                    IncomingCalls.event(this@EloConnectionService,it,"mute",state.isMuted)
-                }
-            }
-        }
-        result.connectionProperties=Connection.PROPERTY_SELF_MANAGED
-        result.setAudioModeIsVoip(true)
-        result.setCallerDisplayName("elo.now",TelecomManager.PRESENTATION_ALLOWED)
-        result.setRinging();connection=result
-        return result
-    }
-    override fun onCreateIncomingConnectionFailed(manager:PhoneAccountHandle?,request:ConnectionRequest?) {
-        IncomingCalls.current(this)?.optString("id")?.let { IncomingCalls.finish(this,it) }
-    }
-    override fun onConnectionServiceFocusLost() {
-        IncomingCalls.silence(this)
-        connectionServiceFocusReleased()
     }
 }
 
@@ -220,8 +174,8 @@ class IncomingCallActivity:Activity() {
     override fun onCreate(saved:Bundle?) {
         super.onCreate(saved)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        if(Build.VERSION.SDK_INT>=27) { setShowWhenLocked(true);setTurnScreenOn(true) }
-        else window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
         val call=IncomingCalls.current(this) ?: run { finish();return }
         val id=call.optString("id")
         setContentView(incomingCallScreen(

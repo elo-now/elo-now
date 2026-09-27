@@ -46,7 +46,7 @@ import WebRTC
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
         do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
         } catch { peer.close(); throw MediaError.unavailable }
         audio = Self.factory.audioTrack(with: Self.factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)), trackId: "microphone")
         audio?.isEnabled = false
@@ -183,7 +183,9 @@ import WebRTC
             for candidate in pending { try await add(candidate) }
             if !answering {
                 if channels.isEmpty {
-                    channels = pc.transceivers.filter { $0.mid != nil }
+                    // WebRTC documents nil before negotiation, but its header marks mid
+                    // nonnull. Read the Objective-C value without forcing a Swift String.
+                    channels = pc.transceivers.filter { $0.value(forKey: "mid") is String }
                     guard channels.count == 3, channels.map({ $0.mediaType }) == [.audio, .video, .video] else { throw MediaError.invalid }
                     for channel in channels {
                         var error: NSError?

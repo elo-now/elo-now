@@ -7,7 +7,13 @@ import WebRTC
 import Tauri
 
 /// No profile key or message plaintext is accessible from this native ring path.
-final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate, URLSessionTaskDelegate {
+private final class CallRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate {
     static let shared = IncomingCalls()
     private let prefs = UserDefaults.standard
     private var registry: PKPushRegistry?
@@ -32,8 +38,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
         RTCAudioSession.sharedInstance().isAudioEnabled = false
         RTCAudioSession.sharedInstance().audioSessionDidDeactivate(audioSession)
     }
-    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: CallRedirectPolicy(), delegateQueue: nil)
     private func event(_ call:[String:Any], action:String, muted:Bool? = nil) {
         var value=call;value["action"]=action;value["event"]=UUID().uuidString
         if let muted=muted { value["muted"]=muted }
@@ -214,7 +219,7 @@ final class IncomingCalls: NSObject, PKPushRegistryDelegate, CXProviderDelegate,
     func provider(_ provider:CXProvider,perform action:CXAnswerCallAction) {
         guard var call=pending,call["uuid"] as? String == action.callUUID.uuidString else { action.fail();return }
         if call["connected"] as? Bool == true { action.fulfill();return }
-        do { try AVAudioSession.sharedInstance().setCategory(.playAndRecord,mode:.voiceChat,options:[.allowBluetooth,.defaultToSpeaker]) }
+        do { try AVAudioSession.sharedInstance().setCategory(.playAndRecord,mode:.voiceChat,options:[.allowBluetoothHFP,.defaultToSpeaker]) }
         catch { action.fail();return }
         call["action"]="answer";pending=call;answer=action
         // Rust can join using the in-memory unlocked session while WebKit is

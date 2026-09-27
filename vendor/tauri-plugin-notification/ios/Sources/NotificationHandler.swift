@@ -47,11 +47,7 @@ public class NotificationHandler: NSObject, NotificationHandlerProtocol {
       }
     }
 
-    return [
-      .badge,
-      .sound,
-      .alert,
-    ]
+    return [.badge, .sound, .banner, .list]
   }
 
   public func didReceive(response: UNNotificationResponse) {

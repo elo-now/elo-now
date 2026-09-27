@@ -5,6 +5,7 @@ import {
   mergeHistory,
   sameHistoryScope,
   preparedHistoryMatches,
+  watchHistoryResume,
   type HistoryPage,
 } from "./messageHistory";
 import { useToast } from "./Toast";
@@ -264,6 +265,9 @@ export function useMessageHistory(
       clearTimeout(timer);
     };
   }, [key, enabled, view?.revision]);
+  useEffect(() => {
+    if (enabled) return watchHistoryResume(() => void loader.current());
+  }, [key, enabled]);
   useEffect(() => {
     if (
       enabled &&

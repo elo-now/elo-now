@@ -1,8 +1,9 @@
 //! Desktop unread badges and synchronization while the main window is hidden.
 //! Only aggregate counts are retained here; read state belongs to the profile.
 use serde_json::{Value, json};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use std::collections::BTreeMap;
 use std::{
-    collections::BTreeMap,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,42 +12,7 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 
-#[derive(Default)]
-struct Counts {
-    identity: String,
-    streams: BTreeMap<(String, String, String), u64>,
-}
-
-impl Counts {
-    fn update(&mut self, view: &Value) -> Option<u64> {
-        let identity = view["identity"].as_str()?;
-        if identity != self.identity || view["partial"] != true {
-            self.streams.clear();
-            self.identity = identity.into();
-        }
-        // Use native unread summaries instead of only the loaded history page.
-        // Their projection already excludes blocked authors and expired locators.
-        let streams = view.get("all_streams").unwrap_or(&view["streams"]);
-        for stream in streams.as_array().into_iter().flatten() {
-            let key = (
-                stream["space_context"].as_str().unwrap_or("").into(),
-                stream["space"].as_str()?.into(),
-                stream["stream"].as_str()?.into(),
-            );
-            let count = if stream["muted"] == true {
-                0
-            } else {
-                stream["unread_count"].as_u64().unwrap_or(0)
-            };
-            self.streams.insert(key, count);
-        }
-        Some(
-            self.streams
-                .values()
-                .fold(0u64, |sum, n| sum.saturating_add(*n)),
-        )
-    }
-}
+use crate::notification_counts::Counts;
 
 #[derive(Default)]
 pub(crate) struct Activity {

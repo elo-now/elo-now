@@ -3,6 +3,7 @@ declare global {
     eloAppearance?: {
       setDarkMode(dark: boolean): void;
       getTextScale?(): number;
+      revealApp?(): void;
     };
   }
 }

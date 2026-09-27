@@ -876,11 +876,23 @@ async fn discovery_backlog_resumes_without_poll_delay_and_delivers_a_new_dm_once
     let path = dir.path().join("peer.json");
     vault::write_private(&path, &serde_json::to_vec(&descriptor).unwrap(), false).unwrap();
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    #[derive(Default)]
+    struct Downloads {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        started: Mutex<Vec<String>>,
+        completed: Mutex<Vec<String>>,
+        second_started: tokio::sync::Notify,
+        failed: AtomicBool,
+    }
     let armed = Arc::new(AtomicBool::new(false));
-    let reads = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(Downloads::default());
+    let first_object = ObjectId::of_ciphertext(&[0; 256]).to_string();
+    let second_object = ObjectId::of_ciphertext(&[1; 256]).to_string();
+    let failed_object = ObjectId::of_ciphertext(&[9; 256]).to_string();
     let fail_armed = armed.clone();
     let fail_reads = reads.clone();
     let router = elo_core::http::router(
@@ -891,13 +903,41 @@ async fn discovery_backlog_resumes_without_poll_delay_and_delivers_a_new_dm_once
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let armed = fail_armed.clone();
             let reads = fail_reads.clone();
+            let first_object = first_object.clone();
+            let second_object = second_object.clone();
+            let failed_object = failed_object.clone();
             async move {
                 if armed.load(Ordering::SeqCst)
                     && request.method() == axum::http::Method::GET
                     && request.uri().path().contains("/objects/")
-                    && reads.fetch_add(1, Ordering::SeqCst) == 9
                 {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    let object = request.uri().path().rsplit('/').next().unwrap().to_owned();
+                    reads.started.lock().unwrap().push(object.clone());
+                    let active = reads.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    reads.peak.fetch_max(active, Ordering::SeqCst);
+                    if object == first_object {
+                        // Serial fetching cannot release this request. The second
+                        // object must finish first, without skipping the first.
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            reads.second_started.notified(),
+                        )
+                        .await
+                        .expect("discovery must overlap two downloads");
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    }
+                    let response =
+                        if object == failed_object && !reads.failed.swap(true, Ordering::SeqCst) {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            next.run(request).await
+                        };
+                    reads.completed.lock().unwrap().push(object.clone());
+                    reads.active.fetch_sub(1, Ordering::SeqCst);
+                    if object == second_object {
+                        reads.second_started.notify_one();
+                    }
+                    return response;
                 }
                 next.run(request).await
             }
@@ -927,6 +967,21 @@ async fn discovery_backlog_resumes_without_poll_delay_and_delivers_a_new_dm_once
         .unwrap();
     assert_eq!(first["delivery"]["more"], true);
     assert_eq!(first["delivery"]["retry"], 0);
+    assert_eq!(
+        reads.started.lock().unwrap().len(),
+        8,
+        "keep the existing batch limit"
+    );
+    assert_eq!(
+        reads.peak.load(Ordering::SeqCst),
+        2,
+        "only two concurrent downloads"
+    );
+    assert_eq!(
+        reads.completed.lock().unwrap()[0],
+        ObjectId::of_ciphertext(&[1; 256]).to_string(),
+        "exercise completion out of inventory order"
+    );
     maya.close().await.unwrap();
     let mut maya = ClientApp::open(dir.path().join("Maya"), PASSWORD.into(), true)
         .await
@@ -956,6 +1011,17 @@ async fn discovery_backlog_resumes_without_poll_delay_and_delivers_a_new_dm_once
     assert!(
         partial_failure,
         "the injected failure must preserve committed progress"
+    );
+    assert_eq!(
+        reads
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| **id == ObjectId::of_ciphertext(&[9; 256]).to_string())
+            .count(),
+        2,
+        "a completed later download cannot advance the cursor past an earlier failure"
     );
     let view = maya.view().await.unwrap();
     assert_eq!(chat(&view, &created["stream"])["name"], "Alex");

@@ -155,6 +155,17 @@ object PluginManager {
     }
   }
 
+  fun onWebViewDestroyed() {
+    for (plugin in plugins.values) {
+      plugin.instance.onWebViewDestroyed()
+      plugin.loaded = false
+    }
+    // Pending results and permissions belonged to the terminated document.
+    requestPermissionsCallback = null
+    startActivityForResultCallback = null
+    startIntentSenderForResultCallback = null
+  }
+
   @JniMethod
   fun load(webView: WebView?, name: String, plugin: Plugin, config: String) {
     val handle = PluginHandle(this, name, plugin, config, jsonMapper)

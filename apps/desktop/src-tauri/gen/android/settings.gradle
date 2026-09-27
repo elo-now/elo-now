@@ -18,3 +18,13 @@ def cargoPackages = file("../../../../../Cargo.lock").text.split(/\[\[package\]\
     }
     project(":${module}").projectDir = file("../../../../../vendor/android/${crate}")
 }
+
+// Normalize Tauri's generated dependency script before Gradle compiles it.
+// Keep this reproducible when Cargo regenerates the file; no registry mutation.
+def generatedDependencies = file("app/tauri.build.gradle.kts")
+if (generatedDependencies.exists()) {
+    def original = generatedDependencies.text
+    def modern = original.replace("val implementation by configurations\n", "")
+        .replaceAll(/(?m)^  implementation\(/, '  add("implementation", ')
+    if (modern != original) generatedDependencies.text = modern
+}

@@ -59,6 +59,10 @@ import { MessageBubble, ThreadLink } from "./MessageBubble";
 import { UnavailableMessage } from "./UnavailableMessage";
 import { AttachmentButton, type AttachmentProgress } from "./AttachmentButton";
 import {
+  clearAttachmentPreviews,
+  loadAttachmentPreview,
+} from "./attachmentPreview";
+import {
   chatTimeline,
   findThread,
   replyRoot,
@@ -924,6 +928,9 @@ function App() {
       transferId: transfer.transferId,
     }).catch(reportError);
   };
+  useEffect(() => {
+    clearAttachmentPreviews();
+  }, [view?.identity, view?.credential]);
   const downloadAttachment = (row: MessageRow) => {
     if (downloadingAttachment) return;
     if (!stream) return;
@@ -958,12 +965,26 @@ function App() {
         });
         const filename =
           row.body.attachment?.name ?? row.body.filename ?? "attachment.bin";
-        if (await invoke<boolean>("save_export", { path: output, filename })) {
+        const preview = await loadAttachmentPreview(
+          {
+            expected_identity: view!.identity,
+            expected_space: view!.active_space!,
+            space: stream.space,
+            stream: stream.stream,
+            record: row.id,
+          },
+          true,
+        );
+        if (preview) {
+          await invoke("discard_exchange", { path: output });
+        } else if (
+          await invoke<boolean>("save_export", { path: output, filename })
+        ) {
           await invoke("discard_exchange", { path: output });
           notify(t("file.exportSaved"));
         } else {
-          // Closing the system picker cancels this download. The attachment
-          // remains in the conversation and can be downloaded again.
+          // Closing the system picker discards only this export. The encrypted
+          // local copy remains available for another attempt.
           await invoke("discard_exchange", { path: output });
         }
       } catch (error) {
@@ -984,11 +1005,17 @@ function App() {
   const refresh = () =>
     perform(async () => {
       // Keep a manual refresh bounded; the foreground worker drains the rest.
-      const result = await call({ op: "sync_live" });
-      requestSync(true);
-      setSyncSummary(
-        t("sync.summary", result.result as Record<string, number>),
-      );
+      try {
+        const result = await call({ op: "sync_live" });
+        requestSync(true);
+        setSyncSummary(
+          t("sync.summary", result.result as Record<string, number>),
+        );
+      } finally {
+        // A no-change or failed network pass must not leave already saved
+        // messages hidden behind an older local page.
+        if (visibleHistory.enabled) await visibleHistory.retry();
+      }
     });
   const openHome = (tab: "stream" | "chats" | "contacts") => {
     setCollection(null);
@@ -1213,11 +1240,22 @@ function App() {
         showMessage(
           t(invites ? "notifications.invitation" : "notifications.membership"),
           () => {
+            const destination = result.view?.spaces?.find(
+              (space) =>
+                space.status === "joined" &&
+                (space.activity ?? 0) >
+                  (view?.spaces?.find((old) => old.id === space.id)?.activity ??
+                    0),
+            );
+            void (async () => {
+              if (destination && destination.id !== view?.active_space)
+                await call({ op: "space_select", id: destination.id });
+              setInvitationRoute({ page, unscoped: true });
+            })().catch(reportError);
             setCollection(null);
             setNewChat(null);
             setMembersOpen(false);
             setSettingsOpen(false);
-            setInvitationRoute({ page, unscoped: true });
           },
         );
       }
@@ -1284,14 +1322,24 @@ function App() {
     busy,
     requestSync,
     receiveSync,
-    (entry, page) => {
+    async (entry, page, space, chat) => {
+      if ((page || chat) && space && space !== view?.active_space) {
+        await call({ op: "space_select", id: space });
+      }
       clearMessages();
       setCollection(null);
       setNewChat(null);
       setMembersOpen(false);
       setInvitationRoute(null);
       if (entry) return openStreamMessage(entry);
-      else if (page) {
+      else if (chat) {
+        openHome("chats");
+        setSelected(chat.stream);
+        setMessageQuery("");
+        setThreadRoot(undefined);
+        setMessageTarget(undefined);
+        setConversationOpen(true);
+      } else if (page) {
         setSettingsOpen(false);
         setInvitationRoute({ page, unscoped: true });
       } else openHome("chats");
@@ -2139,6 +2187,16 @@ function App() {
                         ) : (
                           <AttachmentButton
                             row={r}
+                            context={
+                              view.active_space && stream
+                                ? {
+                                    expected_identity: view.identity,
+                                    expected_space: view.active_space,
+                                    space: stream.space,
+                                    stream: stream.stream,
+                                  }
+                                : undefined
+                            }
                             disabled={busy}
                             expired={attachmentExpired}
                             download={
@@ -2184,22 +2242,10 @@ function App() {
                       awaitingDirect
                         ? t("dm.waiting")
                         : stream
-                          ? t("channel.historyStarts")
-                          : t("channel.welcome")
+                          ? t("channel.noMessages")
+                          : t("groups.empty")
                     }
-                  >
-                    <p
-                      className={
-                        stream
-                          ? "empty-state-help expert-only"
-                          : "empty-state-help"
-                      }
-                    >
-                      {stream
-                        ? t("channel.noPastHistory")
-                        : t("channel.emptyHelp")}
-                    </p>
-                  </EmptyState>
+                  />
                 )}
             </PullToRefresh>
             {mobile && messagesActive && (

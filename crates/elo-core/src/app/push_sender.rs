@@ -12,7 +12,12 @@ struct Proof {
     event: String,
     scope: String,
     target_hash: String,
+    #[serde(default = "message_category")]
+    category: String,
     expires: u64,
+}
+fn message_category() -> String {
+    "message".into()
 }
 pub fn sender_tag(route: &str, identity: IdentityId) -> String {
     let mut hash = Sha256::new();
@@ -62,6 +67,11 @@ pub fn verify_sender(route: &str, request: &Value, time: u64) -> Result<Sender> 
         || body.route != route
         || body.event != field(request, "event")?
         || body.scope != field(request, "scope")?
+        || body.category != request["category"].as_str().unwrap_or("message")
+        || !matches!(
+            body.category.as_str(),
+            "message" | "invitation" | "membership"
+        )
         || body.target_hash
             != record::encode_hex(&Sha256::digest(field(request, "target")?.as_bytes()))
         || body.expires < time
@@ -81,6 +91,7 @@ pub fn sign(session: &Session, route: &str, request: &mut Value) -> Result<()> {
         route: route.into(),
         event: field(request, "event")?.into(),
         scope: field(request, "scope")?.into(),
+        category: request["category"].as_str().unwrap_or("message").into(),
         target_hash: record::encode_hex(&Sha256::digest(field(request, "target")?.as_bytes())),
         expires: now()?.as_millis() as u64 / 1000 + 120,
     };
@@ -105,7 +116,7 @@ mod tests {
         let credential = verify_sender(&route, &body, time).unwrap().credential;
         assert_eq!(credential, session.credential().id());
         assert!(verify(&"d".repeat(32), &body, time).is_err());
-        for field in ["event", "scope", "target"] {
+        for field in ["event", "scope", "target", "category"] {
             let mut forged = body.clone();
             forged[field] = json!("changed");
             assert!(verify(&route, &forged, time).is_err());

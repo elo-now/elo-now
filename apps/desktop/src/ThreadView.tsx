@@ -197,9 +197,13 @@ export function ThreadView({
               {t("history.newer")}
             </button>
           )}
-          {historyReady && !hasOlder && !thread.replies.length && (
-            <EmptyState message={t("thread.empty")} />
-          )}
+          {historyReady &&
+            thread.root &&
+            !hasOlder &&
+            !hasNewer &&
+            !thread.replies.length && (
+              <EmptyState message={t("thread.empty")} />
+            )}
         </PullToRefresh>
       </div>
       <form
@@ -313,6 +317,10 @@ function ThreadMessage({
           ) : (
             <AttachmentButton
               row={row}
+              context={view.active_space ? {
+                expected_identity: view.identity, expected_space: view.active_space,
+                space: chat.space, stream: chat.stream,
+              } : undefined}
               disabled={busy}
               download={
                 downloadingAttachment === row.id

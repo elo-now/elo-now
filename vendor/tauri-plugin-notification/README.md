@@ -6,6 +6,11 @@
 > and keeps ordinary notification text visible when inboxLines is empty.
 > Android resolves permission requests immediately when permission is already granted,
 > so re-enabling notifications does not leave the caller waiting indefinitely.
+> Android reads scheduled notification extras through typed `IntentCompat`.
+> Android drops an unused WebView reference and uses an exhaustive schedule match.
+> iOS now requires 16.0 and uses banner/list presentation and the notification-center
+> badge API directly. The ignored, deprecated summaryArgument assignment is removed.
+> Its Swift Package manifest uses tools 5.9, which supports the iOS 16 platform declaration.
 > Swift regression coverage is in `ios/Tests`. Upstream license files are unchanged.
 
 ![plugin-notification](https://github.com/tauri-apps/plugins-workspace/raw/v2/plugins/notification/banner.png)

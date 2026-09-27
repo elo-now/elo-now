@@ -1,4 +1,9 @@
 {
+  "notifications.nativeMessage": "New messages",
+  "notifications.nativeInvitation": "New invitation",
+  "notifications.nativeActivity": "New activity",
+  "notifications.channelMessages": "Messages",
+  "notifications.channelInvitations": "Invitations",
   "calls.background": "Incoming calls in the background",
   "calls.backgroundHelp": "Ring when elo is closed. Unlock your profile to answer. Muted chats and blocked users stay silent.",
   "calls.unlockToAnswer": "Unlock your profile to answer.",

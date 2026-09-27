@@ -945,7 +945,11 @@ async fn attachment_download(
     };
     let stored = match storage.get(&id, &grant.object_id.to_string()).await {
         Ok(stored) => stored,
-        Err(_) => {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
             if let Ok(client) = space.client.try_lock()
                 && let Some(client) = client.as_ref()
             {
@@ -953,6 +957,9 @@ async fn attachment_download(
             }
             return StatusCode::NOT_FOUND.into_response();
         }
+        // A provider outage or timeout is not evidence that the object was
+        // deleted. Keep it available so the client can retry the download.
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if stored.size != grant.encrypted_size {
         let _ = storage.delete(&id, &grant.object_id.to_string()).await;
@@ -1804,6 +1811,36 @@ mod tests {
 
     #[tokio::test]
     async fn attachments_are_encrypted_outside_the_replica_and_round_trip() {
+        struct ReadOutageStorage {
+            inner: Arc<dyn AttachmentStorage>,
+            unavailable: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl AttachmentStorage for ReadOutageStorage {
+            async fn put(&self, space: &str, object: &str, body: Body, size: u64) -> Result<()> {
+                self.inner.put(space, object, body, size).await
+            }
+            async fn get(
+                &self,
+                space: &str,
+                object: &str,
+            ) -> Result<crate::attachments::StoredObject> {
+                if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Provider timeout",
+                    )
+                    .into());
+                }
+                self.inner.get(space, object).await
+            }
+            async fn delete(&self, space: &str, object: &str) -> Result<()> {
+                self.inner.delete(space, object).await
+            }
+            async fn delete_space(&self, space: &str) -> Result<()> {
+                self.inner.delete_space(space).await
+            }
+        }
         let temp = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1822,7 +1859,12 @@ mod tests {
                 root: external.clone(),
             }),
         };
-        let host = Host::open(config, true).await.unwrap();
+        let mut host = Host::open(config, true).await.unwrap();
+        let storage = Arc::new(ReadOutageStorage {
+            inner: host.attachment_storage.as_ref().unwrap().clone(),
+            unavailable: std::sync::atomic::AtomicBool::new(false),
+        });
+        Arc::get_mut(&mut host).unwrap().attachment_storage = Some(storage.clone());
         let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
         let mut owner = profile(&temp.path().join("owner")).await;
         let created = owner
@@ -2008,6 +2050,30 @@ mod tests {
                 .windows(content.len())
                 .any(|window| window == content)
         );
+        storage
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed_output = temp.path().join("unavailable-download.txt");
+        let error = owner
+            .operate(json!({
+                "op":"attachment_download", "space":general["space"], "stream":general["stream"],
+                "record":record, "output":failed_output
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Could not download this attachment")
+        );
+        assert!(
+            !failed_output.exists(),
+            "failed transfer must not publish a file"
+        );
+        storage
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // The same record must remain downloadable after a provider outage.
         let cancelled_output = temp.path().join("cancelled-download.txt");
         let cancellation = elo_core::app::AttachmentCancellation::default();
         let cancel_download = cancellation.clone();
@@ -2051,6 +2117,29 @@ mod tests {
         assert_eq!(std::fs::read(second_output).unwrap(), content);
         task.abort();
         let _ = task.await;
+        let cached_request = json!({"space":general["space"],"stream":general["stream"],"record":record,
+            "expected_identity":owner.identity_id(),"expected_space":owner.active_space_id()});
+        let local_output = temp.path().join("offline-cached.txt");
+        assert!(
+            owner
+                .cached_attachment(&cached_request, &local_output)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&local_output).unwrap(), content);
+        std::fs::remove_file(&local_output).unwrap();
+        for key in ["expected_identity", "expected_space", "record"] {
+            let mut wrong = cached_request.clone();
+            wrong[key] = json!("00".repeat(32));
+            assert!(
+                owner
+                    .cached_attachment(&wrong, &local_output)
+                    .await
+                    .is_err()
+            );
+            assert!(!local_output.exists());
+        }
         close_host(host).await;
     }
     #[tokio::test]

@@ -17,6 +17,7 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.UUID
 
 @InvokeArg
 class ShareTextOptions {
@@ -34,6 +35,21 @@ class ShareFileOptions {
 
 @TauriPlugin
 class SharePlugin(private val activity: Activity): Plugin(activity) {
+    // The receiving app may read after the chooser returns. Keep only these
+    // explicitly shared copies older than a day off disk on load/next share,
+    // without touching camera files.
+    private fun cleanSharedFiles() {
+        val cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+        File(activity.cacheDir, "elo-captures").listFiles()?.forEach { file ->
+            if (file.isDirectory && file.name.startsWith("elo-share-") && file.lastModified() < cutoff) {
+                file.deleteRecursively()
+            }
+        }
+    }
+
+    override fun load(webView: WebView) {
+        cleanSharedFiles()
+    }
     /**
      * Open the native sharing interface to share some text
      */
@@ -77,7 +93,8 @@ class SharePlugin(private val activity: Activity): Plugin(activity) {
         
         // The host app only grants FileProvider access to this private cache
         // directory. Copying to cacheDir itself cannot be shared on Android.
-        val shareDir = File(activity.cacheDir, "elo-captures")
+        cleanSharedFiles()
+        val shareDir = File(activity.cacheDir, "elo-captures/elo-share-${UUID.randomUUID()}")
         if (!shareDir.isDirectory && !shareDir.mkdirs()) {
             invoke.reject("Unable to prepare the share file")
             return

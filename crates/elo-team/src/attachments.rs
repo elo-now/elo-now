@@ -81,6 +81,7 @@ fn validate_segment(value: &str) -> Result<()> {
 
 struct MegaWebDavStorage {
     client: reqwest::Client,
+    download_client: reqwest::Client,
     base: String,
 }
 
@@ -103,6 +104,9 @@ impl MegaWebDavStorage {
                 .connect_timeout(std::time::Duration::from_secs(4))
                 .timeout(std::time::Duration::from_secs(90))
                 .build()?,
+            download_client: elo_core::attachments::download::client(
+                reqwest::Client::builder().no_proxy(),
+            )?,
             base: base_url.trim_end_matches('/').to_owned(),
         })
     }
@@ -163,12 +167,16 @@ impl AttachmentStorage for MegaWebDavStorage {
         validate_segment(space)?;
         validate_segment(object)?;
         let response = self
-            .client
+            .download_client
             .get(self.url(&format!("spaces/{space}/{object}")))
             .send()
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Err("Attachment object is missing.".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Attachment object is missing.",
+            )
+            .into());
         }
         if !response.status().is_success() {
             return Err(format!("MEGA WebDAV download failed ({})", response.status()).into());
@@ -303,6 +311,7 @@ impl AttachmentStorage for LocalStorage {
 
 struct S3CompatibleStorage {
     client: reqwest::Client,
+    download_client: reqwest::Client,
     endpoint: String,
     region: String,
     bucket: String,
@@ -338,6 +347,7 @@ impl S3CompatibleStorage {
                 .connect_timeout(std::time::Duration::from_secs(4))
                 .timeout(std::time::Duration::from_secs(90))
                 .build()?,
+            download_client: elo_core::attachments::download::client(reqwest::Client::builder())?,
             endpoint: endpoint.trim_end_matches('/').to_owned(),
             region: region.to_owned(),
             bucket: bucket.to_owned(),
@@ -403,8 +413,12 @@ impl S3CompatibleStorage {
             "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
             self.access_key, scope, signed_headers, signature
         );
-        Ok(self
-            .client
+        let client = if method == Method::GET {
+            &self.download_client
+        } else {
+            &self.client
+        };
+        Ok(client
             .request(method, url)
             .header(reqwest::header::HOST, host)
             .header("x-amz-content-sha256", payload)
@@ -446,7 +460,11 @@ impl AttachmentStorage for S3CompatibleStorage {
             .send()
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Err("Attachment object is missing.".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Attachment object is missing.",
+            )
+            .into());
         }
         if !response.status().is_success() {
             return Err(format!("S3-compatible download failed ({})", response.status()).into());
@@ -486,6 +504,38 @@ impl AttachmentStorage for S3CompatibleStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_outage_is_not_a_missing_attachment() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::from_u16(509).unwrap(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let storage =
+                MegaWebDavStorage::new(&format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().fallback(move || async move { status }),
+                )
+                .await
+                .unwrap();
+            });
+            let error = storage.get("11", "22").await.err().unwrap();
+            let missing = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            assert_eq!(
+                missing,
+                status == StatusCode::NOT_FOUND,
+                "provider status {status}"
+            );
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn webdav_waits_for_new_collection_and_never_treats_conflict_as_success() {

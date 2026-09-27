@@ -1228,7 +1228,7 @@ impl ClientApp {
                 let delivery = if live {
                     Value::Null
                 } else {
-                    self.sync_invitations(true, false).await?
+                    self.sync_invitations(true, false, false).await?
                 };
                 self.refresh_chat_devices().await?;
                 let sync = SyncClient {

@@ -50,6 +50,7 @@ export function ProfileGate({
 }) {
   const introFrame = useBrandIntro();
   const [environment, setEnvironment] = useState<Environment | null>(null);
+  const [environmentPending, setEnvironmentPending] = useState(true);
   const [existing, setExisting] = useState(false);
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
@@ -63,23 +64,29 @@ export function ProfileGate({
   useEffect(() => {
     let live = true;
     void invoke<Environment>("profile_environment")
-      .then(async (env) => {
+      .then((env) => {
+        if (!live) return;
+        setBiometric(null);
+        setEnvironment(env);
+        setExisting(env.has_profile);
         // Unbound legacy entries are never read. Failed cleanup must not block
         // password login (e.g. while the device keychain is unavailable).
-        if (env.mobile) await clearLegacyBiometricUnlock().catch(() => {});
-        if (live) {
-          setBiometric(null);
-          setEnvironment(env);
-          setExisting(env.has_profile);
-        }
+        if (env.mobile) void clearLegacyBiometricUnlock().catch(() => {});
       })
       .catch((e: unknown) => {
         if (live) reportError(e);
+      })
+      .finally(() => {
+        if (live) setEnvironmentPending(false);
       });
     return () => {
       live = false;
     };
   }, []);
+  useEffect(() => {
+    // Reveal the Android WebView only after the form (or startup error) is ready.
+    if (!environmentPending) window.eloAppearance?.revealApp?.();
+  }, [environmentPending]);
   useEffect(() => {
     setBiometric(null);
     if (!environment?.mobile || !environment.has_profile) return;
@@ -213,13 +220,14 @@ export function ProfileGate({
     <main className={`unlock${card ? " recovery" : ""}`}>
       <div className={card ? "unlock-brand" : "unlock-tools"}>
         {card && <Brand />}
-        {!pinAppearance && (card ? appearance : menu)}
+        {environment && !pinAppearance && (card ? appearance : menu)}
       </div>
       <UpdateBanner />
       <div
         className="unlock-content"
         data-credentials={!card}
-        data-registration={!existing && !card}
+        data-registration={!!environment && !existing && !card}
+        aria-busy={environmentPending}
       >
         {!card ? (
           <div className="unlock-logo">
@@ -234,138 +242,140 @@ export function ProfileGate({
             <RecoveryQr mobile={!!environment?.mobile} />
           </RecoveryCodePanel>
         )}
-        <form
-          aria-label={
-            unlocking
-              ? t("unlock.title")
-              : card
-                ? t("onboarding.recovery")
-                : t("onboarding.new")
-          }
-          onInvalid={onInvalid}
-          onSubmit={(event) => {
-            event.preventDefault();
-            void perform(async () => {
-              if (existing || card) {
-                await open();
-                return;
-              }
-              setName(checkedProfileName(name));
-              if (password !== repeat) throw t("onboarding.passwordMismatch");
-              setCard(await invoke<Card>("prepare_profile"));
-            });
-          }}
-        >
-          {unlocking && needsLegalNotice && <LegalNotice unlocking />}
-          {unlocking && environment?.mobile && biometric?.enabled && (
-            <>
-              <button
-                className="biometric-unlock"
-                type="button"
-                disabled={busy}
-                onClick={() => void unlockWithBiometrics()}
-              >
-                {t("biometric.unlockWith", {
-                  name: biometricName(biometric.type),
-                })}
-              </button>
-              <div className="auth-divider">{t("biometric.orPassword")}</div>
-            </>
-          )}
-          {card && (
-            <>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={acknowledged}
-                  onChange={(e) => setAcknowledged(e.target.checked)}
-                />
-                {t("onboarding.confirm")}
-              </label>
-            </>
-          )}
-          {!card && (
-            <>
-              {!existing && (
-                <ProfileNameField value={name} onChange={setName} />
-              )}
-              <label>
-                {t("unlock.password")}
-                <PasswordInput
-                  required
-                  minLength={existing ? undefined : 12}
-                  maxLength={1024}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
-                />
-              </label>
-              {!existing && (
-                <>
-                  <small>{t("onboarding.passwordHelp")}</small>
-                  <label>
-                    {t("onboarding.confirmPassword")}
-                    <PasswordInput
-                      required
-                      minLength={12}
-                      maxLength={1024}
-                      value={repeat}
-                      onChange={(e) => setRepeat(e.target.value)}
-                      autoComplete="off"
-                    />
-                  </label>
-                </>
-              )}
-            </>
-          )}
-          {!existing && !card && (
-            <LegalNotice action={t("onboarding.create")} />
-          )}
-          <div className="auth-actions">
-            <button
-              disabled={busy || !environment || (!!card && !acknowledged)}
-            >
-              {busy
-                ? t("sync.busy")
+        {environment && (
+          <form
+            aria-label={
+              unlocking
+                ? t("unlock.title")
                 : card
-                  ? t("onboarding.finish")
-                  : existing
-                    ? t("unlock.open")
-                    : t("onboarding.create")}
-            </button>
-          </div>
-          <button
-            className="ghost"
-            type="button"
-            disabled={busy}
-            onClick={() =>
-              void perform(async () => {
-                if (card) {
-                  await invoke("cancel_profile");
-                  setCard(null);
-                  setAcknowledged(false);
-                } else if (
-                  environment?.mobile &&
-                  !environment.has_profile &&
-                  !existing
-                ) {
-                  setRecovering(true);
-                } else setExisting(!existing);
-                setPassword("");
-                setRepeat("");
-              })
+                  ? t("onboarding.recovery")
+                  : t("onboarding.new")
             }
+            onInvalid={onInvalid}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void perform(async () => {
+                if (existing || card) {
+                  await open();
+                  return;
+                }
+                setName(checkedProfileName(name));
+                if (password !== repeat) throw t("onboarding.passwordMismatch");
+                setCard(await invoke<Card>("prepare_profile"));
+              });
+            }}
           >
-            {card
-              ? t("onboarding.cancel")
-              : existing
-                ? t("onboarding.newPrompt")
-                : t("onboarding.existing")}
-          </button>
-        </form>
+            {unlocking && needsLegalNotice && <LegalNotice unlocking />}
+            {unlocking && environment?.mobile && biometric?.enabled && (
+              <>
+                <button
+                  className="biometric-unlock"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void unlockWithBiometrics()}
+                >
+                  {t("biometric.unlockWith", {
+                    name: biometricName(biometric.type),
+                  })}
+                </button>
+                <div className="auth-divider">{t("biometric.orPassword")}</div>
+              </>
+            )}
+            {card && (
+              <>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={acknowledged}
+                    onChange={(e) => setAcknowledged(e.target.checked)}
+                  />
+                  {t("onboarding.confirm")}
+                </label>
+              </>
+            )}
+            {!card && (
+              <>
+                {!existing && (
+                  <ProfileNameField value={name} onChange={setName} />
+                )}
+                <label>
+                  {t("unlock.password")}
+                  <PasswordInput
+                    required
+                    minLength={existing ? undefined : 12}
+                    maxLength={1024}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                  />
+                </label>
+                {!existing && (
+                  <>
+                    <small>{t("onboarding.passwordHelp")}</small>
+                    <label>
+                      {t("onboarding.confirmPassword")}
+                      <PasswordInput
+                        required
+                        minLength={12}
+                        maxLength={1024}
+                        value={repeat}
+                        onChange={(e) => setRepeat(e.target.value)}
+                        autoComplete="off"
+                      />
+                    </label>
+                  </>
+                )}
+              </>
+            )}
+            {!existing && !card && (
+              <LegalNotice action={t("onboarding.create")} />
+            )}
+            <div className="auth-actions">
+              <button
+                disabled={busy || !environment || (!!card && !acknowledged)}
+              >
+                {busy
+                  ? t("sync.busy")
+                  : card
+                    ? t("onboarding.finish")
+                    : existing
+                      ? t("unlock.open")
+                      : t("onboarding.create")}
+              </button>
+            </div>
+            <button
+              className="ghost"
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                void perform(async () => {
+                  if (card) {
+                    await invoke("cancel_profile");
+                    setCard(null);
+                    setAcknowledged(false);
+                  } else if (
+                    environment?.mobile &&
+                    !environment.has_profile &&
+                    !existing
+                  ) {
+                    setRecovering(true);
+                  } else setExisting(!existing);
+                  setPassword("");
+                  setRepeat("");
+                })
+              }
+            >
+              {card
+                ? t("onboarding.cancel")
+                : existing
+                  ? t("onboarding.newPrompt")
+                  : t("onboarding.existing")}
+            </button>
+          </form>
+        )}
       </div>
       {pinAppearance &&
         createPortal(

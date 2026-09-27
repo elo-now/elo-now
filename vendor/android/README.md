@@ -1,16 +1,28 @@
-# Android build compatibility patches
+# Android compatibility patches
 
 These Android modules are copied from the corresponding published crates. Original
 licenses are preserved. Rust and iOS continue using the upstream crates from Cargo.
-`kotlinOptions.jvmTarget` is migrated to `kotlin.compilerOptions.jvmTarget`;
+The modules use AGP's built-in Kotlin and public Android DSL, with top-level
+`kotlin.compilerOptions.jvmTarget` instead of `kotlinOptions.jvmTarget`;
 Java/Kotlin bytecode targets are aligned at JVM 11, as required by current AndroidX. AndroidX, Material, Jackson 2.x,
 CameraX and ML Kit dependencies are refreshed; the modules use the application
-minimum API 24 and compile API 37.0. No native runtime code is changed.
+minimum API 24 internally and compile API 37.0; the application requires API 27.
+Tauri's back-button fallback uses
+`OnBackPressedDispatcher`, keeping the callback temporarily disabled to avoid
+recursion and preserving the existing WebView history and listener behavior.
+Unused deprecated no-argument lifecycle hooks have been removed; all included
+plugins use the activity-aware callbacks. The barcode scanner uses CameraX's
+`ResolutionSelector` with the existing 1280×720 target, 16:9 preference and
+closest-higher-then-lower fallback. Camera framing and scan controls are unchanged.
+The plugin lifecycle also releases document-specific state after a WebView renderer
+crash and rebinds plugins to the replacement view. The scanner stops its camera
+and drops the dead WebView; stale camera-provider results cannot attach to a new
+document. Unused WebView references in the deep-link plugin are removed.
 
 `apps/desktop/src-tauri/gen/android/settings.gradle` selects these modules after
 Tauri generates its module list. It checks these versions against `Cargo.lock`
 and fails configuration if a crate update has not been reviewed here.
-Remove each override once its upstream Gradle script supports Kotlin 2.4. Do not
+Remove each override once upstream includes its build and API changes. Do not
 copy generated Gradle caches or build products into this directory.
 
 | Crate | Version | Source crate SHA-256 |

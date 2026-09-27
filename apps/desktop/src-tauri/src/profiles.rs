@@ -232,6 +232,13 @@ fn check_removable(path: &Path) -> Result<()> {
                         .parse::<elo_core::ids::SpaceId>()?;
                     check_files(&child.path(), false)?;
                 }
+            } else if name == "attachment-cache" {
+                elo_core::attachments::cache::removable_files(&entry.path())?;
+            } else if name == "attachment-transfers"
+                && entry.file_type()?.is_dir()
+                && std::fs::read_dir(entry.path())?.next().is_none()
+            {
+                // Completed transfers leave an empty private staging directory.
             } else if !entry.file_type()?.is_file()
                 || !(matches!(
                     name,
@@ -250,7 +257,7 @@ fn check_removable(path: &Path) -> Result<()> {
                         | "client.sqlite-shm"
                         | "client.sqlite-journal"
                         | ".elo-client.lock"
-                ) || (root && name == "spaces.age")
+                ) || (root && matches!(name, "spaces.age" | "push-preferences.json"))
                     || (!root && name == "space-vault-cache.age"))
             {
                 return Err(
@@ -265,22 +272,19 @@ fn check_removable(path: &Path) -> Result<()> {
 fn remove_profile_files(path: &Path) -> Result<()> {
     check_removable(path)?;
     // Validate the complete tree first; only application-owned files are removed.
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            for child in std::fs::read_dir(entry.path())? {
-                let child = child?;
-                for file in std::fs::read_dir(child.path())? {
-                    std::fs::remove_file(file?.path())?;
-                }
-                std::fs::remove_dir(child.path())?;
+    fn remove_validated(path: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                remove_validated(&entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
             }
-            std::fs::remove_dir(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
         }
+        std::fs::remove_dir(path)?;
+        Ok(())
     }
-    std::fs::remove_dir(path)?;
+    remove_validated(path)?;
     Ok(())
 }
 
@@ -926,7 +930,7 @@ async fn run(
             if op == "delete_account" {
                 crate::push::forget(app)?;
             } else {
-                crate::push::suspend(app).await?;
+                crate::push::suspend(app, Some(client)).await?;
             }
             let client = state.client.take().ok_or("The profile is locked")?;
             #[cfg(desktop)]
@@ -1068,6 +1072,11 @@ mod tests {
         std::fs::create_dir(&profile).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(profile.join("vault.age"), b"synthetic vault").unwrap();
+        std::fs::write(
+            profile.join("push-preferences.json"),
+            b"synthetic preferences",
+        )
+        .unwrap();
         std::fs::write(other.join("vault.age"), b"keep").unwrap();
         std::fs::write(profile.join("my-notes.txt"), b"keep").unwrap();
         assert!(remove_profile_files(&profile).is_err());
@@ -1110,6 +1119,14 @@ mod tests {
             assert!(child.join("vault.age").exists());
             std::fs::remove_file(link).unwrap();
         }
+        let cache = child.join("attachment-cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(
+            cache.join(format!("{}.ciphertext", "ab".repeat(32))),
+            b"cached ciphertext",
+        )
+        .unwrap();
+        std::fs::create_dir(child.join("attachment-transfers")).unwrap();
         remove_profile_files(&profile).unwrap();
         assert_eq!(std::fs::read(other.join("vault.age")).unwrap(), b"keep");
         assert!(!profile.exists());

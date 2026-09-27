@@ -21,6 +21,7 @@ import type { Calls } from "./calls/controller";
 import { scopeKey } from "./calls/types";
 import { t } from "./i18n";
 import { ProfileAvatar } from "./ProfileEditor";
+import { unreadStreamEntries } from "./streamFeed";
 
 type Props = {
   view: View;
@@ -147,6 +148,7 @@ export function DesktopSidebar({
     (space) => space.id === view.active_space,
   );
   const name = profileName(view) || t("profile.yourProfile");
+  const unreadMessages = unreadStreamEntries(view).length;
   const memberCount = new Set(
     view.streams.flatMap((chat) =>
       chat.members.map((member) => member.identity_id),
@@ -387,15 +389,16 @@ export function DesktopSidebar({
             type="button"
             className="desktop-nav-item"
             data-active={current === "stream" || undefined}
+            aria-label={
+              unreadMessages > 0
+                ? t("nav.streamNew", { count: unreadMessages })
+                : t("nav.stream")
+            }
             onClick={() => navigate(() => onHome("stream"))}
           >
-            <Icon
-              name="buzz"
-              attention={view.streams.some(
-                (chat) => (chat.unread_count ?? 0) > 0,
-              )}
-            />
+            <Icon name="buzz" attention={unreadMessages > 0} />
             <span className="desktop-nav-label">{t("nav.stream")}</span>
+            {unreadMessages > 0 && <NewIndicator />}
           </button>
           <button
             type="button"

@@ -149,6 +149,8 @@ struct Invitations {
     own_wake: Option<push::Route>,
     #[serde(default)]
     seen_notices: Vec<String>,
+    #[serde(default)]
+    seen_activity: Vec<String>,
 }
 fn packet_subjects(packet: &Packet) -> Result<Vec<IdentityId>> {
     Ok(match packet {
@@ -348,6 +350,7 @@ impl ClientApp {
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
+            || state.seen_activity.len() > 3 * MAX_ITEMS
         {
             return Err("Invalid invitation state.".into());
         }
@@ -414,6 +417,7 @@ impl ClientApp {
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
+            || state.seen_activity.len() > 3 * MAX_ITEMS
         {
             return Err("There are too many saved invitations. Remove an old entry first.".into());
         }
@@ -507,10 +511,34 @@ impl ClientApp {
             }
             "invitation_sync" => {
                 return self
-                    .sync_invitations(v["force"] == true, v["foreground"] == true)
+                    .sync_invitations(
+                        v["force"] == true,
+                        v["foreground"] == true,
+                        v["receive_only"] == true,
+                    )
                     .await;
             }
             "invitation_activity" => return self.invitation_activity(&state),
+            "invitation_activity_seen" => {
+                let ids: Vec<String> = serde_json::from_value(v["ids"].clone())?;
+                if ids.len() > 3 * MAX_ITEMS {
+                    return Err("Too many notifications.".into());
+                }
+                let available = self.invitation_attention(&state)?;
+                state.seen_activity.retain(|id| available.contains(id));
+                for id in ids {
+                    if (available.contains(&id) || self.joined_invitation_event(&id))
+                        && !state.seen_activity.contains(&id)
+                    {
+                        state.seen_activity.push(id);
+                    }
+                }
+                // Joined-chat receipts are handed to the native queue by this
+                // operation; they must not grow the saved attention journal.
+                let excess = state.seen_activity.len().saturating_sub(3 * MAX_ITEMS);
+                state.seen_activity.drain(..excess);
+                self.save_invitations(&state)?;
+            }
             "invitation_notifications_seen" => {
                 let ids: Vec<String> = serde_json::from_value(v["ids"].clone())?;
                 if ids.len() > MAX_ITEMS {

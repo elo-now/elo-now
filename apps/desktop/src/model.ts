@@ -147,7 +147,11 @@ export type View = {
   spaces?: SpaceSummary[];
   space_requests?: number;
   all_streams?: Stream[];
-  all_invitations?: { actionable: number; notifications: number };
+  all_invitations?: {
+    actionable: number;
+    notifications: number;
+    unseen?: number;
+  };
   all_reminders?: NonNullable<View["reminders"]>;
   /** Native operation order prevents an older sync response replacing a local edit. */
   revision?: number;
@@ -166,6 +170,7 @@ export type View = {
     responses: number;
     actionable?: number;
     notifications?: number;
+    unseen?: number;
   };
   demo_names?: Record<string, string>;
   groups?: ChatGroup[];

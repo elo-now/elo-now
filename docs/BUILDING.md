@@ -61,12 +61,35 @@ npm run tauri -- android init
 The Android project uses Gradle 9.8.0, AGP 9.4.1 and Kotlin 2.4.20 with JDK 17
 and Android SDK Platform 37.0 (`platforms;android-37.0`).
 Use the released API 37 baseline; do not adopt QPR preview SDKs for production builds.
-The application target remains API 36 and the minimum remains API 24.
+The application target remains API 36; the minimum is API 27 (Android 8.1).
+Target API 37 is a separate behavior migration: it changes background audio and
+local-network permissions and removes the large-screen orientation opt-out.
+Do not raise it solely to hide the `OldTargetApi` suggestion while preserving
+the current behavior is a release requirement.
+The iOS minimum is 16.0. Native incoming calls use stable Core-Telecom 1.0.1;
+the existing portrait layout and call notification controls are preserved.
 Android-only copies of Tauri modules under [vendor/android](../vendor/android/README.md)
 migrate the removed `kotlinOptions.jvmTarget` DSL to `compilerOptions`. Java and
-Kotlin target JVM 11 for current AndroidX; the application minimum remains API 24.
-External Kotlin and the legacy Android DSL are explicitly selected for these
-modules. Keep Firebase resource generation enabled (`buildFeatures.resValues`)
+Kotlin target JVM 11 for current AndroidX.
+All ten Android modules, including the application, use AGP's built-in Kotlin and public
+Android DSL. The root buildscript pins Kotlin 2.4.20; JVM 11 remains explicit.
+The local [Wry patch](../vendor/wry/ELO_PATCH.md) updates generated WebView APIs.
+Release builds enable both R8 and resource shrinking. Runtime-selected native
+ringtones and notification icons have explicit resource keep rules. Android 27+
+uses adaptive vector launcher icons; PNG store-art sources are not APK resources.
+`settings.gradle` normalizes Tauri's generated dependency script before evaluation
+to avoid Gradle's deprecated configuration property delegates.
+
+FCM registration uses Firebase Installation IDs on both mobile platforms:
+`register`/`unregister`, the registration callback, and HTTP v1 `message.fid`.
+The Android manifest and iOS Info.plist explicitly enable installation-ID mode.
+Obtaining an FID alone is insufficient: Messaging registration must succeed first.
+APNs VoIP delivery still uses the PushKit device token and App Attest ownership
+proof. Update the notification server and mobile builds together; the new sender
+does not fall back to deprecated FCM registration-token addressing.
+
+Do not restore the deprecated `android.builtInKotlin=false`, `android.newDsl=false`
+or `android.nonFinalResIds=false` compatibility settings. Keep Firebase resource generation enabled (`buildFeatures.resValues`)
 and apply the generated Tauri script through `file("tauri.build.gradle.kts")` to
 avoid the Android Lint Kotlin-script resolver crash. The vendored share plugin
 also includes its declared consumer ProGuard file. Keep `settings.gradle` and

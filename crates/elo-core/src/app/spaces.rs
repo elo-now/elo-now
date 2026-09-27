@@ -115,9 +115,15 @@ fn remove_child(path: &Path) -> Result<()> {
     check_directory(path)?;
     let files = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
     let mut empty_transfer_cache = None;
+    let mut attachment_cache = None;
     for file in &files {
         let name = file.file_name();
         let name = name.to_str().ok_or("Unexpected Space file.")?;
+        if name == "attachment-cache" {
+            let cached = crate::attachments::cache::removable_files(&file.path())?;
+            attachment_cache = Some((file.path(), cached));
+            continue;
+        }
         if name == "attachment-transfers"
             && file.file_type()?.is_dir()
             && std::fs::read_dir(file.path())?.next().is_none()
@@ -145,8 +151,16 @@ fn remove_child(path: &Path) -> Result<()> {
     if let Some(cache) = &empty_transfer_cache {
         std::fs::remove_dir(cache)?;
     }
+    if let Some((directory, files)) = &attachment_cache {
+        for file in files {
+            std::fs::remove_file(file)?;
+        }
+        std::fs::remove_dir(directory)?;
+    }
     for file in files {
-        if empty_transfer_cache.as_ref() != Some(&file.path()) {
+        if empty_transfer_cache.as_ref() != Some(&file.path())
+            && attachment_cache.as_ref().map(|(path, _)| path) != Some(&file.path())
+        {
             std::fs::remove_file(file.path())?;
         }
     }
@@ -765,6 +779,7 @@ impl Spaces {
         let mut reminders = Vec::new();
         let mut actionable = 0u64;
         let mut notifications = 0u64;
+        let mut unseen = 0u64;
         for e in self.catalog.entries.iter().filter(|e| e.status == "joined") {
             let data = if self.catalog.active.as_deref() == Some(&e.id) {
                 view.clone()
@@ -781,6 +796,7 @@ impl Spaces {
             let notices = data["invitations"]["notifications"].as_u64().unwrap_or(0);
             actionable += count;
             notifications += notices;
+            unseen += data["invitations"]["unseen"].as_u64().unwrap_or(0);
             if let Some(entries) = view["spaces"].as_array_mut()
                 && let Some(entry) = entries.iter_mut().find(|entry| entry["id"] == e.id)
             {
@@ -795,7 +811,8 @@ impl Spaces {
                 reminders.push(reminder);
             }
         }
-        view["all_invitations"] = json!({"actionable":actionable,"notifications":notifications});
+        view["all_invitations"] =
+            json!({"actionable":actionable,"notifications":notifications,"unseen":unseen});
         view["all_streams"] = json!(background);
         view["all_reminders"] = json!(reminders);
         Ok(view)
@@ -1703,9 +1720,40 @@ impl Spaces {
                 let mut reports = Vec::new();
                 let mut storage_full_spaces = Vec::new();
                 let live = v["op"] == "sync_live";
-                let foreground_discovery = op == "invitation_sync" && v["foreground"] == true;
+                // A notification can prioritize discovery in a locally joined
+                // Space. It cannot join a Space or supply a transport address.
+                let target_discovery = if op == "invitation_sync"
+                    && let Some(id) = v["target_space"].as_str()
+                {
+                    Some(
+                        self.catalog
+                            .entries
+                            .iter()
+                            .find(|entry| entry.id == id && entry.status == "joined")
+                            .cloned()
+                            .ok_or("Space unavailable.")?,
+                    )
+                } else {
+                    None
+                };
+                let receive_discovery = op == "invitation_sync" && v["receive_only"] == true;
+                if receive_discovery && target_discovery.is_none() {
+                    return Err("Space unavailable.".into());
+                }
+                let foreground_discovery = op == "invitation_sync"
+                    && (v["foreground"] == true || target_discovery.is_some());
                 let mut poll_retry = false;
-                let discovery_entry = if foreground_discovery && !self.catalog.entries.is_empty() {
+                let scoped_discovery = target_discovery.is_some();
+                let discovery_entry = if let Some(entry) = target_discovery {
+                    // A tapped invitation receives signed envelopes first. Host
+                    // status and outbound work stay on the regular sync worker;
+                    // this pass grants no fresh lease for sending messages.
+                    if !receive_discovery {
+                        poll_retry = self.poll_entry(root, entry.clone(), true).await?;
+                        self.save(root)?;
+                    }
+                    Some((entry.id, false))
+                } else if foreground_discovery && !self.catalog.entries.is_empty() {
                     let index = self.invitation_round % self.catalog.entries.len();
                     self.invitation_round = self.invitation_round.wrapping_add(1);
                     self.invitation_force |= v["force"] == true;
@@ -1719,9 +1767,12 @@ impl Spaces {
                 };
                 let mut v = v.clone();
                 if foreground_discovery {
-                    v["force"] = json!(self.invitation_force);
-                    if discovery_entry.as_ref().is_none_or(|(_, rest)| !rest) {
-                        self.invitation_force = false;
+                    v["foreground"] = json!(true);
+                    if !scoped_discovery {
+                        v["force"] = json!(self.invitation_force);
+                        if discovery_entry.as_ref().is_none_or(|(_, rest)| !rest) {
+                            self.invitation_force = false;
+                        }
                     }
                 }
                 let ids = self
@@ -1836,6 +1887,7 @@ impl Spaces {
                     "generation_changes",
                     "repaired",
                     "repair_downloaded",
+                    "repair_expired",
                     "repair_pending",
                 ]
                 .iter()
@@ -2062,6 +2114,17 @@ mod tests {
             b"user data"
         );
         std::fs::remove_file(cache.join("unexpected.txt")).unwrap();
+        let downloaded = space.join("attachment-cache");
+        std::fs::create_dir(&downloaded).unwrap();
+        std::fs::write(downloaded.join("unexpected.txt"), b"keep").unwrap();
+        assert!(remove_child(&space).is_err());
+        assert!(space.join("vault.age").exists());
+        std::fs::remove_file(downloaded.join("unexpected.txt")).unwrap();
+        std::fs::write(
+            downloaded.join(format!("{}.ciphertext", "ab".repeat(32))),
+            b"ciphertext",
+        )
+        .unwrap();
         remove_child(&space).unwrap();
         assert!(!space.exists());
     }
@@ -2349,6 +2412,95 @@ mod tests {
             previous = Some((name, retry.request_id.clone()));
         }
         user.spaces = Some(spaces);
+        user.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn notification_discovery_skips_other_spaces_and_requires_local_membership() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let mut user = profile(temp.path(), "notification").await;
+        user.enable_spaces().await.unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let router = axum::Router::new().fallback(move || {
+            let requests = requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<axum::http::StatusCode>().await
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let scope = team::TeamScope {
+            space: user.authorities.0[0].space(),
+            stream: user.authorities.0[0].stream(),
+            controller: user.authorities.0[0].controller().id(),
+            root: field(user.session.credential().record().body(), "root_public_key")
+                .unwrap()
+                .into(),
+        };
+        let spaces = user.spaces.as_mut().unwrap();
+        let joined = spaces.catalog.entries[0].clone();
+        let pending = "01".repeat(32);
+        spaces.catalog.entries.insert(
+            0,
+            Entry {
+                id: pending.clone(),
+                root: false,
+                status: "pending".into(),
+                address: Some(SpaceAddress {
+                    url: format!("http://{address}/spaces/{pending}/team/v1/spaces"),
+                    scope: scope.clone(),
+                    message_lifetime_seconds: 86_400,
+                }),
+                ..joined.clone()
+            },
+        );
+        // A targeted tap must not consume the normal background discovery round.
+        spaces.invitation_force = true;
+        let request = json!({
+            "op":"invitation_sync", "force":true,
+            "target_space":joined.id, "expected_identity":user.identity_id()
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3), user.operate(request.clone()))
+            .await
+            .expect("notification waited for an unrelated Space")
+            .unwrap();
+        assert_eq!(result["delivery"]["remaining_spaces"], false);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(user.spaces.as_ref().unwrap().invitation_round, 0);
+        assert!(user.spaces.as_ref().unwrap().invitation_force);
+        // Even this Space's stalled status endpoint must not delay receiving
+        // a tapped invitation. Normal discovery still refreshes that status.
+        user.spaces.as_mut().unwrap().catalog.entries[1].address = Some(SpaceAddress {
+            url: format!("http://{address}/spaces/{}/team/v1/spaces", scope.space),
+            scope,
+            message_lifetime_seconds: 86_400,
+        });
+        let mut receiving = request.clone();
+        receiving["receive_only"] = json!(true);
+        tokio::time::timeout(Duration::from_secs(1), user.operate(receiving.clone()))
+            .await
+            .expect("notification waited for host maintenance")
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        receiving.as_object_mut().unwrap().remove("target_space");
+        assert!(user.operate(receiving).await.is_err());
+        for id in [pending, "unknown-space".into()] {
+            let mut invalid = request.clone();
+            invalid["target_space"] = json!(id);
+            assert!(user.operate(invalid).await.is_err());
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let regular = user.operate(request).await.unwrap();
+        assert_eq!(regular["delivery"]["retry"], 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.abort();
         user.close().await.unwrap();
     }
     #[tokio::test]

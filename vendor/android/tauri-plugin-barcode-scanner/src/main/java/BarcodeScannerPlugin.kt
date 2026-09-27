@@ -25,6 +25,10 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.activity.result.ActivityResult
 import androidx.camera.core.Camera
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -69,7 +73,7 @@ class ScanOptions {
 )
 class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     ImageAnalysis.Analyzer {
-    private lateinit var webView: WebView
+    private var webView: WebView? = null
     private var previewView: PreviewView? = null
     private var cameraProviderFuture: ListenableFuture<ProcessCameraProvider>? = null
     private var cameraProvider: ProcessCameraProvider? = null
@@ -92,6 +96,17 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     override fun load(webView: WebView) {
         super.load(webView)
         this.webView = webView
+    }
+
+    override fun onWebViewDestroyed() {
+        // Stop the camera before detaching its hosting WebView.
+        destroy()
+        scanner?.close()
+        scanner = null
+        cameraProviderFuture = null
+        requestPermissionResponse = null
+        webView = null
+        super.onWebViewDestroyed()
     }
 
     private fun supportedFormats(): Map<String, Int> {
@@ -120,6 +135,7 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     private fun setupCamera(cameraDirection: String, windowed: Boolean) {
         activity
             .runOnUiThread {
+                val webView = this.webView ?: return@runOnUiThread
                 val previewView = PreviewView(activity)
                 previewView.layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -150,6 +166,7 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
                     {
                         try {
                             val cameraProvider = cameraProviderFuture.get()
+                            if (this.webView !== webView || this.previewView !== previewView) return@addListener
                             bindPreview(
                                 cameraProvider,
                                 if (cameraDirection == "front") CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
@@ -176,7 +193,10 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
                 preview.setSurfaceProvider(previewView?.surfaceProvider)
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(1280, 720))
+                    .setResolutionSelector(ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy(AspectRatio.RATIO_16_9, AspectRatioStrategy.FALLBACK_RULE_AUTO))
+                        .setResolutionStrategy(ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                        .build())
                     .build()
                 imageAnalysis.setAnalyzer(
                     ContextCompat.getMainExecutor(activity),
@@ -199,15 +219,12 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     private fun dismantleCamera() {
         activity
             .runOnUiThread {
-                if (cameraProvider != null) {
-                    cameraProvider?.unbindAll()
-                    val parent = webView.parent as ViewGroup
-                    parent.removeView(previewView)
-                    parent.removeView(graphicOverlay)
-                    camera = null
-                    previewView = null
-                    graphicOverlay = null
-                }
+                cameraProvider?.unbindAll()
+                (previewView?.parent as? ViewGroup)?.removeView(previewView)
+                (graphicOverlay?.parent as? ViewGroup)?.removeView(graphicOverlay)
+                camera = null
+                previewView = null
+                graphicOverlay = null
             }
     }
 
@@ -230,7 +247,8 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     private fun destroy() {
         dismantleCamera()
         savedInvoke = null
-        if (windowed) {
+        val webView = this.webView
+        if (windowed && webView != null) {
             if (webViewBackground != null) {
                 webView.background = webViewBackground
                 webViewBackground = null
@@ -240,12 +258,14 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
         }
     }
 
-    @Suppress("DEPRECATION")
     private fun configureCamera(formats: List<Int>) {
         activity
             .runOnUiThread {
-                val vibrator =
-                    activity.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                val vibrator = if (Build.VERSION.SDK_INT >= 31) {
+                    activity.getSystemService(android.os.VibratorManager::class.java).defaultVibrator
+                } else {
+                    activity.getSystemService(Vibrator::class.java)
+                }
                 this.vibrator = vibrator
                 if (previewView == null) {
                     throw Exception("Something went wrong configuring the BarcodeScanner")

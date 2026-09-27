@@ -359,6 +359,7 @@ impl ClientApp {
         recipient: &str,
         event: &str,
         membership: bool,
+        chat: Option<InvitationChat>,
         deadline: tokio::time::Instant,
     ) -> Result<bool> {
         let time = now()?.as_millis() as u64;
@@ -383,8 +384,9 @@ impl ClientApp {
                     "invitation"
                 }
                 .into(),
-                space: None,
+                space: self.call_host.as_ref().map(|host| host.scope.space),
                 stream: None,
+                chat: chat.clone(),
                 record: None,
                 thread: None,
                 expires: time + 86_400_000,
@@ -438,7 +440,7 @@ impl ClientApp {
                     scopes.insert(field(value, "scope")?.to_owned(), value.clone());
                 }
             }
-            scopes.insert(scope(route, None)?, json!({"scope":scope(route,None)?,"enabled":true,"alert_once":false,"allow_unknown":true,"senders":introductions}));
+            scopes.insert(scope(route, None)?, json!({"scope":scope(route,None)?,"enabled":true,"alert_once":true,"allow_unknown":true,"senders":introductions}));
             return Ok(
                 json!({"introductions":true,"scopes":scopes.into_values().collect::<Vec<_>>(),"authenticated_senders":true,"blocked_senders":blocked}),
             );
@@ -506,7 +508,7 @@ impl ClientApp {
                     .map(|id| super::super::push_sender::credential_tag(&route.id, *id))
             })
             .collect();
-        scopes.push(json!({"scope":scope(route,None)?,"enabled":true,"alert_once":false,"allow_unknown":true,"senders":introductions}));
+        scopes.push(json!({"scope":scope(route,None)?,"enabled":true,"alert_once":true,"allow_unknown":true,"senders":introductions}));
         Ok(json!({"introductions":true,"scopes":scopes}))
     }
     /// Recipient-created call contexts stay encrypted until the profile unlocks.
@@ -542,6 +544,7 @@ impl ClientApp {
                     category: "call_context".into(),
                     space: Some(pin.space),
                     stream: Some(pin.stream),
+                    chat: None,
                     record: None,
                     thread: None,
                     expires: now()?.as_millis() as u64 + 30 * 86_400_000,
@@ -660,6 +663,52 @@ impl ClientApp {
     /// Produce opaque relay receipts only for messages already verified and
     /// marked read by a successful local operation, including connected Spaces.
     pub fn notification_read_receipts(&self, route: &Route, request: &Value) -> Result<Vec<Value>> {
+        if matches!(
+            request["op"].as_str(),
+            Some("invitation_activity_seen" | "invitation_notifications_seen")
+        ) {
+            let clients = self
+                .spaces
+                .as_ref()
+                .map(|spaces| spaces.clients(self))
+                .unwrap_or_else(|| vec![self]);
+            let mut receipts = Vec::new();
+            for client in clients {
+                let state = client.invitation_state()?;
+                let ids = request["ids"].as_array().ok_or("Invalid read receipt.")?;
+                for id in ids.iter().filter_map(Value::as_str) {
+                    let event = if request["op"] == "invitation_activity_seen" {
+                        state
+                            .seen_activity
+                            .contains(&id.to_owned())
+                            .then(|| id.to_owned())
+                    } else {
+                        if state.seen_notices.iter().any(|seen| seen == id) {
+                            id.strip_prefix("removed:")
+                                .and_then(|id| id.parse::<RecordId>().ok())
+                                .and_then(|id| {
+                                    client.authorities.0.iter().find_map(|a| {
+                                        a.config(id)
+                                            .ok()?
+                                            .previous_config_id
+                                            .map(|previous| format!("membership:{previous}"))
+                                    })
+                                })
+                        } else {
+                            state
+                                .responses
+                                .get(id)
+                                .filter(|r| r.seen && matches!(r.packet, Packet::Declined { .. }))
+                                .map(|_| format!("declined:{id}"))
+                        }
+                    };
+                    if let Some(event) = event {
+                        receipts.push(json!({"scope":scope(route,None)?,"event":keyed(route,"elo.notification.event.v1",&event)?}));
+                    }
+                }
+            }
+            return Ok(receipts);
+        }
         if let Some(spaces) = &self.spaces {
             for client in spaces.clients(self) {
                 if client.pins.iter().any(|p| {
@@ -730,7 +779,7 @@ impl ClientApp {
                 let mut complete=true;
                 for (route,credential,_) in routes.iter().filter(|(r,c,_)| c.identity()!=self.session.identity_id() && chat.audience.contains(&c.identity()) && r.since<=stored_at as u64) {
                     if !a.head()?.members.iter().any(|m|m.identity_id==credential.identity() && m.credential_ids.contains(&credential.id()) && m.capabilities.contains(&Capability::Read)) {continue;}
-                    let target=Target{v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,expires:time.as_millis() as u64+86_400_000};
+                    let target=Target{chat:None,v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,expires:time.as_millis() as u64+86_400_000};
                     let mut request=wake_request(route,Some((chat.space_id,chat.stream_id)),&id.to_string(),&target,&credential.recipient())?;
                     super::super::push_sender::sign(&self.session, &route.id, &mut request)?;
                     found=true;
@@ -760,9 +809,18 @@ struct Target {
     category: String,
     space: Option<SpaceId>,
     stream: Option<StreamId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat: Option<InvitationChat>,
     record: Option<RecordId>,
     thread: Option<RecordId>,
     expires: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InvitationChat {
+    pub space: SpaceId,
+    pub stream: StreamId,
+    pub invitation: RecordId,
 }
 pub fn scope(route: &Route, chat: Option<(SpaceId, StreamId)>) -> Result<String> {
     keyed(
@@ -794,7 +852,7 @@ fn wake_request(
         2048,
     )?;
     Ok(
-        json!({"event":keyed(route,"elo.notification.event.v1",event)?,"scope":scope(route,chat)?,"target":URL_SAFE_NO_PAD.encode(cipher)}),
+        json!({"event":keyed(route,"elo.notification.event.v1",event)?,"scope":scope(route,chat)?,"target":URL_SAFE_NO_PAD.encode(cipher),"category":target.category}),
     )
 }
 
@@ -984,6 +1042,7 @@ mod tests {
             category: "message".into(),
             space: Some(pin.space),
             stream: Some(pin.stream),
+            chat: None,
             record: Some(RecordId::from_bytes([5; 32])),
             thread: None,
             expires: now().unwrap().as_millis() as u64 + 60000,

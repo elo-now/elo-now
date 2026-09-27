@@ -332,6 +332,11 @@ impl ClientApp {
                         },
                         &recipient,
                     )?;
+                    // Existing members receive the configuration silently. Only
+                    // newly selected people receive an invitation alert.
+                    if people.contains(&next.credential(*credential)?.identity()) {
+                        self.queue_member_notification(&mut prepared, &id, &packet, &recipient)?;
+                    }
                     prepared
                         .jobs
                         .get_mut(&id)

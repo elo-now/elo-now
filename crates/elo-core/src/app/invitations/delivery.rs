@@ -60,6 +60,10 @@ struct NotificationJob {
     expires: u64,
     next: u64,
     membership: bool,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    chat: Option<push::InvitationChat>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +83,26 @@ struct Report {
     progressed: bool,
 }
 
+pub(super) fn notification_event(packet: &Packet) -> Result<Option<String>> {
+    Ok(match packet {
+        Packet::Invitation { bundle }
+        | Packet::Direct { bundle, .. }
+        | Packet::Members { bundle, .. } => Some(format!(
+            "invitation:{}",
+            decode_record(&bundle.invitation)?.id()
+        )),
+        Packet::Request { request, .. } => {
+            Some(format!("request:{}", decode_record(request)?.id()))
+        }
+        Packet::Grant { reference, .. } => Some(format!("approved:{reference}")),
+        Packet::Declined { reference, .. } => Some(format!("declined:{reference}")),
+        Packet::MembershipChange { bundle, .. } => {
+            let offer: shared::Offer = decode_record(&bundle.invitation)?.decode()?;
+            Some(format!("membership:{}", offer.base_config_id))
+        }
+        _ => None,
+    })
+}
 fn inbox(parent: PeerDescriptor, expires_at: u64, quota_bytes: u64) -> Result<Inbox> {
     // Do not duplicate a parent's private read capability in the exchange state.
     let parent = PeerDescriptor {
@@ -175,7 +199,12 @@ impl ClientApp {
                         recipient: recipient.to_string(),
                         expires: now()?.as_millis() as u64 + 86_400_000,
                         next: 0,
-                        membership: matches!(packet, Packet::MembershipChange { .. }),
+                        membership: matches!(
+                            packet,
+                            Packet::MembershipChange { .. } | Packet::Declined { .. }
+                        ),
+                        event: notification_event(packet)?,
+                        chat: None,
                     })
                 } else {
                     None
@@ -188,6 +217,34 @@ impl ClientApp {
                 discovery: false,
             },
         );
+        Ok(())
+    }
+    pub(super) fn queue_member_notification(
+        &self,
+        state: &mut Invitations,
+        id: &str,
+        packet: &Packet,
+        recipient: &age::x25519::Recipient,
+    ) -> Result<()> {
+        let Packet::Members { bundle, .. } = packet else {
+            return Err("Expected a membership invitation.".into());
+        };
+        state
+            .jobs
+            .get_mut(id)
+            .ok_or("Missing membership delivery.")?
+            .notification = Some(NotificationJob {
+            recipient: recipient.to_string(),
+            expires: now()?.as_millis() as u64 + 86_400_000,
+            next: 0,
+            membership: false,
+            event: notification_event(packet)?,
+            chat: Some(push::InvitationChat {
+                space: bundle.space,
+                stream: bundle.stream,
+                invitation: decode_record(&bundle.invitation)?.id(),
+            }),
+        });
         Ok(())
     }
     pub(super) fn queue_response(
@@ -236,6 +293,77 @@ impl ClientApp {
         }
         Ok(false)
     }
+    pub(super) fn invitation_attention(&self, state: &Invitations) -> Result<Vec<String>> {
+        self.invitation_attention_with_received(state, &self.received_offer_activity(state)?)
+    }
+    pub(super) fn joined_invitation_event(&self, event: &str) -> bool {
+        let Some(proof) = event
+            .strip_prefix("invitation:")
+            .and_then(|s| s.parse().ok())
+        else {
+            return false;
+        };
+        self.authorities.0.iter().any(|authority| {
+            self.authorities.space_ready(authority)
+                && authority.has_membership_approval(proof)
+                && authority.head().is_ok_and(|head| {
+                    head.members.iter().any(|member| {
+                        member.identity_id == self.session.identity_id()
+                            && member
+                                .credential_ids
+                                .contains(&self.session.credential().id())
+                            && member.capabilities.contains(&Capability::Read)
+                    })
+                })
+        })
+    }
+    fn invitation_attention_with_received(
+        &self,
+        state: &Invitations,
+        received: &[Value],
+    ) -> Result<Vec<String>> {
+        // The encrypted journal already contains verified packets. Counting attention
+        // must not rebuild display links or verify every outgoing offer on each view.
+        let mut ids = Vec::new();
+        for row in received {
+            ids.push(format!("invitation:{}", field(row, "id")?));
+        }
+        for (id, entry) in &state.incoming {
+            if entry.status == "pending" {
+                ids.push(format!("request:{id}"));
+            }
+        }
+        for (id, packet) in &state.outgoing {
+            let Packet::Request { bundle, .. } = packet else {
+                continue;
+            };
+            let Some(response) = state.responses.get(id) else {
+                continue;
+            };
+            if response.joined || !matches!(response.packet, Packet::Grant { .. }) {
+                continue;
+            }
+            let locally_joined = self.authorities.0.iter().any(|authority| {
+                authority.space() == bundle.space
+                    && authority.stream() == bundle.stream
+                    && id
+                        .parse()
+                        .is_ok_and(|reference| authority.has_membership_approval(reference))
+                    && authority.head().is_ok_and(|head| {
+                        head.members.iter().any(|member| {
+                            member.identity_id == self.session.identity_id()
+                                && member
+                                    .credential_ids
+                                    .contains(&self.session.credential().id())
+                        })
+                    })
+            });
+            if !locally_joined {
+                ids.push(format!("approved:{id}"));
+            }
+        }
+        Ok(ids)
+    }
     pub(in crate::app) fn invitation_summary(&self) -> Result<Value> {
         let state = self.invitation_state()?;
         let pending = state
@@ -243,7 +371,8 @@ impl ClientApp {
             .values()
             .filter(|e| e.status == "pending")
             .count();
-        let received = self.received_offer_activity(&state)?.len();
+        let received_activity = self.received_offer_activity(&state)?;
+        let received = received_activity.len();
         let responses = state.responses.values().filter(|e| !e.seen).count() + received;
         let actionable = pending
             + received
@@ -262,6 +391,11 @@ impl ClientApp {
                 .values()
                 .filter(|e| !e.seen && matches!(e.packet, Packet::Declined { .. }))
                 .count();
+        let unseen = self
+            .invitation_attention_with_received(&state, &received_activity)?
+            .iter()
+            .filter(|id| !state.seen_activity.contains(id))
+            .count();
         let time = now()?.as_millis() as u64;
         let enabled = self.discovery_enabled()
             || state.mailboxes.iter().any(|(id, m)| {
@@ -274,7 +408,7 @@ impl ClientApp {
                 .values()
                 .any(|j| !j.stored && j.target.expires_at > time);
         Ok(
-            json!({"enabled":enabled,"pending":pending,"responses":responses,"actionable":actionable,"notifications":notifications}),
+            json!({"enabled":enabled,"pending":pending,"responses":responses,"actionable":actionable,"notifications":notifications,"unseen":unseen}),
         )
     }
     /// These notices come from verified authority, never an untrusted transport status.
@@ -377,10 +511,12 @@ impl ClientApp {
         &mut self,
         force: bool,
         foreground: bool,
+        receive_only: bool,
     ) -> Result<Value> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(if foreground { 3 } else { 12 });
-        let team_changed = self.sync_team(force, foreground).await.unwrap_or(false);
+        let team_changed =
+            !receive_only && self.sync_team(force, foreground).await.unwrap_or(false);
         let time = now()?.as_millis() as u64;
         let mut state = self.invitation_state()?;
         self.resume_committed_additions(&mut state)?;
@@ -391,7 +527,8 @@ impl ClientApp {
             .mailboxes
             .iter()
             .filter(|(id, m)| {
-                (force || m.next <= time)
+                !receive_only
+                    && (force || m.next <= time)
                     && m.child.expires_at > time
                     && (state.offers.get(*id).is_some_and(|e| e.active)
                         || self.awaiting_invitation_response(&state, id))
@@ -419,20 +556,23 @@ impl ClientApp {
             state.mailboxes.insert(id, mailbox);
             self.save_invitations(&state)?;
         }
-        self.deliver_jobs(&mut state, &mut report, force, false, time, deadline)
-            .await?;
+        if !receive_only {
+            self.deliver_jobs(&mut state, &mut report, force, false, time, deadline)
+                .await?;
+        }
         let discovery = self.discover_offers(&mut state, force, deadline).await?;
         report.received += discovery.received;
         report.retry += discovery.retry;
         report.more |= discovery.more;
         report.progressed = discovery.progressed || report.stored > 0;
         // A bounded upload pass may also leave ready envelopes behind.
-        report.more |= state.jobs.iter().any(|(id, job)| {
-            !job.stored
-                && job.next <= time
-                && job.target.expires_at > time
-                && state.mailboxes.get(id).is_none_or(|m| m.ready)
-        });
+        report.more |= !receive_only
+            && state.jobs.iter().any(|(id, job)| {
+                !job.stored
+                    && job.next <= time
+                    && job.target.expires_at > time
+                    && state.mailboxes.get(id).is_none_or(|m| m.ready)
+            });
         let changed = team_changed
             || before != serde_json::to_vec(&self.invitation_activity(&state)?)?
             || report.received > 0
@@ -531,8 +671,12 @@ impl ClientApp {
                         .notify_invitation(
                             state,
                             &notification.recipient,
-                            &format!("invitation:{id}"),
+                            notification
+                                .event
+                                .as_deref()
+                                .unwrap_or(&format!("invitation:{id}")),
                             notification.membership,
+                            notification.chat.clone(),
                             deadline,
                         )
                         .await

@@ -3,6 +3,9 @@ import { distinctErrorDetail, presentError } from "./errors";
 import { en } from "./locales/en";
 
 describe("native error presentation", () => {
+  it("explains a native export failure instead of hiding it as cancellation", () => {
+    expect(presentError("file_export_failed")).toEqual({ message: en["error.fileExport"] });
+  });
   it("explains cleanup errors without implying that logout failed", () => {
     for (const [reason, key] of [
       ["profile_logout_notifications_pending", "profile.logoutNotificationsPending"],

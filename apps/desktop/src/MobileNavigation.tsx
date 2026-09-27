@@ -82,7 +82,9 @@ export function MobileNavigation({
               ? t("nav.moreNew", { count: notifications })
               : tab.id === "stream" && unreadMessages > 0
                 ? t("nav.streamNew", { count: unreadMessages })
-                : t(tab.label)
+                : tab.id === "chats" && unreadMessages > 0
+                  ? t("nav.chatsNew", { count: unreadMessages })
+                  : t(tab.label)
           }
           aria-current={active === tab.id ? "page" : undefined}
           onContextMenu={(event) => event.preventDefault()}
@@ -120,7 +122,9 @@ export function MobileNavigation({
               name={tab.icon}
               attention={tab.id === "stream" && unreadMessages > 0}
             />
-            {tab.id === "profile" && notifications > 0 && <NewIndicator />}
+            {((tab.id === "profile" && notifications > 0) ||
+              ((tab.id === "stream" || tab.id === "chats") &&
+                unreadMessages > 0)) && <NewIndicator />}
           </span>
           {hint?.tab === tab.id && (
             <span

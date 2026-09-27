@@ -1,5 +1,7 @@
 //! Provider-independent attachment metadata and bounded client-side encryption.
+pub mod cache;
 pub mod crypto;
+pub mod download;
 pub mod model;
 
 pub use model::{

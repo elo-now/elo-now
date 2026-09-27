@@ -2,6 +2,10 @@
 use elo_core::app::ClientApp;
 use serde_json::{Value, json};
 
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
+#[path = "push_preferences.rs"]
+mod preferences;
+
 #[cfg(all(mobile, feature = "mobile-push"))]
 pub fn setup(app: &tauri::AppHandle) {
     use tauri::{Emitter, Manager};
@@ -104,15 +108,11 @@ mod registration_tests {
 }
 
 pub fn configure_client(client: &mut ClientApp) -> Result<(), String> {
-    #[cfg(all(mobile, feature = "mobile-push"))]
-    {
-        let url = env!("ELO_CONFIGURED_WAKE");
-        client
-            .configure_push(url, cfg!(debug_assertions))
-            .map_err(|_| "Invalid notification service configuration".to_owned())?;
-    }
-    let _ = client;
-    Ok(())
+    // Desktop clients also send wakes to mobile recipients. Only receiving
+    // native push notifications requires the mobile plugin.
+    client
+        .configure_push(env!("ELO_CONFIGURED_WAKE"), cfg!(debug_assertions))
+        .map_err(|_| "Invalid notification service configuration".to_owned())
 }
 
 #[tauri::command]
@@ -156,16 +156,20 @@ pub async fn changed(app: &tauri::AppHandle, client: &ClientApp) -> bool {
         false
     }
 }
-pub async fn suspend(app: &tauri::AppHandle) -> Result<(), String> {
+pub async fn suspend(app: &tauri::AppHandle, client: Option<&ClientApp>) -> Result<(), String> {
     let media = crate::native_media::shutdown(app).await;
     #[cfg(all(mobile, feature = "mobile-push"))]
     {
+        // Preference persistence must never prevent local delivery from stopping.
+        let remembered = client
+            .map(|client| mobile::remember(app, client))
+            .transpose();
         let notifications = mobile::suspend(app).await;
-        return media.and(notifications);
+        return media.and(notifications).and(remembered.map(|_| ()));
     }
     #[cfg(not(all(mobile, feature = "mobile-push")))]
     {
-        let _ = app;
+        let _ = (app, client);
         media
     }
 }
@@ -180,6 +184,13 @@ pub fn forget(app: &tauri::AppHandle) -> Result<(), String> {
         let _ = app;
         Ok(())
     }
+}
+
+pub fn update(app: &tauri::AppHandle, result: &Value) {
+    #[cfg(all(mobile, feature = "mobile-push"))]
+    mobile::update(app, result);
+    #[cfg(not(all(mobile, feature = "mobile-push")))]
+    let _ = (app, result);
 }
 
 pub fn messages_read(
@@ -200,6 +211,7 @@ pub fn messages_read(
 
 #[cfg(all(mobile, feature = "mobile-push"))]
 mod mobile {
+    use super::preferences::Preferences;
     use super::*;
     use elo_core::{
         app::push::{Route, endpoint},
@@ -221,6 +233,8 @@ mod mobile {
         route: Route,
         owner: String,
         token: String,
+        #[serde(default)]
+        next_registration_attempt: u64,
         next_attempt: u64,
         policy: Value,
         revision: u64,
@@ -230,6 +244,8 @@ mod mobile {
         #[serde(default)]
         reads: Vec<PendingRead>,
         #[serde(default)]
+        cleared: Vec<PendingRead>,
+        #[serde(default)]
         calls_enabled: bool,
         #[serde(default)]
         calls_policy: String,
@@ -238,7 +254,7 @@ mod mobile {
         #[serde(default)]
         call_ringtone: String,
     }
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PendingRead {
         receipt: Value,
@@ -307,6 +323,25 @@ mod mobile {
             return Err("Notification settings do not match this application.".into());
         }
         Ok(Some(device))
+    }
+    fn choices(client: &ClientApp, device: Option<&Device>) -> Result<Preferences, String> {
+        let identity = client.identity_id().to_string();
+        if let Some(saved) = Preferences::load(client.profile_path(), &identity)? {
+            return Ok(saved);
+        }
+        let mut prefs = Preferences::new(&identity);
+        // Adopt an existing opt-in once. An old suspended route is not consent.
+        if let Some(device) = device.filter(|d| d.identity == identity && d.enabled) {
+            prefs.enabled = true;
+            prefs.calls_enabled = device.calls_enabled;
+            prefs.call_ringtone.clone_from(&device.call_ringtone);
+            prefs.save(client.profile_path())?;
+        }
+        Ok(prefs)
+    }
+    pub(super) fn remember(app: &tauri::AppHandle, client: &ClientApp) -> Result<(), String> {
+        let device = load(app, env!("ELO_CONFIGURED_WAKE"))?;
+        choices(client, device.as_ref()).map(|_| ())
     }
     async fn request(
         app: &tauri::AppHandle,
@@ -479,6 +514,83 @@ mod mobile {
         device.calls_updated = time();
         save(app, device)
     }
+    static UNREAD: std::sync::Mutex<(crate::notification_counts::Counts, u64)> =
+        std::sync::Mutex::new((crate::notification_counts::Counts::new(), 0));
+
+    pub(super) fn update(app: &tauri::AppHandle, result: &Value) {
+        let view = result.get("view").unwrap_or(result);
+        if !view["streams"].is_array() {
+            return;
+        }
+        let mut state = UNREAD.lock().expect("notification unread state");
+        if let Some(count) = state.0.update(view) {
+            let changed = (count > 0) != (state.1 > 0);
+            state.1 = count;
+            drop(state);
+            if changed {
+                schedule_reconcile(app);
+            }
+        }
+    }
+    static RECONCILE_PENDING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static RECONCILE_RUNNING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    fn schedule_reconcile(app: &tauri::AppHandle) {
+        use std::sync::atomic::Ordering::SeqCst;
+        RECONCILE_PENDING.store(true, SeqCst);
+        if RECONCILE_RUNNING.swap(true, SeqCst) {
+            return;
+        }
+        let app = app.clone();
+        // OS notification-center callbacks never delay message send/read or profile unlock.
+        tauri::async_runtime::spawn_blocking(move || {
+            loop {
+                RECONCILE_PENDING.store(false, SeqCst);
+                let _ = reconcile(&app);
+                if RECONCILE_PENDING.load(SeqCst) {
+                    continue;
+                }
+                RECONCILE_RUNNING.store(false, SeqCst);
+                if !RECONCILE_PENDING.load(SeqCst) || RECONCILE_RUNNING.swap(true, SeqCst) {
+                    break;
+                }
+            }
+        });
+    }
+    fn reconcile(app: &tauri::AppHandle) -> Result<(), String> {
+        let Some(device) = load(app, env!("ELO_CONFIGURED_WAKE"))? else {
+            return Ok(());
+        };
+        if !device.enabled || !device.policy["scopes"].is_array() {
+            return Ok(());
+        }
+        let scopes = device.policy["scopes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["enabled"] == true)
+            .map(|s| s["scope"].clone())
+            .collect::<Vec<_>>();
+        let receipts = device
+            .cleared
+            .iter()
+            .filter(|r| r.expires > time())
+            .map(|r| &r.receipt)
+            .collect::<Vec<_>>();
+        let state = UNREAD.lock().expect("notification unread state");
+        if state.0.identity != device.identity {
+            return Ok(());
+        }
+        let unread = state.1 > 0;
+        drop(state);
+        let labels: Value = serde_json::from_str(include_str!("../../src/locales/native.en.json"))
+            .map_err(|_| "Invalid notification labels")?;
+        let _: Value = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>().call("reconcile", json!({
+            "registration":device.route.id,"unread":unread,"receipts":receipts,"scopes":scopes,"labels":labels
+        }))?;
+        Ok(())
+    }
     pub(super) fn messages_read(
         app: &tauri::AppHandle,
         client: &ClientApp,
@@ -496,7 +608,14 @@ mod mobile {
             .map_err(|_| "Could not update read notifications")?;
         let expires = time() + 86400;
         device.reads.retain(|r| r.expires > time());
+        device.cleared.retain(|r| r.expires > time());
         for receipt in receipts {
+            if !device.cleared.iter().any(|r| r.receipt == receipt) {
+                device.cleared.push(PendingRead {
+                    receipt: receipt.clone(),
+                    expires,
+                });
+            }
             if !device.reads.iter().any(|r| r.receipt == receipt) {
                 device.reads.push(PendingRead { receipt, expires });
             }
@@ -505,7 +624,11 @@ mod mobile {
         // Keep recent receipts within the private registration-file budget.
         let excess = device.reads.len().saturating_sub(1024);
         device.reads.drain(..excess);
-        save(app, &device)
+        let excess = device.cleared.len().saturating_sub(1024);
+        device.cleared.drain(..excess);
+        save(app, &device)?;
+        schedule_reconcile(app);
+        Ok(())
     }
     async fn flush_reads(app: &tauri::AppHandle, device: &mut Device) -> Result<(), String> {
         device.reads.retain(|r| r.expires > time());
@@ -555,8 +678,16 @@ mod mobile {
             .call("disable", json!({}))
             .map_err(|_| "Could not turn off notifications".to_owned());
         if let Some(mut saved) = load(app, url)? {
-            saved.enabled = false;
-            saved.active = false;
+            if saved.enabled {
+                saved.enabled = false;
+                saved.active = false;
+                saved.next_attempt = 0;
+            }
+            // Retry offline revocation at most once per 30 seconds, not on every status poll.
+            if saved.next_attempt > time() {
+                return disabled.map(|_| ());
+            }
+            saved.next_attempt = time() + 30;
             save(app, &saved)?;
             // Keep the owner capability for revocation retries after an offline logout.
             if request(app, &saved, "", None, reqwest::Method::DELETE)
@@ -606,7 +737,10 @@ mod mobile {
             return Err("The open profile has changed".into());
         }
         let mut device = load(&app, url)?;
+        let mut prefs = choices(client, device.as_ref())?;
         if op == "disable" {
+            prefs.enabled = false;
+            prefs.save(client.profile_path())?;
             suspend(&app).await?;
             client
                 .advertise_wake_route(None)
@@ -616,15 +750,28 @@ mod mobile {
             );
         }
         if let Some(saved) = device.as_ref()
-            && (saved.identity != identity || !saved.enabled || native["permission"] == false)
+            && (saved.identity != identity
+                || !saved.enabled
+                || !prefs.enabled
+                || native["permission"] == false)
         {
-            suspend(&app).await?;
-            client
-                .advertise_wake_route(None)
-                .map_err(|_| "Could not update notification settings")?;
-            device = load(&app, url)?;
+            // A status read must not wait for an offline logout's server cleanup.
+            let cleanup_due =
+                saved.enabled || native["enabled"] == true || saved.next_attempt <= time();
+            if op != "status" && !op.starts_with("calls_") && cleanup_due {
+                suspend(&app).await?;
+                client
+                    .advertise_wake_route(None)
+                    .map_err(|_| "Could not update notification settings")?;
+                device = load(&app, url)?;
+                native = adapter.call("status", json!({}))?;
+            }
             if device.is_some() {
-                return Ok(json!({"available":true,"enabled":false,"pending":true,"wake":false}));
+                schedule_reconcile(&app);
+                let enabled = prefs.enabled && native["permission"] == true;
+                return Ok(json!({"available":true,"enabled":enabled,"pending":true,
+                    "callsEnabled":enabled && prefs.calls_enabled,
+                    "callsPending":enabled && prefs.calls_enabled,"wake":false}));
             }
         }
         if op.starts_with("calls_") {
@@ -635,6 +782,8 @@ mod mobile {
             match op.as_str() {
                 "calls_enable" | "calls_disable" => {
                     saved.calls_enabled = op == "calls_enable";
+                    prefs.calls_enabled = saved.calls_enabled;
+                    prefs.save(client.profile_path())?;
                     saved.calls_updated = 0;
                     save(&app, saved)?;
                     call_policy(&app, client, saved).await?;
@@ -645,6 +794,8 @@ mod mobile {
                         return Err("Invalid call ringtone".into());
                     }
                     saved.call_ringtone = tone.into();
+                    prefs.call_ringtone = tone.into();
+                    prefs.save(client.profile_path())?;
                     save(&app, saved)?;
                     call_policy(&app, client, saved).await?;
                 }
@@ -686,14 +837,26 @@ mod mobile {
                 _ => return Err("Unknown call action".into()),
             }
         }
-        if op == "enable" {
-            if app
-                .notification()
-                .request_permission()
-                .map_err(|_| "Could not request notifications")?
-                != tauri_plugin_notification::PermissionState::Granted
-            {
-                return Err("Allow notifications in system settings.".into());
+        let automatic = preferences::should_resume(
+            prefs.enabled,
+            native["permission"] == true,
+            op == "maintain",
+            device.as_ref().is_none_or(|d| d.token.is_empty()),
+            time(),
+            device.as_ref().map_or(0, |d| d.next_registration_attempt),
+        );
+        if op == "enable" || automatic {
+            if op == "enable" {
+                if app
+                    .notification()
+                    .request_permission()
+                    .map_err(|_| "Could not request notifications")?
+                    != tauri_plugin_notification::PermissionState::Granted
+                {
+                    return Err("Allow notifications in system settings.".into());
+                }
+                prefs.enabled = true;
+                prefs.save(client.profile_path())?;
             }
             if device.is_none() {
                 device = Some(Device {
@@ -710,29 +873,37 @@ mod mobile {
                     },
                     owner: random::<32>()?,
                     token: String::new(),
+                    next_registration_attempt: 0,
                     next_attempt: 0,
                     policy: Value::Null,
                     revision: 0,
                     acknowledged: 0,
                     generation: client.notification_generation(),
                     reads: Vec::new(),
-                    calls_enabled: false,
+                    cleared: Vec::new(),
+                    calls_enabled: prefs.calls_enabled,
                     calls_policy: String::new(),
                     calls_updated: 0,
-                    call_ringtone: "classic".into(),
+                    call_ringtone: prefs.call_ringtone.clone(),
                 });
             }
             let saved = device.as_mut().ok_or("Could not prepare notifications")?;
+            saved.next_registration_attempt = time() + 30;
             save(&app, saved)?;
             let registered: Value = adapter
-                .call("register", json!({"registration":saved.route.id}))
+                .call(
+                    "register",
+                    json!({"registration":saved.route.id,"background":automatic}),
+                )
                 .map_err(|_| "Could not register notifications. Try again.")?;
-            saved.token = registered["token"]
-                .as_str()
-                .ok_or("Could not register notifications")?
-                .into();
-            saved.next_attempt = 0;
-            save(&app, saved)?;
+            if !automatic {
+                saved.token = registered["token"]
+                    .as_str()
+                    .ok_or("Could not register notifications")?
+                    .into();
+                saved.next_attempt = 0;
+                save(&app, saved)?;
+            }
             native = adapter
                 .call("status", json!({}))
                 .map_err(|_| "Could not read notifications")?;
@@ -745,6 +916,7 @@ mod mobile {
         }
         if let Some(saved) = device.as_mut()
             && saved.enabled
+            && !automatic
             && (op == "maintain" || op == "enable")
         {
             if let Some(token) = native["token"].as_str()
@@ -777,6 +949,7 @@ mod mobile {
                     .map_err(|_| "Could not read notifications")?;
             }
             if saved.token.is_empty()
+                && native["registration"] == saved.route.id
                 && let Some(token) = native["token"].as_str()
             {
                 saved.token = token.into();
@@ -859,12 +1032,15 @@ mod mobile {
                 .call("ack", json!({"wake":wake}))
                 .map_err(|_| "Could not acknowledge notification")?;
         }
-        Ok(
-            json!({"available":true,"enabled":device.as_ref().is_some_and(|d|d.enabled),
-            "pending":device.as_ref().is_some_and(|d|d.enabled && (!d.active || d.acknowledged!=d.revision)),
-            "callsEnabled":device.as_ref().is_some_and(|d|d.calls_enabled),
-            "callsPending":device.as_ref().is_some_and(|d| d.calls_enabled && (d.calls_policy.is_empty() || d.calls_updated == 0)),
-            "wake":native["wake"].is_string(),"opened":opened}),
-        )
+        schedule_reconcile(&app);
+        let enabled = prefs.enabled && native["permission"] == true;
+        let current = device
+            .as_ref()
+            .filter(|d| d.enabled && d.identity == identity);
+        Ok(json!({"available":true,"enabled":enabled,
+            "pending":enabled && current.is_none_or(|d| !d.active || d.acknowledged != d.revision),
+            "callsEnabled":enabled && prefs.calls_enabled,
+            "callsPending":enabled && prefs.calls_enabled && current.is_none_or(|d| d.calls_policy.is_empty() || d.calls_updated == 0),
+            "wake":native["wake"].is_string(),"opened":opened}))
     }
 }

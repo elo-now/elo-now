@@ -4,6 +4,7 @@ import WebKit
 import GoogleUtilities_NSData
 import FirebaseCore
 import FirebaseMessaging
+import FirebaseInstallations
 import Tauri
 import UIKit
 import UserNotifications
@@ -13,12 +14,19 @@ private struct NativeMediaArgs: Decodable { let payload: String }
 private struct CallListenerArgs: Decodable { let channel: Channel }
 private struct CallConfigureArgs: Decodable { let enabled: Bool; let registration: String; let endpoint: String; let labels: [String:String]; let ringtone: String? }
 private struct CallActionArgs: Decodable { let action: String; let callId: String; let event:String? }
-private struct PushRegisterArgs: Decodable { let registration: String }
+private struct PushRegisterArgs: Decodable { let registration: String; let background: Bool? }
 private struct PushAckArgs: Decodable { let opened: String?; let wake: String? }
+private struct PushReconcileArgs: Decodable {
+    let registration: String
+    let unread: Bool
+    let receipts: [[String:String]]
+    let scopes: [String]
+}
 private struct PushStatus: Encodable {
     let available: Bool
     let enabled: Bool
     let permission: Bool
+    let registration: String?
     let wake: String?
     let opened: String?
     let token: String?
@@ -38,7 +46,9 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
     }
 
     private let prefs = UserDefaults.standard
+    private var registrationOperation: Task<Void, Never>?
     private var waiting: Invoke?
+    private var registrationAttempt: UUID?
     private var observers: [NSObjectProtocol] = []
     private var statusChannel: Channel?
 
@@ -133,7 +143,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         }
         // Tauri dispatches commands on its IPC queue. UIKit registration and
         // pending-invoke state must remain on the main queue with FCM callbacks.
-        DispatchQueue.main.async { [weak self] in
+        DispatchQueue.main.async { [weak self, invoke] in
             guard let self = self, self.configure() else {
                 invoke.reject("Notifications are not configured."); return
             }
@@ -141,35 +151,57 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             self.prefs.removeObject(forKey: "elo.push.challenge")
             self.prefs.set(true, forKey: "elo.push.enabled")
             self.waiting?.reject("Notification setup was restarted.")
-            self.waiting = invoke
+            let attempt = UUID()
+            self.registrationAttempt = attempt
+            self.waiting = args.background == true ? nil : invoke
             Messaging.messaging().isAutoInitEnabled = true
             UIApplication.shared.registerForRemoteNotifications()
-            if Messaging.messaging().apnsToken != nil {
-                Messaging.messaging().token { [weak self] token, _ in
-                    DispatchQueue.main.async {
-                        guard let self = self, self.waiting === invoke else { return }
-                        if let token = token { self.receivedToken(token) }
+            let previous = self.registrationOperation
+            self.registrationOperation = Task { @MainActor [weak self] in
+                await previous?.value
+                guard let self = self, self.registrationAttempt == attempt else { return }
+                do {
+                    // APNs registration is asynchronous. Do not register an FID
+                    // before Firebase can bind it to this installation's APNs token.
+                    while Messaging.messaging().apnsToken == nil {
+                        guard self.registrationAttempt == attempt else { return }
+                        try await Task.sleep(nanoseconds: 100_000_000)
                     }
+                    try await Messaging.messaging().register()
+                    let installationId = try await Installations.installations().installationID()
+                    guard self.registrationAttempt == attempt, self.prefs.bool(forKey: "elo.push.enabled") else { return }
+                    self.receivedRegistration(installationId)
+                    self.registrationAttempt = nil
+                    self.waiting?.resolve(["token": installationId])
+                    self.waiting = nil
+                } catch {
+                    guard self.registrationAttempt == attempt else { return }
+                    self.registrationAttempt = nil
+                    self.waiting?.reject("Could not register notifications. Try again.")
+                    self.waiting = nil
                 }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self, weak invoke] in
-                guard let self = self, let invoke = invoke, self.waiting === invoke else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
+                guard let self = self, self.registrationAttempt == attempt else { return }
+                self.registrationAttempt = nil
+                self.waiting?.reject("Could not register notifications. Try again.")
                 self.waiting = nil
-                invoke.reject("Could not register notifications. Try again.")
             }
+            // Resolve after arming the attempt, so logout can cancel it before delivery resumes.
+            if args.background == true { invoke.resolve() }
         }
     }
-    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+    func messaging(_ messaging: Messaging, didReceiveRegistration installationId: String?) {
         DispatchQueue.main.async { [weak self] in
-            if let token = fcmToken { self?.receivedToken(token) }
+            if let installationId = installationId { self?.receivedRegistration(installationId) }
         }
     }
-    private func receivedToken(_ token: String) {
+    private func receivedRegistration(_ installationId: String) {
         guard prefs.bool(forKey: "elo.push.enabled"),
-              Messaging.messaging().apnsToken != nil, !token.isEmpty else { return }
-        prefs.set(token, forKey: "elo.push.token")
-        waiting?.resolve(["token": token])
-        waiting = nil
+              Messaging.messaging().apnsToken != nil, !installationId.isEmpty else { return }
+        prefs.set(installationId, forKey: "elo.push.installation-id")
+        prefs.removeObject(forKey: "elo.push.token")
+        try? statusChannel?.send([:] as [String: Bool])
     }
     @objc func status(_ invoke: Invoke) {
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
@@ -177,8 +209,46 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             invoke.resolve(PushStatus(available: FirebaseApp.app() != nil,
                 enabled: self.prefs.bool(forKey: "elo.push.enabled"),
                 permission: settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
+                registration: self.prefs.string(forKey: "elo.push.registration"),
                 wake: self.prefs.string(forKey: "elo.push.wake"), opened: self.prefs.string(forKey: "elo.push.opened"),
-                token: self.prefs.string(forKey: "elo.push.token"), challenge: self.prefs.string(forKey: "elo.push.challenge")))
+                token: self.prefs.string(forKey: "elo.push.installation-id"), challenge: self.prefs.string(forKey: "elo.push.challenge")))
+        }
+    }
+    @objc func reconcile(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(PushReconcileArgs.self)
+        DispatchQueue.main.async { [self] in
+            guard prefs.bool(forKey: "elo.push.enabled"),
+                  prefs.string(forKey: "elo.push.registration") == args.registration else { invoke.resolve(); return }
+            let time = Date().timeIntervalSince1970
+            var reads = (prefs.dictionary(forKey: "elo.push.reads") as? [String:Double] ?? [:]).filter { $0.value > time }
+            for receipt in args.receipts.prefix(1024) {
+                guard let scope = receipt["scope"], let event = receipt["event"],
+                      scope.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                      event.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { continue }
+                reads[scope + ":" + event] = time + 86400
+            }
+            for key in reads.keys.sorted(by: { reads[$0, default: 0] < reads[$1, default: 0] }).prefix(max(0, reads.count - 1024)) { reads.removeValue(forKey: key) }
+            prefs.set(reads, forKey: "elo.push.reads")
+            let acknowledged = reads
+            let center = UNUserNotificationCenter.current()
+            center.getDeliveredNotifications { [self] notifications in
+                DispatchQueue.main.async { [self] in
+                    guard prefs.bool(forKey: "elo.push.enabled"), prefs.string(forKey: "elo.push.registration") == args.registration else { invoke.resolve(); return }
+                    var remove: [String] = []
+                    var remaining = false
+                    for notification in notifications {
+                        let data = notification.request.content.userInfo
+                        guard data["elo_wake"] as? String == "1", let scope = data["elo_scope"] as? String else { continue }
+                        let event = data["elo_event"] as? String ?? ""
+                        if data["elo_registration"] as? String != args.registration || !args.scopes.contains(scope) || acknowledged[scope + ":" + event] != nil {
+                            remove.append(notification.request.identifier)
+                        } else { remaining = true }
+                    }
+                    center.removeDeliveredNotifications(withIdentifiers: remove)
+                    // iOS has no dot-only badge. One indicates unread activity; it is not a message total.
+                    center.setBadgeCount(args.unread || remaining ? 1 : 0) { _ in invoke.resolve() }
+                }
+            }
         }
     }
     @objc func ack(_ invoke: Invoke) throws {
@@ -224,8 +294,10 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             NativeMedia.shared.stopAll()
             waiting?.reject("Notification setup was cancelled.")
             waiting = nil
-            for key in ["enabled", "token", "challenge", "registration", "wake", "opened"] { prefs.removeObject(forKey: "elo.push." + key) }
+            registrationAttempt = nil
+            for key in ["enabled", "token", "installation-id", "challenge", "registration", "wake", "opened", "reads"] { prefs.removeObject(forKey: "elo.push." + key) }
             let center = UNUserNotificationCenter.current()
+            center.setBadgeCount(0) { _ in }
             center.getDeliveredNotifications { notifications in
                 center.removeDeliveredNotifications(withIdentifiers: notifications.filter {
                     $0.request.content.userInfo["elo_registration"] != nil
@@ -234,8 +306,14 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             UIApplication.shared.unregisterForRemoteNotifications()
             if FirebaseApp.app() != nil {
                 Messaging.messaging().isAutoInitEnabled = false
-                Messaging.messaging().deleteToken { _ in invoke.resolve() }
-            } else { invoke.resolve() }
+                let previous = registrationOperation
+                registrationOperation = Task { @MainActor in
+                    await previous?.value
+                    try? await Messaging.messaging().unregister()
+                }
+            }
+            // Rust can revoke its route immediately, even while Firebase is offline.
+            invoke.resolve()
         }
     }
 }

@@ -51,7 +51,7 @@ impl ClientStore {
         let kind:String=tx.query_row("SELECT kind FROM records WHERE record_id=?1",[attempt.record_id.to_string()],|r|r.get(0))?;
         let body=receipt.body();
         super::repair::remember_copy(&tx,body.peer_id,body.mailbox_id,&InventoryEntry{arrival_seq:body.arrival_seq,object_id:body.object_id,size_bytes:body.size_bytes,transfer_hint:if kind=="file.body"{TransferHint::Lazy}else{TransferHint::Eager}})?;
-        tx.execute("UPDATE replica_copies SET receipt_record=?1,missing=0 WHERE peer_id=?2 AND mailbox_id=?3 AND object_id=?4",params![receipt.bytes(),body.peer_id.to_string(),body.mailbox_id.to_string(),body.object_id.to_string()])?;
+        tx.execute("UPDATE replica_copies SET receipt_record=?1,missing=0,retention_expired=0 WHERE peer_id=?2 AND mailbox_id=?3 AND object_id=?4",params![receipt.bytes(),body.peer_id.to_string(),body.mailbox_id.to_string(),body.object_id.to_string()])?;
         let mut event=audit::Event::new("STORED",Some(attempt.target));event.attempt=Some(attempt.number);event.http_status=http_status;
         audit::append(&tx,attempt.record_id,audit::clock()?,&event)?;
         if kind=="chat.message" { let time=audit::clock()?.as_millis();tx.execute("INSERT OR IGNORE INTO notification_outbox(record_id,object_id,created_local_ms,next_local_ms) VALUES(?,?,?,?)",params![attempt.record_id.to_string(),attempt.object_id.to_string(),time,time])?; }
@@ -325,7 +325,7 @@ impl ClientStore {
                  CASE
                    WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state='REJECTED' AND COALESCE(o.last_error_code,'')!='REMOTE_PRUNED') THEN 'REJECTED'
                    WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state='HELD_STALE_CONFIG') THEN 'HELD_STALE_CONFIG'
-                   WHEN EXISTS(SELECT 1 FROM replica_copies c JOIN outbox o USING(peer_id,mailbox_id,object_id) WHERE o.record_id=r.record_id AND c.missing=1 AND c.pruned_record IS NULL) THEN 'REPAIR_PENDING'
+                   WHEN EXISTS(SELECT 1 FROM replica_copies c JOIN outbox o USING(peer_id,mailbox_id,object_id) WHERE o.record_id=r.record_id AND c.missing=1 AND c.retention_expired=0 AND c.pruned_record IS NULL) THEN 'REPAIR_PENDING'
                    WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state IN ('PENDING','INFLIGHT')) THEN 'QUEUED'
                    WHEN EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id) AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.record_id=r.record_id AND o.state!='STORED') THEN 'STORED'
                    ELSE r.status

@@ -2,7 +2,7 @@ import { updateRequired, subscribeUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { View } from "./model";
+import type { Stream, View } from "./model";
 import { invitationCount, notificationCount } from "./model";
 import type { StreamEntry } from "./streamFeed";
 import type { SyncResult } from "./liveSync";
@@ -22,7 +22,32 @@ export type NotificationTarget = {
   space?: string | null;
   stream?: string | null;
   record?: string | null;
+  chat?: { space: string; stream: string; invitation: string } | null;
 };
+/** A preapproved invitation may already be a joined chat. Resolve only against
+ * verified local membership; an encrypted target alone never grants access. */
+export function notificationChat(
+  view: View,
+  target: NotificationTarget | null,
+): Stream | undefined {
+  if (
+    target?.identity !== view.identity ||
+    target.category !== "invitation" ||
+    !target.chat ||
+    target.record
+  )
+    return;
+  return (view.all_streams ?? view.streams).find(
+    (chat) =>
+      chat.space === target.chat!.space &&
+      chat.stream === target.chat!.stream &&
+      chat.members.some(
+        (member) =>
+          member.identity_id === view.identity &&
+          member.capabilities.includes("READ"),
+      ),
+  );
+}
 type Opened = { id: string; target: NotificationTarget | null };
 type Status = {
   available: boolean;
@@ -108,10 +133,30 @@ export function notificationPage(
   target: NotificationTarget | null,
 ) {
   if (target?.identity !== view.identity || target.record) return;
+  if (notificationChat(view, target)) return;
+  if (target.space && view.spaces) {
+    const space = view.spaces.find(
+      (space) => space.id === target.space && space.status === "joined",
+    );
+    if (!space || !space.activity) return;
+  }
   if (target.category === "membership" && notificationCount(view) > 0)
     return "notifications" as const;
   if (target.category === "invitation" && invitationCount(view) > 0)
     return "activity" as const;
+}
+
+export function notificationSpace(
+  view: View,
+  target: NotificationTarget | null,
+): string | undefined {
+  const chat = notificationChat(view, target);
+  if (chat) return chat.space_context ?? view.active_space ?? undefined;
+  if (target?.identity !== view.identity || !target.space || target.record)
+    return;
+  return view.spaces?.find(
+    (space) => space.id === target.space && space.status === "joined",
+  )?.id;
 }
 
 /** Receive only within a locally joined chat's compartment. Unknown chats or
@@ -125,15 +170,32 @@ export function notificationCatchUpRequest(
   const chat = (view.all_streams ?? view.streams).find(
     (s) => s.space === target.space && s.stream === target.stream,
   );
+  const context =
+    chat?.space_context ??
+    (chat
+      ? view.active_space
+      : view.spaces?.find(
+          (space) => space.id === target.space && space.status === "joined",
+        )?.id);
   return chat && !needsProof
     ? {
         op: "sync_live",
+        foreground: true,
         receive_only: true,
         target_space: chat.space_context ?? view.active_space,
         expected_identity: view.identity,
         expected_space: view.active_space,
       }
-    : { op: "invitation_sync", force: true, expected_identity: view.identity };
+    : {
+        op: "invitation_sync",
+        foreground: true,
+        force: true,
+        ...(context ? { target_space: context } : {}),
+        ...(context && target.category === "invitation" && target.chat
+          ? { receive_only: true }
+          : {}),
+        expected_identity: view.identity,
+      };
 }
 
 export function usePushNotifications(
@@ -144,6 +206,8 @@ export function usePushNotifications(
   onOpen: (
     entry: StreamEntry | undefined,
     page: "activity" | "notifications" | undefined,
+    space: string | undefined,
+    chat: Stream | undefined,
   ) => boolean | Promise<boolean>,
   onError: (error: unknown) => void,
   offerReady = false,
@@ -368,10 +432,19 @@ export function usePushNotifications(
         return;
       const current = latest.current.view;
       acknowledged.current = opened.id;
-      const navigated = await latest.current.onOpen(
-        entry,
-        notificationPage(current, opened.target),
-      );
+      let navigated = false;
+      try {
+        navigated = await latest.current.onOpen(
+          entry,
+          notificationPage(current, opened.target),
+          notificationSpace(current, opened.target),
+          notificationChat(current, opened.target),
+        );
+      } catch (error) {
+        acknowledged.current = undefined;
+        latest.current.onError(error);
+        return;
+      }
       if (
         latest.current.view?.identity !== current.identity ||
         activeOpened.current?.id !== opened.id
@@ -386,6 +459,16 @@ export function usePushNotifications(
       setShowOpening(false);
       activeOpened.current = null;
       setOpened(null);
+      if (notificationChat(current, opened.target) && opened.target?.chat) {
+        // The core checks the signed membership approval before issuing a receipt.
+        void invoke("operate", {
+          request: {
+            op: "invitation_activity_seen",
+            expected_identity: current.identity,
+            ids: [`invitation:${opened.target.chat.invitation}`],
+          },
+        }).catch(latest.current.onError);
+      }
       void invoke("push_task", {
         op: `ack:${opened.id}`,
         expectedIdentity: view.identity,
@@ -405,12 +488,14 @@ export function usePushNotifications(
       if (cancelled) return;
       if (
         entry ||
+        notificationChat(view, opened.target) ||
         notificationPage(view, opened.target) ||
         !opened.target ||
         Date.now() - opened.received >= 60000
       ) {
         void finish(entry);
       } else {
+        let delay = 1000;
         if (!catchingUp.current && Date.now() >= nextCatchUp.current) {
           const request = notificationCatchUpRequest(
             view,
@@ -428,6 +513,14 @@ export function usePushNotifications(
               ) {
                 needsProof.current =
                   (result.result?.waiting_for_proof ?? 0) > 0;
+                if (
+                  result.delivery?.more &&
+                  (!result.delivery.retry || result.delivery.progressed)
+                ) {
+                  // Continue a bounded inbox batch without the idle retry gap.
+                  delay = 250;
+                  nextCatchUp.current = Date.now() + delay;
+                }
                 latest.current.onSync(result);
               }
             } catch {
@@ -438,7 +531,7 @@ export function usePushNotifications(
           }
         }
         if (cancelled) return;
-        timer = setTimeout(() => void resolve(), 1000);
+        timer = setTimeout(() => void resolve(), delay);
       }
     };
     void resolve();

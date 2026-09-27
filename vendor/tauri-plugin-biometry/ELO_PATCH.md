@@ -9,3 +9,10 @@ Keystore private key, enrollment invalidation, AES-GCM bound to domain/name and
 elo stores only a random age wrapping key through this adapter. The profile
 password is wrapped in a separate local file, excluded from portable exports.
 Old password entries require explicit reenrollment. Preserve upstream licenses.
+
+The Android non-crypto prompt and availability check use explicit AndroidX
+`BIOMETRIC_WEAK` authenticators on every supported OS. Optional device-credential
+fallback remains controlled by the existing flag and secure-lock check. These
+replace deprecated convenience APIs without changing the accepted authenticator
+set or the separate Keystore `CryptoObject` flow. The module uses AGP's built-in
+Kotlin with JVM 11.

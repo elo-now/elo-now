@@ -26,14 +26,16 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailabilityLight
-import com.google.android.gms.tasks.Task
 import java.util.concurrent.atomic.AtomicBoolean
 
 @InvokeArg
-class RegisterArgs { var registration: String = "" }
+class RegisterArgs { var registration: String = ""; var background: Boolean = false }
 
 @InvokeArg
 class AckArgs { var opened: String? = null; var wake: String? = null }
+
+@InvokeArg
+class ReconcileArgs { var registration: String = ""; var unread: Boolean = false; var receipts: List<Map<String,String>> = emptyList(); var scopes: List<String> = emptyList(); var labels: Map<String,String> = emptyMap() }
 
 @InvokeArg
 class StatusListenerArgs { lateinit var channel: Channel }
@@ -53,11 +55,10 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private val prefs get() = activity.getSharedPreferences("elo-push", Context.MODE_PRIVATE)
-    private var tokenDeletion: Task<Void>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var statusChannel: Channel? = null
     private val statusChanged = SharedPreferences.OnSharedPreferenceChangeListener { values, key ->
-        if (key in listOf("wake", "opened", "challenge") && values.getString(key, null) != null) {
+        if (key in listOf("wake", "opened", "challenge", "installation-id") && values.getString(key, null) != null) {
             statusChannel?.send(JSObject())
         }
     }
@@ -68,11 +69,17 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         prefs.registerOnSharedPreferenceChangeListener(statusChanged)
         if (Build.VERSION.SDK_INT >= 26) {
             val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(NotificationChannel("elo_messages", "Messages", NotificationManager.IMPORTANCE_DEFAULT))
+            manager.createNotificationChannel(NotificationChannel("elo_messages", activity.getString(R.string.notification_channel_messages), NotificationManager.IMPORTANCE_DEFAULT).apply { setShowBadge(true) })
+            manager.createNotificationChannel(NotificationChannel("elo_invitations", activity.getString(R.string.notification_channel_invitations), NotificationManager.IMPORTANCE_DEFAULT).apply { setShowBadge(true) })
         }
         onIntent(activity.intent)
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); onIntent(intent) }
+    override fun onWebViewDestroyed() {
+        statusChannel = null
+        prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
+        super.onWebViewDestroyed()
+    }
     override fun onDestroy(activity: AppCompatActivity) {
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         statusChannel = null
@@ -102,34 +109,42 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         prefs.edit().putString("registration", args.registration).remove("challenge").putBoolean("enabled", true).commit()
         val messaging = FirebaseMessaging.getInstance()
         messaging.isAutoInitEnabled = true
-        // A quick re-enable must obtain its token after an earlier deletion.
-        val token = tokenDeletion?.continueWithTask { messaging.token } ?: messaging.token
+        val registration = PushRegistration.register()
         val finished = AtomicBoolean(false)
         val timeout = Runnable {
-            if (finished.compareAndSet(false, true)) {
+            if (finished.compareAndSet(false, true) && !args.background) {
                 invoke.reject("Could not register notifications. Try again.")
             }
         }
         mainHandler.postDelayed(timeout, 15_000)
-        token.addOnCompleteListener { result ->
+        registration.addOnCompleteListener { result ->
             if (!finished.compareAndSet(false, true)) return@addOnCompleteListener
             mainHandler.removeCallbacks(timeout)
-            if (result.isSuccessful) {
-                prefs.edit().putString("token", result.result).apply()
-                invoke.resolve(JSObject().put("token", result.result))
-            } else { invoke.reject("Could not register notifications. Try again.") }
+            if (result.isSuccessful && prefs.getBoolean("enabled", false) &&
+                prefs.getString("registration", null) == args.registration) {
+                prefs.edit().putString("installation-id", result.result).remove("token").apply()
+                if (!args.background) invoke.resolve(JSObject().put("token", result.result))
+            } else if (!args.background) { invoke.reject("Could not register notifications. Try again.") }
         }
+        // Resume must not hold the profile lock while Firebase contacts the network.
+        if (args.background) invoke.resolve()
     }
     @Command
     fun status(invoke: Invoke) {
         val value = JSObject().put("available", available())
             .put("enabled", prefs.getBoolean("enabled", false))
-            .put("token", prefs.getString("token", null))
+            .put("registration", prefs.getString("registration", null))
+            .put("token", prefs.getString("installation-id", null))
             .put("challenge", prefs.getString("challenge", null))
             .put("wake", prefs.getString("wake", null))
             .put("opened", prefs.getString("opened", null))
             .put("permission", NotificationManagerCompat.from(activity).areNotificationsEnabled())
         invoke.resolve(value)
+    }
+    @Command
+    fun reconcile(invoke: Invoke) {
+        NotificationInbox.reconcile(activity, invoke.parseArgs(ReconcileArgs::class.java))
+        invoke.resolve()
     }
     @Command
     fun ack(invoke: Invoke) {
@@ -150,9 +165,9 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         if(args.ringtone in listOf("classic","chime","pulse","silent")) edit.putString("call-ringtone",args.ringtone)
         edit.commit()
         IncomingCalls.current(activity)?.let {
-            if(!args.enabled || (it.optBoolean("connected") && EloConnectionService.connection==null)) IncomingCalls.finish(activity,it.optString("id"))
+            if(!args.enabled || (it.optBoolean("connected") && !TelecomCalls.hasCall(it.optString("id")))) IncomingCalls.finish(activity,it.optString("id"))
         }
-        invoke.resolve(JSObject().put("token",prefs.getString("token",null)))
+        invoke.resolve(JSObject().put("token",prefs.getString("installation-id",null)))
     }
     @Command
     fun callStatus(invoke:Invoke) {
@@ -177,12 +192,10 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         manager.activeNotifications.filter { it.tag?.startsWith("elo-wake:") == true }.forEach { manager.cancel(it.tag, it.id) }
         if (FirebaseApp.getApps(activity).isNotEmpty()) {
             FirebaseMessaging.getInstance().isAutoInitEnabled = false
-            if (tokenDeletion?.isComplete != false) {
-                tokenDeletion = FirebaseMessaging.getInstance().deleteToken()
-            }
+            PushRegistration.unregister()
         }
         // Local delivery is already disabled. Let Rust revoke the server route
-        // immediately; an offline Firebase token deletion must not hold its lock.
+        // immediately; offline provider unregistration must not hold its lock.
         invoke.resolve()
     }
 }

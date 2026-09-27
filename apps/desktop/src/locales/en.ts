@@ -527,7 +527,7 @@ export const en = {
   "notifications.systemHelp":
     "Get notified about new messages and invitations on this device. Muted conversations stay quiet.",
   "notifications.settingUp": "Setting up notifications…",
-  "notifications.opening": "Opening message…",
+  "notifications.opening": "Opening…",
   "notifications.pending":
     "Notification settings haven’t synced yet. We’ll retry automatically.",
   "notifications.mutePending":
@@ -1061,6 +1061,8 @@ export const en = {
     "A profile already exists here. Open it or choose another folder.",
   "error.generic":
     "This action failed. If it keeps happening, contact support.",
+  "error.fileExport": "Could not save this file. Try again with the app open.",
+  "file.shareImage": "Share image: {filename}",
   "error.profilePath": "Enter the full path to your profile folder.",
   "error.lockFirst": "Lock your current profile first.",
   "error.saveRecovery":
@@ -1233,6 +1235,7 @@ export const en = {
   "nav.close": "Back to chat",
   "nav.primary": "Main navigation",
   "nav.chats": "Messages",
+  "nav.chatsNew": "Messages, {count} unread messages",
   "nav.actions": "Actions",
   "conversationTools.show": "Show conversation tools",
   "conversationTools.hide": "Hide conversation tools",
@@ -1498,12 +1501,6 @@ export const en = {
   "sync.button": "Sync",
   "warning.forked":
     "The configuration conflicts or the controller change is incomplete. Posting and administration are on hold.",
-  "channel.historyStarts": "No messages yet",
-  "channel.welcome": "No chats yet",
-  "channel.noPastHistory":
-    "New membership does not unlock past messages. You can request a history bundle.",
-  "channel.emptyHelp":
-    "Create a chat or import a configuration from More actions.",
   "composer.label": "Message text",
   "composer.placeholder": "Write a message…",
   "composer.unavailable": "Select a chat you can post in",

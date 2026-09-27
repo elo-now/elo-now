@@ -13,6 +13,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.WindowCompat
 
 /** The locked screen deliberately shows no decrypted profile or conversation data. */
 internal fun Activity.incomingCallScreen(answer: () -> Unit, decline: () -> Unit): View {
@@ -31,12 +32,15 @@ internal fun Activity.incomingCallScreen(answer: () -> Unit, decline: () -> Unit
         gravity = Gravity.CENTER
         typeface = Typeface.create("sans-serif", Typeface.NORMAL)
     }
-    window.statusBarColor = background
-    window.navigationBarColor = background
-    window.decorView.systemUiVisibility = 0
     val root = FrameLayout(this).apply {
         setBackgroundColor(background)
         fitsSystemWindows = true
+    }
+    // The theme supplies the same fixed bar colors on older Android versions;
+    // the content supplies the background where the OS enforces edge-to-edge.
+    WindowCompat.getInsetsController(window, root).apply {
+        isAppearanceLightStatusBars = false
+        isAppearanceLightNavigationBars = false
     }
     val content = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
