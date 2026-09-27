@@ -1,7 +1,6 @@
 package now.elo.push
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.telecom.DisconnectCause
 import androidx.core.telecom.CallAttributesCompat
@@ -24,6 +23,10 @@ internal object TelecomCalls {
     @Volatile private var session: Session? = null
 
     fun hasCall(id: String): Boolean = session?.let { it.id == id && !it.state.ended } == true
+
+    fun isReady(id: String): Boolean = session?.let {
+        it.id == id && it.state.ready && !it.state.ended
+    } == true
 
     fun incoming(context: Context, id: String) {
         val app = context.applicationContext
@@ -64,7 +67,7 @@ internal object TelecomCalls {
                         current.state.ended = true
                         applyState(app, current)
                     } else {
-                        app.startForegroundService(Intent(app, IncomingCallService::class.java))
+                        app.startForegroundService(IncomingCalls.serviceIntent(app, id))
                         applyState(app, current)
                         launch {
                             var lastMuted = false

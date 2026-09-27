@@ -2,10 +2,12 @@ package now.elo.push
 
 import android.app.*
 import android.content.*
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.*
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
+import androidx.core.app.ServiceCompat
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -49,7 +51,21 @@ object IncomingCalls {
         if(current(c)?.optString("id")!=id) return
         c.startActivity(Intent(c,IncomingCallActivity::class.java).putExtra("answer",true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
-    fun refresh(c:Context) { c.startService(Intent(c,IncomingCallService::class.java)) }
+    fun serviceIntent(c: Context, id: String) = Intent(c, IncomingCallService::class.java)
+        .setAction(IncomingCallServiceRequest.ACTION)
+        .putExtra(IncomingCallServiceRequest.CALL_ID, id)
+
+    fun refresh(c:Context) {
+        val id = current(c)?.optString("id") ?: return
+        if (!TelecomCalls.isReady(id)) return
+        try {
+            c.startService(serviceIntent(c, id))
+        } catch (_: IllegalStateException) {
+            reject(c, id)
+        } catch (_: SecurityException) {
+            reject(c, id)
+        }
+    }
     fun reject(c:Context,id:String) {
         val call=current(c)?.takeIf { it.optString("id")==id } ?: return
         event(c,call,"decline")
@@ -93,7 +109,20 @@ class IncomingCallService: Service() {
     }
     override fun onBind(intent:Intent?) = null
     override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
-        val call=IncomingCalls.current(this) ?: run { stopSelf();return START_NOT_STICKY }
+        // Boot broadcasts and system restarts must never resurrect a phoneCall service.
+        if (intent?.action != IncomingCallServiceRequest.ACTION) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        val call = IncomingCalls.current(this)
+        val id = call?.optString("id")
+        if (!IncomingCallServiceRequest.isAllowed(
+                intent.action, intent.getStringExtra(IncomingCallServiceRequest.CALL_ID),
+                id, id != null && TelecomCalls.isReady(id),
+            ) || call == null) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val p=IncomingCalls.prefs(this)
         val tone=p.getString("call-ringtone","classic") ?: "classic"
         val ringing=call.optString("action")=="ring"
@@ -105,7 +134,6 @@ class IncomingCallService: Service() {
             settings.enableVibration(ringing && tone!="silent")
             getSystemService(NotificationManager::class.java).createNotificationChannel(settings)
         }
-        val id=call.optString("id")
         fun open(answer:Boolean)=PendingIntent.getActivity(this,if(answer)71003 else 71004,
             Intent(this,IncomingCallActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).setData(Uri.parse("elo-call://$id")).putExtra("answer",answer),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val reject=PendingIntent.getBroadcast(this,71005,Intent(this,DeclineCallReceiver::class.java).putExtra("id",id),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -120,7 +148,19 @@ class IncomingCallService: Service() {
                 .setFullScreenIntent(open(false),true)
                 .setStyle(NotificationCompat.CallStyle.forIncomingCall(person,reject,open(true)))
         } else builder.setSilent(true).setStyle(NotificationCompat.CallStyle.forOngoingCall(person,reject))
-        startForeground(71002,builder.build())
+        try {
+            val serviceType = if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL else 0
+            ServiceCompat.startForeground(this, 71002, builder.build(), serviceType)
+        } catch (_: IllegalStateException) {
+            // Includes ForegroundServiceStartNotAllowedException on Android 12+.
+            IncomingCalls.reject(this, call.optString("id"))
+            stopSelf(startId)
+            return START_NOT_STICKY
+        } catch (_: SecurityException) {
+            IncomingCalls.reject(this, call.optString("id"))
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         updateRingtone(call)
         handler.removeCallbacksAndMessages(null);handler.post(tick)
         return START_NOT_STICKY
