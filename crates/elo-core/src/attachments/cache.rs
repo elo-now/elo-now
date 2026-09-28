@@ -124,6 +124,51 @@ pub(crate) fn store(root: &Path, source: &Path, hash: &str) -> std::io::Result<(
     result
 }
 
+pub(crate) fn restore(root: &Path, descriptor: &AttachmentDescriptor, output: &Path) -> bool {
+    if output.exists() {
+        return false;
+    }
+    let Ok(filename) = name(&descriptor.encryption.ciphertext_sha256) else {
+        return false;
+    };
+    // A cache miss must neither create a directory nor access the network.
+    let directory = root.join("attachment-cache");
+    let Ok(metadata) = fs::symlink_metadata(&directory) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let path = directory.join(filename);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != descriptor.encrypted_size
+    {
+        return false;
+    }
+    if crypto::decrypt_file(
+        &path,
+        output,
+        &descriptor.encryption.key,
+        &descriptor.encryption.nonce_prefix,
+        descriptor.plaintext_size,
+        &descriptor.encryption.ciphertext_sha256,
+    )
+    .is_err()
+    {
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_file(path);
+        return false;
+    }
+    if let Ok(file) = fs::File::open(path) {
+        let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,49 +224,4 @@ mod tests {
         assert!(!output.exists());
         assert!(!cached.exists());
     }
-}
-
-pub(crate) fn restore(root: &Path, descriptor: &AttachmentDescriptor, output: &Path) -> bool {
-    if output.exists() {
-        return false;
-    }
-    let Ok(filename) = name(&descriptor.encryption.ciphertext_sha256) else {
-        return false;
-    };
-    // A cache miss must neither create a directory nor access the network.
-    let directory = root.join("attachment-cache");
-    let Ok(metadata) = fs::symlink_metadata(&directory) else {
-        return false;
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return false;
-    }
-    let path = directory.join(filename);
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return false;
-    };
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() != descriptor.encrypted_size
-    {
-        return false;
-    }
-    if crypto::decrypt_file(
-        &path,
-        output,
-        &descriptor.encryption.key,
-        &descriptor.encryption.nonce_prefix,
-        descriptor.plaintext_size,
-        &descriptor.encryption.ciphertext_sha256,
-    )
-    .is_err()
-    {
-        let _ = fs::remove_file(output);
-        let _ = fs::remove_file(path);
-        return false;
-    }
-    if let Ok(file) = fs::File::open(path) {
-        let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
-    }
-    true
 }

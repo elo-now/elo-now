@@ -37,7 +37,19 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                let mut received = 0;
+                while !request[..received]
+                    .windows(4)
+                    .any(|part| part == b"\r\n\r\n")
+                {
+                    assert!(
+                        received < request.len(),
+                        "Test request headers are too large"
+                    );
+                    let count = socket.read(&mut request[received..]).await.unwrap();
+                    assert_ne!(count, 0, "Test client closed before completing its headers");
+                    received += count;
+                }
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nx",
