@@ -63,6 +63,18 @@ def expired(name, cutoff):
                 .replace(tzinfo=dt.timezone.utc) < cutoff)
 
 
+def clean_interrupted_staging(directory):
+    # Call only while holding the job lock. Never follow a directory symlink or
+    # traverse anything outside this dedicated, root-owned backup destination.
+    for path in directory.iterdir():
+        if path.is_symlink():
+            continue
+        if re.fullmatch(r'\.snapshot-[a-z0-9_]{8}', path.name) and path.is_dir():
+            shutil.rmtree(path)
+        elif path.name.endswith('.partial') and NAME.fullmatch(path.name[:-8]) and path.is_file():
+            path.unlink()
+
+
 def snapshot(config, directory):
     recipient = Path(config['recipient_file']).read_text().strip()
     if not re.fullmatch(r'age1[0-9a-z]+', recipient):
@@ -117,6 +129,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='/etc/elo-backup/config.json')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--cleanup', action='store_true')
     export = parser.add_mutually_exclusive_group()
     export.add_argument('--list-encrypted', action='store_true')
     export.add_argument('--read-encrypted', metavar='NAME')
@@ -149,6 +162,9 @@ def main():
             raise ValueError('Operational retention must be between one and seven days')
         directory = Path(config['destination'])
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        clean_interrupted_staging(directory)
+        if args.cleanup:
+            return
         archive = snapshot(config, directory)
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
         for path in directory.iterdir():

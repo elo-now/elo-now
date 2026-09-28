@@ -133,6 +133,25 @@ class BackupTests(unittest.TestCase):
 
 
 class RetentionTests(unittest.TestCase):
+    def test_interrupted_plain_staging_cleanup_preserves_archives_and_symlink_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            staging = directory / '.snapshot-1234abcd'
+            staging.mkdir()
+            (staging / 'private.txt').write_text('synthetic')
+            target = directory / 'keep'
+            target.mkdir()
+            (directory / '.snapshot-abcd1234').symlink_to(target, target_is_directory=True)
+            archive = directory / 'elo-ops-20260928T000000Z.tar.gz.age'
+            archive.write_bytes(b'encrypted fixture')
+            partial = directory / (archive.name + '.partial')
+            partial.write_bytes(b'incomplete encrypted fixture')
+            backup.clean_interrupted_staging(directory)
+            self.assertFalse(staging.exists())
+            self.assertFalse(partial.exists())
+            self.assertTrue(archive.exists())
+            self.assertTrue(target.exists())
+
     def test_retention_only_selects_our_own_old_snapshot_names(self):
         now = backup.dt.datetime(2026, 9, 28, tzinfo=backup.dt.timezone.utc)
         self.assertTrue(backup.expired('elo-ops-20260901T000000Z.tar.gz.age', now))
