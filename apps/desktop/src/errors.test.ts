@@ -16,6 +16,7 @@ describe("native error presentation", () => {
   });
   it("distinguishes device confirmation, wrong password and missing recovery code", () => {
     for (const [reason, key] of [
+      ["profile_password_weak", "error.passwordWeak"],
       [
         "Compare and confirm the code on both devices",
         "recover.error.pairCode",

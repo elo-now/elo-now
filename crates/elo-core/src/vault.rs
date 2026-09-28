@@ -24,6 +24,8 @@ pub enum VaultError {
     Invalid,
     #[error("passphrase must contain 12..=1024 UTF-8 bytes")]
     Passphrase,
+    #[error("profile_password_weak")]
+    WeakPassphrase,
     #[error("vault file unavailable, unsafe permissions, or output already exists")]
     File,
     #[error("root recovery needs the expected public identity fingerprint")]
@@ -460,6 +462,16 @@ fn cache_binding(space: SpaceId, vault: &[u8]) -> [u8; 32] {
     digest.update(vault);
     digest.finalize().into()
 }
+/// Apply only when a person chooses a new profile password. Opening, pairing
+/// and importing existing vaults must not silently change their password policy.
+pub fn validate_new_password(password: &SecretString) -> Result<()> {
+    validate_passphrase(password)?;
+    if !crate::crypto::passphrase::strong_export_secret(password) {
+        return Err(VaultError::WeakPassphrase);
+    }
+    Ok(())
+}
+
 fn validate_passphrase(p: &SecretString) -> Result<()> {
     if !(12..=1024).contains(&p.expose_secret().len()) {
         return Err(VaultError::Passphrase);
@@ -648,6 +660,19 @@ impl Session {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn new_password_policy_does_not_lock_out_existing_vaults() {
+        let weak: SecretString = "Password123456!".into();
+        assert!(matches!(
+            validate_new_password(&weak),
+            Err(VaultError::WeakPassphrase)
+        ));
+        assert!(validate_new_password(&"meadow tungsten orbit marzipan".into()).is_ok());
+        let (session, _) = Session::create().unwrap();
+        let encrypted = session.seal(weak.clone()).unwrap();
+        assert!(Session::open(&encrypted, weak, session.identity_id()).is_ok());
+    }
 
     #[test]
     fn space_cache_binds_profile_space_vault_and_authenticated_payload() {

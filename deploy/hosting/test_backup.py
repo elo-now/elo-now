@@ -1,13 +1,18 @@
 """Operational backup failure and restore checks using synthetic files only."""
 import importlib.util
+from contextlib import closing
 import io
 from pathlib import Path
 import shutil
 import subprocess
+import sqlite3
+import sys
 import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 spec = importlib.util.spec_from_file_location('elo_backup', Path(__file__).with_name('backup.py'))
 backup = importlib.util.module_from_spec(spec)
@@ -42,23 +47,23 @@ class BackupTests(unittest.TestCase):
         self.mock.start()
         self.addCleanup(self.mock.stop)
 
-    def test_snapshot_decrypts_and_service_is_resumed(self):
+    def test_snapshot_decrypts_without_interrupting_services(self):
         archive = backup.snapshot(self.config, self.root)
         clear = subprocess.check_output(['age', '-d', '-i', str(self.root / 'key'), str(archive)])
         with tarfile.open(fileobj=io.BytesIO(clear), mode='r:gz') as tar:
             self.assertEqual(tar.extractfile(str(self.data).lstrip('/')).read(), self.data.read_bytes())
-        self.assertIn(['systemctl', 'stop', 'synthetic.service'], self.calls)
-        self.assertIn(['systemctl', 'start', 'synthetic.service'], self.calls)
+        self.assertFalse(self.calls)
         self.assertFalse(backup.STATE.exists())
 
-    def test_capture_failure_always_resumes_and_removes_partial_archive(self):
+    def test_capture_failure_removes_plain_staging_and_partial_archive(self):
         with patch.object(backup.subprocess, 'Popen', side_effect=OSError('synthetic failure')):
             # Leave the successful age preflight independent of Popen's failure.
             with patch.object(backup, 'run', side_effect=lambda *a, **kw:
                               None if a[0] == 'age' else self.calls.append(list(a))):
                 with self.assertRaises(OSError):
                     backup.snapshot(self.config, self.root)
-        self.assertIn(['systemctl', 'start', 'synthetic.service'], self.calls)
+        self.assertFalse(self.calls)
+        self.assertFalse(list(self.root.glob('.snapshot-*')))
         self.assertFalse(backup.STATE.exists())
         self.assertFalse(list(self.root.glob('*.partial')))
 
@@ -67,6 +72,64 @@ class BackupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             backup.snapshot(self.config, self.root)
         self.assertFalse(self.calls)
+
+    def test_online_snapshot_includes_wal_and_preserves_config_links(self):
+        state = self.root / 'state'
+        state.mkdir()
+        db = sqlite3.connect(state / 'state.sqlite')
+        self.addCleanup(db.close)
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE record (value TEXT)')
+        db.execute("INSERT INTO record VALUES ('committed WAL value')")
+        db.commit()
+        (state / 'setting').write_text('setting')
+        (state / 'link').symlink_to('setting')
+        self.config['paths'] = [str(state)]
+        archive = backup.snapshot(self.config, self.root)
+        clear = subprocess.check_output(['age', '-d', '-i', str(self.root / 'key'), str(archive)])
+        with tarfile.open(fileobj=io.BytesIO(clear), mode='r:gz') as tar:
+            names = tar.getnames()
+            self.assertFalse(any(n.endswith(('-wal', '-shm')) for n in names))
+            self.assertEqual(tar.getmember(str(state / 'link').lstrip('/')).linkname, 'setting')
+            restored = self.root / 'restored.sqlite'
+            restored.write_bytes(tar.extractfile(str(state / 'state.sqlite').lstrip('/')).read())
+        with closing(sqlite3.connect(restored)) as restored_db:
+            self.assertEqual(restored_db.execute('SELECT value FROM record').fetchone(),
+                             ('committed WAL value',))
+            self.assertEqual(restored_db.execute('PRAGMA integrity_check').fetchone(), ('ok',))
+        self.assertFalse(self.calls)
+
+    def test_changing_source_is_retried_but_never_published_after_exhaustion(self):
+        with patch.object(backup, 'capture', side_effect=backup.SourceChanged('changed')) as capture:
+            with patch.object(backup.time, 'sleep'):
+                with self.assertRaises(backup.SourceChanged):
+                    backup.snapshot(self.config, self.root)
+        self.assertEqual(capture.call_count, 3)
+        self.assertFalse(list(self.root.glob('*.age')))
+        self.assertFalse(list(self.root.glob('.snapshot-*')))
+        self.assertFalse(self.calls)
+
+    def test_write_to_a_previously_copied_database_rejects_mixed_snapshot(self):
+        from online_snapshot import capture, inventory, SourceChanged
+        first = self.root / 'first.sqlite'
+        second = self.root / 'second.sqlite'
+        for path in (first, second):
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute('CREATE TABLE record (value INTEGER)')
+                db.execute('INSERT INTO record VALUES (1)')
+        calls = 0
+
+        def changed_inventory(paths):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with closing(sqlite3.connect(first)) as db, db:
+                    db.execute('UPDATE record SET value=2')
+            return inventory(paths)
+
+        with patch('online_snapshot.inventory', side_effect=changed_inventory):
+            with self.assertRaises(SourceChanged):
+                capture([str(first), str(second)], self.root / 'snapshot')
 
 
 class RetentionTests(unittest.TestCase):

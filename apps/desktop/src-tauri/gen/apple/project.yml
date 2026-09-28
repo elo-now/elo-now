@@ -56,6 +56,7 @@ targets:
         NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.
         NSPhotoLibraryAddUsageDescription: Save images from your conversations or your password-protected recovery QR image to Photos.
         NSCameraUsageDescription: Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
+        NSLocalNetworkUsageDescription: Connect to a Space server you choose on your local network.
         NSMicrophoneUsageDescription: Use your microphone during audio and video calls.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

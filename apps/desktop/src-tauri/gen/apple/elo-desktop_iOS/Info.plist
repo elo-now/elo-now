@@ -41,6 +41,8 @@
 	<string>Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID to unlock your encrypted elo profile on this device.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to a Space server you choose on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Use your microphone during audio and video calls.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

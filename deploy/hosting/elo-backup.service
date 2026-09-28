@@ -1,5 +1,5 @@
 [Unit]
-Description=elo.now encrypted off-site operational backup
+Description=elo.now online encrypted operational backup
 After=network-online.target elo-megacmd.service
 Wants=network-online.target
 
@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=oneshot
 UMask=0077
 ExecStart=/usr/bin/python3 /opt/elo/hosting/backup.py
-ExecStopPost=/usr/bin/python3 /opt/elo/hosting/backup.py --resume
 TimeoutStartSec=30min
 TimeoutStopSec=90
 Nice=10

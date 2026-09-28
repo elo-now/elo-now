@@ -8,8 +8,13 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
+from online_snapshot import capture, SourceChanged
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -65,38 +70,45 @@ def snapshot(config, directory):
     paths = config['paths']
     if not paths or any(not p.startswith('/') or not Path(p).exists() for p in paths):
         raise ValueError('A required backup path is missing')
-    # Probe encryption before interrupting any service.
+    # Probe encryption before staging private data.
     run('age', '-r', recipient, input=b'', stdout=subprocess.DEVNULL)
-    active = [s for s in config['services'] if subprocess.run(
-        ['systemctl', 'is-active', '--quiet', s]).returncode == 0]
     name = 'elo-ops-' + dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '.tar.gz.age'
     archive = directory / name
     partial = directory / (name + '.partial')
     if archive.exists() or partial.exists():
         raise FileExistsError('Backup destination already exists')
-    STATE.write_text(json.dumps(active))
     try:
-        if active:
-            run('systemctl', 'stop', *active)
-        with partial.open('xb') as output:
-            tar = subprocess.Popen(['tar', '-C', '/', '-czf', '-', '--',
-                                    *[p.lstrip('/') for p in paths]], stdout=subprocess.PIPE)
-            try:
-                encrypted = subprocess.run(['age', '-r', recipient], stdin=tar.stdout,
-                                           stdout=output)
-                tar.stdout.close()
-                status = tar.wait()
-                if encrypted.returncode or status:
-                    raise RuntimeError('Snapshot or encryption failed')
-                output.flush()
-                os.fsync(output.fileno())
-            finally:
-                if tar.poll() is None:
-                    tar.kill()
-                    tar.wait()
-        partial.rename(archive)
+        # Plain staging is private and always removed, including on failure.
+        # Retry a changing source without freezing production or accepting a
+        # snapshot spanning a deletion/revocation and its previous state.
+        for attempt in range(3):
+            with tempfile.TemporaryDirectory(prefix='.snapshot-', dir=directory) as temporary:
+                try:
+                    capture(paths, Path(temporary))
+                except (SourceChanged, FileNotFoundError):
+                    if attempt == 2:
+                        raise
+                    time.sleep(1)
+                    continue
+                with partial.open('xb') as output:
+                    tar = subprocess.Popen(['tar', '-C', temporary, '-czf', '-', '--',
+                                            *[p.lstrip('/') for p in paths]], stdout=subprocess.PIPE)
+                    try:
+                        encrypted = subprocess.run(['age', '-r', recipient], stdin=tar.stdout,
+                                                   stdout=output)
+                        tar.stdout.close()
+                        status = tar.wait()
+                        if encrypted.returncode or status:
+                            raise RuntimeError('Snapshot or encryption failed')
+                        output.flush()
+                        os.fsync(output.fileno())
+                    finally:
+                        if tar.poll() is None:
+                            tar.kill()
+                            tar.wait()
+                partial.rename(archive)
+                break
     finally:
-        resume()
         partial.unlink(missing_ok=True)
     return archive
 
@@ -105,10 +117,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='/etc/elo-backup/config.json')
     parser.add_argument('--resume', action='store_true')
+    export = parser.add_mutually_exclusive_group()
+    export.add_argument('--list-encrypted', action='store_true')
+    export.add_argument('--read-encrypted', metavar='NAME')
     args = parser.parse_args()
     os.umask(0o077)
     if args.resume:
         resume()
+        return
+    if args.list_encrypted or args.read_encrypted:
+        config = json.loads(Path(args.config).read_text())
+        directory = Path(config['destination'])
+        if args.list_encrypted:
+            print(json.dumps(sorted(p.name for p in directory.iterdir()
+                                    if NAME.fullmatch(p.name) and p.is_file() and not p.is_symlink())))
+        else:
+            if not NAME.fullmatch(args.read_encrypted):
+                raise ValueError('Invalid encrypted backup name')
+            fd = os.open(directory / args.read_encrypted, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError('Expected a regular encrypted backup')
+                shutil.copyfileobj(source, sys.stdout.buffer)
         return
     with open('/run/lock/elo-operational-backup.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -119,13 +149,13 @@ def main():
             raise ValueError('Operational retention must be between one and seven days')
         directory = Path(config['destination'])
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        archive = snapshot(config, directory)
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
         for path in directory.iterdir():
             if expired(path.name, cutoff):
                 path.unlink()
                 path.with_suffix(path.suffix + '.uploaded').unlink(missing_ok=True)
-        archive = snapshot(config, directory)
-        # Services are already available again while off-site transfer runs.
+        # Services remain available during capture, encryption and transfer.
         base = config['offsite_url']
         webdav(base, 'MKCOL')
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)

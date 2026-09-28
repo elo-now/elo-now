@@ -9,6 +9,7 @@ const sourceMessageKeys = new Map<string, MessageKey>(
 );
 
 const known: Record<string, MessageKey> = {
+  profile_password_weak: "error.passwordWeak",
   file_export_failed: "error.fileExport",
   profile_logout_notifications_pending: "profile.logoutNotificationsPending",
   profile_logout_cleanup_pending: "profile.logoutCleanupPending",

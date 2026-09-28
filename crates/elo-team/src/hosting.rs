@@ -653,15 +653,12 @@ async fn command(
     }
     let marker = host.config.root.join("deleted").join(format!("{id}.json"));
     if marker.exists() {
-        let _permit = host
-            .creation
-            .try_lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let receipt = host
-            .finish_deletion(&id)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        return Ok((StatusCode::GONE, Json(receipt)).into_response());
+        // A durable tombstone is authoritative even while remote storage is
+        // offline. HTTP retries must never run cleanup or lock all creators.
+        let bytes = vault::read_private(&marker).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let deleted: Deleted =
+            serde_json::from_slice(&bytes).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        return Ok((StatusCode::GONE, Json(deleted.receipt)).into_response());
     }
     let space = host
         .spaces
@@ -700,14 +697,10 @@ async fn command(
         .authorize_space_deletion(&space.config, &request)
         .map_err(|_| StatusCode::BAD_REQUEST)?
     {
-        let _permit = host
-            .creation
-            .try_lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         save(
             &marker,
             &Deleted {
-                receipt,
+                receipt: receipt.clone(),
                 mailbox: space.mailbox,
                 attachment_objects: client
                     .attachment_all_targets()
@@ -719,15 +712,13 @@ async fn command(
             },
         )
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        guard
-            .take()
-            .unwrap()
-            .close()
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let closed = guard.take().unwrap();
         drop(guard);
-        let receipt = host
-            .finish_deletion(&id)
+        // Drain admitted Replica requests, then close the transport gate before
+        // acknowledging deletion. The background worker owns physical cleanup.
+        *space.serving.write().await = false;
+        closed
+            .close()
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         return Ok((StatusCode::GONE, Json(receipt)).into_response());
@@ -2907,7 +2898,37 @@ mod tests {
             &json!({"test":true}),
         )
         .unwrap();
-        guest.operate(delete).await.unwrap();
+        // A busy creator and stalled background storage cleanup must not delay
+        // deletion acknowledgement or repeat requests for its signed receipt.
+        let creation = host.creation.lock().await;
+        let cleanup = host.deletion_cleanup.lock().await;
+        tokio::time::timeout(Duration::from_secs(3), guest.operate(delete))
+            .await
+            .unwrap()
+            .unwrap();
+        let deleted_space = host.spaces.read().await.get(&deleted_id).unwrap().clone();
+        assert!(!*deleted_space.serving.read().await);
+        assert!(deleted_space.client.lock().await.is_none());
+        let closed = reqwest::Client::new()
+            .get(format!("{base}/spaces/{deleted_id}/replica/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(closed.status(), StatusCode::GONE);
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(3),
+            owner.operate(json!({"op":"space_refresh"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(refreshed["view"]["space_setup"], true);
+        assert!(refreshed["view"]["spaces"].as_array().unwrap().is_empty());
+        // Files remain until the independent cleanup worker finishes.
+        assert!(host.config.root.join("spaces").join(&deleted_id).exists());
+        drop(cleanup);
+        drop(creation);
+        host.retry_deletions().await;
         assert_eq!(host.spaces.read().await.len(), 1);
         assert!(!host.config.root.join("spaces").join(&deleted_id).exists());
         assert!(!backup.join(&deleted_id).exists());
@@ -2927,9 +2948,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        let refreshed = owner.operate(json!({"op":"space_refresh"})).await.unwrap();
-        assert_eq!(refreshed["view"]["space_setup"], true);
-        assert!(refreshed["view"]["spaces"].as_array().unwrap().is_empty());
         let proof = host.finish_deletion(&deleted_id).await.unwrap();
         assert!(!serde_json::to_string(&proof).unwrap().contains("Family"));
         assert!(

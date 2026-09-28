@@ -96,7 +96,7 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
 }
 ```
 
-`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB. The deployment-wide limits also count new identities: at most 1,000 allocated Spaces and 100 new reservations per UTC day by default. Lower these values to fit the disk budget; 1,000 fully used Spaces require at least 200 GB before overhead. Retries of an existing reservation do not spend another daily slot. These caps bound resource consumption; they do not prove that two profiles belong to different people.
+`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB. The deployment-wide limits also count new identities: at most 128 allocated Spaces and 32 new reservations per UTC day by default. Lower these values to fit the disk budget; 128 fully used Spaces require at least 25.6 GB before overhead. Retries of an existing reservation do not spend another daily slot. These caps bound resource consumption; they do not prove that two profiles belong to different people.
 
 The next-release baseline also requires a 20-bit SHA-256 proof of work tied to
 each signed Space-creation request. The client computes it locally on a worker;
@@ -359,20 +359,36 @@ Create a root-owned mode-0600 `/etc/elo-backup/config.json` with:
 {
   "recipient_file": "/etc/elo-backup/recipient.txt",
   "paths": ["/var/lib/elo/host", "/var/lib/elo/wake", "/var/lib/elo/call", "/etc/elo"],
-  "services": ["elo-host", "elo-wake", "elo-call"],
   "destination": "/var/backups/elo-operations",
   "offsite_url": "http://127.0.0.1:18930/REPLACE_WITH_PRIVATE_COLLECTION/operations-backups",
   "retention_days": 7
 }
 ```
 
-Adapt paths and service names to the deployment; every listed path must exist. Install the script at `/opt/elo/hosting/backup.py`, create the destination directory with mode 0700, install the units, run `systemctl start elo-backup`, and verify its successful result before enabling `elo-backup.timer`. Snapshots briefly stop the listed active services; both normal and service-manager cleanup restart them. The archive is encrypted while streaming, without a plaintext staging archive. Services resume before upload. The timer runs daily; local and off-site retention is seven days. Failed transfers remain local for retry. Inspect `systemctl status elo-backup` and the last successful off-site object; a timer being enabled is not proof of a successful backup.
+Adapt paths to the deployment; every listed path must exist. Install `backup.py` and `online_snapshot.py` together in `/opt/elo/hosting/`, create the destination directory with mode 0700, install the units, run `systemctl start elo-backup`, and verify its successful result before enabling `elo-backup.timer`.
+
+Snapshots use SQLite's online backup API, including committed WAL data. Persistent database observers and before/after file inventories reject a capture that overlaps a committed write, file replacement, deletion or configuration change. The job retries three times; sustained writes can make the backup fail rather than publish inconsistent state. It never stops application services. Plain staging files live only in a private temporary directory under the backup destination and are removed after encryption or failure; a forced machine shutdown can leave staging remnants that must be removed after investigating the failed run. Allow free disk for staging plus encrypted output. Each capture has a two-minute budget. The timer runs daily; VPS and MEGA retention is seven days. Old local snapshots are pruned only after a new capture succeeds. Failed transfers remain local for retry. Inspect `systemctl status elo-backup` and the last successful off-site object; an enabled timer is not proof of a successful backup.
+
+For an independently controlled copy, run `pull_backup.py --config /private/path/pull.json` on an administrator's computer with `age` and SSH available. Example private configuration:
+
+```json
+{
+  "host": "operator@your-vps.example",
+  "ssh_key": "/private/path/server-ssh-key",
+  "age_key": "/private/path/offline-backup.agekey",
+  "age": "/usr/local/bin/age",
+  "destination": "/private/path/independent-backups"
+}
+```
+
+Keep this configuration and destination private. SSH host-key verification is mandatory and agent forwarding is disabled. The remote account needs permission to invoke the encrypted-only listing/export commands of `/opt/elo/hosting/backup.py`; use a narrowly scoped sudo policy for a dedicated backup reader. Schedule the pull on that separate computer (for example an hourly launchd agent on macOS), not from the VPS. The server receives no access to the local directory or decryption key. Remote deletion never propagates locally. Each downloaded archive is decrypted to a discard sink to check authentication before retention; at least two local copies survive retention, including during an extended outage. Review that separate retention policy against your own deletion obligations. The computer must be available regularly; this is not immutable cloud storage or an offline key copy. Transfers are bounded to 2 GiB per archive and five minutes.
+
 
 This archive covers the listed state/configuration, **not attachment bytes** or a complete operating-system image. Keep attachment objects in their provider and plan a separate independent copy if protection against provider loss is required. MEGA backups and attachments share a provider failure domain. Download a copy independently of the VPS and rehearse decryption with `age --decrypt --identity /secure/offline-backup.agekey snapshot.tar.gz.age`. Validate every SQLite database, then start the restored service on a network-isolated host with matching binaries and a rewritten local storage root. Do not expose restored listeners or publish stale membership. Preserve/reapply all newer deletion receipts, revoked-device records and account-erasure requests before returning restored state to service.
 
 For **newly provisioned Spaces**, set `recovery_recipient` in the hosting configuration to the same age public recipient. The host writes `spaces/<id>/service-recovery.age` before advertising the Space. The backup includes this encrypted service recovery card. Existing service root secrets that were discarded cannot be reconstructed; complete device-vault backups preserve their current controller instead.
 
-The host shares four SQLite worker slots across profiles. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. Pending cleanup retries in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. Only interrupted reservations that never issued an invitation expire after 24 hours; inactivity never deletes a published Space.
+The host shares four SQLite worker slots across profiles. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. HTTP deletion and subsequent requests return the durable signed receipt without contacting attachment storage or acquiring the creation lock. Access closes immediately; physical cleanup retries only in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. Only interrupted reservations that never issued an invitation expire after 24 hours; inactivity never deletes a published Space.
 
 ### Isolate the local attachment bridge
 

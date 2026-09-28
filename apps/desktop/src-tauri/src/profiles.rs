@@ -168,6 +168,7 @@ async fn recover_without_backup(
     password: SecretString,
     name: &str,
 ) -> Result<ClientApp> {
+    elo_core::vault::validate_new_password(&password)?;
     let mut client = draft.save_named(path, password, "General", name).await?;
     // Recovery words restore identity, not Space memberships or server ownership.
     // Use the same Create/Join flow as registration instead of a local Personal entry.

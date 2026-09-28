@@ -1053,6 +1053,7 @@ export const en = {
   "error.exportPasswordWeak":
     "Choose a less predictable password, such as four unrelated words.",
   "error.passwordLong": "Use a shorter password.",
+  "error.passwordWeak": "Choose a less predictable password, such as several unrelated words.",
   "error.passwordCheck": "Incorrect password. Try again.",
   "error.profileOpen":
     "Couldn’t open this profile. Check your password and try again.",

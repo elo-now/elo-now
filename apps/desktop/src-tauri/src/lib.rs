@@ -199,6 +199,7 @@ async fn create_profile(
     acknowledged: bool,
 ) -> Result<serde_json::Value, String> {
     let secret: age::secrecy::SecretString = password.into();
+    elo_core::vault::validate_new_password(&secret).map_err(|e| e.to_string())?;
     let mut state = state.lock().await;
     if state.client.is_some() {
         return Err("Lock the open profile first".into());
