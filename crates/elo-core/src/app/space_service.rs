@@ -677,7 +677,11 @@ impl ClientApp {
     }
     /// Local administrator bootstrap; the caller already holds the private
     /// service profile. This method is never exposed as an unauthenticated HTTP action.
-    pub fn bootstrap_space_invitation(&self, address: &SpaceAddress) -> Result<String> {
+    pub fn bootstrap_space_invitation(
+        &self,
+        address: &SpaceAddress,
+        require_approval: bool,
+    ) -> Result<String> {
         address.validate(self.allow_loopback)?;
         let scope = self.team_scope()?;
         if serde_json::to_value(&scope)? != serde_json::to_value(&address.scope)? {
@@ -699,7 +703,7 @@ impl ClientApp {
                 token: token.clone(),
                 issued_at: current,
                 expires_at: current + 86_400_000,
-                require_approval: true,
+                require_approval,
                 revoked: false,
             },
         );
@@ -1508,6 +1512,7 @@ mod transport_tests {
                     "Family",
                     "owner@example.test",
                     86_400,
+                    true,
                 )
                 .await
                 .unwrap_err()

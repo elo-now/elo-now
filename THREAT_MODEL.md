@@ -100,3 +100,7 @@ missing decryption keys.
 See [core adversarial tests](crates/elo-core/tests), [call-service tests](crates/elo-call-service/tests)
 and [deployment boundaries](docs/API_COMPATIBILITY.md). Test success does not
 replace independent assessment or physical-device acceptance.
+
+## Hosted General trust boundary
+
+The hosting service is both the membership controller and an authorized reader of General. On publisher-operated hosting this includes 9bits, not only a Space owner. Its device vault and unlock secret are available on the VPS, so VPS access can expose General content present in a replica or backup. Encrypting operational backups reduces off-site exposure but does not remove this live-server capability. Independent private chats have their own recipient lists. Removing the operator from General content requires a protocol change separating configuration authority from message recipients; it is not achieved by disabling routine downloads.

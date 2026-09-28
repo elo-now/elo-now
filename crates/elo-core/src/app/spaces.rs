@@ -48,6 +48,8 @@ struct CreationIntent {
     request_id: String,
     name: String,
     message_lifetime_seconds: u64,
+    #[serde(default = "super::space_host::default_require_approval")]
+    require_approval: bool,
     #[serde(default)]
     space: Option<String>,
     #[serde(default)]
@@ -756,7 +758,7 @@ impl Spaces {
             .catalog
             .creation
             .as_ref()
-            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"space":c.space,"invitation":c.invitation}))
+            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"require_approval":c.require_approval,"space":c.space,"invitation":c.invitation}))
             .unwrap_or(Value::Null);
         view["space_role_requests"] = json!(self.catalog.entries.iter().flat_map(|e|e.role_requests.iter().map(|request|json!({"space_id":e.id,"space_name":e.name,"revision":e.roles_revision,"request":request}))).collect::<Vec<_>>());
         if let Some(streams) = view["streams"].as_array_mut() {
@@ -1211,6 +1213,10 @@ impl Spaces {
             .as_u64()
             .ok_or("Choose a server message lifetime.")?;
         super::space_service::validate_message_lifetime(message_lifetime_seconds)?;
+        let require_approval = match request.get("require_approval") {
+            Some(value) => value.as_bool().ok_or("Invalid Space request.")?,
+            None => true,
+        };
         // A client may be rebuilt for another hosting service while an earlier
         // creation was still only a local intent. Do not strand the new build
         // on that uncompleted endpoint; a joined Space is never discarded.
@@ -1228,6 +1234,7 @@ impl Spaces {
                 || request["name"].as_str().is_some_and(|n| n != intent.name)
                 || (!intent.contact_email.is_empty() && email != intent.contact_email)
                 || message_lifetime_seconds != intent.message_lifetime_seconds
+                || require_approval != intent.require_approval
             {
                 return Err("Continue the pending Space creation first.".into());
             }
@@ -1246,6 +1253,7 @@ impl Spaces {
                     && intent.name == name
                     && intent.contact_email == email
                     && intent.message_lifetime_seconds == message_lifetime_seconds
+                    && intent.require_approval == require_approval
             });
             self.catalog.creation = Some(retry.unwrap_or(CreationIntent {
                 contact_email: email.into(),
@@ -1253,6 +1261,7 @@ impl Spaces {
                 request_id: record::random_hex::<16>()?,
                 name: name.into(),
                 message_lifetime_seconds,
+                require_approval,
                 space: None,
                 invitation: None,
             }));
@@ -1284,6 +1293,7 @@ impl Spaces {
                 &intent.name,
                 &intent.contact_email,
                 intent.message_lifetime_seconds,
+                intent.require_approval,
             )
             .await?;
         let invite = SpaceInvitation::parse(&link, root.allow_loopback)?;
@@ -1304,8 +1314,8 @@ impl Spaces {
         self.catalog.active = Some(id.clone());
         self.catalog.creation.as_mut().unwrap().space = Some(id);
         self.save(root)?;
-        // The host's bootstrap invitation is reusable and already requires
-        // approval. Reuse it for sharing instead of creating a second offer.
+        // The host's reusable bootstrap invitation uses the selected approval
+        // policy. Reuse it for sharing instead of creating a second offer.
         self.catalog.creation.as_mut().unwrap().invitation = Some(link);
         self.catalog.creation_retry = None;
         self.save(root)
@@ -2230,7 +2240,9 @@ mod tests {
             peer,
         };
         let invitation = SpaceInvitation::parse(
-            &server.bootstrap_space_invitation(&config.address).unwrap(),
+            &server
+                .bootstrap_space_invitation(&config.address, true)
+                .unwrap(),
             true,
         )
         .unwrap();

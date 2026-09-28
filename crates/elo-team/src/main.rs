@@ -253,7 +253,7 @@ async fn run() -> Result<()> {
             };
             address.validate(false)?;
             if let Some(path) = invitation {
-                let link = client.bootstrap_space_invitation(&address)?;
+                let link = client.bootstrap_space_invitation(&address, true)?;
                 vault::write_private(&path, link.as_bytes(), false)?;
             }
             value.spaces = Some(ServiceConfig {

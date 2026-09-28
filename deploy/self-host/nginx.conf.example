@@ -7,6 +7,9 @@
 limit_req_zone $binary_remote_addr zone=elo_signup:1m rate=2r/m;
 limit_req_zone $binary_remote_addr zone=elo_push:1m rate=5r/s;
 limit_req_zone $binary_remote_addr zone=elo_call_connect:1m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=elo_replica_requests:1m rate=30r/s;
+limit_req_zone $binary_remote_addr zone=elo_attachment_requests:1m rate=5r/s;
+limit_conn_zone $binary_remote_addr zone=elo_attachment_connections:1m;
 limit_conn_zone $binary_remote_addr zone=elo_call_sockets:1m;
 
 log_format elo_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';
@@ -65,6 +68,8 @@ server {
         proxy_pass http://127.0.0.1:18900;
     }
     location ~ "^/spaces/[0-9a-f]{64}/attachments/v1/(upload|download)$" {
+        limit_req zone=elo_attachment_requests burst=20 nodelay;
+        limit_conn elo_attachment_connections 8;
         client_max_body_size 6m;
         proxy_request_buffering off;
         proxy_send_timeout 125s;
@@ -72,6 +77,7 @@ server {
         proxy_pass http://127.0.0.1:18900;
     }
     location ~ "^/spaces/[0-9a-f]{64}/replica/" {
+        limit_req zone=elo_replica_requests burst=120 nodelay;
         proxy_request_buffering off;
         proxy_pass http://127.0.0.1:18900;
     }

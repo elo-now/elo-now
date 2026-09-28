@@ -1,0 +1,10 @@
+# Include from the host's existing nftables configuration. Do not flush its
+# ruleset when applying this table. Replace service names with actual local
+# users and confirm the WebDAV bind/port before installing.
+table inet elo_local_storage {
+    chain output {
+        type filter hook output priority -10; policy accept;
+        ip daddr 127.0.0.1 tcp dport 18930 meta skuid != { 0, "elo-host", "elo-attachments" } counter reject with tcp reset
+        ip6 daddr ::1 tcp dport 18930 meta skuid != { 0, "elo-host", "elo-attachments" } counter reject with tcp reset
+    }
+}

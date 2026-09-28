@@ -4,6 +4,9 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const CREATE_LIMIT: usize = 64 * 1024;
+pub fn default_require_approval() -> bool {
+    true
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
@@ -85,6 +88,8 @@ pub struct CreateCommand {
     pub name: String,
     pub contact_email: String,
     pub message_lifetime_seconds: u64,
+    #[serde(default = "default_require_approval")]
+    pub require_approval: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +149,7 @@ pub fn seal_creation(
     command: &CreateCommand,
     invitation: &str,
 ) -> Result<CreateResponse> {
-    let value = json!({"request_id":command.request_id,"host":command.host,"name":command.name,"contact_email":command.contact_email,"message_lifetime_seconds":command.message_lifetime_seconds,"invitation":invitation});
+    let value = json!({"request_id":command.request_id,"host":command.host,"name":command.name,"contact_email":command.contact_email,"message_lifetime_seconds":command.message_lifetime_seconds,"require_approval":command.require_approval,"invitation":invitation});
     Ok(CreateResponse {
         ciphertext: STANDARD.encode(crypto::seal_bytes(
             &Zeroizing::new(serde_json::to_vec(&value)?),
@@ -161,6 +166,7 @@ impl ClientApp {
         name: &str,
         contact_email: &str,
         message_lifetime_seconds: u64,
+        require_approval: bool,
     ) -> Result<CreateRequest> {
         let mut request = self.hosted_create_payload(
             host,
@@ -168,6 +174,7 @@ impl ClientApp {
             name,
             contact_email,
             message_lifetime_seconds,
+            require_approval,
         )?;
         request.solve_work()?;
         Ok(request)
@@ -179,6 +186,7 @@ impl ClientApp {
         name: &str,
         contact_email: &str,
         message_lifetime_seconds: u64,
+        require_approval: bool,
     ) -> Result<CreateRequest> {
         validate_host(host, self.allow_loopback)?;
         record::hex::<16>(request_id)?;
@@ -196,6 +204,7 @@ impl ClientApp {
             name: name.into(),
             contact_email: contact_email.into(),
             message_lifetime_seconds,
+            require_approval,
         };
         Ok(CreateRequest {
             record: STANDARD.encode(
@@ -213,6 +222,7 @@ impl ClientApp {
         name: &str,
         contact_email: &str,
         message_lifetime_seconds: u64,
+        require_approval: bool,
     ) -> Result<String> {
         let mut request = self.hosted_create_payload(
             host,
@@ -220,6 +230,7 @@ impl ClientApp {
             name,
             contact_email,
             message_lifetime_seconds,
+            require_approval,
         )?;
         let request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
             request.solve_work()?;
@@ -270,6 +281,7 @@ impl ClientApp {
             || value["name"] != name
             || value["contact_email"] != contact_email
             || value["message_lifetime_seconds"] != message_lifetime_seconds
+            || value["require_approval"] != require_approval
         {
             return Err("Unexpected Space hosting response.".into());
         }

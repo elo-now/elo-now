@@ -29,6 +29,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tower::ServiceExt;
 mod account_deletion;
 mod calls;
+mod lifecycle;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,14 +48,17 @@ pub(super) struct HostConfig {
     pub call_admission_key: Option<PathBuf>,
     #[serde(default)]
     pub attachment_storage: Option<AttachmentStorageConfig>,
+    /// Only a public recovery recipient belongs on the hosting server.
+    #[serde(default)]
+    pub recovery_recipient: Option<String>,
     #[serde(default)]
     pub client_policy: elo_core::client_policy::ClientPolicy,
 }
 fn default_max_spaces() -> usize {
-    1000
+    128
 }
 fn default_daily_creations() -> usize {
-    100
+    32
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -74,18 +78,26 @@ struct Reservation {
     #[serde(default)]
     contact_email: Option<String>,
     message_lifetime_seconds: u64,
+    #[serde(default = "space_host::default_require_approval")]
+    require_approval: bool,
     mailbox: MailboxDescriptor,
     password: String,
     #[serde(default)]
     invitation: Option<String>,
     #[serde(default)]
     invitation_issued: u64,
+    #[serde(default)]
+    reserved_at: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Deleted {
     receipt: DeletionReceipt,
     mailbox: elo_core::ids::MailboxId,
+    #[serde(default)]
+    attachment_objects: Vec<elo_core::ids::AttachmentObjectId>,
+    #[serde(default)]
+    cleanup_completed: bool,
 }
 struct HostedSpace {
     id: String,
@@ -104,6 +116,7 @@ struct Host {
     spaces: RwLock<BTreeMap<String, Arc<HostedSpace>>>,
     // A single admitted creator bounds Argon2 work and makes reservations atomic.
     creation: Mutex<()>,
+    deletion_cleanup: Mutex<()>,
     allocations: std::sync::Mutex<BTreeMap<String, Option<IdentityId>>>,
     accounts: RwLock<()>,
     started: std::time::Instant,
@@ -166,7 +179,11 @@ fn reservation_id(creator: IdentityId, request_id: &str) -> String {
 }
 impl Host {
     async fn open(config: HostConfig, allow_loopback: bool) -> Result<Arc<Self>> {
+        elo_core::store::ClientStore::configure_shared_workers(4)?;
         config.client_policy.validate()?;
+        if let Some(recipient) = &config.recovery_recipient {
+            recipient.parse::<age::x25519::Recipient>()?;
+        }
         space_host::validate_host(
             &format!("{}/spaces/v1/create", config.public_url),
             allow_loopback,
@@ -197,69 +214,14 @@ impl Host {
             config,
             spaces: RwLock::new(BTreeMap::new()),
             creation: Mutex::new(()),
+            deletion_cleanup: Mutex::new(()),
             allocations: std::sync::Mutex::new(BTreeMap::new()),
             accounts: RwLock::new(()),
             started: std::time::Instant::now(),
             allow_loopback,
             attachment_storage,
         });
-        let mut pending_deletions = Vec::new();
-        for entry in std::fs::read_dir(host.config.root.join("deleted"))? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".elo-") && name.ends_with(".tmp"))
-            {
-                continue;
-            }
-            let id = entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or("Invalid deletion marker.")?
-                .to_owned();
-            let _: ObjectId = id.parse()?;
-            pending_deletions.push(id);
-        }
-        for entry in std::fs::read_dir(host.config.root.join("spaces"))? {
-            let entry = entry?;
-            let id = entry
-                .file_name()
-                .to_str()
-                .ok_or("Invalid hosted Space directory.")?
-                .to_owned();
-            let _: ObjectId = id.parse()?;
-            private_directory(&entry.path())?;
-            // A crash during directory removal can leave only Replica files.
-            // The durable deletion marker, not a missing reservation, owns
-            // that remainder; finish_deletion validates it before cleanup.
-            if pending_deletions.contains(&id) && !entry.path().join("config.json").exists() {
-                continue;
-            }
-            let reservation: Reservation = serde_json::from_slice(&Zeroizing::new(
-                vault::read_private(&entry.path().join("reservation.json"))?,
-            ))?;
-            if reservation
-                .creator
-                .is_some_and(|creator| reservation_id(creator, &reservation.request_id) != id)
-            {
-                return Err("Hosting reservation mismatch.".into());
-            }
-            host.allocations
-                .lock()
-                .map_err(|_| "Hosting allocation index unavailable.")?
-                .insert(id.clone(), reservation.creator);
-            if entry.path().join("config.json").exists() {
-                let space = host.open_ready(&id, &reservation, None).await?;
-                host.spaces.write().await.insert(id, space);
-            }
-        }
-        // Open a Space before finishing an interrupted deletion so its signed
-        // attachment inventory is available to every storage provider.
-        for id in pending_deletions {
-            host.finish_deletion(&id).await?;
-        }
+        host.load_spaces().await?;
         Ok(host)
     }
     async fn open_ready(
@@ -335,24 +297,41 @@ impl Host {
         }))
     }
     async fn finish_deletion(&self, id: &str) -> Result<DeletionReceipt> {
-        let deleted: Deleted = serde_json::from_slice(&Zeroizing::new(vault::read_private(
-            &self.config.root.join("deleted").join(format!("{id}.json")),
-        )?))?;
-        if let Some(storage) = &self.attachment_storage {
-            if let Some(space) = self.spaces.read().await.get(id).cloned() {
-                let targets = {
-                    let client = space.client.lock().await;
-                    client
-                        .as_ref()
-                        .map(ClientApp::attachment_all_targets)
-                        .transpose()?
-                        .unwrap_or_default()
-                };
-                for target in targets {
-                    storage.delete(id, &target.object_id.to_string()).await?;
+        let _cleanup = self.deletion_cleanup.lock().await;
+        let marker = self.config.root.join("deleted").join(format!("{id}.json"));
+        let mut deleted: Deleted =
+            serde_json::from_slice(&Zeroizing::new(vault::read_private(&marker)?))?;
+        if !deleted.cleanup_completed {
+            let space = self.spaces.read().await.get(id).cloned();
+            if let Some(space) = space {
+                *space.serving.write().await = false;
+                let client = space.client.lock().await;
+                if let Some(client) = client.as_ref() {
+                    for target in client.attachment_all_targets()? {
+                        if !deleted.attachment_objects.contains(&target.object_id) {
+                            deleted.attachment_objects.push(target.object_id);
+                        }
+                    }
                 }
+                // Preserve the inventory before any remote deletion or profile close.
+                save(&marker, &deleted)?;
+            } else if self
+                .config
+                .root
+                .join("spaces")
+                .join(id)
+                .join("config.json")
+                .exists()
+            {
+                // A quarantined profile must not lose its S3 cleanup inventory.
+                return Err("Deleted Space must be repaired before cleanup can finish.".into());
             }
-            storage.delete_space(id).await?;
+            if let Some(storage) = &self.attachment_storage {
+                for object in &deleted.attachment_objects {
+                    storage.delete(id, &object.to_string()).await?;
+                }
+                storage.delete_space(id).await?;
+            }
         }
         let removed = self.spaces.write().await.remove(id);
         let path = self.config.root.join("spaces").join(id);
@@ -383,6 +362,11 @@ impl Host {
         if backup.exists() {
             private_directory(&backup)?;
             std::fs::remove_dir_all(&backup)?;
+        }
+        if !deleted.cleanup_completed {
+            deleted.cleanup_completed = true;
+            deleted.attachment_objects.clear();
+            save(&marker, &deleted)?;
         }
         Ok(deleted.receipt)
     }
@@ -450,7 +434,7 @@ impl Host {
             }
             if let Some(network) = network {
                 let count = budget.networks.entry(network).or_default();
-                if *count >= 10 {
+                if *count >= 4 {
                     return Err("Hosting capacity reached.".into());
                 }
                 *count += 1;
@@ -463,10 +447,12 @@ impl Host {
                 name: command.name.clone(),
                 contact_email: Some(command.contact_email.clone()),
                 message_lifetime_seconds: command.message_lifetime_seconds,
+                require_approval: command.require_approval,
                 mailbox: MailboxDescriptor::random()?,
                 password: record::random_hex::<32>()?,
                 invitation: None,
                 invitation_issued: 0,
+                reserved_at: current()?,
             };
             // Stage and rename the reservation directory so a crash cannot leave
             // a counted directory without its durable allocation descriptor.
@@ -490,6 +476,7 @@ impl Host {
             || reservation.name != command.name
             || reservation.contact_email.as_deref() != Some(&command.contact_email)
             || reservation.message_lifetime_seconds != command.message_lifetime_seconds
+            || reservation.require_approval != command.require_approval
         {
             return Err("Creation request cannot be changed.".into());
         }
@@ -518,14 +505,15 @@ impl Host {
                 };
                 // Only General's service holds a sending capability. New members
                 // receive the full Space descriptor in their encrypted reply.
-                let client = ProfileDraft::new()?
-                    .with_peer(
-                        PeerDescriptor {
-                            read_token: None,
-                            ..peer.clone()
-                        },
-                        self.allow_loopback,
-                    )?
+                let draft = ProfileDraft::new()?.with_peer(
+                    PeerDescriptor {
+                        read_token: None,
+                        ..peer.clone()
+                    },
+                    self.allow_loopback,
+                )?;
+                self.save_service_recovery(&path, &draft)?;
+                let client = draft
                     .save_named(
                         profile,
                         reservation.password.clone().into(),
@@ -569,7 +557,10 @@ impl Host {
                     .await
                     .as_ref()
                     .ok_or("Space was deleted.")?
-                    .bootstrap_space_invitation(&space.config.address)?,
+                    .bootstrap_space_invitation(
+                        &space.config.address,
+                        reservation.require_approval,
+                    )?,
             );
             reservation.invitation_issued = current()?;
             save(&reservation_path, &reservation)?;
@@ -718,6 +709,13 @@ async fn command(
             &Deleted {
                 receipt,
                 mailbox: space.mailbox,
+                attachment_objects: client
+                    .attachment_all_targets()
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+                    .into_iter()
+                    .map(|target| target.object_id)
+                    .collect(),
+                cleanup_completed: false,
             },
         )
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -1123,6 +1121,22 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
     let config: HostConfig =
         serde_json::from_slice(&Zeroizing::new(vault::read_private(&config)?))?;
     let host = Host::open(config, false).await?;
+    let cleanup_host = host.clone();
+    let cleanup_task = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if cleanup_host
+                .expire_unpublished_reservations()
+                .await
+                .is_err()
+            {
+                eprintln!("Unpublished Space reservation cleanup will be retried.");
+            }
+            cleanup_host.retry_deletions().await;
+        }
+    });
     let worker = host.clone();
     let task = tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(5));
@@ -1131,6 +1145,9 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
             let _ = worker.process_account_deletions().await;
             let spaces: Vec<_> = worker.spaces.read().await.values().cloned().collect();
             for space in spaces {
+                if !*space.serving.read().await {
+                    continue;
+                }
                 let _ = space.replica.maintain_message_lifetime().await;
                 let mut cleanup = Vec::new();
                 if let Ok(client) = space.client.try_lock()
@@ -1180,8 +1197,10 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
     })
     .await;
     task.abort();
+    cleanup_task.abort();
     operator_task.abort();
     let _ = task.await;
+    let _ = cleanup_task.await;
     let _ = operator_task.await;
     for (_, space) in std::mem::take(&mut *host.spaces.write().await) {
         Arc::try_unwrap(space)
@@ -1285,6 +1304,7 @@ mod tests {
             call_admission_key: None,
             client_policy: Default::default(),
             attachment_storage: None,
+            recovery_recipient: None,
         };
         let command = CreateCommand {
             v: 1,
@@ -1295,6 +1315,7 @@ mod tests {
             name: "Capacity test".into(),
             contact_email: "owner@example.test".into(),
             message_lifetime_seconds: 86400,
+            require_approval: true,
         };
         let host = Host::open(config.clone(), false).await.unwrap();
         for id in ["11", "22"] {
@@ -1423,6 +1444,7 @@ mod tests {
                 call_admission_key: None,
                 client_policy: Default::default(),
                 attachment_storage: None,
+                recovery_recipient: None,
             },
             true,
         )
@@ -1852,6 +1874,7 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            recovery_recipient: None,
             operator_snapshot: None,
             call_admission_key: None,
             client_policy: Default::default(),
@@ -2163,6 +2186,7 @@ mod tests {
             call_admission_key: None,
             client_policy: Default::default(),
             attachment_storage: None,
+            recovery_recipient: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
         let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
@@ -2396,6 +2420,128 @@ mod tests {
         close_host(host).await;
     }
     #[tokio::test]
+    async fn hosted_creation_open_invitation_retries_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let config = HostConfig {
+            root: temp.path().join("hosting"),
+            public_url: base.clone(),
+            max_spaces_per_identity: 1,
+            max_spaces: default_max_spaces(),
+            max_space_creations_per_day: default_daily_creations(),
+            mailbox_quota_bytes: 32 * 1024 * 1024,
+            operator_snapshot: None,
+            call_admission_key: None,
+            client_policy: Default::default(),
+            attachment_storage: None,
+            recovery_recipient: None,
+        };
+        let host = Host::open(config.clone(), true).await.unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let router = app(host.clone()).layer(axum::middleware::from_fn(
+            move |request: Request, next: axum::middleware::Next| {
+                let fail = fail.clone();
+                async move {
+                    if request.uri().path().ends_with("/team/v1/spaces")
+                        && fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+        let task = tokio::spawn(axum::serve(listener, router).into_future());
+        let mut owner = profile(&temp.path().join("owner")).await;
+        let create = json!({"op":"space_create","host":format!("{base}/spaces/v1/create"),
+            "name":"Open Space","contact_email":"owner@example.test",
+            "message_lifetime_seconds":86400,"require_approval":false});
+        assert!(owner.operate(create.clone()).await.is_err());
+        assert_eq!(host.spaces.read().await.len(), 1);
+        owner.close().await.unwrap();
+        owner = ClientApp::open(temp.path().join("owner"), PASSWORD.into(), true)
+            .await
+            .unwrap();
+        owner.enable_spaces().await.unwrap();
+        let created = owner.operate(create.clone()).await.unwrap();
+        assert_eq!(created["view"]["space_creation"]["require_approval"], false);
+        assert_eq!(created["view"]["spaces"][0]["role"], "primary_owner");
+        let space = created["view"]["active_space"].clone();
+        let invitation = created["view"]["space_creation"]["invitation"].clone();
+        assert_eq!(
+            owner.operate(create).await.unwrap()["view"]["space_creation"]["invitation"],
+            invitation
+        );
+        assert_eq!(host.spaces.read().await.len(), 1);
+        let managed = owner
+            .operate(json!({"op":"space_manage","id":space,"body":{}}))
+            .await
+            .unwrap();
+        assert_eq!(managed["result"]["offers"].as_array().unwrap().len(), 1);
+        assert_eq!(managed["result"]["offers"][0]["require_approval"], false);
+
+        // Reusing an allocation key must not silently change its admission policy.
+        let hosted_id = host.spaces.read().await.keys().next().unwrap().clone();
+        let reservation: Reservation = serde_json::from_slice(
+            &vault::read_private(
+                &config
+                    .root
+                    .join("spaces")
+                    .join(hosted_id)
+                    .join("reservation.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let changed = CreateCommand {
+            v: 1,
+            kind: "space.create".into(),
+            host: format!("{base}/spaces/v1/create"),
+            request_id: reservation.request_id,
+            issued: current().unwrap(),
+            name: reservation.name,
+            contact_email: "owner@example.test".into(),
+            message_lifetime_seconds: 86400,
+            require_approval: true,
+        };
+        assert_eq!(
+            host.provision(&changed, owner.identity_id())
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "Creation request cannot be changed."
+        );
+        owner.close().await.unwrap();
+        task.abort();
+        let _ = task.await;
+        close_host(host).await;
+
+        let host = Host::open(config, true).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
+        let mut guest = profile(&temp.path().join("guest")).await;
+        let preview = guest
+            .operate(json!({"op":"space_preview","link":invitation}))
+            .await
+            .unwrap();
+        assert_eq!(preview["preview"]["require_approval"], false);
+        let joined = guest
+            .operate(json!({"op":"space_join","link":invitation}))
+            .await
+            .unwrap();
+        assert_eq!(joined["view"]["spaces"][0]["status"], "joined");
+        assert_eq!(joined["view"]["spaces"][0]["role"], "member");
+        assert_eq!(joined["view"]["space_setup"], false);
+        guest.close().await.unwrap();
+        task.abort();
+        let _ = task.await;
+        close_host(host).await;
+    }
+    #[tokio::test]
     async fn hosted_creation_retries_restart_approval_roles_and_mailbox_isolation() {
         let temp = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2411,6 +2557,7 @@ mod tests {
             call_admission_key: None,
             client_policy: Default::default(),
             attachment_storage: None,
+            recovery_recipient: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
         let fail_first_join = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -2466,6 +2613,7 @@ mod tests {
         );
         let space = first["view"]["active_space"].as_str().unwrap().to_owned();
         assert_eq!(first["view"]["spaces"][0]["role"], "primary_owner");
+        assert_eq!(first["view"]["space_creation"]["require_approval"], true);
         assert_eq!(first["view"]["space_setup"], true);
         let invitation = first["view"]["space_creation"]["invitation"]
             .as_str()
@@ -2882,6 +3030,7 @@ mod tests {
             call_admission_key: None,
             client_policy: Default::default(),
             attachment_storage: None,
+            recovery_recipient: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
         let route = Arc::new(RwLock::new(app(host.clone())));

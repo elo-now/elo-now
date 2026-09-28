@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily encrypted elo.now operational backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

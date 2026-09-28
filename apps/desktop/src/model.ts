@@ -138,6 +138,7 @@ export type View = {
   space_creation?: {
     name: string;
     contact_email?: string;
+    require_approval?: boolean;
     space?: string;
     invitation?: string;
     message_lifetime_seconds?: number;

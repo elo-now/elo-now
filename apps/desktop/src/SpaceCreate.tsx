@@ -23,6 +23,9 @@ export function SpaceCreate({
   const [messageLifetime, setMessageLifetime] = useState(
     view.space_creation?.message_lifetime_seconds ?? 86_400,
   );
+  const [requireApproval, setRequireApproval] = useState(
+    view.space_creation?.require_approval ?? true,
+  );
   const [busy, setBusy] = useState(false);
   const alive = useRef(true);
   useEffect(() => {
@@ -68,7 +71,13 @@ export function SpaceCreate({
               mobile={mobile}
               showLink={false}
             />
-            <p className="muted">{t("spaces.firstInvitationHelp")}</p>
+            <p className="muted">
+              {t(
+                creation.require_approval === false
+                  ? "spaces.firstInvitationOpenHelp"
+                  : "spaces.firstInvitationHelp",
+              )}
+            </p>
             <button disabled={busy} onClick={() => void finish()}>
               {t("spaces.openCreated")}
             </button>
@@ -86,6 +95,7 @@ export function SpaceCreate({
                 contact_email: creation?.contact_email || email.trim(),
                 message_lifetime_seconds:
                   creation?.message_lifetime_seconds ?? messageLifetime,
+                require_approval: creation?.require_approval ?? requireApproval,
               })
                 .catch(async (error) => {
                   if (!alive.current) return;
@@ -139,6 +149,15 @@ export function SpaceCreate({
                 {t("spaces.messageLifetime.help")}
               </p>
             </div>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={creation?.require_approval ?? requireApproval}
+                disabled={busy || !!creation}
+                onChange={(event) => setRequireApproval(event.target.checked)}
+              />
+              <span>{t("spaces.requireApproval")}</span>
+            </label>
             {creation && <p className="muted">{t("spaces.resumeHelp")}</p>}
             <p id="space-hosting-limits" className="space-hosting-limits muted">
               {t("spaces.hostingLimits")}

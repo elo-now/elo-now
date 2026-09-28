@@ -341,6 +341,7 @@ mod tests {
             call_admission_key: None,
             client_policy: Default::default(),
             attachment_storage: None,
+            recovery_recipient: None,
         };
         let host = Host::open(config.clone(), true).await.unwrap();
         let server = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());

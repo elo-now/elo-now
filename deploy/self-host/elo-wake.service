@@ -4,6 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=128
 User=elo-wake
 Group=elo-wake
 UMask=0077

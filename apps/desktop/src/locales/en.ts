@@ -408,6 +408,8 @@ export const en = {
     "Invite people to {name}: let them scan this QR in elo or share the invitation link.",
   "spaces.firstInvitationHelp":
     "This invitation is valid for 24 hours and requires your approval. Manage invitations and members in Spaces.",
+  "spaces.firstInvitationOpenHelp":
+    "This invitation is valid for 24 hours. Anyone with its link or QR can join without your approval. Manage invitations and members in Spaces.",
   "spaces.openCreated": "Open Space",
   "spaces.refresh": "Check for approval",
   "spaces.membersTitle": "Members ({count})",

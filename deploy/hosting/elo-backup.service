@@ -1,0 +1,21 @@
+[Unit]
+Description=elo.now encrypted off-site operational backup
+After=network-online.target elo-megacmd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/elo/hosting/backup.py
+ExecStopPost=/usr/bin/python3 /opt/elo/hosting/backup.py --resume
+TimeoutStartSec=30min
+TimeoutStopSec=90
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/elo-operations /run
+MemoryMax=256M
+TasksMax=32

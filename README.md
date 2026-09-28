@@ -21,7 +21,7 @@ elo.now is a messaging app for small groups and teams. A **Space** keeps one gro
 ### Start in five steps
 
 1. Install elo.now, choose **New with elo?**, enter your name and set a password. Save the recovery code somewhere safe; it is how you recover your identity if you lose the device.
-2. Choose **Create a Space**, give it a name and enter a contact email. You become its primary owner. The **General** conversation is ready automatically.
+2. Choose **Create a Space**, give it a name and enter a contact email. Keep **Require owner approval** enabled to approve people using the first invitation, or turn it off to let anyone with that QR/link join directly. You become its primary owner. The **General** conversation is ready automatically.
 3. In **Spaces**, tap the Share icon beside your Space. Send its QR code or invitation link to someone you trust.
 4. That person chooses **Join a Space** and scans the code or opens the link. If the invitation requires approval, approve their request in **Approvals**.
 5. Open **General** to send your first message. Add other channels or start a direct conversation as needed. You can enable notifications in Settings.
@@ -80,7 +80,7 @@ Calls use a separate authorization and control service. Direct calls try an auth
 
 The design uses Ed25519 signatures, the age encryption format and HTTPS transport. A storage Replica does not need participants' decryption keys to deliver their messages. Passwords, recovery secrets and server administrator credentials do not belong in a source repository or notification payload.
 
-These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. The General enrollment service holds an authorized participant key for General, so organizational administrators are part of its trust model.
+These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. The General enrollment service holds a key that can decrypt General messages. On publisher-operated hosting, that operator is 9bits: General is not end-to-end encrypted against the hosting operator. This service role does not grant access to independent private conversations.
 
 Newly linked and recovered devices receive independent keys. To link a device, show the QR from **Devices → +**, scan it on the new device, then choose **Accept** on the original device. The new device opens the transferred profile with the same password. Keep this QR private. An unlocked, admitted device can revoke another device through **Delete** and confirmation. Server confirmation is required, private-chat controllers must update recipient keys, and copies already on a device cannot be erased. These protocol changes require matching app and server versions; see the [threat model](THREAT_MODEL.md) for rollout boundaries and remaining risks.
 

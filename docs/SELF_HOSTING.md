@@ -85,8 +85,8 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
   "root": "/var/lib/elo/host",
   "public_url": "https://chat.example.org",
   "max_spaces_per_identity": 2,
-  "max_spaces": 1000,
-  "max_space_creations_per_day": 100,
+  "max_spaces": 128,
+  "max_space_creations_per_day": 32,
   "mailbox_quota_bytes": 150000000,
   "call_admission_key": "/etc/elo/host/admission.key",
   "attachment_storage": {
@@ -348,6 +348,35 @@ Before giving the service to users:
 4. Back up **the complete, stopped** `/var/lib/elo/host` tree and the attachment provider's objects together. Also protect wake state, call database, private service configs and keys. A live SQLite main file alone is not a consistent backup; use a coordinated stopped copy or SQLite's online-backup method. A restore of stale membership/deletion state is not safe to automate. Rehearse recovery on an isolated host before promising it to users.
 
 This guide defines a reproducible **configuration layout**, but is not evidence that a particular VPS or package was accepted. Debian 13, Oracle Linux 10, every chosen storage provider, provider credentials, DNS/TLS and final signed mobile apps require validation on the actual installation. The publisher's private deployment scripts, credentials and multi-server routing are deliberately not included.
+
+## Encrypted operational backups
+
+`deploy/hosting/backup.py` and `elo-backup.{service,timer}` provide daily age-encrypted operational snapshots for a systemd deployment. Install `age` and `curl`. Generate the age identity on an administrator's separate machine; keep an independent recovery copy there. Put **only its public recipient** in `/etc/elo-backup/recipient.txt` on the server. Never include the age identity in a source archive, VPS configuration or backup job.
+
+Create a root-owned mode-0600 `/etc/elo-backup/config.json` with:
+
+```json
+{
+  "recipient_file": "/etc/elo-backup/recipient.txt",
+  "paths": ["/var/lib/elo/host", "/var/lib/elo/wake", "/var/lib/elo/call", "/etc/elo"],
+  "services": ["elo-host", "elo-wake", "elo-call"],
+  "destination": "/var/backups/elo-operations",
+  "offsite_url": "http://127.0.0.1:18930/REPLACE_WITH_PRIVATE_COLLECTION/operations-backups",
+  "retention_days": 7
+}
+```
+
+Adapt paths and service names to the deployment; every listed path must exist. Install the script at `/opt/elo/hosting/backup.py`, create the destination directory with mode 0700, install the units, run `systemctl start elo-backup`, and verify its successful result before enabling `elo-backup.timer`. Snapshots briefly stop the listed active services; both normal and service-manager cleanup restart them. The archive is encrypted while streaming, without a plaintext staging archive. Services resume before upload. The timer runs daily; local and off-site retention is seven days. Failed transfers remain local for retry. Inspect `systemctl status elo-backup` and the last successful off-site object; a timer being enabled is not proof of a successful backup.
+
+This archive covers the listed state/configuration, **not attachment bytes** or a complete operating-system image. Keep attachment objects in their provider and plan a separate independent copy if protection against provider loss is required. MEGA backups and attachments share a provider failure domain. Download a copy independently of the VPS and rehearse decryption with `age --decrypt --identity /secure/offline-backup.agekey snapshot.tar.gz.age`. Validate every SQLite database, then start the restored service on a network-isolated host with matching binaries and a rewritten local storage root. Do not expose restored listeners or publish stale membership. Preserve/reapply all newer deletion receipts, revoked-device records and account-erasure requests before returning restored state to service.
+
+For **newly provisioned Spaces**, set `recovery_recipient` in the hosting configuration to the same age public recipient. The host writes `spaces/<id>/service-recovery.age` before advertising the Space. The backup includes this encrypted service recovery card. Existing service root secrets that were discarded cannot be reconstructed; complete device-vault backups preserve their current controller instead.
+
+The host shares four SQLite worker slots across profiles. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. Pending cleanup retries in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. Only interrupted reservations that never issued an invitation expire after 24 hours; inactivity never deletes a published Space.
+
+### Isolate the local attachment bridge
+
+A loopback bind is not authorization between local users. Restrict MEGA's WebDAV port to the hosting service UID, attachment daemon UID and root using an nftables output rule. Cover both `127.0.0.1` and `::1`, persist it with the existing firewall configuration, and verify that a request as `elo-wake` or `elo-call` is rejected while hosting still works. Do not expose or log the private WebDAV collection URL. Bound wake and MEGA service memory and task counts as well as the hosting service. Keep key-only SSH, disable root/password/X11 access after testing a separate key connection, and retain a guarded rollback until that check succeeds.
 
 ## Coordinated device-security upgrade
 

@@ -129,6 +129,7 @@ mod tests {
                 call_admission_key: Some(key_path),
                 client_policy: Default::default(),
                 attachment_storage: None,
+                recovery_recipient: None,
             },
             true,
         )
@@ -191,6 +192,7 @@ mod tests {
                 call_admission_key: Some(key_path),
                 client_policy: Default::default(),
                 attachment_storage: None,
+                recovery_recipient: None,
             },
             true,
         )

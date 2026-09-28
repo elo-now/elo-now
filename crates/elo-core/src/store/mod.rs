@@ -1,4 +1,5 @@
-//! One connection, one dedicated OS thread, a bounded async command queue.
+//! One connection and a bounded async command queue per profile. Servers may
+//! share a bounded blocking-worker budget instead of a thread per profile.
 //!
 //! Cancellation AFTER enqueue does not cancel a transaction. If the response is
 //! lost, retry the SAME PreparedLocalRecord. Do not infer rollback or create a new
@@ -18,6 +19,7 @@ mod model;
 mod notifications;
 mod presentation;
 mod repair;
+mod shared;
 pub use inbox::{DisplaySource, InboxItem, PeerCursor};
 #[cfg(test)]
 mod tests;
@@ -148,13 +150,23 @@ impl ClientStore {
         let path = data_dir.as_ref().to_path_buf();
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
-        let _worker = thread::Builder::new()
-            .name("elo-sqlite".into())
-            .spawn(move || run_worker(path, receiver, ready_sender))?;
+        if let Some(pool) = shared::pool() {
+            tokio::spawn(shared::run(path, receiver, ready_sender, pool));
+        } else {
+            thread::Builder::new()
+                .name("elo-sqlite".into())
+                .spawn(move || run_worker(path, receiver, ready_sender))?;
+        }
         ready_receiver
             .await
             .map_err(|_| StoreError::OutcomeUnknown)??;
         Ok(Self { sender })
+    }
+
+    /// Server-only process setting. Existing stores retain their worker mode.
+    /// Mobile and desktop callers keep the dedicated writer unless opted in.
+    pub fn configure_shared_workers(workers: usize) -> Result<()> {
+        shared::configure(workers)
     }
 
     async fn call<T, F>(&self, operation: F) -> Result<T>

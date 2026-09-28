@@ -1,6 +1,6 @@
 [Unit]
 Description=elo.now hosted Spaces
-After=network-online.target
+After=network-online.target elo-megacmd.service
 Wants=network-online.target
 
 [Service]
@@ -24,6 +24,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 LimitNOFILE=8192
 TasksMax=512
+MemoryMax=2G
 ReadWritePaths=/var/lib/elo/host /var/lib/elo/attachments
 
 [Install]
