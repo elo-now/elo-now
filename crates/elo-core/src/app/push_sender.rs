@@ -130,6 +130,9 @@ mod tests {
         // Recovering the same identity with a new device cannot evade its block.
         let recovered = Session::recover(&card, session.identity_id()).unwrap();
         sign(&recovered, &route, &mut body).unwrap();
+        // A fresh signature has its own two-minute window. Recovery can cross
+        // a wall-clock second, so the earlier verification time is now stale.
+        let time = now().unwrap().as_millis() as u64 / 1000;
         assert_eq!(verify(&route, &body, time).unwrap(), tag);
         assert_ne!(
             credential_tag(&route, credential),
