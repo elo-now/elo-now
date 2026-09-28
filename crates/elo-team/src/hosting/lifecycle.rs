@@ -3,10 +3,13 @@ use super::*;
 
 impl Host {
     pub(super) async fn expire_unpublished_reservations(&self) -> Result<()> {
+        self.expire_reservations_at(current()?).await
+    }
+
+    pub(super) async fn expire_reservations_at(&self, now: u64) -> Result<()> {
         let Ok(_creation) = self.creation.try_lock() else {
             return Ok(());
         };
-        let now = current()?;
         for entry in std::fs::read_dir(self.config.root.join("spaces"))? {
             let entry = entry?;
             let id = entry.file_name().to_string_lossy().into_owned();
@@ -29,22 +32,35 @@ impl Host {
             let Some(reservation) = reservation else {
                 continue;
             };
-            if reservation.invitation.is_some()
+            if (reservation.invitation.is_some() && !reservation.reclaim_if_unclaimed)
                 || reservation.reserved_at == 0
                 || now.saturating_sub(reservation.reserved_at) < 86_400_000
             {
                 continue;
             }
-            // Only an interrupted creation that never issued its first invite
-            // can expire. Inactive, empty or offline users' Spaces are retained.
-            private_directory(&path)?;
-            let removed = self.spaces.write().await.remove(&id);
-            if let Some(space) = removed {
-                *space.serving.write().await = false;
-                if let Some(client) = space.client.lock().await.take() {
-                    client.close().await?;
+            // Serialize against joins. Once even a pending join has been saved,
+            // this Space is retained forever, including after members leave.
+            let space = self.spaces.read().await.get(&id).cloned();
+            if let Some(space) = space {
+                let Ok(mut guard) = space.client.try_lock() else {
+                    continue;
+                };
+                let Some(client) = guard.as_ref() else {
+                    continue;
+                };
+                if !client.space_reservation_is_unused(now).unwrap_or(false) {
+                    continue;
                 }
+                private_directory(&path)?;
+                *space.serving.write().await = false;
+                let client = guard.take().unwrap();
+                client.close().await?;
+                self.spaces.write().await.remove(&id);
+            } else if reservation.invitation.is_some() {
+                // Never infer emptiness from an unavailable or damaged service.
+                continue;
             }
+            private_directory(&path)?;
             std::fs::remove_dir_all(&path)?;
             self.allocations
                 .lock()
@@ -195,6 +211,8 @@ mod tests {
                     invitation: issued.then(|| "synthetic-issued-invite".into()),
                     invitation_issued: 0,
                     reserved_at: time,
+                    creation_network: None,
+                    reclaim_if_unclaimed: false,
                 },
             )
             .unwrap();
@@ -286,5 +304,105 @@ mod tests {
         deleted.cleanup_completed = true;
         save(&marker, &deleted).unwrap();
         assert_eq!(host.finish_deletion(&id).await.unwrap().record, "synthetic");
+    }
+}
+
+#[cfg(test)]
+mod reservation_limits_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn issued_unused_reservation_expires_only_after_all_invites() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: HostConfig = serde_json::from_value(json!({
+            "root":temp.path().join("host"), "public_url":"https://host.example.test",
+            "max_spaces_per_identity":2, "mailbox_quota_bytes":150_000_000
+        }))
+        .unwrap();
+        let host = Host::open(config, true).await.unwrap();
+        let command = CreateCommand {
+            v: 1,
+            kind: "space.create".into(),
+            host: "https://host.example.test/spaces/v1/create".into(),
+            request_id: "11".repeat(16),
+            issued: current().unwrap(),
+            name: "Never joined".into(),
+            contact_email: "owner@example.test".into(),
+            message_lifetime_seconds: 86400,
+            require_approval: true,
+        };
+        let (id, reservation) = host
+            .provision(&command, "77".repeat(32).parse().unwrap())
+            .await
+            .unwrap();
+        host.expire_reservations_at(reservation.invitation_issued + 86_399_000)
+            .await
+            .unwrap();
+        assert!(host.spaces.read().await.contains_key(&id));
+        host.expire_reservations_at(reservation.invitation_issued + 86_401_000)
+            .await
+            .unwrap();
+        assert!(!host.spaces.read().await.contains_key(&id));
+        assert!(!host.allocations.lock().unwrap().contains_key(&id));
+        assert!(!host.config.root.join("spaces").join(id).exists());
+        super::super::tests::close_host(host).await;
+    }
+
+    #[tokio::test]
+    async fn active_network_limit_survives_restart_and_daily_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: HostConfig = serde_json::from_value(json!({
+            "root":temp.path().join("host"), "public_url":"https://host.example.test",
+            "max_spaces_per_identity":2, "mailbox_quota_bytes":150_000_000
+        }))
+        .unwrap();
+        let host = Host::open(config.clone(), true).await.unwrap();
+        let network = "synthetic-network".to_owned();
+        for index in 1..=8 {
+            let id = format!("{index:064x}");
+            let path = config.root.join("spaces").join(&id);
+            private_directory(&path).unwrap();
+            save(
+                &path.join("reservation.json"),
+                &Reservation {
+                    creator: None,
+                    request_id: "synthetic".into(),
+                    name: "Unclaimed".into(),
+                    contact_email: None,
+                    message_lifetime_seconds: 86400,
+                    require_approval: true,
+                    mailbox: MailboxDescriptor::random().unwrap(),
+                    password: "synthetic".into(),
+                    invitation: None,
+                    invitation_issued: 0,
+                    reserved_at: current().unwrap(),
+                    creation_network: Some(network.clone()),
+                    reclaim_if_unclaimed: true,
+                },
+            )
+            .unwrap();
+        }
+        super::super::tests::close_host(host).await;
+        let host = Host::open(config, true).await.unwrap();
+        let command = CreateCommand {
+            v: 1,
+            kind: "space.create".into(),
+            host: "https://host.example.test/spaces/v1/create".into(),
+            request_id: "11".repeat(16),
+            issued: current().unwrap(),
+            name: "Capacity".into(),
+            contact_email: "owner@example.test".into(),
+            message_lifetime_seconds: 86400,
+            require_approval: true,
+        };
+        assert_eq!(
+            host.provision_from_network(&command, "77".repeat(32).parse().unwrap(), Some(network))
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "Hosting capacity reached."
+        );
+        super::super::tests::close_host(host).await;
     }
 }

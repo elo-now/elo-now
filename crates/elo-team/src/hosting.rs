@@ -28,6 +28,7 @@ use std::{
 use tokio::sync::{RwLock, Semaphore};
 use tower::ServiceExt;
 mod account_deletion;
+mod backup;
 mod calls;
 mod lifecycle;
 
@@ -88,6 +89,11 @@ struct Reservation {
     invitation_issued: u64,
     #[serde(default)]
     reserved_at: u64,
+    #[serde(default)]
+    creation_network: Option<String>,
+    // Existing advertised Spaces are never eligible for automatic reclamation.
+    #[serde(default)]
+    reclaim_if_unclaimed: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -415,6 +421,22 @@ impl Host {
             if owned >= self.config.max_spaces_per_identity {
                 return Err("Hosting capacity reached.".into());
             }
+            if let Some(network) = &network {
+                let mut active = 0;
+                for entry in std::fs::read_dir(self.config.root.join("spaces"))? {
+                    let path = entry?.path().join("reservation.json");
+                    if let Ok(bytes) = vault::read_private(&path)
+                        && let Ok(saved) =
+                            serde_json::from_slice::<Reservation>(&Zeroizing::new(bytes))
+                        && saved.creation_network.as_ref() == Some(network)
+                    {
+                        active += 1;
+                    }
+                }
+                if active >= 8 {
+                    return Err("Hosting capacity reached.".into());
+                }
+            }
             // Persist a deployment-wide budget, including identities minted by an attacker.
             let budget_path = self.config.root.join("creation-budget.json");
             let mut budget: CreationBudget = if budget_path.exists() {
@@ -432,8 +454,8 @@ impl Host {
             if budget.count >= self.config.max_space_creations_per_day {
                 return Err("Hosting capacity reached.".into());
             }
-            if let Some(network) = network {
-                let count = budget.networks.entry(network).or_default();
+            if let Some(network) = &network {
+                let count = budget.networks.entry(network.clone()).or_default();
                 if *count >= 4 {
                     return Err("Hosting capacity reached.".into());
                 }
@@ -453,6 +475,8 @@ impl Host {
                 invitation: None,
                 invitation_issued: 0,
                 reserved_at: current()?,
+                creation_network: network,
+                reclaim_if_unclaimed: true,
             };
             // Stage and rename the reservation directory so a crash cannot leave
             // a counted directory without its durable allocation descriptor.
@@ -1016,6 +1040,11 @@ async fn statistics(State(host): State<Arc<Host>>) -> impl IntoResponse {
         );
     }
     let storage = complete.then_some(storage);
+    let allocated = host
+        .allocations
+        .lock()
+        .map(|index| index.len())
+        .unwrap_or(host.config.max_spaces);
     let snapshot = host
         .config
         .operator_snapshot
@@ -1024,7 +1053,7 @@ async fn statistics(State(host): State<Arc<Host>>) -> impl IntoResponse {
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     Json(
         json!({"spaces":summaries,"storage":storage,"uptime_seconds":host.started.elapsed().as_secs(),
-        "capacity":{"per_identity":host.config.max_spaces_per_identity,"bytes_per_space":host.config.mailbox_quota_bytes},
+        "capacity":{"per_identity":host.config.max_spaces_per_identity,"bytes_per_space":host.config.mailbox_quota_bytes,"allocated":allocated,"limit":host.config.max_spaces,"remaining":host.config.max_spaces.saturating_sub(allocated),"near_full":allocated.saturating_mul(10) >= host.config.max_spaces.saturating_mul(8)},
         "system":system_statistics(),"operator_snapshot":snapshot}),
     )
 }
@@ -1171,6 +1200,11 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
             get(|| async { Html(include_str!("hosting/admin.html")) }),
         )
         .route("/stats", get(statistics))
+        .route("/backup/attachments", get(backup::inventory))
+        .route(
+            "/backup/attachments/{space}/{object}",
+            get(backup::download),
+        )
         .route("/internal/calls/admission", post(calls::admit))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(host.clone());
@@ -2064,6 +2098,52 @@ mod tests {
                 .windows(content.len())
                 .any(|window| window == content)
         );
+        let Json(manifest) = backup::inventory(State(host.clone())).await.unwrap();
+        let (hosted_id, inventory) = manifest["spaces"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let objects = inventory["objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["size"], encrypted.len());
+        assert_eq!(
+            objects[0]["sha256"],
+            elo_core::record::encode_hex(&Sha256::digest(&encrypted))
+        );
+        assert!(!manifest.to_string().contains("family-photo.txt"));
+        let response = backup::download(
+            State(host.clone()),
+            Path((
+                hosted_id.clone(),
+                objects[0]["object"].as_str().unwrap().into(),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 6 * 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            encrypted
+        );
+        let public = app(host.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/backup/attachments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
+        // Inactivity must never delete a Space used by a real member.
+        host.expire_reservations_at(current().unwrap() + 8 * 86_400_000)
+            .await
+            .unwrap();
+        assert!(host.spaces.read().await.contains_key(hosted_id));
         storage
             .unavailable
             .store(true, std::sync::atomic::Ordering::SeqCst);

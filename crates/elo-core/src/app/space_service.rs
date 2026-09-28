@@ -136,6 +136,8 @@ struct Applicant {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceState {
+    #[serde(default)]
+    claimed: bool,
     offers: BTreeMap<String, Offer>,
     applicants: BTreeMap<String, Applicant>,
     replies: BTreeMap<String, (u64, String, Value)>,
@@ -159,6 +161,15 @@ struct ServiceState {
 }
 
 impl ServiceState {
+    fn reservation_is_unused(&self, now: u64) -> bool {
+        !self.claimed
+            && self.applicants.is_empty()
+            && self.removals.is_empty()
+            && self.erased_accounts.is_empty()
+            && self.attachments.is_empty()
+            && self.offers.values().all(|offer| offer.expires_at <= now)
+    }
+
     fn prune_applicants(&mut self, current: u64) {
         self.applicants.retain(|_, applicant| {
             applicant.status != "pending"
@@ -528,6 +539,12 @@ impl ClientApp {
             }
         }
         Ok(())
+    }
+    /// Reclamation is allowed only for a newly provisioned, never-used reservation.
+    /// The hosting layer separately excludes all older reservations.
+    pub fn space_reservation_is_unused(&self, now: u64) -> Result<bool> {
+        let state = self.service_state()?;
+        Ok(state.reservation_is_unused(now))
     }
     /// Operator aggregates only; never exports messages, keys, or member identities.
     pub fn space_service_statistics(&self) -> Result<Value> {
@@ -900,6 +917,7 @@ impl ClientApp {
                     );
                 }
                 if succeeded {
+                    state.claimed = true;
                     self.save_service_state(&state)?;
                 }
                 value
@@ -1062,6 +1080,7 @@ impl ClientApp {
                     let pending = state.removals.contains_key(&identity)
                         || (offer.require_approval && !owner);
                     state.require_applicant_capacity(identity, offer_id, pending)?;
+                    state.claimed = true;
                     state.applicants.insert(
                         key.clone(),
                         Applicant {
@@ -1354,6 +1373,29 @@ impl ClientApp {
 
 #[cfg(test)]
 mod transport_tests {
+    #[test]
+    fn claimed_reservation_never_becomes_unused_again() {
+        use super::*;
+        let mut state = ServiceState::default();
+        state.offers.insert(
+            "test".into(),
+            Offer {
+                token: "synthetic".into(),
+                issued_at: 1,
+                expires_at: 100,
+                require_approval: true,
+                revoked: false,
+            },
+        );
+        assert!(!state.reservation_is_unused(99));
+        assert!(state.reservation_is_unused(100));
+        state.claimed = true;
+        state.offers.clear();
+        let restored: ServiceState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(!restored.reservation_is_unused(u64::MAX));
+    }
+
     use super::*;
     use std::sync::{
         Arc,

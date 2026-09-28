@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from online_snapshot import capture, SourceChanged
+from attachment_snapshot import AttachmentSnapshot
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -96,7 +97,11 @@ def snapshot(config, directory):
         for attempt in range(3):
             with tempfile.TemporaryDirectory(prefix='.snapshot-', dir=directory) as temporary:
                 try:
+                    attachments = AttachmentSnapshot(config['attachments']) if config.get('attachments') else None
+                    manifest = attachments.capture(Path(temporary)) if attachments else None
                     capture(paths, Path(temporary))
+                    if attachments:
+                        attachments.verify_unchanged(manifest)
                 except (SourceChanged, FileNotFoundError):
                     if attempt == 2:
                         raise
@@ -104,7 +109,8 @@ def snapshot(config, directory):
                     continue
                 with partial.open('xb') as output:
                     tar = subprocess.Popen(['tar', '-C', temporary, '-czf', '-', '--',
-                                            *[p.lstrip('/') for p in paths]], stdout=subprocess.PIPE)
+                                            *[p.lstrip('/') for p in paths],
+                                            *(['elo-attachments'] if attachments else [])], stdout=subprocess.PIPE)
                     try:
                         encrypted = subprocess.run(['age', '-r', recipient], stdin=tar.stdout,
                                                    stdout=output)

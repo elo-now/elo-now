@@ -55,6 +55,28 @@ class BackupTests(unittest.TestCase):
         self.assertFalse(self.calls)
         self.assertFalse(backup.STATE.exists())
 
+    def test_encrypted_archive_contains_verified_attachment_bytes(self):
+        from attachment_snapshot import AttachmentSnapshot
+        import hashlib
+        import json
+        content = b'synthetic encrypted attachment'
+        space, obj = 'a' * 64, 'b' * 32
+        manifest = {'version': 1, 'spaces': {space: {'revision': 'c' * 64,
+                    'objects': [{'object': obj, 'size': len(content),
+                                 'sha256': hashlib.sha256(content).hexdigest()}]}}}
+        self.config['attachments'] = {'operator_url': 'http://127.0.0.1:18901'}
+        job = AttachmentSnapshot(self.config['attachments'])
+        with patch.object(backup, 'AttachmentSnapshot', return_value=job), patch.object(
+                job, 'request', side_effect=lambda path: io.BytesIO(
+                    json.dumps(manifest).encode() if path == '/backup/attachments' else content)):
+            archive = backup.snapshot(self.config, self.root)
+        clear = subprocess.check_output(['age', '-d', '-i', str(self.root / 'key'), str(archive)])
+        with tarfile.open(fileobj=io.BytesIO(clear), mode='r:gz') as tar:
+            self.assertEqual(tar.extractfile(f'elo-attachments/spaces/{space}/{obj}').read(), content)
+            self.assertEqual(json.load(tar.extractfile('elo-attachments/manifest.json')), manifest)
+        self.assertFalse(list(self.root.glob('.snapshot-*')))
+        self.assertFalse(self.calls)
+
     def test_capture_failure_removes_plain_staging_and_partial_archive(self):
         with patch.object(backup.subprocess, 'Popen', side_effect=OSError('synthetic failure')):
             # Leave the successful age preflight independent of Popen's failure.

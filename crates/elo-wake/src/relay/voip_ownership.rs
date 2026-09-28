@@ -9,7 +9,7 @@ const ROOT: &[u8] = include_bytes!("Apple_App_Attestation_Root_CA.pem");
 pub(super) struct Token {
     token: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Proof {
     token: String,
@@ -66,8 +66,8 @@ pub(super) async fn challenge(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let time = now()?;
-    let mut db = relay.database()?;
-    let identity = owner(&db, &route, &headers, time)?;
+    relay.db.call(move |db| {
+    let identity = owner(db, &route, &headers, time)?;
     let tx = db.transaction().map_err(db_error)?;
     tx.execute("DELETE FROM voip_keys WHERE updated<? AND NOT EXISTS(SELECT 1 FROM voip_bindings b WHERE b.key_id=voip_keys.id)", [time-90*86400]).map_err(db_error)?;
     if verified(&tx, &route, &input.token)? {
@@ -98,6 +98,7 @@ pub(super) async fn challenge(
         params![route,input.token,nonce,time,time+120]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(Json(json!({"nonce":nonce,"identity":identity})))
+    }).await
 }
 fn enrollment(identity: &str, nonce: &str) -> String {
     format!("elo.now/voip-key/v1\n{identity}\n{nonce}")
@@ -274,20 +275,28 @@ pub(super) async fn prove(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .app_id();
-    let (identity, known) = {
-        let db = relay.database()?;
-        let identity = owner(&db, &route, &headers, time)?;
-        check_challenge(&db, &route, &proof, time)?;
-        let known: Option<(String, Vec<u8>, u32)> = db
-            .query_row(
-                "SELECT identity,public_key,counter FROM voip_keys WHERE id=?",
-                [&proof.key_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(db_error)?;
-        (identity, known)
-    };
+    let check_route = route.clone();
+    let check_headers = headers.clone();
+    let check_proof = proof.clone();
+    let (identity, known) = relay
+        .db
+        .call(move |db| {
+            let route = check_route;
+            let headers = check_headers;
+            let proof = check_proof;
+            let identity = owner(db, &route, &headers, time)?;
+            check_challenge(db, &route, &proof, time)?;
+            let known: Option<(String, Vec<u8>, u32)> = db
+                .query_row(
+                    "SELECT identity,public_key,counter FROM voip_keys WHERE id=?",
+                    [&proof.key_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(db_error)?;
+            Ok((identity, known))
+        })
+        .await?;
     let (key, previous) = if let Some((saved, key, counter)) = known {
         if saved != identity {
             return Err(StatusCode::FORBIDDEN);
@@ -303,7 +312,7 @@ pub(super) async fn prove(
         &key,
         previous,
     )?;
-    let mut db = relay.database()?;
+    relay.db.call(move |db| {
     let tx = db.transaction().map_err(db_error)?;
     if owner(&tx, &route, &headers, now()?)? != identity {
         return Err(StatusCode::FORBIDDEN);
@@ -332,6 +341,7 @@ pub(super) async fn prove(
         .map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+    }).await
 }
 fn check_challenge(db: &Connection, route: &str, proof: &Proof, time: i64) -> Result<()> {
     let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM voip_challenges WHERE route=? AND token=? AND nonce=? AND created<=? AND expires>?)",

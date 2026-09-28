@@ -784,6 +784,31 @@ impl ClientApp {
         Ok(targets)
     }
 
+    /// Operator-only ciphertext inventory, never attachment names or decryption keys.
+    /// Bind it to all attachment metadata so concurrent changes invalidate a backup.
+    pub fn attachment_backup_inventory(&self) -> Result<Value> {
+        let state = self.service_state()?;
+        let revision = record::encode_hex(&Sha256::digest(serde_json::to_vec(&state.attachments)?));
+        let objects: Vec<_> = state
+            .attachments
+            .values()
+            .filter(|attachment| {
+                matches!(
+                    attachment.state,
+                    HostedAttachmentState::Uploaded | HostedAttachmentState::Available
+                )
+            })
+            .map(|attachment| {
+                json!({
+                    "object": attachment.object_id,
+                    "size": attachment.encrypted_size,
+                    "sha256": attachment.ciphertext_sha256,
+                })
+            })
+            .collect();
+        Ok(json!({"revision": revision, "objects": objects}))
+    }
+
     pub fn attachment_all_targets(&self) -> Result<Vec<AttachmentCleanupTarget>> {
         Ok(self
             .service_state()?

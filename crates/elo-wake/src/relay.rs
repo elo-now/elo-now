@@ -16,11 +16,12 @@ use std::{
     future::Future,
     path::Path as FilePath,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 mod calls;
+mod database;
 mod voip_ownership;
 
 type Result<T> = std::result::Result<T, StatusCode>;
@@ -42,7 +43,7 @@ impl Provider for Fcm {
 }
 
 pub struct Relay {
-    db: Mutex<Connection>,
+    db: database::Database,
     provider: Arc<dyn Provider>,
     delivery_gate: tokio::sync::Mutex<()>,
     registrations: tokio::sync::Semaphore,
@@ -300,7 +301,7 @@ impl Relay {
         calls::schema(&db).map_err(|_| "Cannot initialize call delivery")?;
         voip_ownership::schema(&db).map_err(|_| "Cannot initialize VoIP ownership")?;
         Ok(Arc::new(Self {
-            db: Mutex::new(db),
+            db: database::Database::new(db)?,
             provider,
             delivery_gate: tokio::sync::Mutex::new(()),
             registrations: tokio::sync::Semaphore::new(4),
@@ -367,10 +368,9 @@ impl Relay {
             .endpoint = url.origin().ascii_serialization();
         Ok(self)
     }
+    #[cfg(test)]
     fn database(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.db
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        self.db.inspect()
     }
 }
 
@@ -385,7 +385,7 @@ async fn erase_account(
         protocol::verify(&request, &endpoint, time).map_err(|_| StatusCode::BAD_REQUEST)?;
     let identity = credential.identity().to_string();
     let _gate = relay.delivery_gate.lock().await;
-    let mut db = relay.database()?;
+    relay.db.call(move |db| {
     let previous: Option<(String, u64)> = db
         .query_row(
             "SELECT request_id,completed FROM erased_accounts WHERE identity=?1",
@@ -464,6 +464,7 @@ async fn erase_account(
     protocol::seal(&command, &credential, &outcome)
         .map(Json)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    }).await
 }
 
 async fn register(
@@ -499,8 +500,9 @@ async fn register(
         return Err(StatusCode::BAD_REQUEST);
     }
     let time = now()?;
-    let challenge = {
-        let db = relay.database()?;
+    let token = input.token.clone();
+    let route = id.clone();
+    let challenge = relay.db.call(move |db| {
         if db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM erased_accounts WHERE identity=?1)",
@@ -513,7 +515,7 @@ async fn register(
         }
         db.execute("DELETE FROM routes WHERE expires<=?", [time])
             .map_err(db_error)?;
-        if let Some(saved) = row(&db, &id)? {
+        let challenge = if let Some(saved) = row(db, &id)? {
             let bound: Option<String> = db
                 .query_row(
                     "SELECT identity FROM route_accounts WHERE route=?1",
@@ -537,7 +539,7 @@ async fn register(
                     params![time + 30 * 86400, id],
                 )
                 .map_err(db_error)?;
-                return Ok(Json(json!({"active":true})));
+                return Ok(None);
             }
             if saved.next_send > time {
                 return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -583,12 +585,17 @@ async fn register(
             )
             .map_err(db_error)?;
             challenge
-        }
+        };
+        Ok(Some(challenge))
+    }).await?;
+    let Some(challenge) = challenge else {
+        return Ok(Json(json!({"active":true})));
     };
+    let id = route;
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         relay.provider.send(
-            input.token,
+            token,
             Notice::Challenge {
                 registration: id.clone(),
                 challenge: challenge.clone(),
@@ -599,12 +606,16 @@ async fn register(
     if !matches!(result, Ok(Ok(()))) {
         // Failed or arbitrary tokens must not occupy the active-route budget.
         relay
-            .database()?
-            .execute(
-                "DELETE FROM routes WHERE id=?1 AND challenge=?2 AND active=0",
-                params![id, challenge],
-            )
-            .map_err(db_error)?;
+            .db
+            .call(move |db| {
+                db.execute(
+                    "DELETE FROM routes WHERE id=?1 AND challenge=?2 AND active=0",
+                    params![id, challenge],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            })
+            .await?;
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(Json(json!({"active":false})))
@@ -617,21 +628,25 @@ async fn confirm(
 ) -> Result<Json<Value>> {
     let owner = auth(&headers)?;
     let time = now()?;
-    let db = relay.database()?;
-    let saved = row(&db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
-    if !matches(&saved.owner, &owner)
-        || saved.expires <= time
-        || !hex(&input.challenge, 32)
-        || !bool::from(saved.challenge.as_bytes().ct_eq(input.challenge.as_bytes()))
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    db.execute(
-        "UPDATE routes SET active=1,expires=?,next_send=0 WHERE id=?",
-        params![time + 30 * 86400, id],
-    )
-    .map_err(db_error)?;
-    Ok(Json(json!({"active":true})))
+    relay
+        .db
+        .call(move |db| {
+            let saved = row(db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
+            if !matches(&saved.owner, &owner)
+                || saved.expires <= time
+                || !hex(&input.challenge, 32)
+                || !bool::from(saved.challenge.as_bytes().ct_eq(input.challenge.as_bytes()))
+            {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            db.execute(
+                "UPDATE routes SET active=1,expires=?,next_send=0 WHERE id=?",
+                params![time + 30 * 86400, id],
+            )
+            .map_err(db_error)?;
+            Ok(Json(json!({"active":true})))
+        })
+        .await
 }
 async fn remove(
     State(relay): State<Arc<Relay>>,
@@ -640,15 +655,19 @@ async fn remove(
 ) -> Result<StatusCode> {
     let owner = auth(&headers)?;
     let _gate = relay.delivery_gate.lock().await;
-    let db = relay.database()?;
-    if let Some(saved) = row(&db, &id)? {
-        if !matches(&saved.owner, &owner) {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        db.execute("DELETE FROM routes WHERE id=?", [id])
-            .map_err(db_error)?;
-    }
-    Ok(StatusCode::NO_CONTENT)
+    relay
+        .db
+        .call(move |db| {
+            if let Some(saved) = row(db, &id)? {
+                if !matches(&saved.owner, &owner) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                db.execute("DELETE FROM routes WHERE id=?", [id])
+                    .map_err(db_error)?;
+            }
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 // Replacing the allowlist also deletes queued notifications for muted/removed
 // scopes. Once this operation acknowledges, no worker can start their delivery.
@@ -684,8 +703,8 @@ async fn policy(
         return Err(StatusCode::BAD_REQUEST);
     }
     let _gate = relay.delivery_gate.lock().await;
-    let mut db = relay.database()?;
-    let saved = row(&db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
+    relay.db.call(move |db| {
+    let saved = row(db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
     if !matches(&saved.owner, &owner) || !saved.active || saved.expires <= now()? {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -778,6 +797,7 @@ async fn policy(
     tx.execute("DELETE FROM queue WHERE route=? AND (credential IS NULL OR (EXISTS(SELECT 1 FROM scopes s WHERE s.route=queue.route AND s.scope=queue.scope) AND NOT EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=queue.route AND o.scope=queue.scope) AND NOT EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=queue.route AND a.scope=queue.scope AND a.credential=queue.credential)))",[&id]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::NO_CONTENT)
+    }).await
 }
 // Only the device owner can re-arm a conversation. Reading an older alert must
 // not re-arm a newer, still unread one; retries and delayed senders are harmless.
@@ -811,38 +831,42 @@ async fn read(
         return Err(StatusCode::BAD_REQUEST);
     }
     let _gate = relay.delivery_gate.lock().await;
-    let mut db = relay.database()?;
-    let saved = row(&db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
-    let time = now()?;
-    if !matches(&saved.owner, &owner) || !saved.active || saved.expires <= time {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let tx = db.transaction().map_err(db_error)?;
-    tx.execute("DELETE FROM events WHERE expires<=?", [time])
-        .map_err(db_error)?;
-    for receipt in input.events {
-        // A read can arrive before its sender's delayed wake. Remember it using
-        // the same bounded dedup ledger, with no message or identity information.
-        if event_capacity(&tx, &id)? {
-            tx.execute(
-                "INSERT OR IGNORE INTO events VALUES(?,?,?)",
-                params![id, receipt.event, time + 86400],
-            )
-            .map_err(db_error)?;
-        }
-        tx.execute(
-            "DELETE FROM attention WHERE route=? AND scope=? AND event=?",
-            params![id, receipt.scope, receipt.event],
-        )
-        .map_err(db_error)?;
-        tx.execute(
-            "DELETE FROM queue WHERE route=? AND scope=? AND event=?",
-            params![id, receipt.scope, receipt.event],
-        )
-        .map_err(db_error)?;
-    }
-    tx.commit().map_err(db_error)?;
-    Ok(StatusCode::NO_CONTENT)
+    relay
+        .db
+        .call(move |db| {
+            let saved = row(db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
+            let time = now()?;
+            if !matches(&saved.owner, &owner) || !saved.active || saved.expires <= time {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            let tx = db.transaction().map_err(db_error)?;
+            tx.execute("DELETE FROM events WHERE expires<=?", [time])
+                .map_err(db_error)?;
+            for receipt in input.events {
+                // A read can arrive before its sender's delayed wake. Remember it using
+                // the same bounded dedup ledger, with no message or identity information.
+                if event_capacity(&tx, &id)? {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO events VALUES(?,?,?)",
+                        params![id, receipt.event, time + 86400],
+                    )
+                    .map_err(db_error)?;
+                }
+                tx.execute(
+                    "DELETE FROM attention WHERE route=? AND scope=? AND event=?",
+                    params![id, receipt.scope, receipt.event],
+                )
+                .map_err(db_error)?;
+                tx.execute(
+                    "DELETE FROM queue WHERE route=? AND scope=? AND event=?",
+                    params![id, receipt.scope, receipt.event],
+                )
+                .map_err(db_error)?;
+            }
+            tx.commit().map_err(db_error)?;
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 async fn wake(
     State(relay): State<Arc<Relay>>,
@@ -863,8 +887,8 @@ async fn wake(
         return Err(StatusCode::BAD_REQUEST);
     }
     let time = now()?;
-    let mut db = relay.database()?;
-    let saved = row(&db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
+    relay.db.call(move |db| {
+    let saved = row(db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
     if !saved.active || saved.expires <= time || !matches(&saved.notify, &key) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1024,6 +1048,7 @@ async fn wake(
     tx.execute("INSERT INTO queue(route,scope,event,target,next,expires,sender,credential,category) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event,target=excluded.target,expires=excluded.expires,sender=excluded.sender,credential=excluded.credential,category=excluded.category",params![id,input.scope,input.event,input.target,time+2,time+86400,sender,credential,input.category]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::ACCEPTED)
+    }).await
 }
 impl Relay {
     /// One bounded delivery; the SQLite mutex is released during provider I/O.
@@ -1031,27 +1056,28 @@ impl Relay {
     pub async fn deliver_due(&self) -> Result<bool> {
         let _gate = self.delivery_gate.lock().await;
         let time = now()?;
-        let item = {
-            let db = self.database()?;
+        let item = self.db.call(move |db| {
             db.execute("DELETE FROM routes WHERE expires<=?", [time])
                 .map_err(db_error)?;
             db.execute("DELETE FROM queue WHERE expires<=?", [time])
                 .map_err(db_error)?;
-            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures,q.category FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.credential IS NOT NULL AND (s.scope IS NULL OR EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=q.route AND o.scope=q.scope) OR EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=q.route AND a.scope=q.scope AND a.credential=q.credential)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?,r.get::<_,String>(6)?))).optional().map_err(db_error)?
-        };
+            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures,q.category FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.credential IS NOT NULL AND (s.scope IS NULL OR EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=q.route AND o.scope=q.scope) OR EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=q.route AND a.scope=q.scope AND a.credential=q.credential)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?,r.get::<_,String>(6)?))).optional().map_err(db_error)
+        }).await?;
         let Some((route, scope, event, target, token, failures, category)) = item else {
             return Ok(false);
         };
         // Only an explicitly repeatable, authorized scope can alert again before
         // a read receipt. Unknown senders remain quiet even in that scope.
-        let quiet = self
-            .database()?
-            .query_row(
+        let quiet_route = route.clone();
+        let quiet_scope = scope.clone();
+        let quiet = self.db.call(move |db| {
+            db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM scope_senders a JOIN queue q ON q.route=a.route AND q.scope=a.scope AND q.credential=a.credential WHERE q.route=?1 AND q.scope=?2) OR NOT EXISTS(SELECT 1 FROM scopes WHERE route=?1 AND scope=?2 AND enabled=1) OR (EXISTS(SELECT 1 FROM attention WHERE route=?1 AND scope=?2) AND NOT EXISTS(SELECT 1 FROM repeat_alerts WHERE route=?1 AND scope=?2))",
-                params![route, scope],
+                params![quiet_route, quiet_scope],
                 |r| r.get::<_, bool>(0),
             )
-            .map_err(db_error)?;
+            .map_err(db_error)
+        }).await?;
         let result = self
             .provider
             .send(
@@ -1066,7 +1092,7 @@ impl Relay {
                 },
             )
             .await;
-        let db = self.database()?;
+        self.db.call(move |db| {
         match result {
             Ok(()) => {
                 db.execute("INSERT INTO attention VALUES(?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event",
@@ -1091,6 +1117,7 @@ impl Relay {
             }
         }
         Ok(true)
+        }).await
     }
     pub async fn run(self: Arc<Self>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1110,5 +1137,7 @@ impl Relay {
     }
 }
 
+#[cfg(test)]
+use std::sync::Mutex;
 #[cfg(test)]
 mod tests;
