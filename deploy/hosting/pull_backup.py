@@ -12,10 +12,45 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 
 NAME = re.compile(r'elo-ops-(\d{8}T\d{6}Z)\.tar\.gz\.age\Z')
+MAX_INVENTORY_BYTES = 256 * 1024
+MAX_ARCHIVE_BYTES = 2 * 1024**3
+MAX_DIRECTORY_BYTES = 8 * 1024**3
+MIN_FREE_BYTES = 2 * 1024**3
+
+
+def read_inventory(command):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    timer = threading.Timer(30, process.kill)
+    timer.start()
+    try:
+        data = process.stdout.read(MAX_INVENTORY_BYTES + 1)
+        if len(data) > MAX_INVENTORY_BYTES:
+            raise ValueError('Backup inventory exceeds local size limit')
+        if process.wait() != 0:
+            raise RuntimeError('Backup inventory transfer failed')
+        return json.loads(data)
+    finally:
+        timer.cancel()
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def download_budget(directory):
+    used = sum(p.stat().st_size for p in directory.rglob('*')
+               if p.is_file() and not p.is_symlink())
+    available = min(MAX_ARCHIVE_BYTES, MAX_DIRECTORY_BYTES - used,
+                    shutil.disk_usage(directory).free - MIN_FREE_BYTES)
+    if available <= 0:
+        raise RuntimeError('Insufficient local backup space; existing copies preserved')
+    return available
 
 
 def timestamp(name):
@@ -45,33 +80,34 @@ def pull(config):
            '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'ForwardAgent=no',
            '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10',
            config['host'], 'sudo -n /usr/bin/python3 /opt/elo/hosting/backup.py']
-    listed = subprocess.run([*ssh, '--list-encrypted'], check=True, capture_output=True,
-                            text=True, timeout=30)
-    names = json.loads(listed.stdout)
+    names = read_inventory([*ssh, '--list-encrypted'])
     if not isinstance(names, list) or len(names) > 1000:
         raise ValueError('Invalid backup inventory')
     now = dt.datetime.now(dt.timezone.utc)
     names = candidates(names, now)
     if not names or now - timestamp(names[-1]) > dt.timedelta(hours=36):
         raise RuntimeError('No recent encrypted snapshot is available')
+    # One newest snapshot per run bounds work even with a hostile inventory.
+    # Older local copies remain independent of remote retention or deletion.
+    names = names[-1:]
     for name in names:
         target = directory / name
         if target.exists():
             continue
+        budget = download_budget(directory)
         with tempfile.TemporaryDirectory(prefix='.pull-', dir=directory) as temporary:
             partial = Path(temporary) / 'snapshot.age'
             with partial.open('xb') as output:
                 # Bound disk consumption even if the remote host is compromised.
                 process = subprocess.Popen([*ssh, '--read-encrypted', name],
                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                import threading
                 timer = threading.Timer(300, process.kill)
                 timer.start()
                 try:
                     total = 0
                     for chunk in iter(lambda: process.stdout.read(1024 * 1024), b''):
                         total += len(chunk)
-                        if total > 2 * 1024**3:
+                        if total > budget:
                             raise ValueError('Encrypted snapshot exceeds local size limit')
                         output.write(chunk)
                     if process.wait() != 0:
