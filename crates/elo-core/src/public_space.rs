@@ -992,6 +992,17 @@ impl PublicSpaceService {
                 }
                 let mut result = if let Some(applicant) = state.applicants.get_mut(&key) {
                     applicant.request = request;
+                    // A root-recovered device has independent keys and no active
+                    // parent proof. Surface its request for an owner's signed
+                    // decision instead of leaving an unverifiable eligible entry.
+                    if applicant.status == "eligible"
+                        && applicant.authorization.is_none()
+                        && applicant.invitation.is_empty()
+                        && credential.authorizing_device().is_none()
+                        && !self.device_admitted(device)
+                    {
+                        applicant.status = "pending".into();
+                    }
                     self.space_join_reply(config, state, &key, Some(&command.body))
                         .await?
                 } else {
@@ -1009,7 +1020,11 @@ impl PublicSpaceService {
                     {
                         return Err("Join this Space using an invitation first.".into());
                     }
-                    state.require_applicant_capacity(identity, "", false)?;
+                    state.require_applicant_capacity(
+                        identity,
+                        "",
+                        !self.device_admitted(device),
+                    )?;
                     state.applicants.insert(
                         key.clone(),
                         Applicant {
@@ -1018,7 +1033,9 @@ impl PublicSpaceService {
                             name,
                             status: if self.device_admitted(device) {
                                 "approved"
-                            } else if state.device_was_declined(&key)? {
+                            } else if state.device_was_declined(&key)?
+                                || credential.authorizing_device().is_none()
+                            {
                                 "pending"
                             } else {
                                 "eligible"
@@ -1721,10 +1738,13 @@ mod tests {
     impl Device {
         fn new() -> Self {
             let root = generate_signing_key().unwrap();
+            Self::with_root(&root)
+        }
+        fn with_root(root: &SigningKey) -> Self {
             let key = generate_signing_key().unwrap();
             let recipient = age::x25519::Identity::generate();
             let credential =
-                DeviceCredential::issue(&root, &key.verifying_key(), &recipient.to_public())
+                DeviceCredential::issue(root, &key.verifying_key(), &recipient.to_public())
                     .unwrap();
             Self {
                 key,
@@ -2032,6 +2052,233 @@ mod tests {
         service.publish_authority(&mut state, &owner.credential, &json!({"expected_head":authority.head_id(),"proof":accepted.call_proof().unwrap()}), None).unwrap();
         assert_eq!(service.service_state().unwrap().committed_journal.len(), 1);
     }
+    #[tokio::test]
+    async fn recovered_root_device_is_visible_for_explicit_owner_approval() {
+        use std::io::Write;
+        async fn command(
+            service: &mut PublicSpaceService,
+            config: &ServiceConfig,
+            device: &Device,
+            action: &str,
+            body: Value,
+        ) -> Value {
+            let nonce = record::random_hex::<16>().unwrap();
+            let signed = SignedRecord::sign(
+                &serde_json::to_vec(&json!({"v":1,"kind":"space.command","space":config.address.scope.space,"nonce":nonce,"issued":time().unwrap(),"action":action,"body":body})).unwrap(),
+                &device.key,
+            ).unwrap();
+            let reply = service
+                .serve_space_inner(
+                    config,
+                    Request {
+                        nonce,
+                        invitation: None,
+                        record: Some(STANDARD.encode(signed.bytes())),
+                        credential: Some(STANDARD.encode(device.credential.record().bytes())),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            serde_json::from_slice(
+                &crypto::open_bytes(
+                    &STANDARD.decode(reply.ciphertext.unwrap()).unwrap(),
+                    &device._recipient,
+                    LIMIT,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        }
+        fn enrollment(guest: &Device, authority: &Authority) -> team::EnrollmentRequest {
+            let contact = crate::invite::shared::contact(
+                &guest.credential,
+                &guest.key,
+                "Guest",
+                time().unwrap() + 86_400_000,
+            )
+            .unwrap();
+            let packet = json!({"kind":"Contact","card":STANDARD.encode(contact.bytes()),"credential":STANDARD.encode(guest.credential.record().bytes())});
+            let mut compressed =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            compressed
+                .write_all(&serde_json::to_vec(&packet).unwrap())
+                .unwrap();
+            team::EnrollmentRequest {
+            v: 1,
+            contact: format!("elo://exchange/v1#{}", URL_SAFE_NO_PAD.encode(compressed.finish().unwrap())),
+            proof: STANDARD.encode(SignedRecord::sign(&serde_json::to_vec(&json!({"v":1,"kind":"team.join","space":authority.space(),"stream":authority.stream(),"controller":authority.initial_controller().id(),"contact":contact.id()})).unwrap(), &guest.key).unwrap().bytes()),
+        }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = generate_signing_key().unwrap();
+        let owner = Device::with_root(&root);
+        let recovered = Device::with_root(&root);
+        let linked = owner.child();
+        let authority = initial(&owner);
+        let mut service = PublicSpaceService::create(
+            directory.path(),
+            authority.call_proof().unwrap(),
+            &[owner.credential.identity()],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let config = ServiceConfig {
+            name: "Recovered enrollment".into(),
+            owners: vec![owner.credential.identity()],
+            contact_email: None,
+            address: SpaceAddress {
+                url: "http://127.0.0.1:12345/team/v1/spaces".into(),
+                scope: service.team_scope().unwrap(),
+                message_lifetime_seconds: 86400,
+                service_credential: Some(service.transport_credential()),
+            },
+            peer: crate::sync::PeerDescriptor {
+                url: "http://127.0.0.1:12345/".into(),
+                signing_public_key: record::encode_hex(owner.key.verifying_key().as_bytes()),
+                mailbox_id: crate::ids::MailboxId::from_bytes([3; 32]),
+                read_token: Some("11".repeat(32)),
+                write_token: Some("22".repeat(32)),
+            },
+        };
+
+        let admitted = command(
+            &mut service,
+            &config,
+            &owner,
+            "status",
+            json!({"enrollment":enrollment(&owner,&authority)}),
+        )
+        .await;
+        assert_eq!(admitted["status"], "approved");
+        let restored = command(
+            &mut service,
+            &config,
+            &recovered,
+            "status",
+            json!({"enrollment":enrollment(&recovered,&authority)}),
+        )
+        .await;
+        assert_eq!(restored["status"], "pending");
+        let key = recovered.credential.id().to_string();
+        assert_eq!(
+            service.service_state().unwrap().applicants[&key].status,
+            "pending"
+        );
+        let requests = command(&mut service, &config, &owner, "manage", json!({})).await;
+        assert!(
+            requests["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == key)
+        );
+        assert!(!service.device_admitted(recovered.credential.id()));
+
+        // Repair a stranded request written by the previous server without
+        // granting membership or fabricating an owner signature.
+        let mut state = service.service_state().unwrap();
+        state.applicants.get_mut(&key).unwrap().status = "eligible".into();
+        service.save_service_state(&state).unwrap();
+        command(
+            &mut service,
+            &config,
+            &recovered,
+            "status",
+            json!({"enrollment":enrollment(&recovered,&authority)}),
+        )
+        .await;
+        assert_eq!(
+            service.service_state().unwrap().applicants[&key].status,
+            "pending"
+        );
+
+        let approved = command(
+            &mut service,
+            &config,
+            &owner,
+            "decide",
+            json!({"authority_head":authority.head_id(),"id":key,"approve":true}),
+        )
+        .await;
+        assert!(approved.get("error").is_none(), "{approved}");
+        let state = service.service_state().unwrap();
+        assert_eq!(state.applicants[&key].status, "eligible");
+        assert!(state.applicants[&key].authorization.is_some());
+        assert!(
+            !service.device_admitted(recovered.credential.id()),
+            "Only an owner-signed General commit can grant membership"
+        );
+        command(
+            &mut service,
+            &config,
+            &recovered,
+            "status",
+            json!({"enrollment":enrollment(&recovered,&authority)}),
+        )
+        .await;
+        assert_eq!(
+            service.service_state().unwrap().applicants[&key].status,
+            "eligible",
+            "Do not discard a signed approval"
+        );
+
+        command(
+            &mut service,
+            &config,
+            &linked,
+            "status",
+            json!({"enrollment":enrollment(&linked,&authority)}),
+        )
+        .await;
+        let linked_key = linked.credential.id().to_string();
+        assert_eq!(
+            service.service_state().unwrap().applicants[&linked_key].status,
+            "eligible",
+            "An active parent already authorized the linked device"
+        );
+        let requests = command(&mut service, &config, &owner, "manage", json!({})).await;
+        assert!(
+            !requests["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == linked_key)
+        );
+
+        for _ in 0..2 {
+            let another = Device::with_root(&root);
+            let pending = command(
+                &mut service,
+                &config,
+                &another,
+                "status",
+                json!({"enrollment":enrollment(&another,&authority)}),
+            )
+            .await;
+            assert_eq!(pending["status"], "pending");
+        }
+        let excessive = Device::with_root(&root);
+        let rejected = command(
+            &mut service,
+            &config,
+            &excessive,
+            "status",
+            json!({"enrollment":enrollment(&excessive,&authority)}),
+        )
+        .await;
+        assert_eq!(rejected["error"], "Space request limit reached.");
+        assert!(
+            !service
+                .service_state()
+                .unwrap()
+                .applicants
+                .contains_key(&excessive.credential.id().to_string())
+        );
+    }
+
     #[tokio::test]
     async fn declined_device_rejoining_an_open_invitation_stays_pending_until_a_new_head_approval()
     {
