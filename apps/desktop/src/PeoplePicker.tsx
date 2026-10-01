@@ -1,6 +1,7 @@
 import { useDesktopLayout } from "./PageSurface";
 import { t } from "./i18n";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import { FloatingSearch, SearchField } from "./Search";
 import { EmptyState } from "./EmptyState";
 import { findPeople, type KnownPerson } from "./directMessages";
@@ -68,8 +69,9 @@ export function PeoplePicker({
                   data-hide-avatars={hideAvatars || undefined}
                 >
                   {!hideAvatars && (
-                    <span className="avatar" aria-hidden="true">
+                    <span className="avatar">
                       {person.initials}
+                      <OnlineIndicator identity={person.id} />
                     </span>
                   )}
                   <span className="dm-person-copy">

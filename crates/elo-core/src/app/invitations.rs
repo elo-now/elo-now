@@ -14,6 +14,7 @@ mod contacts;
 mod delivery;
 mod direct;
 mod membership;
+mod owner_general;
 mod personal;
 pub mod push;
 mod removal;
@@ -242,6 +243,9 @@ fn verify_bundle(
         initial,
         bundle.stream,
     )?;
+    if a.is_owner_managed() {
+        return Err("Manage General members from Space settings.".into());
+    }
     if bundle.recovery.len() > 64 {
         return Err("Invitation recovery proof is too large.".into());
     }
@@ -315,6 +319,16 @@ fn caps(v: &Value) -> Vec<Capability> {
     caps
 }
 impl ClientApp {
+    pub(in crate::app) fn require_private_chat_controller(
+        &self,
+        authority: &Authority,
+    ) -> Result<()> {
+        if authority.is_owner_managed() {
+            return Err("Manage General members from Space settings.".into());
+        }
+        self.require_controller(authority)
+    }
+
     fn invitation_state(&self) -> Result<Invitations> {
         let path = self.directory.join("invitations.age");
         if !path.exists() {
@@ -432,7 +446,7 @@ impl ClientApp {
     }
     fn offer_bundle(&self, index: usize, v: &Value, duration_ms: u64) -> Result<Bundle> {
         let a = &self.authorities.0[index];
-        self.require_controller(a)?;
+        self.require_private_chat_controller(a)?;
         let p = &self.pins[index];
         let time = now()?.as_millis() as u64;
         let mut signed = shared::create(
@@ -610,7 +624,7 @@ impl ClientApp {
             }
             "invitation_list" => {
                 let i = self.authority_index(&v)?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 let p = &self.pins[i];
                 let mut offers = Vec::new();
                 for (id, e) in &state.offers {
@@ -637,7 +651,7 @@ impl ClientApp {
             }
             "invitation_disable" => {
                 let i = self.authority_index(&v)?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 let e = state
                     .offers
                     .get_mut(field(&v, "id")?)
@@ -739,7 +753,7 @@ impl ClientApp {
             "invitation_receive" => {
                 let packet = decode(field(&v, "link")?)?;
                 let i = self.incoming_scope(&packet, &v)?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 if let Packet::Request { bundle, .. } = &packet {
                     self.active_offer(&state, bundle)?;
                 }
@@ -775,7 +789,7 @@ impl ClientApp {
                 let mut entry = state.incoming.get(&id).ok_or("Request not found.")?.clone();
                 let i =
                     self.authority_index(&json!({"space":entry.space,"stream":entry.stream}))?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 if op == "invitation_decline" {
                     if entry.status != "pending" {
                         return Err("This request has already been handled.".into());
@@ -957,7 +971,7 @@ impl ClientApp {
             }
             Packet::Contact { .. } | Packet::Request { .. } => {
                 let i = self.incoming_scope(packet, v)?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 if let Packet::Request { bundle, .. } = packet {
                     self.active_offer(state, bundle)?;
                 }

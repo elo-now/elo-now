@@ -1,4 +1,4 @@
-//! A direct call's signed participant lease must outlive suspended WebView timers.
+//! A joined session's signed participant lease outlives suspended WebView timers.
 //! This socket carries no media and never authorizes an operation without a fresh
 //! signature and the server's current admission check.
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -26,6 +26,8 @@ pub(crate) struct Target {
     pub call_id: String,
     pub scope: Value,
     pub identity: String,
+    pub credential: String,
+    pub config_id: String,
 }
 
 impl Target {
@@ -45,9 +47,13 @@ impl Target {
     fn admitted(&self, call: &Value) -> bool {
         call["call_id"] == self.call_id
             && call["scope"] == self.scope
-            && call["kind"] == "direct"
+            && call["config_id"] == self.config_id
+            && matches!(call["kind"].as_str(), Some("direct" | "group"))
             && call["participants"].as_object().is_some_and(|people| {
-                people.len() == 2 && people.values().any(|p| p["identity_id"] == self.identity)
+                !people.is_empty()
+                    && people.get(&self.identity).is_some_and(|p| {
+                        p["identity_id"] == self.identity && p["credential_id"] == self.credential
+                    })
             })
     }
 }
@@ -181,13 +187,32 @@ mod tests {
             url,
             call_id: "call".into(),
             identity: "self".into(),
+            credential: "local-device".into(),
+            config_id: "head".into(),
             scope: json!({"scope":"one"}),
         }
     }
     fn call() -> Value {
-        json!({"call_id":"call","scope":{"scope":"one"},"kind":"direct","participants":{
-            "self":{"identity_id":"self"},"peer":{"identity_id":"peer"}
+        json!({"call_id":"call","scope":{"scope":"one"},"kind":"direct","config_id":"head","participants":{
+            "self":{"identity_id":"self","credential_id":"local-device"},"peer":{"identity_id":"peer"}
         }})
+    }
+    #[test]
+    fn lease_accepts_solo_and_group_but_rejects_replacement_device_or_head() {
+        let target = target(String::new());
+        let mut active = call();
+        active["participants"]
+            .as_object_mut()
+            .unwrap()
+            .remove("peer");
+        assert!(target.admitted(&active));
+        active["kind"] = "group".into();
+        assert!(target.admitted(&active));
+        active["config_id"] = "new-head".into();
+        assert!(!target.admitted(&active));
+        active["config_id"] = "head".into();
+        active["participants"]["self"]["credential_id"] = "replacement-device".into();
+        assert!(!target.admitted(&active));
     }
     #[tokio::test]
     async fn native_lease_renews_without_ui_and_remote_end_finishes_it() {

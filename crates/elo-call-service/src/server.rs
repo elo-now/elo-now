@@ -164,7 +164,6 @@ pub struct Service {
     admission: Arc<dyn Admission>,
     media: Option<Arc<crate::media::Provider>>,
     events: Arc<events::Events>,
-    wake: Option<Arc<crate::wake::Delivery>>,
     connections: Arc<Semaphore>,
     verification: Arc<Semaphore>,
 }
@@ -190,76 +189,9 @@ impl Service {
             admission,
             media,
             events,
-            wake: None,
             connections: Arc::new(Semaphore::new(max_connections.clamp(1, 4096))),
             verification: Arc::new(Semaphore::new(2)),
         })
-    }
-    pub fn with_wake(mut self: Arc<Self>, wake: Arc<crate::wake::Delivery>) -> Arc<Self> {
-        Arc::get_mut(&mut self)
-            .expect("Configure call delivery before sharing the service")
-            .wake = Some(wake);
-        self
-    }
-    pub async fn deliver_wakes(&self) {
-        if let Some(wake) = &self.wake {
-            let declined = wake.declined().await;
-            let events = {
-                let mut engine = self.engine.lock().await;
-                declined
-                    .into_iter()
-                    .flat_map(|(id, recipient)| engine.background_decline(&id, recipient))
-                    .collect()
-            };
-            let _ = self.publish_media(events).await;
-            wake.deliver(self.admission.as_ref(), now()).await;
-        }
-    }
-    async fn queue_wakes(&self, events: &[Event]) {
-        use elo_core::calls::{CallKind, InitialMedia, wake::Notice};
-        let Some(wake) = &self.wake else {
-            return;
-        };
-        let notices = {
-            let engine = self.engine.lock().await;
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Presence { call } if call.kind == CallKind::Direct => {
-                        let notice = if call.ringing {
-                            Notice::Ring {
-                                call_id: call.call_id.clone(),
-                                scope: elo_core::calls::wake::scope(
-                                    call.scope.hosting_space_id,
-                                    call.scope.conversation,
-                                ),
-                                head: call.config_id,
-                                caller: call.started_by,
-                                recipients: engine.wake_recipients(call),
-                                expires: call.started_at
-                                    + engine.registry.limits.ring_timeout.min(60),
-                                video: call.initial_media == InitialMedia::Video,
-                            }
-                        } else {
-                            Notice::End {
-                                call_id: call.call_id.clone(),
-                            }
-                        };
-                        notice.valid(now()).then_some((call.scope, notice))
-                    }
-                    Event::Ended { scope, call_id } => Some((
-                        *scope,
-                        Notice::End {
-                            call_id: call_id.clone(),
-                        },
-                    )),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        for (scope, notice) in notices {
-            wake.enqueue(scope, notice, now()).await;
-        }
     }
     fn publish(&self, events: Vec<Event>) {
         for event in events {
@@ -269,7 +201,6 @@ impl Service {
     async fn publish_media(&self, events: Vec<Event>) -> Result<(), CallError> {
         // Notify peers before closing the previous epoch's room. Otherwise a
         // deliberate rekey disconnect could be mistaken for a failed call.
-        self.queue_wakes(&events).await;
         self.publish(events.clone());
         if let Some(media) = &self.media {
             media.reconcile(&events, now()).await?;
@@ -285,7 +216,6 @@ impl Service {
         };
         if self.publish_media(events).await.is_err() {
             let ended = self.engine.lock().await.registry.tick(u64::MAX);
-            self.queue_wakes(&ended).await;
             self.publish(ended);
         }
     }
@@ -428,6 +358,17 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 };
                 let credential = device.unwrap();
                 if !scopes.contains(&scope) || matches!(&event, Event::Signal { to, .. } if *to != credential) { continue; }
+                // A Leave/Join cycle keeps the session ID but replaces its media
+                // generation. Never forward a queued negotiation from the old peer.
+                if let Event::Signal { call_id, epoch, from, to, .. } = &event {
+                    let engine = service.engine.lock().await;
+                    let current = engine.registry.presence(&scope).is_some_and(|call| {
+                        call.call_id == *call_id && call.key_epoch == *epoch
+                            && call.participants.values().any(|participant| participant.credential_id == *from)
+                            && call.participants.values().any(|participant| participant.credential_id == *to)
+                    });
+                    if !current { continue; }
+                }
                 if !service.engine.lock().await.authorized(scope, credential) {
                     scopes.remove(&scope);
                     receiver.update(credential, &scopes);

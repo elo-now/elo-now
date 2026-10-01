@@ -103,24 +103,24 @@ describe("call subscriptions", () => {
     expect(command).toHaveBeenCalledTimes(86);
     calls.dispose();
   });
-  it("resubscribes after server eviction without clearing a different incoming call", async () => {
+  it("resubscribes after server eviction without clearing a session in another chat", async () => {
     const calls = new Calls();
     const other = { ...chat, stream: "other" };
     const command = vi.fn(async () => ({ type: "result" }));
     Object.assign(calls, { command });
     calls.update({ ...view, streams: [chat, other] });
     await vi.waitFor(() => expect(command).toHaveBeenCalledTimes(2));
-    const incoming = {
-      chat: other,
-      call: {
-        call_id: "other-call",
-        scope: {
-          hosting_space_id: "host",
-          conversation: { space_id: "space", stream_id: "other" },
-        },
-      } as ActiveCall,
+    const session = {
+      call_id: "other-call",
+      scope: {
+        hosting_space_id: "host",
+        conversation: { space_id: "space", stream_id: "other" },
+      },
+    } as ActiveCall;
+    calls.snapshot = {
+      ...calls.snapshot,
+      available: { "host:space:other": session },
     };
-    calls.snapshot = { ...calls.snapshot, incoming };
     const runtime = calls as unknown as {
       event(event: Record<string, unknown>): Promise<void>;
       subscribeChats(): Promise<void>;
@@ -133,12 +133,12 @@ describe("call subscriptions", () => {
         hosting_space_id: "host",
       },
     });
-    expect(calls.snapshot.incoming).toBe(incoming);
+    expect(calls.snapshot.available["host:space:other"]).toBe(session);
     await runtime.subscribeChats();
     expect(command).toHaveBeenCalledTimes(3);
     expect(command).toHaveBeenLastCalledWith(chat, { type: "subscribe" });
     await runtime.event({ type: "ended", call_id: "other-call" });
-    expect(calls.snapshot.incoming).toBeUndefined();
+    expect(calls.snapshot.available["host:space:other"]).toBeUndefined();
     calls.dispose();
   });
 
@@ -190,7 +190,7 @@ describe("capture ownership", () => {
     calls.update(view);
     pendingCapture();
     const capture = vi.spyOn(navigator.mediaDevices, "getUserMedia");
-    await calls.start(chat, false, {
+    await calls.start(chat, {
       participants: { me: { credential_id: "another-device" } },
     } as unknown as ActiveCall);
     expect(capture).not.toHaveBeenCalled();
@@ -224,7 +224,7 @@ describe("capture ownership", () => {
     const calls = new Calls();
     calls.update(view);
     const capture = pendingCapture();
-    const starting = calls.start(chat, true);
+    const starting = calls.start(chat);
     await vi.waitFor(() => expect(calls.snapshot.phase).toBe("connecting"));
     calls.update(null);
     capture.resolve();
@@ -280,7 +280,6 @@ it("removes an empty group call from the available-call indicator immediately", 
     config_id: "head",
     participants: {},
     key_epoch: 2,
-    ringing: false,
     started_by: "me",
     started_at: 1,
   };
@@ -537,75 +536,6 @@ it("obtains the screen publishing grant before sending a screen track to the SFU
   await calls.toggle("screen");
   expect(calls.snapshot.media.screen_published).toBe(true);
   expect(calls.snapshot.error).toBeUndefined();
-  calls.dispose();
-});
-
-it("silences muted chats and immediately dismisses a ringing call when muted or blocked", async () => {
-  const calls = new Calls();
-  const direct = {
-    ...chat,
-    chat_kind: "direct",
-    members: [
-      {
-        identity_id: "peer",
-        credential_ids: ["peer-device"],
-        capabilities: ["POST"],
-      },
-    ],
-  } as Stream;
-  const directView = { ...view, streams: [direct] };
-  calls.update(directView);
-  const call: ActiveCall = {
-    call_id: "incoming",
-    scope: {
-      hosting_space_id: "host",
-      conversation: { space_id: "space", stream_id: "chat" },
-    },
-    kind: "direct",
-    initial_media: "audio",
-    config_id: "head",
-    key_epoch: 1,
-    ringing: true,
-    started_by: "peer",
-    started_at: 1,
-    participants: {
-      peer: {
-        identity_id: "peer",
-        credential_id: "peer-device",
-        media: {
-          audio_muted: false,
-          video_published: false,
-          screen_published: false,
-        },
-      },
-    },
-  };
-  const events = calls as unknown as {
-    event(event: { type: string; call: ActiveCall }): Promise<void>;
-  };
-  await events.event({ type: "presence", call });
-  expect(calls.snapshot.incoming?.call.call_id).toBe("incoming");
-  const controls = (
-    calls as unknown as { connections: Map<string, { networkClosed(): void }> }
-  ).connections;
-  await vi.waitFor(() => expect(controls.size).toBe(1));
-  controls.values().next().value!.networkClosed();
-  expect(calls.snapshot.incoming).toBeUndefined();
-  await events.event({ type: "presence", call });
-  expect(calls.snapshot.incoming).toBeDefined();
-  calls.update({ ...directView, streams: [{ ...direct, muted: true }] });
-  expect(calls.snapshot.incoming).toBeUndefined();
-  await events.event({ type: "presence", call });
-  expect(calls.snapshot.incoming).toBeUndefined();
-  expect(calls.snapshot.available["host:space:chat"]).toBeDefined();
-  calls.update(directView);
-  await events.event({ type: "presence", call });
-  expect(calls.snapshot.incoming).toBeDefined();
-  calls.update({
-    ...directView,
-    blocked_users: [{ identity: "peer", name: "Peer" }],
-  });
-  expect(calls.snapshot.incoming).toBeUndefined();
   calls.dispose();
 });
 

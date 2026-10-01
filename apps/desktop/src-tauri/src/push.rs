@@ -245,14 +245,6 @@ mod mobile {
         reads: Vec<PendingRead>,
         #[serde(default)]
         cleared: Vec<PendingRead>,
-        #[serde(default)]
-        calls_enabled: bool,
-        #[serde(default)]
-        calls_policy: String,
-        #[serde(default)]
-        calls_updated: u64,
-        #[serde(default)]
-        call_ringtone: String,
     }
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -310,8 +302,20 @@ mod mobile {
         })? {
             return Ok(None);
         }
-        let device: Device =
+        let mut value: Value =
             serde_json::from_slice(&bytes).map_err(|_| "Invalid notification settings")?;
+        if let Some(fields) = value.as_object_mut() {
+            for key in [
+                "calls_enabled",
+                "calls_policy",
+                "calls_updated",
+                "call_ringtone",
+            ] {
+                fields.remove(key);
+            }
+        }
+        let device: Device =
+            serde_json::from_value(value).map_err(|_| "Invalid notification settings")?;
         if device.v != 2
             || device.route.endpoint != url
             || !valid_hex(&device.route.id, 16)
@@ -331,10 +335,8 @@ mod mobile {
         }
         let mut prefs = Preferences::new(&identity);
         // Adopt an existing opt-in once. An old suspended route is not consent.
-        if let Some(device) = device.filter(|d| d.identity == identity && d.enabled) {
+        if device.is_some_and(|d| d.identity == identity && d.enabled) {
             prefs.enabled = true;
-            prefs.calls_enabled = device.calls_enabled;
-            prefs.call_ringtone.clone_from(&device.call_ringtone);
             prefs.save(client.profile_path())?;
         }
         Ok(prefs)
@@ -427,92 +429,7 @@ mod mobile {
                 .advertise_wake_route(Some(device.route.clone()))
                 .map_err(|_| "Could not share notification availability")?;
         }
-        call_policy(app, client, device).await?;
         Ok(())
-    }
-    async fn call_policy(
-        app: &tauri::AppHandle,
-        client: &ClientApp,
-        device: &mut Device,
-    ) -> Result<(), String> {
-        if !device.active {
-            return Ok(());
-        }
-        let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
-        let copy: Value = serde_json::from_str(include_str!("../../src/locales/native.en.json"))
-            .map_err(|_| "Invalid call labels")?;
-        let native = adapter.call("callConfigure",json!({"enabled":device.calls_enabled,
-            "ringtone":device.call_ringtone,"labels":{"incoming":copy["calls.nativeIncoming"],"answer":copy["calls.nativeAnswer"],"decline":copy["calls.nativeDecline"],"unlock":copy["calls.unlockToAnswer"],"connected":copy["calls.nativeConnected"]},
-            "registration":device.route.id,"endpoint":device.route.endpoint}))?;
-        let token = if cfg!(target_os = "ios") {
-            native["token"].as_str().unwrap_or("")
-        } else {
-            &device.token
-        };
-        if device.calls_enabled && token.is_empty() {
-            return Ok(());
-        }
-        if !device.calls_enabled && device.calls_policy.is_empty() {
-            return Ok(());
-        }
-        let subscriptions = if device.calls_enabled {
-            client
-                .notification_call_subscriptions(&device.route)
-                .map_err(|_| "Could not read incoming call preferences")?
-        } else {
-            vec![]
-        };
-        let mut semantic = json!({"ownership_version":1,"enabled":device.calls_enabled,"token":token,"subscriptions":subscriptions});
-        if let Some(items) = semantic["subscriptions"].as_array_mut() {
-            for item in items {
-                item.as_object_mut().unwrap().remove("target");
-            }
-        }
-        let digest =
-            elo_core::ids::ObjectId::of_ciphertext(semantic.to_string().as_bytes()).to_string();
-        if digest == device.calls_policy && device.calls_updated + 86400 > time() {
-            return Ok(());
-        }
-        #[cfg(target_os = "ios")]
-        if device.calls_enabled {
-            let challenge = request(
-                app,
-                device,
-                "/voip/challenge",
-                Some(json!({"token":token})),
-                reqwest::Method::POST,
-            )
-            .await?;
-            if challenge["verified"] != true {
-                if challenge["identity"] != json!(client.identity_id()) {
-                    return Err(
-                        "Could not verify this device for incoming calls. Try again.".into(),
-                    );
-                }
-                let proof = adapter.call(
-                    "voipOwnership",
-                    json!({"identity":client.identity_id(),"nonce":challenge["nonce"]}),
-                )?;
-                if proof["token"] != token {
-                    return Err(
-                        "Could not verify this device for incoming calls. Try again.".into(),
-                    );
-                }
-                request(
-                    app,
-                    device,
-                    "/voip/proof",
-                    Some(proof),
-                    reqwest::Method::POST,
-                )
-                .await?;
-            }
-        }
-        request(app, device,"/calls",Some(json!({"enabled":device.calls_enabled,"platform":if cfg!(target_os="ios"){"ios"}else{"android"},
-            "token":token,"subscriptions":subscriptions})),reqwest::Method::PUT).await?;
-        device.calls_policy = digest;
-        device.calls_updated = time();
-        save(app, device)
     }
     static UNREAD: std::sync::Mutex<(crate::notification_counts::Counts, u64)> =
         std::sync::Mutex::new((crate::notification_counts::Counts::new(), 0));
@@ -758,7 +675,7 @@ mod mobile {
             // A status read must not wait for an offline logout's server cleanup.
             let cleanup_due =
                 saved.enabled || native["enabled"] == true || saved.next_attempt <= time();
-            if op != "status" && !op.starts_with("calls_") && cleanup_due {
+            if op != "status" && cleanup_due {
                 suspend(&app).await?;
                 client
                     .advertise_wake_route(None)
@@ -769,72 +686,7 @@ mod mobile {
             if device.is_some() {
                 schedule_reconcile(&app);
                 let enabled = prefs.enabled && native["permission"] == true;
-                return Ok(json!({"available":true,"enabled":enabled,"pending":true,
-                    "callsEnabled":enabled && prefs.calls_enabled,
-                    "callsPending":enabled && prefs.calls_enabled,"wake":false}));
-            }
-        }
-        if op.starts_with("calls_") {
-            let saved = device
-                .as_mut()
-                .filter(|d| d.enabled && d.active)
-                .ok_or("Enable system notifications first.")?;
-            match op.as_str() {
-                "calls_enable" | "calls_disable" => {
-                    saved.calls_enabled = op == "calls_enable";
-                    prefs.calls_enabled = saved.calls_enabled;
-                    prefs.save(client.profile_path())?;
-                    saved.calls_updated = 0;
-                    save(&app, saved)?;
-                    call_policy(&app, client, saved).await?;
-                }
-                _ if op.starts_with("calls_ringtone:") => {
-                    let tone = op.trim_start_matches("calls_ringtone:");
-                    if !["classic", "chime", "pulse", "silent"].contains(&tone) {
-                        return Err("Invalid call ringtone".into());
-                    }
-                    saved.call_ringtone = tone.into();
-                    prefs.call_ringtone = tone.into();
-                    prefs.save(client.profile_path())?;
-                    save(&app, saved)?;
-                    call_policy(&app, client, saved).await?;
-                }
-                "calls_status" => {
-                    let result = adapter
-                        .call("callStatus", json!({}))
-                        .map_err(|_| "Could not read incoming call")?;
-                    let mut incoming = result["incoming"].clone();
-                    if let Some(target) = incoming["target"].as_str() {
-                        incoming["target"] =
-                            client.open_call_notification(target).unwrap_or(Value::Null);
-                    }
-                    return Ok(
-                        json!({"incoming":if incoming["id"].is_string() {json!({"id":incoming["id"],"action":incoming["action"],"target":incoming["target"],"expires":incoming["expires"],"event":incoming["event"],"muted":incoming["muted"]})}else{Value::Null}}),
-                    );
-                }
-                _ if op.starts_with("calls_answering:")
-                    || op.starts_with("calls_connected:")
-                    || op.starts_with("calls_end:")
-                    || op.starts_with("calls_ack:") =>
-                {
-                    let mut parts = op.split(':');
-                    let action = parts.next().ok_or("Invalid call action")?;
-                    let id = parts.next().ok_or("Invalid call action")?;
-                    let event = parts.next();
-                    if parts.next().is_some()
-                        || event.is_some_and(|e| {
-                            e.len() != 36 || !e.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-                        })
-                        || !valid_hex(id, 16)
-                    {
-                        return Err("Invalid call action".into());
-                    }
-                    return adapter.call(
-                        "callAction",
-                        json!({"action":action.trim_start_matches("calls_"),"callId":id,"event":event}),
-                    );
-                }
-                _ => return Err("Unknown call action".into()),
+                return Ok(json!({"available":true,"enabled":enabled,"pending":true,"wake":false}));
             }
         }
         let automatic = preferences::should_resume(
@@ -881,10 +733,6 @@ mod mobile {
                     generation: client.notification_generation(),
                     reads: Vec::new(),
                     cleared: Vec::new(),
-                    calls_enabled: prefs.calls_enabled,
-                    calls_policy: String::new(),
-                    calls_updated: 0,
-                    call_ringtone: prefs.call_ringtone.clone(),
                 });
             }
             let saved = device.as_mut().ok_or("Could not prepare notifications")?;
@@ -907,11 +755,7 @@ mod mobile {
             native = adapter
                 .call("status", json!({}))
                 .map_err(|_| "Could not read notifications")?;
-        } else if op != "maintain"
-            && op != "status"
-            && !op.starts_with("ack:")
-            && !op.starts_with("calls_")
-        {
+        } else if op != "maintain" && op != "status" && !op.starts_with("ack:") {
             return Err("Unknown notification action".into());
         }
         if let Some(saved) = device.as_mut()
@@ -938,8 +782,6 @@ mod mobile {
                 saved.token = token.into();
                 saved.generation = client.notification_generation();
                 saved.reads.clear();
-                saved.calls_policy.clear();
-                saved.calls_updated = 0;
                 save(&app, saved)?;
                 let _: Value = adapter
                     .call("register", json!({"registration":saved.route.id}))
@@ -1039,8 +881,6 @@ mod mobile {
             .filter(|d| d.enabled && d.identity == identity);
         Ok(json!({"available":true,"enabled":enabled,
             "pending":enabled && current.is_none_or(|d| !d.active || d.acknowledged != d.revision),
-            "callsEnabled":enabled && prefs.calls_enabled,
-            "callsPending":enabled && prefs.calls_enabled && current.is_none_or(|d| d.calls_policy.is_empty() || d.calls_updated == 0),
             "wake":native["wake"].is_string(),"opened":opened}))
     }
 }

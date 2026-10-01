@@ -117,7 +117,7 @@ impl ClientApp {
             self.pins[index].name = name.into();
             self.persist_workspace()?;
         }
-        self.require_controller(&self.authorities.0[index])?;
+        self.require_private_chat_controller(&self.authorities.0[index])?;
         if draft.bundle.is_none() {
             let head = self.authorities.0[index].head()?;
             if head.members.len() != 1 || head.sequence != 1 {

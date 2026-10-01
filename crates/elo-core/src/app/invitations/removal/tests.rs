@@ -284,6 +284,7 @@ async fn recovered_device_repairs_imported_seed_without_hiding_ordinary_general(
         controller: general.controller().id(),
     };
     let descriptor = team::TeamDescriptor {
+        service_credential: None,
         v: 1,
         url: "http://127.0.0.1:9/team/v1/enroll".into(),
         token: "ab".repeat(32),
@@ -291,6 +292,7 @@ async fn recovered_device_repairs_imported_seed_without_hiding_ordinary_general(
         message_lifetime_seconds: 86400,
     };
     let address = super::super::super::space_service::SpaceAddress {
+        service_credential: None,
         url: "http://127.0.0.1:9".into(),
         scope,
         message_lifetime_seconds: 86400,

@@ -1,4 +1,10 @@
-import { profileName, senderInitials, senderName, type View } from "./model";
+import {
+  generalServiceIdentities,
+  profileName,
+  senderInitials,
+  senderName,
+  type View,
+} from "./model";
 
 export type KnownPerson = {
   id: string;
@@ -10,8 +16,9 @@ export type KnownPerson = {
 /** Explicitly saved cards and verified current memberships, never a global directory. */
 export function knownPeople(view: View): KnownPerson[] {
   const people = new Map<string, KnownPerson>();
+  const services = generalServiceIdentities(view);
   for (const contact of view.contacts ?? []) {
-    if (contact.id === view.identity) continue;
+    if (contact.id === view.identity || services.has(contact.id)) continue;
     people.set(contact.id, {
       ...contact,
       initials: contact.name
@@ -38,6 +45,7 @@ export function knownPeople(view: View): KnownPerson[] {
     for (const member of chat.members) {
       if (
         member.identity_id === view.identity ||
+        services.has(member.identity_id) ||
         member.identity_type !== "HUMAN" ||
         !member.credential_ids.length
       )

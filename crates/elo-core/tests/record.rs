@@ -222,7 +222,7 @@ fn credential_requires_pinned_root_and_exact_device_binding() {
     assert!(VerifiedCredential::verify(r.bytes(), &root.verifying_key()).is_err());
 }
 #[test]
-fn companion_credentials_require_original_authority_and_reject_nested_or_forged_chains() {
+fn companion_credentials_bind_every_parent_and_reject_forged_or_unbounded_chains() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     let root = SigningKey::from_bytes(&[23; 32]);
     let original_key = SigningKey::from_bytes(&[24; 32]);
@@ -240,6 +240,7 @@ fn companion_credentials_require_original_authority_and_reject_nested_or_forged_
     assert_eq!(companion.identity(), original.identity());
     assert_eq!(companion.authorizing_device(), Some(original.id()));
     assert_ne!(companion.id(), original.id());
+    assert!(companion.can_issue_companion());
     assert!(
         VerifiedCredential::verify(companion.record().bytes(), &original_key.verifying_key())
             .is_err()
@@ -253,25 +254,49 @@ fn companion_credentials_require_original_authority_and_reject_nested_or_forged_
         )
         .is_err()
     );
+    let mut parent = companion.clone();
+    let mut parent_key = companion_key.clone();
+    for depth in 2..=elo_core::identity::MAX_COMPANION_DEPTH {
+        let key = SigningKey::from_bytes(&[30 + depth as u8; 32]);
+        let nested = DeviceCredential::issue_companion(
+            &parent,
+            &parent_key,
+            &key.verifying_key(),
+            &age::x25519::Identity::generate().to_public(),
+        )
+        .unwrap();
+        assert_eq!(nested.identity(), original.identity());
+        assert_eq!(nested.authorizing_device(), Some(parent.id()));
+        assert!(nested.record().bytes().len() <= elo_core::identity::MAX_CREDENTIAL_BYTES);
+        assert!(VerifiedCredential::verify(nested.record().bytes(), &root.verifying_key()).is_ok());
+        parent = nested;
+        parent_key = key;
+    }
+    assert!(!parent.can_issue_companion());
     assert!(
         DeviceCredential::issue_companion(
-            &companion,
-            &companion_key,
+            &parent,
+            &parent_key,
             &original_key.verifying_key(),
             &age.to_public()
         )
         .is_err()
     );
+    let mut too_deep = parent.record().body().clone();
+    too_deep["authorizing_device"] = json!(STANDARD.encode(parent.record().bytes()));
+    let too_deep =
+        SignedRecord::sign(&serde_json::to_vec(&too_deep).unwrap(), &parent_key).unwrap();
+    assert!(VerifiedCredential::verify(too_deep.bytes(), &root.verifying_key()).is_err());
     for changed in [
         json!({"signing_public_key": elo_core::record::encode_hex(root.verifying_key().as_bytes())}),
-        json!({"authorizing_device": STANDARD.encode(companion.record().bytes())}),
-        json!({"authorizing_device": "x".repeat(4097)}),
+        json!({"root_public_key": elo_core::record::encode_hex(original_key.verifying_key().as_bytes())}),
+        json!({"authorizing_device": "x".repeat(elo_core::identity::MAX_CREDENTIAL_BYTES * 2)}),
     ] {
         let mut body = companion.record().body().clone();
         for (key, value) in changed.as_object().unwrap() {
             body[key] = value.clone();
         }
-        // An attacker may possess a companion key, but cannot mint original authority.
+        // Changing a parent-signed credential needs that parent's actual key.
         let forged =
             SignedRecord::sign(&serde_json::to_vec(&body).unwrap(), &companion_key).unwrap();
         assert!(VerifiedCredential::verify(forged.bytes(), &root.verifying_key()).is_err());

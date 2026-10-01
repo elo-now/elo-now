@@ -102,6 +102,28 @@ impl ClientApp {
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
+        self.upload_attachment_observed_with_activity(
+            address,
+            request,
+            cancellation,
+            progress,
+            |_| {},
+        )
+        .await
+    }
+
+    pub(super) async fn upload_attachment_observed_with_activity<F, A>(
+        &mut self,
+        address: &space_service::SpaceAddress,
+        request: &Value,
+        cancellation: AttachmentCancellation,
+        progress: F,
+        activity: A,
+    ) -> Result<Value>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+        A: Fn(AttachmentActivity) + Send + Sync + 'static,
+    {
         if cancellation.is_cancelled() {
             return Err("Attachment transfer cancelled.".into());
         }
@@ -124,6 +146,48 @@ impl ClientApp {
             crate::attachments::crypto::encrypt_file(&input, &temporary.0, &plan, |_| {})?;
         let attachment: AttachmentId = record::random_hex::<16>()?.parse()?;
         let object: AttachmentObjectId = record::random_hex::<16>()?.parse()?;
+        let mut descriptor = AttachmentDescriptor {
+            id: attachment,
+            name: name.to_owned(),
+            mime: mime_for(name).into(),
+            plaintext_size: metadata.len(),
+            encrypted_size: encrypted.encrypted_size,
+            // The reservation supplies these values before any activity is sent.
+            created_at_ms: 0,
+            expires_at_ms: None,
+            object_id: object,
+            encryption: AttachmentEncryption {
+                algorithm: "xchacha20-poly1305-chunks-v1".into(),
+                key: STANDARD.encode(plan.key.as_slice()),
+                nonce_prefix: STANDARD.encode(plan.nonce_prefix),
+                chunk_bytes: crate::attachments::ATTACHMENT_CHUNK_BYTES,
+                ciphertext_sha256: encrypted.ciphertext_sha256.clone(),
+            },
+        };
+        // Validate display metadata before reserving storage or exposing it in
+        // a remote placeholder. Activity has the same audience as a file share.
+        descriptor.validate()?;
+        let authority = &self.authorities.0[index];
+        let head = authority
+            .head_id()
+            .ok_or("Chat permissions are unavailable.")?;
+        if authority.is_forked()
+            || !self.authorities.space_ready(authority)
+            || !authority.has(head, self.identity_id(), Capability::Post)
+        {
+            return Err("You cannot send attachments in this chat.".into());
+        }
+        authority.expected_recipients(head, self.session.credential().id())?;
+        if authority.head()?.chat_kind.or(self.pins[index].chat_kind) == Some(ChatKind::Direct)
+            && authority
+                .head()?
+                .members
+                .iter()
+                .any(|member| self.blocked.contains(member.identity_id))
+        {
+            return Err("Unblock this user before contacting them.".into());
+        }
+        self.require_fresh_membership(authority).await?;
         let reservation = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
@@ -139,6 +203,17 @@ impl ClientApp {
                 }),
             ) => result?,
         };
+        descriptor.created_at_ms = reservation["created_at_ms"]
+            .as_u64()
+            .ok_or("Invalid attachment reservation.")?;
+        descriptor.expires_at_ms = reservation["expires_at_ms"].as_u64();
+        activity(AttachmentActivity::Uploading {
+            attachment_id: attachment,
+            name: descriptor.name.clone(),
+            size_bytes: descriptor.plaintext_size,
+            created_at_ms: descriptor.created_at_ms,
+        });
+        let mut finalizing = false;
         let result: Result<Value> = async {
         let token = field(&reservation, "upload_token")?;
         let file = tokio::fs::File::open(&temporary.0).await?;
@@ -206,26 +281,6 @@ impl ClientApp {
         if !committed {
             return Err("Could not finish uploading this attachment. Try again.".into());
         }
-        let descriptor = AttachmentDescriptor {
-            id: attachment,
-            name: name.to_owned(),
-            mime: mime_for(name).into(),
-            plaintext_size: metadata.len(),
-            encrypted_size: encrypted.encrypted_size,
-            created_at_ms: reservation["created_at_ms"]
-                .as_u64()
-                .ok_or("Invalid attachment reservation.")?,
-            expires_at_ms: reservation["expires_at_ms"].as_u64(),
-            object_id: object,
-            encryption: AttachmentEncryption {
-                algorithm: "xchacha20-poly1305-chunks-v1".into(),
-                key: STANDARD.encode(plan.key.as_slice()),
-                nonce_prefix: STANDARD.encode(plan.nonce_prefix),
-                chunk_bytes: crate::attachments::ATTACHMENT_CHUNK_BYTES,
-                ciphertext_sha256: encrypted.ciphertext_sha256.clone(),
-            },
-        };
-        descriptor.validate()?;
         self.require_fresh_membership(&self.authorities.0[index]).await?;
         let prepared = crate::files::prepare_external(
             &self.authorities.0[index],
@@ -243,6 +298,7 @@ impl ClientApp {
         // Finalization is the send boundary. Once linking starts, finish the
         // local commit even if Cancel arrives, rather than claim an uncertain
         // cancellation of a request the server may already have accepted.
+        finalizing = true;
         let mut linked = false;
         for attempt in 0..2 {
             let result = self.call_space(address, "attachment_link",
@@ -264,11 +320,26 @@ impl ClientApp {
         self.store
             .commit_attachment_share(prepared, self.targets(), now()?)
             .await?;
+        activity(AttachmentActivity::Ready {
+            attachment_id: attachment,
+            record: message,
+        });
         // Cache failure must not turn an already committed send into a retry.
         let _ = crate::attachments::cache::store(&self.directory, &temporary.0, &encrypted.ciphertext_sha256);
         Ok(json!({"record":message,"attachment_id":attachment}))
         }.await;
-        if result.is_err() && cancellation.is_cancelled() {
+        if result.is_err() {
+            activity(if cancellation.is_cancelled() && !finalizing {
+                AttachmentActivity::Cancelled {
+                    attachment_id: attachment,
+                }
+            } else {
+                AttachmentActivity::Interrupted {
+                    attachment_id: attachment,
+                }
+            });
+        }
+        if result.is_err() && cancellation.is_cancelled() && !finalizing {
             // The PUT may already have reached storage. Revoke its reservation
             // as well as dropping the socket; a bounded best-effort request lets
             // the server's normal cleanup reclaim any completed ciphertext.

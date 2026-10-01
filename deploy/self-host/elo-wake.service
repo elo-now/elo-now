@@ -1,5 +1,5 @@
 [Unit]
-Description=elo.now mobile notifications and calls
+Description=elo.now mobile message notifications
 After=network-online.target
 Wants=network-online.target
 
@@ -10,7 +10,7 @@ TasksMax=128
 User=elo-wake
 Group=elo-wake
 UMask=0077
-ExecStart=/opt/elo/bin/elo-wake --service-account /etc/elo/wake/firebase.json --database /var/lib/elo/wake/wake.sqlite --public-url https://chat.example.org --listen 127.0.0.1:8788 --call-key /etc/elo/wake/calls.key --call-listen 127.0.0.1:8794 --apns-config /etc/elo/wake/apns.json
+ExecStart=/opt/elo/bin/elo-wake --service-account /etc/elo/wake/firebase.json --database /var/lib/elo/wake/wake.sqlite --public-url https://chat.example.org --listen 127.0.0.1:8788
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

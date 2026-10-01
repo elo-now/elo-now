@@ -52,15 +52,6 @@ pub struct Fcm {
 
 #[derive(Clone, Debug)]
 pub enum Notice {
-    Call {
-        registration: String,
-        call_id: String,
-        scope: String,
-        target: String,
-        expires: u64,
-        video: bool,
-        ticket: String,
-    },
     Challenge {
         registration: String,
         challenge: String,
@@ -78,21 +69,6 @@ pub enum Notice {
 /// The provider never receives chat text, account IDs, mailbox capabilities or record IDs.
 pub fn payload(installation_id: &str, notice: &Notice) -> Value {
     let message = match notice {
-        Notice::Call {
-            registration,
-            call_id,
-            scope,
-            target,
-            expires,
-            video,
-            ticket,
-        } => json!({
-            "fid": installation_id,
-            "data": {"elo_call":"1", "elo_registration":registration, "elo_call_id":call_id,
-                "elo_scope":scope, "elo_target":target, "elo_ticket":ticket, "elo_expires":expires.to_string(),
-                "elo_video": if *video { "1" } else { "0" }},
-            "android":{"priority":"HIGH", "ttl":"0s"}
-        }),
         Notice::Challenge {
             registration,
             challenge,
@@ -327,15 +303,6 @@ mod tests {
                 category: "message".into(),
                 target: "ciphertext".into(),
                 quiet: false,
-            },
-            Notice::Call {
-                registration: "route".into(),
-                call_id: "call".into(),
-                scope: "scope".into(),
-                target: "ciphertext".into(),
-                expires: 42,
-                video: false,
-                ticket: "ticket".into(),
             },
         ];
         for notice in notices {

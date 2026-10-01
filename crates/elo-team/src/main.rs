@@ -182,6 +182,7 @@ async fn run() -> Result<()> {
                 .await?;
             client.ensure_peer(peer)?;
             let team = TeamDescriptor {
+                service_credential: None,
                 v: 1,
                 url,
                 token,
@@ -247,6 +248,7 @@ async fn run() -> Result<()> {
                 return Err("The descriptor must match this service mailbox.".into());
             }
             let address = elo_core::app::space_service::SpaceAddress {
+                service_credential: value.team.service_credential.clone(),
                 url: value.team.url.replace("/team/v1/enroll", "/team/v1/spaces"),
                 scope: client.team_scope()?,
                 message_lifetime_seconds: value.team.message_lifetime_seconds,
@@ -406,6 +408,7 @@ mod tests {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let descriptor = TeamDescriptor {
+            service_credential: None,
             v: 1,
             url: format!("http://{}/team/v1/enroll", listener.local_addr().unwrap()),
             token: "fe".repeat(32),
@@ -415,6 +418,7 @@ mod tests {
         let managed_space = ServiceConfig {
             name: "Demo".into(),
             address: elo_core::app::space_service::SpaceAddress {
+                service_credential: descriptor.service_credential.clone(),
                 url: descriptor.url.replace("/enroll", "/spaces"),
                 scope: descriptor.scope.clone(),
                 message_lifetime_seconds: descriptor.message_lifetime_seconds,

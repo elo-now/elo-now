@@ -161,7 +161,7 @@ impl ClientApp {
     async fn share_personal_seed_metadata(&self, index: usize) -> Result<()> {
         let authority = &self.authorities.0[index];
         if !self.is_personal_seed(&self.pins[index], authority)?
-            || self.require_controller(authority).is_err()
+            || self.require_private_chat_controller(authority).is_err()
             || authority.head()?.action.operation != "device.updated"
         {
             return Ok(());
@@ -216,7 +216,7 @@ impl ClientApp {
         for index in 0..self.authorities.0.len() {
             let original = &self.authorities.0[index];
             if original.space() == general.space() && original.stream() == general.stream()
-                || self.require_controller(original).is_err()
+                || self.require_private_chat_controller(original).is_err()
                 || original.recovery_id().is_some()
             {
                 continue;
@@ -362,7 +362,7 @@ impl ClientApp {
 
     pub(in crate::app) async fn remove_chat_member(&mut self, request: Value) -> Result<Value> {
         let index = self.authority_index(&request)?;
-        self.require_controller(&self.authorities.0[index])?;
+        self.require_private_chat_controller(&self.authorities.0[index])?;
         let original = &self.authorities.0[index];
         if original.recovery_id().is_some() {
             return Err("This recovered chat requires a membership review.".into());
@@ -540,7 +540,7 @@ impl ClientApp {
             // A historical, committed reduction is safe to deliver: receivers
             // merge monotonically. It also informs a removed device that will
             // not be addressed by later membership changes.
-            if self.require_controller(current).is_err()
+            if self.require_private_chat_controller(current).is_err()
                 || current.is_forked()
                 || current.recovery_id().is_some()
                 || current.config(draft.head).is_err()

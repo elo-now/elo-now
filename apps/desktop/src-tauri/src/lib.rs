@@ -6,7 +6,7 @@ mod android_files;
 #[cfg(target_os = "android")]
 mod android_tls;
 mod background_history;
-#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
 mod call_lease;
 mod control_recovery;
 #[cfg(debug_assertions)]
@@ -17,15 +17,14 @@ mod device_list_load;
 mod device_name;
 mod download_protection;
 mod exchange;
-#[cfg(all(target_os = "ios", feature = "mobile-push"))]
-mod incoming_answer;
-#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
-mod incoming_call;
 mod mail;
 mod native_media;
+#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
+mod native_session;
 mod notification_counts;
 mod profiles;
 mod push;
+mod realtime;
 mod recovery_clipboard;
 mod recovery_progress;
 mod release_policy;
@@ -133,6 +132,7 @@ async fn open_demo(
         state.client = Some(client);
         app.state::<background_history::BackgroundHistory>()
             .resume();
+        realtime::activate(&app, state.client.as_ref().unwrap());
         push::update(&app, &view);
         #[cfg(desktop)]
         desktop_activity::update(&app, &view);
@@ -234,6 +234,7 @@ async fn create_profile(
     state.client = Some(client);
     app.state::<background_history::BackgroundHistory>()
         .resume();
+    realtime::activate(&app, state.client.as_ref().unwrap());
     push::update(&app, &view);
     #[cfg(desktop)]
     desktop_activity::update(&app, &view);
@@ -317,6 +318,7 @@ async fn unlock(
     state.client = Some(client);
     app.state::<background_history::BackgroundHistory>()
         .resume();
+    realtime::activate(&app, state.client.as_ref().unwrap());
     push::update(&app, &view);
     #[cfg(desktop)]
     desktop_activity::update(&app, &view);
@@ -324,12 +326,14 @@ async fn unlock(
 }
 #[tauri::command]
 async fn lock(app: tauri::AppHandle, state: tauri::State<'_, State>) -> Result<(), String> {
+    realtime::clear(&app);
     app.state::<background_history::BackgroundHistory>()
         .suspend();
     let mut state = state.lock().await;
     // Revoke local access before fallible cleanup. Keep the mutex until stores
     // close so a concurrent unlock cannot race the previous session's shutdown.
     let client = state.detach_profile();
+    realtime::clear(&app);
     #[cfg(desktop)]
     desktop_activity::clear(&app);
     let notifications = push::suspend(&app, client.as_ref()).await;
@@ -441,10 +445,18 @@ async fn attachment_transfer(
                         }
                     }
                     release_policy::require_online(&app)?;
-                    client.operate_attachment_transfer(request, cancellation, move |received, total| {
+                    realtime::refresh(&app, Some(client));
+                    let activity_app = app.clone();
+                    let activity_identity = client.identity_id();
+                    let activity_scope = serde_json::from_value::<elo_core::app::realtime::Scope>(serde_json::json!({
+                        "space_context":client.active_space_id().unwrap_or(""), "space":request["space"], "stream":request["stream"],
+                    })).ok();
+                    client.operate_attachment_transfer_with_activity(request, cancellation, move |received, total| {
                         let _ = progress_app.emit("attachment-transfer-progress", AttachmentTransferProgress {
                             transfer_id: progress_id.clone(), received, total,
                         });
+                    }, move |activity| {
+                        if let Some(scope) = &activity_scope { realtime::activity(&activity_app, activity_identity, scope, activity); }
                     }).await.map_err(|error| error.to_string())
                 }.await
             },
@@ -458,6 +470,7 @@ async fn attachment_transfer(
                 state.view_revision,
                 state.demo_names.as_ref(),
             );
+            realtime::refresh(&app, state.client.as_ref());
             push::update(&app, &result);
             #[cfg(desktop)]
             desktop_activity::update(&app, &result);
@@ -638,6 +651,7 @@ async fn operate(
         serde_json::json!({"view":client.view().await.map_err(|e|e.to_string())?})
     } else {
         let outcome = client.operate(request).await.map_err(|e| e.to_string());
+        realtime::refresh(&app, Some(client));
         if outcome.is_err() && preferences_changed {
             // A durable safety preference may have committed before a later
             // local cleanup failed. Still propagate its restrictive policy.
@@ -686,6 +700,7 @@ async fn operate(
         state.view_revision,
         state.demo_names.as_ref(),
     );
+    realtime::refresh(&app, state.client.as_ref());
     push::update(&app, &result);
     #[cfg(desktop)]
     desktop_activity::update(&app, &result);
@@ -777,6 +792,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(State::default())
+        .manage(realtime::Live::default())
         .manage(release_policy::Checks::default())
         .manage(native_media::MediaGate::default())
         .manage(AttachmentTransfers::default())
@@ -790,10 +806,9 @@ pub fn run() {
                 window.set_decorations(false)?;
             }
             release_policy::setup(app.handle());
+            realtime::setup(app.handle());
             #[cfg(all(mobile, feature = "mobile-push"))]
             push::setup(app.handle());
-            #[cfg(all(target_os = "ios", feature = "mobile-push"))]
-            incoming_answer::setup(app.handle());
             exchange::clear(app.handle()).map_err(std::io::Error::other)?;
             #[cfg(desktop)]
             desktop_activity::setup(app.handle());
@@ -811,8 +826,10 @@ pub fn run() {
             attachment_transfer,
             cancel_attachment_transfer,
             operate,
+            realtime::realtime_context,
             push::push_task,
             native_media::native_call_media,
+            native_media::native_call_state,
             profiles::profile_task,
             exchange::choose_attachment,
             exchange::stage_attachment,

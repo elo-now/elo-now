@@ -202,6 +202,7 @@ struct Db {
 }
 #[derive(Clone)]
 pub struct ReplicaStore {
+    pub(crate) realtime: Arc<crate::realtime::Events>,
     admitted_devices: Arc<Mutex<std::collections::BTreeSet<crate::ids::RecordId>>>,
     revocations: crate::identity::revocations::Revocations,
     db: Arc<Mutex<Db>>,
@@ -216,6 +217,7 @@ impl ReplicaStore {
             .map_err(|_| ReplicaError::Storage)??;
         let key = db.key.verifying_key();
         Ok(Self {
+            realtime: Arc::new(crate::realtime::Events::default()),
             admitted_devices: Arc::new(Mutex::new(Default::default())),
             revocations: crate::identity::revocations::Revocations::open(registry_path)
                 .map_err(|_| ReplicaError::Storage)?,
@@ -565,7 +567,7 @@ impl ReplicaStore {
         actor: Option<crate::retention_access::Actor>,
     ) -> Result<(bool, Vec<u8>)> {
         let revocations = self.revocations.clone();
-        self.call(move|db|{
+        let result = self.call(move|db|{
    authorize(&db.connection,mailbox,&token,true)?;
    let identity = actor.map(|actor| actor.identity);
    if let Some(actor) = actor { retention::authorize_actor(&db.connection, &revocations, mailbox, actor)?; }
@@ -623,7 +625,9 @@ impl ReplicaStore {
    let body=ReceiptBody{v:1,kind:"storage.receipt".into(),peer_id:peer_id(&db.key.verifying_key()),mailbox_id:mailbox,object_id:id,size_bytes:bytes.len() as u64,arrival_seq:seq as u64,storage_generation:db.generation.clone(),storage_class:"sqlite-wal-full".into(),retention:policy.into(),nonce:random_hex::<16>().map_err(|_|ReplicaError::Storage)?,stored_local_ms:stored_time as u64};
    let body=serde_json::to_vec(&body).map_err(|_|ReplicaError::Storage)?;let receipt=SignedRecord::sign(&body,&db.key).map_err(|_|ReplicaError::Storage)?;
    Ok((inserted,receipt.bytes().to_vec()))
-  }).await
+  }).await?;
+        if result.0 { self.realtime.changed(mailbox); }
+        Ok(result)
     }
     pub async fn get(&self, mailbox: MailboxId, token: String, id: ObjectId) -> Result<Vec<u8>> {
         self.call(move |db| {

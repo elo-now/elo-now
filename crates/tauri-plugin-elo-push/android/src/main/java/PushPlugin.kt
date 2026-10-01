@@ -41,9 +41,7 @@ class ReconcileArgs { var registration: String = ""; var unread: Boolean = false
 class StatusListenerArgs { lateinit var channel: Channel }
 
 @InvokeArg
-class CallConfigureArgs { var enabled:Boolean=false;var registration:String="";var endpoint:String="";var labels:Map<String,String> = emptyMap();var ringtone:String?=null }
-@InvokeArg
-class CallActionArgs { var action:String="";var callId:String="";var event:String?=null }
+class CallStateArgs { var active: Boolean = false; var sessionId: String = ""; var camera: Boolean = false }
 
 @TauriPlugin
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
@@ -72,15 +70,18 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
             manager.createNotificationChannel(NotificationChannel("elo_messages", activity.getString(R.string.notification_channel_messages), NotificationManager.IMPORTANCE_DEFAULT).apply { setShowBadge(true) })
             manager.createNotificationChannel(NotificationChannel("elo_invitations", activity.getString(R.string.notification_channel_invitations), NotificationManager.IMPORTANCE_DEFAULT).apply { setShowBadge(true) })
         }
+        ChatSessions.clearLegacy(activity)
         onIntent(activity.intent)
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); onIntent(intent) }
     override fun onWebViewDestroyed() {
+        ChatSessions.stop(activity)
         statusChannel = null
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         super.onWebViewDestroyed()
     }
     override fun onDestroy(activity: AppCompatActivity) {
+        ChatSessions.stop(activity)
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         statusChannel = null
         super.onDestroy(activity)
@@ -157,36 +158,20 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
     @Command
-    fun callConfigure(invoke:Invoke) {
-        val args=invoke.parseArgs(CallConfigureArgs::class.java)
-        if(args.registration!=prefs.getString("registration",null) || !args.endpoint.startsWith("https://")) { invoke.reject("Invalid call registration");return }
-        val edit=prefs.edit().putBoolean("calls-enabled",args.enabled).putString("call-endpoint",args.endpoint)
-        for((key,value) in args.labels) if(key in listOf("incoming","answer","decline","unlock","connected") && value.length<=160) edit.putString("call-label-$key",value)
-        if(args.ringtone in listOf("classic","chime","pulse","silent")) edit.putString("call-ringtone",args.ringtone)
-        edit.commit()
-        IncomingCalls.current(activity)?.let {
-            if(!args.enabled || (it.optBoolean("connected") && !TelecomCalls.hasCall(it.optString("id")))) IncomingCalls.finish(activity,it.optString("id"))
+    fun setCallState(invoke: Invoke) {
+        val args = invoke.parseArgs(CallStateArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                ChatSessions.update(activity, args.sessionId, args.active, args.camera) { error ->
+                    if (error == null) invoke.resolve() else invoke.reject(error)
+                }
+            } catch (_: RuntimeException) {
+                invoke.reject("Open the app and allow microphone or camera access to join a chat session.")
+            }
         }
-        invoke.resolve(JSObject().put("token",prefs.getString("installation-id",null)))
-    }
-    @Command
-    fun callStatus(invoke:Invoke) {
-        val call=(try { org.json.JSONObject(prefs.getString("call-event","") ?: "") } catch (_:Exception) { null }) ?: IncomingCalls.current(activity)
-        invoke.resolve(JSObject().put("incoming",call?.let { JSObject(it.toString()) }))
-    }
-    @Command
-    fun callAction(invoke:Invoke) {
-        val args=invoke.parseArgs(CallActionArgs::class.java)
-        if(args.action=="ack") {
-            val event=try { org.json.JSONObject(prefs.getString("call-event","") ?: "") } catch (_:Exception) { null }
-            if(event?.optString("id")==args.callId && event.optString("event")==args.event) prefs.edit().remove("call-event").commit()
-        }
-        when(args.action) { "answering"->IncomingCalls.answer(activity,args.callId);"connected"->IncomingCalls.connected(activity,args.callId);"end"->IncomingCalls.finish(activity,args.callId) }
-        invoke.resolve()
     }
     @Command
     fun disable(invoke: Invoke) {
-        IncomingCalls.current(activity)?.optString("id")?.let { IncomingCalls.finish(activity,it) }
         prefs.edit().clear().commit()
         val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.activeNotifications.filter { it.tag?.startsWith("elo-wake:") == true }.forEach { manager.cancel(it.tag, it.id) }

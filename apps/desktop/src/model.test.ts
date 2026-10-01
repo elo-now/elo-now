@@ -158,6 +158,37 @@ describe("Member search", () => {
     ).toEqual(["zoe"]);
     expect(visibleMembers(view, stream, "nobody")).toEqual([]);
   });
+  it("hides General's service from member actions without changing signed membership", () => {
+    const general = {
+      ...stream,
+      is_general: true,
+      controller: "service-key",
+      members: [
+        ...stream.members,
+        {
+          ...stream.members[0],
+          identity_id: "service",
+          credential_ids: ["service-key"],
+        },
+      ],
+    };
+    const before = structuredClone(general);
+    expect(
+      visibleMembers(view, general, "").map((member) => member.identity_id),
+    ).toEqual(["me", "bea", "zoe"]);
+    expect(visibleMembers(view, general, "service")).toEqual([]);
+    expect(general).toEqual(before);
+  });
+  it("keeps the real owner visible in owner-managed General", () => {
+    const general = {
+      ...stream,
+      is_general: true,
+      owner_managed: true,
+      controller: stream.members[0].credential_ids[0],
+    };
+    expect(visibleMembers(view, general, "").map((member) => member.identity_id))
+      .toEqual(["me", "bea", "zoe"]);
+  });
 });
 
 describe("Message search", () => {

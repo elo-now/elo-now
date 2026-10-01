@@ -1,14 +1,17 @@
 import { formatAttachmentExpiry, formatFileSize, t } from "./i18n";
 import type { MessageRow } from "./messageThreads";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
-  cachedAttachmentPreview,
+  cachedAttachmentPreviewState,
   loadAttachmentPreview,
+  previewDimensions,
+  rememberAttachmentPreviewDecoded,
   shareAttachment,
   type AttachmentContext,
 } from "./attachmentPreview";
 import { useToast } from "./Toast";
 import { presentError } from "./errors";
+import "./attachmentMotion.css";
 
 export type AttachmentProgress = {
   received: number;
@@ -52,6 +55,11 @@ export function AttachmentButton({
     url: string | null;
   } | null>(null);
   const container = useRef<HTMLDivElement>(null);
+  const image = useRef<HTMLImageElement>(null);
+  const measured = useRef<{ key: string; height: number } | null>(null);
+  const [decoded, setDecoded] = useState<{ key: string; url: string } | null>(
+    null,
+  );
   const press = useRef<{
     timer?: number;
     x: number;
@@ -62,14 +70,72 @@ export function AttachmentButton({
   const lastShared = useRef(0);
   const request = context ? { ...context, record: row.id } : undefined;
   const key = JSON.stringify(request);
-  const cachedPreview = request ? cachedAttachmentPreview(request) : undefined;
+  const cached = request ? cachedAttachmentPreviewState(request) : undefined;
   const previewUrl =
-    cachedPreview ?? (preview && preview.key === key ? preview.url : null);
+    cached?.url ?? (preview && preview.key === key ? preview.url : null);
   const previewResolved =
-    cachedPreview !== undefined || (preview !== null && preview.key === key);
+    cached !== undefined || (preview !== null && preview.key === key);
+  const dimensions =
+    cached?.dimensions ??
+    (previewUrl ? previewDimensions(previewUrl) : undefined);
+  const imageReady =
+    cached?.decoded === true ||
+    (decoded !== null && decoded.key === key && decoded.url === previewUrl);
   const active = !!download;
   const expiresAt = row.body.attachment?.expires_at_ms;
   const [now, setNow] = useState(Date.now);
+  useLayoutEffect(() => {
+    // Preserve the actual download tile during the next local preview lookup.
+    // Static photos do not need a layout read on unrelated chat updates.
+    if (!active) return;
+    const element = container.current;
+    if (!element) return;
+    const remember = (height: number) => {
+      if (Number.isFinite(height) && height > 0)
+        measured.current = { key, height };
+    };
+    remember(element.getBoundingClientRect().height);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(([entry]) => {
+            remember(
+              entry.borderBoxSize?.[0]?.blockSize ??
+                element.getBoundingClientRect().height,
+            );
+          });
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, [key, active, previewUrl]);
+  useEffect(() => {
+    const element = image.current;
+    if (!element || !previewUrl || imageReady) return;
+    let cancelled = false;
+    const reveal = async () => {
+      if (!element.complete || element.naturalWidth === 0) return;
+      try {
+        await element.decode?.();
+      } catch {
+        // Some WebViews reject decode() after load even though the bitmap exists.
+      }
+      if (
+        cancelled ||
+        image.current !== element ||
+        element.getAttribute("src") !== previewUrl ||
+        !element.complete ||
+        element.naturalWidth === 0
+      )
+        return;
+      if (request) rememberAttachmentPreviewDecoded(request, previewUrl);
+      setDecoded({ key, url: previewUrl });
+    };
+    element.addEventListener("load", reveal);
+    void reveal();
+    return () => {
+      cancelled = true;
+      element.removeEventListener("load", reveal);
+    };
+  }, [key, previewUrl, imageReady]);
   useEffect(() => {
     if (expiresAt == null) return;
     let timer: ReturnType<typeof setTimeout>;
@@ -91,7 +157,12 @@ export function AttachmentButton({
     };
   }, [expiresAt]);
   useEffect(() => {
-    if (!request || active) return;
+    if (active) {
+      // The pre-download cache miss is no longer a resolved local lookup.
+      setPreview(null);
+      return;
+    }
+    if (!request) return;
     let cancelled = false;
     const load = () => {
       void loadAttachmentPreview(request)
@@ -173,6 +244,24 @@ export function AttachmentButton({
     return (
       <div ref={container} className="attachment-preview">
         <img
+          ref={image}
+          className="attachment-image"
+          data-preview-ready={imageReady || undefined}
+          width={dimensions?.width}
+          height={dimensions?.height}
+          style={
+            dimensions
+              ? {
+                  width: Math.min(
+                    dimensions.width,
+                    360,
+                    (dimensions.width * 360) / dimensions.height,
+                  ),
+                  aspectRatio: `${dimensions.width} / ${dimensions.height}`,
+                }
+              : undefined
+          }
+          decoding="async"
           src={previewUrl}
           alt={filename}
           draggable={false}
@@ -223,6 +312,7 @@ export function AttachmentButton({
   if (download) {
     return (
       <div
+        ref={container}
         className="attachment attachment-active"
         aria-label={t("file.downloadLabel", { filename, size })}
       >
@@ -260,6 +350,11 @@ export function AttachmentButton({
       <div
         ref={container}
         className="attachment-preview-pending"
+        style={
+          measured.current !== null && measured.current.key === key
+            ? { minHeight: measured.current.height }
+            : undefined
+        }
         aria-busy="true"
       />
     );

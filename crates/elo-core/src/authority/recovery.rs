@@ -32,6 +32,11 @@ impl Authority {
     /// Compare the controller generations known across this Space's Streams.
     /// Include this authority even when it is a newly received external proof.
     pub fn controller_ready_with(&self, peers: &[Self]) -> bool {
+        if self.is_owner_managed() {
+            // Each stream records its own admitted owner devices. Alternating
+            // signers do not create legacy Space-wide controller generations.
+            return !self.is_forked();
+        }
         let mut children = BTreeMap::new();
         let mut latest = (0, self.initial_controller().id());
         for peer in peers
@@ -69,6 +74,10 @@ impl Authority {
         chain: &[SignedRecord],
         current: &VerifiedCredential,
     ) -> Result<()> {
+        // A recovery-only export cannot prove an owner device's admission.
+        if self.is_owner_managed() {
+            return Err(RecordError::Authority);
+        }
         let initial = self.initial_controller();
         let root = VerifyingKey::from_bytes(&record::hex(
             initial.record().body()["root_public_key"]
@@ -156,7 +165,8 @@ impl Authority {
         root: &SigningKey,
     ) -> Result<SignedRecord> {
         let initial = self.initial_controller();
-        if self.checkpoint_evidence.is_some()
+        if self.is_owner_managed()
+            || self.checkpoint_evidence.is_some()
             || self.is_forked()
             || initial.identity() != IdentityId::of_root_key(root.verifying_key().as_bytes())
             || fresh.identity() != initial.identity()
@@ -186,6 +196,9 @@ impl Authority {
         certificate: &SignedRecord,
         key: &SigningKey,
     ) -> Result<SignedRecord> {
+        if self.is_owner_managed() {
+            return Err(RecordError::Authority);
+        }
         let cert: ControllerRecovery = certificate.decode()?;
         let mut c = self.head()?.clone();
         c.nonce = record::random_hex::<16>()?;
@@ -228,6 +241,22 @@ impl Authority {
     }
     pub(super) fn validate_controller_transition(&self, c: &StreamConfig) -> Result<()> {
         let parent = c.previous_config_id.map(|id| self.config(id)).transpose()?;
+        if self.is_owner_managed() {
+            if c.recovery.is_some()
+                || c.action.operation == "controller.recovered"
+                || !parent.map_or_else(
+                    || c.controller_credential_id == self.body.controller_credential_id,
+                    |prior| {
+                        prior
+                            .owner_credential_ids
+                            .contains(&c.controller_credential_id)
+                    },
+                )
+            {
+                return Err(RecordError::Authority);
+            }
+            return Ok(());
+        }
         let prior_controller = parent
             .map(|p| p.controller_credential_id)
             .unwrap_or(self.body.controller_credential_id);
@@ -305,6 +334,24 @@ impl Authority {
         Ok(())
     }
     pub(super) fn select_controller_head(&mut self) -> Result<()> {
+        if self.is_owner_managed() {
+            let mut parents = BTreeSet::new();
+            if self
+                .configs
+                .values()
+                .any(|(_, c)| !parents.insert(c.previous_config_id))
+            {
+                self.forked = true;
+                return Ok(());
+            }
+            self.forked = false;
+            self.head = self
+                .configs
+                .iter()
+                .max_by_key(|(_, (_, c))| c.sequence)
+                .map(|(id, _)| *id);
+            return Ok(());
+        }
         let certificates = self.recovery_records()?;
         let mut children = BTreeMap::new();
         let mut current = self.body.controller_credential_id;

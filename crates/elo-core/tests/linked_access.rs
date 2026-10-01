@@ -10,7 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
-async fn companion_transport_requires_admission_and_stays_independently_revocable() {
+async fn nested_companion_transport_requires_exact_admission_and_independent_revocation() {
     let directory = tempfile::tempdir().unwrap();
     let store = ReplicaStore::open(directory.path()).await.unwrap();
     let mailbox = store.create_mailbox(1_000_000).await.unwrap();
@@ -19,10 +19,29 @@ async fn companion_transport_requires_admission_and_stays_independently_revocabl
         .set_space_members(mailbox.mailbox_id, vec![original.identity_id()])
         .await
         .unwrap();
-    let key = generate_signing_key().unwrap();
-    let child = DeviceCredential::issue_companion(
+    let mut parent_key = generate_signing_key().unwrap();
+    let mut parent = DeviceCredential::issue_companion(
         original.credential(),
         original.signing_key(),
+        &parent_key.verifying_key(),
+        &age::x25519::Identity::generate().to_public(),
+    )
+    .unwrap();
+    for _ in 2..elo_core::identity::MAX_COMPANION_DEPTH {
+        let key = generate_signing_key().unwrap();
+        parent = DeviceCredential::issue_companion(
+            &parent,
+            &parent_key,
+            &key.verifying_key(),
+            &age::x25519::Identity::generate().to_public(),
+        )
+        .unwrap();
+        parent_key = key;
+    }
+    let key = generate_signing_key().unwrap();
+    let child = DeviceCredential::issue_companion(
+        &parent,
+        &parent_key,
         &key.verifying_key(),
         &age::x25519::Identity::generate().to_public(),
     )
@@ -58,6 +77,12 @@ async fn companion_transport_requires_admission_and_stays_independently_revocabl
         403,
         "unadmitted companion must not inherit transport by identity"
     );
+    store.set_admitted_devices(vec![parent.id()]).unwrap();
+    assert_eq!(
+        request().send().await.unwrap().status(),
+        403,
+        "the parent's admission does not admit a new child"
+    );
     store.set_admitted_devices(vec![child.id()]).unwrap();
     assert_eq!(request().send().await.unwrap().status(), 200);
     let root = card.recover_root(original.identity_id()).unwrap();
@@ -69,6 +94,19 @@ async fn companion_transport_requires_admission_and_stays_independently_revocabl
         request().send().await.unwrap().status(),
         200,
         "an admitted child survives retirement of its original device"
+    );
+    let retire_parent = DeviceRevocation::issue_from_device(&child, &key, &parent).unwrap();
+    assert_eq!(
+        DeviceRevocation::verify_request(&retire_parent, &child)
+            .unwrap()
+            .id(),
+        parent.id()
+    );
+    store.revocations().insert(&retire_parent).unwrap();
+    assert_eq!(
+        request().send().await.unwrap().status(),
+        200,
+        "an admitted child survives retirement of its immediate authorizer"
     );
     store.set_admitted_devices(vec![]).unwrap();
     assert_eq!(

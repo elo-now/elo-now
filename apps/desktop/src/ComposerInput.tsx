@@ -1,18 +1,26 @@
 import {
+  useEffect,
   useLayoutEffect,
   useRef,
   type ComponentPropsWithoutRef,
   type RefObject,
 } from "react";
+import { useRealtimePresentation } from "./useRealtime";
 
 /** Share draft sizing between the conversation and its thread. */
 export function ComposerInput({
   inputRef,
+  resetRevision,
   ...props
 }: ComponentPropsWithoutRef<"textarea"> & {
   inputRef?: RefObject<HTMLTextAreaElement | null>;
+  resetRevision?: number;
 }) {
   const localRef = useRef<HTMLTextAreaElement>(null);
+  const realtime = useRealtimePresentation();
+  useEffect(() => {
+    if (!props.value || props.disabled) realtime.typing(false);
+  }, [props.value, props.disabled]);
   const input = inputRef ?? localRef;
   const setExpanded = (expanded: boolean) => {
     const form = input.current?.form;
@@ -40,6 +48,9 @@ export function ComposerInput({
     node.style.height = `${Math.min(height, maximum)}px`;
     node.style.overflowY = height > maximum ? "auto" : "hidden";
   };
+  useLayoutEffect(() => {
+    setExpanded(false);
+  }, [resetRevision]);
   // Includes preference changes and restored drafts, not just keystrokes.
   useLayoutEffect(resize);
   useLayoutEffect(() => {
@@ -115,12 +126,25 @@ export function ComposerInput({
       {...props}
       ref={input}
       rows={1}
+      onChange={(event) => {
+        setExpanded(true);
+        props.onChange?.(event);
+        realtime.typing(!!event.target.value.trim());
+      }}
+      onPointerDown={(event) => {
+        props.onPointerDown?.(event);
+        if (!event.defaultPrevented && !props.disabled) {
+          setExpanded(true);
+          resize();
+        }
+      }}
       onFocus={(event) => {
         props.onFocus?.(event);
         setExpanded(true);
         resize();
       }}
       onBlur={(event) => {
+        realtime.typing(false);
         props.onBlur?.(event);
         requestAnimationFrame(resize);
       }}

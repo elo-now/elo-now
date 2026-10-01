@@ -33,6 +33,7 @@ export type LiveContext = {
   messages: boolean;
   invitations: boolean;
   pendingSpaces?: readonly string[];
+  realtimeConnected?: boolean;
 };
 
 /** One foreground worker for both delivery loops. Native code owns durable
@@ -44,6 +45,7 @@ export function startLiveSync(
     op: "sync_live" | "invitation_sync",
     force?: boolean,
     receiveOnly?: boolean,
+    targetSpace?: string,
   ) => Promise<SyncResult>,
   onResult: (result: SyncResult) => void,
   onProgress: (progress: SyncProgress) => void = () => {},
@@ -63,6 +65,7 @@ export function startLiveSync(
   let receiveRetries = 0;
   let lastMessage = true;
   let progress: SyncProgress = null;
+  const remoteSpaces = new Set<string>();
   const publish = (next: SyncProgress) => {
     progress = next;
     if (active) onProgress(next);
@@ -105,7 +108,8 @@ export function startLiveSync(
     // A repeated push/status hint may make both loops due while discovery is
     // running. Always give message delivery a turn before another such pass.
     const bothDue = messageDue <= now && invitationDue <= now;
-    const receiving = receiveFirst && messageDue <= now;
+    const remoteSpace = remoteSpaces.values().next().value as string | undefined;
+    const receiving = (receiveFirst || remoteSpace !== undefined) && messageDue <= now;
     const message =
       receiving || (bothDue ? !lastMessage : messageDue < invitationDue);
     const due = Math.min(messageDue, invitationDue);
@@ -116,6 +120,7 @@ export function startLiveSync(
     }
     running = true;
     if (receiving) receiveFirst = false;
+    if (receiving && remoteSpace) remoteSpaces.delete(remoteSpace);
     lastMessage = message;
     const started = requests;
     const invitationStarted = invitationRequests;
@@ -128,7 +133,7 @@ export function startLiveSync(
     try {
       const op = message ? "sync_live" : "invitation_sync";
       const result = await (receiving
-        ? deliver(op, false, true)
+        ? remoteSpace ? deliver(op, false, true, remoteSpace) : deliver(op, false, true)
         : force
           ? deliver(op, true)
           : deliver(op));
@@ -173,7 +178,8 @@ export function startLiveSync(
         receiveRetries = retryReceive ? receiveRetries + 1 : 0;
         if (retryReceive) receiveFirst = true;
         messageFailures = failed ? Math.min(messageFailures + 1, 5) : 0;
-        const base = context().conversation ? 4_000 : 20_000;
+        if (remoteSpace && (more || retryReceive)) remoteSpaces.add(remoteSpace);
+        const base = context().realtimeConnected ? 60_000 : context().conversation ? 4_000 : 20_000;
         nextMessage =
           Date.now() +
           (retryReceive
@@ -186,7 +192,7 @@ export function startLiveSync(
                   ? 250
                   : base) +
           Math.random() * 1_000;
-        if (requests !== started) nextMessage = 0;
+        if (requests !== started || (!failed && !more && remoteSpaces.size > 0)) nextMessage = 0;
       } else {
         invitationFailures =
           failed && !discoveryProgressed
@@ -232,6 +238,14 @@ export function startLiveSync(
   window.addEventListener("focus", resume);
   schedule(250);
   return {
+    /** WebSocket hints are coalesced by Space and only receive verified data. */
+    requestRemote(space: string) {
+      if (!space || remoteSpaces.has(space)) return;
+      remoteSpaces.add(space);
+      requests++;
+      nextMessage = 0;
+      if (!running) schedule(100);
+    },
     /** A locally committed send requests one pass; repeated calls coalesce. */
     request(membership = false) {
       requests++;
@@ -254,8 +268,8 @@ export function startLiveSync(
         forceInvitation = true;
       }
       pendingSpaces = nextPending;
-      if (context().conversation)
-        nextMessage = Math.min(nextMessage, Date.now() + 4_000);
+      if (!context().realtimeConnected)
+        nextMessage = Math.min(nextMessage, Date.now() + (context().conversation ? 4_000 : 20_000));
       if (!running) schedule(100);
     },
     stop() {

@@ -53,8 +53,6 @@ type Status = {
   available: boolean;
   enabled: boolean;
   pending: boolean;
-  callsEnabled?: boolean;
-  callsPending?: boolean;
   wake?: boolean;
   opened?: Opened | null;
 };
@@ -354,8 +352,7 @@ export function usePushNotifications(
             ? latest.current.busy || latest.current.changing
               ? 500
               : 100
-            : latest.current.status.pending ||
-                latest.current.status.callsPending
+            : latest.current.status.pending
               ? 1000
               : 8000,
         );
@@ -581,48 +578,6 @@ export function usePushNotifications(
           <span />
         </span>
       </button>
-      {status.enabled && (
-        <>
-          <button
-            type="button"
-            className="settings-toggle"
-            role="switch"
-            aria-checked={!!status.callsEnabled}
-            disabled={changing || busy || status.pending}
-            onClick={() => {
-              if (!view || changing) return;
-              settingsRevision.current++;
-              latest.current.changing = true;
-              setChanging(true);
-              void invoke<Status>("push_task", {
-                op: status.callsEnabled ? "calls_disable" : "calls_enable",
-                expectedIdentity: view.identity,
-              })
-                .then((result) => receive(result, view.identity))
-                .catch((error) => {
-                  onError(error);
-                  refresh.current();
-                })
-                .finally(() => setChanging(false));
-            }}
-          >
-            <span>{t("calls.background")}</span>
-            <span className="toggle-track" aria-hidden="true">
-              <span />
-            </span>
-          </button>
-          <p
-            className={status.callsPending ? "muted danger" : "muted"}
-            role="status"
-          >
-            {t(
-              status.callsPending
-                ? "notifications.pending"
-                : "calls.backgroundHelp",
-            )}
-          </p>
-        </>
-      )}
       <p
         className={changing || status.pending ? "muted danger" : "muted"}
         role="status"

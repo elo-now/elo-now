@@ -1,6 +1,6 @@
 # Self-host elo.now on one VPS
 
-This guide is for a **new, empty installation** on Debian 13 or Oracle Linux 10. It uses one VPS and one public application origin. It covers hosted Spaces and encrypted messages, attachments, voice/video calls, and optional mobile notifications/background calls. There is no migration from the publisher's installation and no requirement for `api.elo.now`.
+This guide is for a **new, empty installation** on Debian 13 or Oracle Linux 10. It uses one VPS and one public application origin. It covers hosted Spaces and encrypted messages, attachments, chat audio/video sessions, and optional mobile notifications. There is no migration from the publisher's installation and no requirement for `api.elo.now`.
 
 The examples use `chat.example.org` for the app API and media WebSocket, and `turn.example.org` for TURN on the same VPS. Replace both names throughout. Keep all private files and credentials **outside the source checkout**. Never put an SSH password, MEGA password, Firebase service account, APNs key, LiveKit secret or TURN secret in the mobile/desktop app.
 
@@ -13,12 +13,12 @@ For upgrades to an existing installation, read [API compatibility and applicatio
 | Component | Install on the VPS | Public route / port | Private configuration |
 | --- | --- | --- | --- |
 | Nginx and TLS | Yes | `https://chat.example.org` on TCP 443 | TLS certificate and allowlisted proxy routes |
-| `elo-team host` | Yes | Spaces, encrypted Replica and attachment gateway behind Nginx | `/etc/elo/host/config.json` |
+| `elo-team host` | Yes | Spaces, encrypted Replica, `/hosting/v1/realtime` WebSocket and attachment gateway behind Nginx | `/etc/elo/host/config.json` |
 | Attachment storage | Choose local, MEGA WebDAV or S3-compatible | No direct public storage endpoint | `attachment_storage` in the host config |
 | `elo-call-service` | For calls | `/calls/v1/connect` WebSocket | `/etc/elo/call/config.json` |
 | LiveKit | For group media and call admission | `/media/` WebSocket plus its ICE ports | `/etc/elo/media/livekit.yaml` |
 | coturn | For direct calls across restrictive networks | `turn.example.org:3478/5349` plus relay ports | `/etc/elo/turn/turnserver.conf` |
-| `elo-wake` | For mobile push and background calls | `/v1/routes/`, `/wake/health` | Firebase service account; optional APNs VoIP config |
+| `elo-wake` | For message and invitation push notifications | `/v1/routes/`, `/wake/health` | Firebase service account; APNs key configured in Firebase for iOS |
 
 For a minimal messages-and-files installation, complete the host, local storage, TLS and client-build steps first. To offer **all** app features, complete the call and wake sections too. The app does not silently provide publisher-operated services when your own endpoint is unavailable.
 
@@ -230,64 +230,39 @@ Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit p
       "turns:turn.example.org:5349?transport=tcp"
     ],
     "turn_secret": "REPLACE_WITH_SAME_TURN_SECRET"
-  },
-  "wake": {
-    "url": "http://127.0.0.1:8794/internal/calls/event",
-    "key_file": "/etc/elo/call/wake.key"
   }
 }
 ```
 
-The `admission_key` must have exactly the same 64 characters as the host's `call_admission_key`. The `wake.key_file` must match the wake service's `--call-key` file. The call service reads its JSON with `--config /etc/elo/call/config.json`. Its public WebSocket is only `/calls/v1/connect`; the private admission and delivery URLs must stay on loopback. Media credentials are issued to clients as short-lived tokens through signed call operations, not baked into an app package.
+The `admission_key` must have exactly the same 64 characters as the host's `call_admission_key`. The call service reads its JSON with `--config /etc/elo/call/config.json`. Its public WebSocket is only `/calls/v1/connect`; the private admission URL must stay on loopback. Media credentials are issued to clients as short-lived tokens through signed call operations, not baked into an app package.
 
 ## 6. Firebase, APNs and the wake service
 
 Create your own Firebase project with Android and iOS apps matching the identifiers in **your** client build. Download the Android `google-services.json` and iOS `GoogleService-Info.plist` as private build inputs. Enable Cloud Messaging, associate APNs credentials with the iOS Firebase app for ordinary message notifications, and create a restricted Firebase service-account key for the VPS. The service account JSON belongs at `/etc/elo/wake/firebase.json`, readable only by `elo-wake`. See [Firebase's server-environment guide](https://firebase.google.com/docs/cloud-messaging/server-environment).
 
-For iOS **incoming call** delivery while the app is closed, create an APNs token-signing `.p8` key in your Apple Developer account and enable the required Push Notifications/VoIP capabilities for the iOS App ID. Save the key as `/etc/elo/wake/apns.p8` and this private config as `/etc/elo/wake/apns.json`:
+iOS uses the APNs credentials associated with Firebase for ordinary notifications.
+Chat audio/video sessions are joined in the foreground and do not use CallKit,
+PushKit, a separate APNs VoIP key or VoIP-token App Attest enrollment.
 
-```json
-{
-  "key_file": "/etc/elo/wake/apns.p8",
-  "key_id": "YOUR10CHARID",
-  "team_id": "YOUR10CHARID",
-  "bundle_id": "your.app.bundle",
-  "sandbox": false
-}
-```
-
-Use `sandbox: true` only for development-signed iOS clients; App Store builds use production. Match `bundle_id` exactly to the signed iOS app. The APNs provider key is independent of Apple distribution-signing certificates. See [Apple's token-based APNs guide](https://developer.apple.com/documentation/usernotifications/establishing-a-token-based-connection-to-apns).
-
-Enable App Attest for that App ID and regenerate the app's provisioning profile.
-The native client reads its token from PushKit and obtains an Apple-attested key;
-the relay challenges a fresh assertion bound to the route, account, endpoint and
-exact token. It checks the production Apple certificate chain, application identity,
-single-use challenge and increasing assertion counter. Enrollment attestation uses
-a native random nonce and is cached because Apple attests a key once; the first
-registration also requires a fresh server challenge assertion. No verification-only
-VoIP push is sent. Unsupported devices cannot enable iOS background incoming calls.
-If the signed app's App ID prefix differs from `team_id`, add `app_id_prefix` to
-the APNs JSON with that ten-character prefix; otherwise it defaults to `team_id`.
-The prefix, bundle ID and production App Attest entitlement must all agree.
-
-These source changes require coordinated deployment: older clients and unproved
-stored VoIP registrations cannot bypass ownership verification. Keep existing
-services running until compatible signed clients have passed device acceptance.
-
-Start the wake service with the same public origin as the host. The `--call-key` option enables its private call-delivery listener on loopback; `--apns-config` adds iOS VoIP delivery:
+Start the wake service with the same public origin as the host:
 
 ```sh
 /opt/elo/bin/elo-wake \
   --service-account /etc/elo/wake/firebase.json \
   --database /var/lib/elo/wake/wake.sqlite \
   --public-url https://chat.example.org \
-  --listen 127.0.0.1:8788 \
-  --call-key /etc/elo/wake/calls.key \
-  --call-listen 127.0.0.1:8794 \
-  --apns-config /etc/elo/wake/apns.json
+  --listen 127.0.0.1:8788
 ```
 
-Before starting the daemon, `elo-wake --service-account /etc/elo/wake/firebase.json --check-authentication` validates Firebase authentication without sending a notification. Ordinary push routes are public only through the TLS proxy; `8794` is private. If APNs is not configured, remove `--apns-config` and do not claim iOS background incoming calls are supported.
+Before starting the daemon, `elo-wake --service-account /etc/elo/wake/firebase.json --check-authentication` validates Firebase authentication without sending a notification. Ordinary push routes are public only through the TLS proxy.
+
+When upgrading from ringing calls, remove the call service's `wake` block and
+`limits.ring_timeout`, plus the wake service's `--call-key`, `--call-listen` and
+`--apns-config` arguments. The relay removes retired call/VoIP tables while retaining
+ordinary routes and message queues. Clients and call service must be deployed
+together: session signaling now requires an epoch in the signed message and envelope.
+Do not update a server used by a reviewer running the previous client until the
+matching client rollout is ready.
 
 ## 7. Keep the services running
 
@@ -317,6 +292,7 @@ Then enable the full example in Nginx's `http` context, replace the domains, and
 | Route | Upstream |
 | --- | --- |
 | `/spaces/v1/create`, `/spaces/v1/health`, `/accounts/v1/deletion`, `/accounts/v1/deletion/status` | `http://127.0.0.1:18900` |
+| `/hosting/v1/realtime` | `http://127.0.0.1:18900`; exact path, WebSocket Upgrade, buffering off and long read timeout |
 | `/spaces/<64-lowercase-hex-id>/team/v1/spaces` | `http://127.0.0.1:18900` |
 | `/spaces/<64-lowercase-hex-id>/replica/...` | `http://127.0.0.1:18900`, **preserve the full path** |
 | `/spaces/<64-lowercase-hex-id>/attachments/v1/upload` and `download` | `http://127.0.0.1:18900`; 6 MiB upload body limit, request buffering off, 125 s transfer timeout |
@@ -325,6 +301,34 @@ Then enable the full example in Nginx's `http` context, replace the domains, and
 | `/media/...` | `http://127.0.0.1:7880/...`; **strip only** the `/media/` prefix, retain WebSocket Upgrade |
 
 The supplied Nginx example keeps `Host` and `Authorization` headers, disables upstream retry and caching, and logs only request metadata rather than body/path. Return 404 for every other path. Nginx's `proxy_pass` behavior differs between prefix and regex locations: check the **actual** upstream URI in your config before starting. A normal `GET /spaces/v1/health` must reach the host unchanged. Public `/internal/calls/admission` and `/internal/calls/event` must return 404. Review and add suitable per-IP rate limits before accepting untrusted traffic; the publisher's [hosting proxy example](../deploy/self-host/hosting-rate-limits.conf.example) shows tested limit zones and burst settings.
+
+The live message route is separate from call control and LiveKit. The current
+Nginx examples include its exact location with HTTP/1.1, `Upgrade` and
+`Connection: upgrade`, a 3,600-second read timeout, no buffering/cache/upstream
+retry, and per-IP handshake/connection limits. Preserve `Host` and the complete
+`/hosting/v1/realtime` path; do not put this route under
+`/spaces/<id>/replica/` or strip `/hosting/`. The native client uses WebSocket
+ping/pong and reconnects with bounded backoff. Authentication occurs in signed
+subscription frames after the upgrade; do not put tokens in URLs or log frames.
+An HTTP health check or a successful 101 upgrade is not proof that mailbox
+subscription is authorized.
+
+For a **standalone Replica** installation, use the exact `/v1/realtime` route
+from its [proxy example](../deploy/replica/nginx.conf.example), forwarding to
+that Replica's private listener (the example uses `127.0.0.1:8787`). It is not
+the hosted route and must receive the same Upgrade/timeout treatment. A blocked
+socket or older service leaves ordinary HTTP synchronization available at its
+fallback cadence; typing, online dots and remote upload previews then may be
+unavailable. Live subscriptions use the same signed access and revocation checks
+as durable synchronization. Ephemeral envelopes are encrypted for participants;
+the relay still observes subscriptions, recipient identities, timing and sizes.
+They carry typing, presence and upload activity, not attachment file bytes.
+Typing and presence expire when updates stop. The relay bounds frames,
+subscriptions, connection counts and outgoing queues; slow consumers reconnect
+and recover durable messages through ordinary synchronization. These transient
+indicators are not a delivery or read receipt.
+The examples are source configuration, not evidence that these new routes have
+been deployed or verified through a particular production proxy.
 
 The certificate for `turn.example.org` is used directly by coturn's TLS listener on TCP 5349, not by the application Nginx server. Copy its renewed certificate and key into the private coturn paths and restart coturn from a Certbot deploy hook. Confirm that renewal does not expose the private key to other service users.
 
@@ -336,18 +340,18 @@ Build the desktop or mobile app from this source with **one** endpoint override 
 export TAURI_ELO_API_URL=https://chat.example.org
 ```
 
-This value is compiled into the client; there is no VPS username/password field in the app. Do **not** set `TAURI_ELO_SPACE_HOST_URL` or `TAURI_ELO_WAKE_URL` together with it. Desktop build commands and native iOS/Android initialization are in [BUILDING.md](BUILDING.md). Mobile builds with notifications must enable the `mobile-push` feature and supply `TAURI_ELO_FIREBASE_ANDROID` / `TAURI_ELO_FIREBASE_IOS` as appropriate. The client app IDs, Firebase apps, Apple entitlements, signing identities and APNs `bundle_id` must match for the target deployment. Builds without these matching provider settings can still use messages, but not mobile push/background calling.
+This value is compiled into the client; there is no VPS username/password field in the app. Do **not** set `TAURI_ELO_SPACE_HOST_URL` or `TAURI_ELO_WAKE_URL` together with it. Desktop build commands and native iOS/Android initialization are in [BUILDING.md](BUILDING.md). Mobile builds with notifications must enable the `mobile-push` feature and supply `TAURI_ELO_FIREBASE_ANDROID` / `TAURI_ELO_FIREBASE_IOS` as appropriate. The client app IDs, Firebase apps, Apple entitlements, signing identities and APNs `bundle_id` must match for the target deployment. Builds without these matching provider settings can still use messages, but not mobile push notifications.
 
-Create a new profile, create a Space, share its invitation with a **second, independent profile**, approve its join request, and exchange messages. Existing Spaces from another installation do not move merely because the app's build-time origin changes; joining relies on signed Space endpoints and key pins.
+Create a new profile, create a Space, share its invitation with a **second, independent profile**, approve its join request, and exchange messages. Keep an authorized owner device online until it commits the new General membership. The owner manages General; the host does not create a readable service profile for it. Existing Spaces from another installation do not move merely because the app's build-time origin changes; joining relies on signed Space endpoints and key pins.
 
 ## 10. Acceptance, backup and operations
 
 Before giving the service to users:
 
 1. Check external HTTPS with normal certificate verification: `GET /spaces/v1/health` returns 200; `GET /calls/v1/health` and `GET /wake/health` return 204 when those services are enabled. The operator-only paths return 404 publicly. Check that the non-public listeners are not reachable from another machine.
-2. On two real devices, test Space creation and join approval, encrypted messages, a 5 MB attachment upload/download/cancel, both direct and three-person calls, a forced TURN connection from another network, and a push while the app is closed. Check iOS and Android background call Answer/Decline separately with their final signed builds.
+2. On real devices, test Space creation and join approval, encrypted messages, a 5 MB attachment upload/download/cancel, two-person and three-person audio/video sessions, a forced TURN connection from another network, and a push while the app is closed. Join sessions from the chat and verify audio after backgrounding each final signed mobile build, leaving, ending and joining again. For live messages, verify an authenticated socket subscription through public TLS, immediate catch-up after reconnect, typing expiry, foreground-only online dots across two devices of one profile, and remote upload completion/cancellation/interruption. Block the socket temporarily to verify HTTP fallback and restore it to verify catch-up. Remove/revoke a subscribed identity/device and check that it loses live access, including queued events, without cross-Space leakage.
 3. Test account deletion, Space deletion, backup export/recovery and a service restart. Verify the stated two-Space/150 MB message/50 MB attachment limits against the running service. Watch disk and inode usage, TLS expiry, errors 429/503/507, and service restarts.
-4. Back up **the complete, stopped** `/var/lib/elo/host` tree and the attachment provider's objects together. Also protect wake state, call database, private service configs and keys. A live SQLite main file alone is not a consistent backup; use a coordinated stopped copy or SQLite's online-backup method. A restore of stale membership/deletion state is not safe to automate. Rehearse recovery on an isolated host before promising it to users.
+4. Back up the complete `/var/lib/elo/host` tree and the attachment provider's objects together using the coordinated online snapshot below, or a complete stopped copy. Also protect wake state, call database, private service configs and keys. A live SQLite main file alone is not a consistent backup. A restore of stale membership/deletion state is not safe to automate. Rehearse recovery on an isolated host before promising it to users.
 
 This guide defines a reproducible **configuration layout**, but is not evidence that a particular VPS or package was accepted. Debian 13, Oracle Linux 10, every chosen storage provider, provider credentials, DNS/TLS and final signed mobile apps require validation on the actual installation. The publisher's private deployment scripts, credentials and multi-server routing are deliberately not included.
 
@@ -393,7 +397,13 @@ The default attachment budget is 1 GiB per attempt, with a ten-minute transfer b
 
 After decryption on an isolated restore host, verify every manifest size and SHA-256 again. Restore the ciphertext tree to the selected provider's `spaces/<space>/<object>` keys, preserving object IDs, before starting hosting with the matching database snapshot and compatible binary. Restore all retained objects even if their expiry is in the past; normal service retention will remove expired data. Do not infer recoverability from an archive containing only metadata. The separate computer's pull and retention protect an already downloaded archive from deletion on the VPS or MEGA; a copy still stored only in MEGA shares the provider failure domain. Download a copy independently of the VPS and rehearse decryption with `age --decrypt --identity /secure/offline-backup.agekey snapshot.tar.gz.age`. Validate every SQLite database, then start the restored service on a network-isolated host with matching binaries and a rewritten local storage root. Do not expose restored listeners or publish stale membership. Preserve/reapply all newer deletion receipts, revoked-device records and account-erasure requests before returning restored state to service.
 
-For **newly provisioned Spaces**, set `recovery_recipient` in the hosting configuration to the same age public recipient. The host writes `spaces/<id>/service-recovery.age` before advertising the Space. The backup includes this encrypted service recovery card. Existing service root secrets that were discarded cannot be reconstructed; complete device-vault backups preserve their current controller instead.
+Owner-managed General v2 has no hosting-side General vault, private message keys
+or `service-recovery.age` card. Operational backups protect public authority state
+and the host's separate response/replica signing material; they do not recover an
+owner's private profile. Keep owner-device backups and recovery material under
+the owner's control. An already authorized linked owner device can manage General
+after another owner device is revoked. Losing every authorized owner device
+still requires the explicit management-recovery process.
 
 The host shares four SQLite worker slots across profiles. The notification relay uses a dedicated SQLite worker with at most 64 queued operations; overload returns HTTP 503. SQLite never runs on the relay's network executor, and provider requests remain outside the database worker. Recipient policy changes and delivery retain their original ordering. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. HTTP deletion and subsequent requests return the durable signed receipt without contacting attachment storage or acquiring the creation lock. Access closes immediately; physical cleanup retries only in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. New reservations can be reclaimed after 24 hours only if all invitations have expired and no authenticated use or join request was ever accepted. The claim marker is permanent, including after a pending request expires or a member leaves. Previously existing advertised Spaces and damaged/unavailable state are never inferred to be unused. This is not inactivity-based deletion. Eight existing Spaces per network supplement the daily limits, but an attacker using many independent networks can still exhaust anonymous capacity. `/stats` reports allocated, remaining and near-full capacity (80% threshold); outbound alerts require separate operator configuration.
 

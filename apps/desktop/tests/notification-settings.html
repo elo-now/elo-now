@@ -4,7 +4,7 @@ import {createRoot} from 'react-dom/client';
 import {usePushNotifications} from '/src/usePushNotifications.tsx';
 import '/src/style.css';
 import '/src/mobile.css';
-let status = {available:true, enabled:false, pending:false, callsEnabled:false, callsPending:false};
+let status = {available:true, enabled:false, pending:false};
 const callbacks=new Map();let callbackId=0;
 const qa=window.notificationSettingsQA={operations:[], hold:false, release:null, ready:()=>{status={...status,pending:false};}, push:()=>{for(const callback of callbacks.values())callback({event:'push-changed',id:1,payload:null});}};
 window.__TAURI_INTERNALS__={transformCallback:callback=>{callbacks.set(++callbackId,callback);return callbackId;},unregisterCallback:id=>callbacks.delete(id),invoke:async(command,{op,handler})=>{
@@ -19,11 +19,7 @@ window.__TAURI_INTERNALS__={transformCallback:callback=>{callbacks.set(++callbac
     return new Promise(resolve=>{qa.release=()=>{qa.release=null;resolve(before);};});
   }
   if(op==='enable')status={...status,enabled:true,pending:true};
-  if(op==='disable')status={...status,enabled:false,pending:false,callsEnabled:false};
-  if(op==='calls_enable'||op==='calls_disable'){
-    if(!status.enabled||status.pending)throw Error('Notification registration is not ready');
-    status={...status,callsEnabled:op==='calls_enable'};
-  }
+  if(op==='disable')status={...status,enabled:false,pending:false};
   return {...status};
 }};
 const view={identity:'synthetic',streams:[]};

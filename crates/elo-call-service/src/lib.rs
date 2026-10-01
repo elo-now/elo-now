@@ -3,5 +3,3 @@ pub mod engine;
 pub mod media;
 pub mod registry;
 pub mod server;
-
-pub mod wake;

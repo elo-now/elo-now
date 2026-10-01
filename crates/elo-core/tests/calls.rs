@@ -201,6 +201,7 @@ fn encrypted_signal_requires_recipient_current_membership_call_and_signature() {
         &a,
         &owner,
         &call,
+        1,
         peer.credential().id(),
         SignalPayload::MediaKey {
             epoch: 1,
@@ -210,8 +211,11 @@ fn encrypted_signal_requires_recipient_current_membership_call_and_signature() {
     )
     .unwrap();
     assert!(!ciphertext.contains(&key));
-    let signal = calls::open_signal(&a, &peer, &call, &ciphertext, NOW).unwrap();
+    let signal = calls::open_signal(&a, &peer, &call, 1, &ciphertext, NOW).unwrap();
     assert_eq!(signal.from, owner.credential().id());
+    assert_eq!(signal.epoch, 1);
+    assert!(calls::open_signal(&a, &peer, &call, 2, &ciphertext, NOW).is_err());
+    assert!(calls::open_signal(&a, &peer, &call, 0, &ciphertext, NOW).is_err());
     match signal.payload {
         SignalPayload::MediaKey { epoch, key: got } => {
             assert_eq!(epoch, 1);
@@ -219,10 +223,12 @@ fn encrypted_signal_requires_recipient_current_membership_call_and_signature() {
         }
         _ => panic!("wrong payload"),
     }
-    assert!(calls::open_signal(&a, &owner, &call, &ciphertext, NOW).is_err());
-    assert!(calls::open_signal(&a, &outsider, &call, &ciphertext, NOW).is_err());
-    assert!(calls::open_signal(&a, &peer, &random_hex::<16>().unwrap(), &ciphertext, NOW).is_err());
-    assert!(calls::open_signal(&a, &peer, &call, &ciphertext, NOW + 60).is_err());
+    assert!(calls::open_signal(&a, &owner, &call, 1, &ciphertext, NOW).is_err());
+    assert!(calls::open_signal(&a, &outsider, &call, 1, &ciphertext, NOW).is_err());
+    assert!(
+        calls::open_signal(&a, &peer, &random_hex::<16>().unwrap(), 1, &ciphertext, NOW).is_err()
+    );
+    assert!(calls::open_signal(&a, &peer, &call, 1, &ciphertext, NOW + 60).is_err());
     let command =
         calls::sign_command(&a, &peer, a.space(), AUDIENCE, Operation::Subscribe, NOW).unwrap();
     let mut next = a.head().unwrap().clone();
@@ -234,12 +240,13 @@ fn encrypted_signal_requires_recipient_current_membership_call_and_signature() {
     a.apply_config(next.sign(owner.signing_key()).unwrap())
         .unwrap();
     assert!(calls::verify_command(&a, &command, AUDIENCE, NOW).is_err());
-    assert!(calls::open_signal(&a, &peer, &call, &ciphertext, NOW).is_err());
+    assert!(calls::open_signal(&a, &peer, &call, 1, &ciphertext, NOW).is_err());
     assert!(
         calls::seal_signal(
             &a,
             &owner,
             &call,
+            1,
             peer.credential().id(),
             SignalPayload::Offer { sdp: "v=0".into() },
             NOW
@@ -254,6 +261,18 @@ fn signalling_payloads_are_bounded_and_do_not_accept_invalid_key_epochs() {
     let peer = Session::create().unwrap().0;
     let a = authority(&owner, &card, &[(&owner, true), (&peer, true)]);
     let call = random_hex::<16>().unwrap();
+    assert!(
+        calls::seal_signal(
+            &a,
+            &owner,
+            &call,
+            0,
+            peer.credential().id(),
+            SignalPayload::Offer { sdp: "v=0".into() },
+            NOW
+        )
+        .is_err()
+    );
     for payload in [
         SignalPayload::MediaKey {
             epoch: 0,
@@ -275,7 +294,46 @@ fn signalling_payloads_are_bounded_and_do_not_accept_invalid_key_epochs() {
         },
     ] {
         assert!(
-            calls::seal_signal(&a, &owner, &call, peer.credential().id(), payload, NOW).is_err()
+            calls::seal_signal(&a, &owner, &call, 1, peer.credential().id(), payload, NOW).is_err()
         );
     }
+}
+
+#[test]
+fn an_unseen_sdp_from_before_rejoining_cannot_enter_a_new_media_epoch() {
+    let (owner, card) = Session::create().unwrap();
+    let peer = Session::create().unwrap().0;
+    let authority = authority(&owner, &card, &[(&owner, true), (&peer, true)]);
+    let call = random_hex::<16>().unwrap();
+    let offer = || SignalPayload::Offer {
+        sdp: "v=0\r\na=fingerprint:sha-256 old-peer".into(),
+    };
+    let old = calls::seal_signal(
+        &authority,
+        &owner,
+        &call,
+        2,
+        peer.credential().id(),
+        offer(),
+        NOW,
+    )
+    .unwrap();
+    assert!(calls::open_signal(&authority, &peer, &call, 2, &old, NOW).is_ok());
+    assert!(calls::open_signal(&authority, &peer, &call, 4, &old, NOW + 1).is_err());
+    let current = calls::seal_signal(
+        &authority,
+        &owner,
+        &call,
+        4,
+        peer.credential().id(),
+        offer(),
+        NOW + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        calls::open_signal(&authority, &peer, &call, 4, &current, NOW + 1)
+            .unwrap()
+            .epoch,
+        4
+    );
 }

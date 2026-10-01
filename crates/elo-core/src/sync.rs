@@ -299,6 +299,28 @@ impl Peer {
         Ok(())
     }
     pub fn new(descriptor: PeerDescriptor, allow_insecure_loopback: bool) -> Result<Self> {
+        let (base, key) = Self::validated_endpoint(&descriptor, allow_insecure_loopback)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| SyncError::Peer)?;
+        Ok(Self {
+            base,
+            key,
+            descriptor,
+            client,
+            signer: None,
+            delegated_access: None,
+        })
+    }
+    /// Validate the endpoint and pinned key without allocating an HTTP client.
+    pub(crate) fn validated_endpoint(
+        descriptor: &PeerDescriptor,
+        allow_insecure_loopback: bool,
+    ) -> Result<(reqwest::Url, VerifyingKey)> {
         let base = reqwest::Url::parse(&descriptor.url).map_err(|_| SyncError::Peer)?;
         if !base.username().is_empty()
             || base.password().is_some()
@@ -324,21 +346,7 @@ impl Peer {
         if key.is_weak() {
             return Err(SyncError::Peer);
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| SyncError::Peer)?;
-        Ok(Self {
-            base,
-            key,
-            descriptor,
-            client,
-            signer: None,
-            delegated_access: None,
-        })
+        Ok((base, key))
     }
     pub fn id(&self) -> PeerId {
         replica::peer_id(&self.key)

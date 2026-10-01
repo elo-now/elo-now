@@ -174,7 +174,7 @@ async fn post(peer: &Peer, bytes: Vec<u8>) -> Result<()> {
 
 impl PairSource {
     pub async fn new(app: &ClientApp) -> Result<Self> {
-        if app.session.credential().authorizing_device().is_some() {
+        if !app.can_link_device() {
             return Err("Link another device from your original device.".into());
         }
         let transport = match &app.spaces {
@@ -311,7 +311,7 @@ impl PairSource {
     }
     pub async fn approve(
         &mut self,
-        app: &ClientApp,
+        app: &mut ClientApp,
         id: &str,
         confirmed_code: &str,
         card: &RecoveryCard,
@@ -319,7 +319,7 @@ impl PairSource {
         self.approve_inner(app, id, confirmed_code, Some(card))
             .await
     }
-    pub async fn accept(&mut self, app: &ClientApp, id: &str) -> Result<()> {
+    pub async fn accept(&mut self, app: &mut ClientApp, id: &str) -> Result<()> {
         let request = self.requests.get(id).ok_or("Device request not found")?;
         let confirmed_code = code(&self.offer, request)?;
         self.approve_inner(app, id, &confirmed_code, None).await
@@ -349,7 +349,7 @@ impl PairSource {
     }
     async fn approve_inner(
         &mut self,
-        app: &ClientApp,
+        app: &mut ClientApp,
         id: &str,
         confirmed_code: &str,
         card: Option<&RecoveryCard>,
@@ -377,6 +377,9 @@ impl PairSource {
         if app.identity_id() != self.offer.identity {
             return Err("The open profile changed".into());
         }
+        if !app.can_link_device() {
+            return Err("This device can no longer link another device.".into());
+        }
         // Bind before the first upload. A retry can never release a second profile.
         self.approved = Some(id.into());
         if self.response.is_none() {
@@ -388,6 +391,10 @@ impl PairSource {
                 });
             }
             let device = self.device.as_ref().ok_or("Missing pairing device")?;
+            // Persist the owner's exact credential admission before snapshotting
+            // its signed authority. A valid device signature alone grants no role.
+            app.authorize_linked_owner_device(device.credential())
+                .await?;
             app.remember_device(device.credential(), &request.name)?;
             let backup = Zeroizing::new(
                 app.export_device_copy(secret.clone().into(), device)
@@ -578,7 +585,7 @@ impl PairTarget {
         {
             return Err("The profile transfer is incomplete".into());
         }
-        let app = ClientApp::restore_profile(
+        let mut app = ClientApp::restore_profile(
             directory,
             &bytes,
             response.secret.clone().into(),
@@ -587,6 +594,7 @@ impl PairTarget {
             self.allow_loopback,
         )
         .await?;
+        app.activate_linked_owner_controls()?;
         self.finished = true;
         self.response = None;
         Ok(app)

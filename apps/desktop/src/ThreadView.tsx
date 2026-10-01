@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Icon } from "./Icon";
 import { ScreenHeader } from "./ScreenHeader";
 import { MessageContent } from "./MessageContent";
+import { TypingIndicator } from "./useRealtime";
 import { ComposerInput } from "./ComposerInput";
 import { ComposerExpiry } from "./ComposerExpiry";
 import type { MessageExpiryHours } from "./messageExpiry";
@@ -25,6 +26,7 @@ export function ThreadView({
   view,
   chat,
   thread,
+  messageListRef,
   hideAvatars,
   mobile,
   busy,
@@ -57,6 +59,7 @@ export function ThreadView({
   view: View;
   chat: Stream;
   thread: MessageThread;
+  messageListRef?: RefObject<HTMLDivElement | null>;
   hideAvatars: boolean;
   mobile: boolean;
   busy: boolean;
@@ -122,7 +125,7 @@ export function ThreadView({
         onBack={onBack}
         backLabel={t("thread.back")}
       />
-      <div className="searchable-list">
+      <div className="searchable-list" ref={messageListRef}>
         <PullToRefresh
           className="messages thread-messages"
           enabled={mobile}
@@ -213,6 +216,7 @@ export function ThreadView({
             )}
         </PullToRefresh>
       </div>
+      <TypingIndicator chat={chat} />
       <form
         className="composer"
         data-message-expiry={messageExpiry}
@@ -223,6 +227,7 @@ export function ThreadView({
       >
         <ComposerInput
           inputRef={composer}
+          resetRevision={ownSendRevision}
           aria-label={t("thread.reply")}
           placeholder={
             canReply ? t("thread.placeholder") : t("composer.unavailable")

@@ -142,8 +142,20 @@ pub fn open_record(
     ciphertext: &[u8],
     identity: &dyn crate::crypto::DecryptionIdentity,
 ) -> Result<SignedRecord> {
-    let bytes = packing::unpack(open_bytes(ciphertext, identity, MAX_RECORD)?, MAX_RECORD)?;
-    let record = SignedRecord::parse(&bytes).map_err(|_| CryptoError::Decrypt)?;
+    open_record_bounded(ciphertext, identity, MAX_RECORD)
+}
+/// Apply the caller's record budget to authenticated plaintext, packed expansion
+/// and ELO1 parsing while preserving the ordinary authentication checks.
+pub(crate) fn open_record_bounded(
+    ciphertext: &[u8],
+    identity: &dyn crate::crypto::DecryptionIdentity,
+    maximum: usize,
+) -> Result<SignedRecord> {
+    if !(72..=MAX_RECORD).contains(&maximum) {
+        return Err(CryptoError::InvalidInput);
+    }
+    let bytes = packing::unpack(open_bytes(ciphertext, identity, maximum)?, maximum)?;
+    let record = SignedRecord::parse_bounded(&bytes, maximum).map_err(|_| CryptoError::Decrypt)?;
     crate::erasure::verify_original(ciphertext, &record)?;
     Ok(record)
 }

@@ -20,7 +20,7 @@ impl Authority {
     /// Only the controller can issue a new checkpoint. Other members reuse the
     /// ordinary proof; an absent controller key must never weaken verification.
     pub fn call_proof_signed(&self, key: &SigningKey) -> Result<CallAuthorityProof> {
-        if self.controller().key() != &key.verifying_key() {
+        if self.is_owner_managed() || self.controller().key() != &key.verifying_key() {
             return self.call_proof();
         }
         self.checkpoint_proof(self.sign_checkpoint(key)?)

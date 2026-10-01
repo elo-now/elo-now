@@ -200,6 +200,8 @@ mod tests {
             save(
                 &path.join("reservation.json"),
                 &Reservation {
+                    creation_evidence: None,
+                    authority: None,
                     creator: None,
                     request_id: "synthetic".into(),
                     name: "Unpublished".into(),
@@ -320,19 +322,11 @@ mod reservation_limits_tests {
         }))
         .unwrap();
         let host = Host::open(config, true).await.unwrap();
-        let command = CreateCommand {
-            v: 1,
-            kind: "space.create".into(),
-            host: "https://host.example.test/spaces/v1/create".into(),
-            request_id: "11".repeat(16),
-            issued: current().unwrap(),
-            name: "Never joined".into(),
-            contact_email: "owner@example.test".into(),
-            message_lifetime_seconds: 86400,
-            require_approval: true,
-        };
+        let (command, creator, evidence) =
+            super::super::tests::creation_command(&temp.path().join("creator"), "Never joined")
+                .await;
         let (id, reservation) = host
-            .provision(&command, "77".repeat(32).parse().unwrap())
+            .provision_from_network_inner(&command, creator, None, Some(evidence))
             .await
             .unwrap();
         host.expire_reservations_at(reservation.invitation_issued + 86_399_000)
@@ -365,6 +359,8 @@ mod reservation_limits_tests {
             save(
                 &path.join("reservation.json"),
                 &Reservation {
+                    creation_evidence: None,
+                    authority: None,
                     creator: None,
                     request_id: "synthetic".into(),
                     name: "Unclaimed".into(),
@@ -384,19 +380,10 @@ mod reservation_limits_tests {
         }
         super::super::tests::close_host(host).await;
         let host = Host::open(config, true).await.unwrap();
-        let command = CreateCommand {
-            v: 1,
-            kind: "space.create".into(),
-            host: "https://host.example.test/spaces/v1/create".into(),
-            request_id: "11".repeat(16),
-            issued: current().unwrap(),
-            name: "Capacity".into(),
-            contact_email: "owner@example.test".into(),
-            message_lifetime_seconds: 86400,
-            require_approval: true,
-        };
+        let (command, creator, _evidence) =
+            super::super::tests::creation_command(&temp.path().join("creator"), "Capacity").await;
         assert_eq!(
-            host.provision_from_network(&command, "77".repeat(32).parse().unwrap(), Some(network))
+            host.provision_from_network(&command, creator, Some(network))
                 .await
                 .err()
                 .unwrap()

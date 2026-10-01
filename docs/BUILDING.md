@@ -66,16 +66,17 @@ Target API 37 is a separate behavior migration: it changes background audio and
 local-network permissions and removes the large-screen orientation opt-out.
 Do not raise it solely to hide the `OldTargetApi` suggestion while preserving
 the current behavior is a release requirement.
-The iOS minimum is 16.0. Native incoming calls use stable Core-Telecom 1.0.1;
-the existing portrait layout and call notification controls are preserved.
+The iOS minimum is 16.0. Audio/video sessions are explicitly joined in a chat.
+Android uses an ongoing microphone/camera service; iOS uses an active audio
+session. CallKit, PushKit, Android Telecom and full-screen incoming-call
+notifications are not used. The existing portrait layout is preserved.
 Android-only copies of Tauri modules under [vendor/android](../vendor/android/README.md)
 migrate the removed `kotlinOptions.jvmTarget` DSL to `compilerOptions`. Java and
 Kotlin target JVM 11 for current AndroidX.
 All ten Android modules, including the application, use AGP's built-in Kotlin and public
 Android DSL. The root buildscript pins Kotlin 2.4.20; JVM 11 remains explicit.
 The local [Wry patch](../vendor/wry/ELO_PATCH.md) updates generated WebView APIs.
-Release builds enable both R8 and resource shrinking. Runtime-selected native
-ringtones and notification icons have explicit resource keep rules. Android 27+
+Release builds enable both R8 and resource shrinking. Runtime-selected notification icons have explicit resource keep rules. Android 27+
 uses adaptive vector launcher icons; PNG store-art sources are not APK resources.
 `settings.gradle` normalizes Tauri's generated dependency script before evaluation
 to avoid Gradle's deprecated configuration property delegates.
@@ -84,8 +85,7 @@ FCM registration uses Firebase Installation IDs on both mobile platforms:
 `register`/`unregister`, the registration callback, and HTTP v1 `message.fid`.
 The Android manifest and iOS Info.plist explicitly enable installation-ID mode.
 Obtaining an FID alone is insufficient: Messaging registration must succeed first.
-APNs VoIP delivery still uses the PushKit device token and App Attest ownership
-proof. Update the notification server and mobile builds together; the new sender
+Update the notification server and mobile builds together; the sender
 does not fall back to deprecated FCM registration-token addressing.
 
 Do not restore the deprecated `android.builtInKotlin=false`, `android.newDsl=false`
@@ -164,13 +164,10 @@ The `team-test-replica` feature embeds the selected client access capabilities i
 
 A Firebase service-account key belongs only on the wake-service host. APNs keys belong in your notification-provider configuration. Neither belongs in the application, repository or release resources. Do not commit environment files, `.p8`, `.p12`, keystores, provisioning profiles or personal test profiles.
 
-iOS VoIP registration additionally requires the App Attest capability and the
-`com.apple.developer.devicecheck.appattest-environment = production` entitlement
-in the signed app. Regenerate provisioning profiles after enabling the capability.
-The relay verifies Apple's production attestation root; a simulator or a development
-App Attest environment cannot register incoming calls. This setting is independent
-of the APNs sandbox/production delivery setting. Test on a physical supported device
-before deploying the matching relay. See [wake setup](SELF_HOSTING.md#6-firebase-apns-and-the-wake-service).
+iOS uses the Push Notifications entitlement for ordinary messages and the audio
+background mode for an explicitly joined session. CallKit, PushKit and the former
+VoIP-token App Attest enrollment are not part of the session model.
+See [wake setup](SELF_HOSTING.md#6-firebase-apns-and-the-wake-service).
 
 ## Single-VPS setup
 

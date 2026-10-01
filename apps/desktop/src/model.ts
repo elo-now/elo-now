@@ -52,6 +52,7 @@ export type SpaceSummary = {
 };
 export type Stream = {
   is_general?: boolean;
+  owner_managed?: boolean;
   space_context?: string;
   name: string;
   chat_kind?: "chat" | "direct";
@@ -342,9 +343,31 @@ export function markVisibleMessagesRead(
   };
 }
 
+/** Identify General's technical participant from verified membership, never its display name. */
+export function generalServiceIdentities(
+  view: View,
+  current?: Stream,
+): Set<string> {
+  const identities = new Set<string>();
+  for (const chat of [
+    ...view.streams,
+    ...(view.all_streams ?? []),
+    ...(current ? [current] : []),
+  ]) {
+    if (!chat.is_general || chat.owner_managed) continue;
+    const service = chat.members.find((member) =>
+      member.credential_ids.includes(chat.controller),
+    );
+    if (service) identities.add(service.identity_id);
+  }
+  return identities;
+}
+
 export function visibleMembers(view: View, stream: Stream, query: string) {
   const search = query.trim().toLocaleLowerCase();
+  const services = generalServiceIdentities(view, stream);
   return stream.members
+    .filter((member) => !services.has(member.identity_id))
     .filter((member) =>
       [
         senderName(view, member.identity_id, stream),

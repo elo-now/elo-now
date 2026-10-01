@@ -42,6 +42,9 @@ pub struct SpaceAddress {
     pub url: String,
     pub scope: team::TeamScope,
     pub message_lifetime_seconds: u64,
+    /// Pinned HTTP response signer, separate from the owner-managed General.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_credential: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -283,6 +286,26 @@ pub fn request_identity(request: &Request) -> Result<Option<IdentityId>> {
     Ok(Some(credential.identity()))
 }
 impl SpaceAddress {
+    pub fn service_signer(&self) -> Result<Option<VerifiedCredential>> {
+        self.service_credential
+            .as_ref()
+            .map(|encoded| {
+                if encoded.len() > 8192 {
+                    return Err("Invalid Space service credential.".into());
+                }
+                verify_credential(encoded)
+            })
+            .transpose()
+    }
+    fn accepts_signer(&self, credential: &VerifiedCredential) -> Result<bool> {
+        Ok(match self.service_signer()? {
+            Some(expected) => credential.id() == expected.id(),
+            None => {
+                credential.id() == self.scope.controller
+                    && field(credential.record().body(), "root_public_key")? == self.scope.root
+            }
+        })
+    }
     pub fn validate(&self, allow_loopback: bool) -> Result<()> {
         let url = reqwest::Url::parse(&self.url)?;
         let loopback = url
@@ -301,6 +324,7 @@ impl SpaceAddress {
         {
             return Err("Invalid Space address.".into());
         }
+        self.service_signer()?;
         Ok(())
     }
 }
@@ -451,9 +475,7 @@ impl ClientApp {
     }
     fn verify_space_deletion(address: &SpaceAddress, receipt: DeletionReceipt) -> Result<Value> {
         let credential = verify_credential(&receipt.credential)?;
-        if credential.id() != address.scope.controller
-            || field(credential.record().body(), "root_public_key")? != address.scope.root
-        {
+        if !address.accepts_signer(&credential)? {
             return Err("Unexpected Space deletion signer.".into());
         }
         let record = decode_record(&receipt.record)?;
@@ -648,9 +670,7 @@ impl ClientApp {
         response: Response,
     ) -> Result<Value> {
         let credential = verify_credential(&response.credential)?;
-        if credential.id() != address.scope.controller
-            || field(credential.record().body(), "root_public_key")? != address.scope.root
-        {
+        if !address.accepts_signer(&credential)? {
             return Err("This Space has an unexpected signing key.".into());
         }
         let signed = decode_record(&response.record)?;
@@ -1524,6 +1544,7 @@ mod transport_tests {
         let invitation = SpaceInvitation {
             v: 1,
             address: SpaceAddress {
+                service_credential: None,
                 url: format!("{base}/team/v1/spaces"),
                 scope: client.team_scope().unwrap(),
                 message_lifetime_seconds: 86_400,
@@ -1628,6 +1649,7 @@ mod deletion_tests {
         let (session, _) = Session::create().unwrap();
         let (other, _) = Session::create().unwrap();
         let address = SpaceAddress {
+            service_credential: None,
             url: "https://example.invalid/team/v1/spaces".into(),
             scope: team::TeamScope {
                 space: SpaceId::from_bytes([1; 32]),
@@ -1669,5 +1691,22 @@ mod deletion_tests {
         bytes[last] ^= 1;
         forged.record = STANDARD.encode(bytes);
         assert!(ClientApp::verify_space_deletion(&address, forged).is_err());
+        let mut public_address = address.clone();
+        public_address.service_credential =
+            Some(STANDARD.encode(other.credential().record().bytes()));
+        public_address.validate(false).unwrap();
+        assert!(public_address.accepts_signer(other.credential()).unwrap());
+        assert!(!public_address.accepts_signer(session.credential()).unwrap());
+        assert!(
+            ClientApp::verify_space_deletion(&public_address, receipt(&other, address.scope.space))
+                .is_ok()
+        );
+        assert!(
+            ClientApp::verify_space_deletion(
+                &public_address,
+                receipt(&session, address.scope.space)
+            )
+            .is_err()
+        );
     }
 }

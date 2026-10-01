@@ -1,12 +1,10 @@
 # API compatibility and application updates
 
-**Status: next-release work, not a feature of release 1.0.0.** The policy endpoint
-and client gate described here have been implemented and tested in the development
-workspace; their source and binaries are not yet part of the published release.
-Treat the configuration below as preparation for that rollout, not as a setting
-supported by the current published server. The current transition establishes a
-new security baseline; older clients and existing runtime data are not supported
-through that cutover.
+The policy endpoint and client restriction described here are implemented in this
+source. Deploy matching application and server versions before enabling a minimum
+version. The owner-managed General v2 transition establishes a new security
+baseline; older clients and existing runtime data are not supported through that
+cutover. A source release does not prove that an app is available in every store.
 
 Application versions, HTTP API versions and signed-record versions are separate.
 A new app release must not silently redefine an existing server contract. Keep
@@ -113,9 +111,16 @@ require an app update rather than preserving a vulnerable protocol indefinitely.
 
 ## Current implementation boundary
 
-The release policy and its local-access restriction are new source changes, not a capability
-of the existing 1.0.0 store builds. The security work changes mailbox request
-proofs to v2, retention authorization, linked-device keys, compact authority checkpoints and iOS VoIP registration. The call-service fence now persists a root-recovery generation in its `recovery` column; the clean cutover requires a fresh call-service database rather than an in-place old-schema start.
+The current baseline includes mailbox request proofs v2, retention authorization,
+linked-device keys, compact authority checkpoints and owner-managed General v2.
+General membership and management changes are signed by the real owner or an
+authorized linked owner device; the hosting service stores public authority state
+without a service-owned General participant or its private message keys.
+Live synchronization uses authenticated WebSocket subscriptions, and audio/video
+sessions are explicitly joined from a chat rather than ringing another device.
+The call-service fence persists a root-recovery generation in its `recovery`
+column; the clean cutover requires a fresh call-service database rather than an
+in-place old-schema start.
 Those changes are **not compatible with the previous installed clients** merely
 because several resource URLs still contain `/v1`. Discovery exposes their
 separate security capabilities. This incompatibility is deliberate for the clean

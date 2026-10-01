@@ -20,9 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-mod calls;
 mod database;
-mod voip_ownership;
 
 type Result<T> = std::result::Result<T, StatusCode>;
 pub trait Provider: Send + Sync {
@@ -48,8 +46,6 @@ pub struct Relay {
     delivery_gate: tokio::sync::Mutex<()>,
     registrations: tokio::sync::Semaphore,
     endpoint: String,
-    call_key: Option<zeroize::Zeroizing<String>>,
-    apns: Option<crate::apns::Apns>,
 }
 struct Route {
     owner: Vec<u8>,
@@ -298,16 +294,27 @@ impl Relay {
             )
             .map_err(|_| "Cannot migrate notification queue")?;
         }
-        calls::schema(&db).map_err(|_| "Cannot initialize call delivery")?;
-        voip_ownership::schema(&db).map_err(|_| "Cannot initialize VoIP ownership")?;
+        // Chat sessions no longer register native incoming-call routes. Remove
+        // only their obsolete short-lived tokens and queues; message routes stay.
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+            DROP TABLE IF EXISTS call_queue;
+            DROP TABLE IF EXISTS call_subscriptions;
+            DROP TABLE IF EXISTS call_devices;
+            DROP TABLE IF EXISTS call_declines;
+            DROP TABLE IF EXISTS call_events;
+            DROP TABLE IF EXISTS voip_bindings;
+            DROP TABLE IF EXISTS voip_challenges;
+            DROP TABLE IF EXISTS voip_keys;
+            COMMIT;",
+        )
+        .map_err(|_| "Cannot retire incoming-call delivery")?;
         Ok(Arc::new(Self {
             db: database::Database::new(db)?,
             provider,
             delivery_gate: tokio::sync::Mutex::new(()),
             registrations: tokio::sync::Semaphore::new(4),
             endpoint: "https://api.elo.now".into(),
-            call_key: None,
-            apns: None,
         }))
     }
     pub fn router(self: Arc<Self>) -> Router {
@@ -321,40 +328,8 @@ impl Relay {
             .route("/v1/routes/{id}/wake", post(wake))
             .route("/v1/routes/{id}/policy", put(policy))
             .route("/v1/routes/{id}/read", post(read))
-            .route("/v1/routes/{id}/calls", put(calls::register))
-            .route(
-                "/v1/routes/{id}/voip/challenge",
-                post(voip_ownership::challenge),
-            )
-            .route("/v1/routes/{id}/voip/proof", post(voip_ownership::prove))
-            .route(
-                "/v1/routes/{id}/calls/{call_id}",
-                get(calls::status).delete(calls::decline),
-            )
             .route("/wake/health", get(|| async { StatusCode::NO_CONTENT }))
             .layer(DefaultBodyLimit::max(1024 * 1024))
-            .with_state(self)
-    }
-    pub fn with_calls(
-        mut self: Arc<Self>,
-        key: zeroize::Zeroizing<String>,
-        apns: Option<crate::apns::Apns>,
-    ) -> std::result::Result<Arc<Self>, &'static str> {
-        if !hex(&key, 32) {
-            return Err("Invalid call-delivery service key");
-        }
-        let this =
-            Arc::get_mut(&mut self).ok_or("Configure call delivery before starting the relay")?;
-        this.call_key = Some(key);
-        this.apns = apns;
-        Ok(self)
-    }
-    /// Bind separately to loopback. Never merge this into the public router.
-    pub fn private_call_router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/internal/calls/event", post(calls::event))
-            .route("/internal/calls/declined", post(calls::declined))
-            .layer(DefaultBodyLimit::max(32 * 1024))
             .with_state(self)
     }
     pub fn with_endpoint(
@@ -411,8 +386,6 @@ async fn erase_account(
             [&identity],
         )
         .map_err(db_error)?;
-        tx.execute("DELETE FROM call_declines WHERE identity=?", [&identity])
-            .map_err(db_error)?;
         let routes = {
             let mut q = tx.prepare("SELECT id FROM routes").map_err(db_error)?;
             q.query_map([], |r| r.get::<_, String>(0))
@@ -422,11 +395,6 @@ async fn erase_account(
         };
         for route in routes {
             let tag = elo_core::app::push_sender::sender_tag(&route, credential.identity());
-            tx.execute(
-                "DELETE FROM call_queue WHERE route=?1 AND sender=?2",
-                params![route, tag],
-            )
-            .map_err(db_error)?;
             tx.execute("DELETE FROM attention WHERE (route,scope) IN(SELECT route,scope FROM queue WHERE route=?1 AND sender=?2)",params![route,tag]).map_err(db_error)?;
             tx.execute("DELETE FROM events WHERE (route,event) IN(SELECT route,event FROM queue WHERE route=?1 AND sender=?2)",params![route,tag]).map_err(db_error)?;
             tx.execute(
@@ -1123,11 +1091,6 @@ impl Relay {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tick.tick().await;
-            for _ in 0..32 {
-                if !matches!(calls::deliver(&self).await, Ok(true)) {
-                    break;
-                }
-            }
             for _ in 0..32 {
                 if !matches!(self.deliver_due().await, Ok(true)) {
                     break;

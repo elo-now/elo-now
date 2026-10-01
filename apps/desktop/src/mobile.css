@@ -684,12 +684,8 @@
       height 180ms ease-out,
       background-color 160ms ease-out;
   }
-  .shell > aside > .channel-scroll,
-  .shell > .conversation > .searchable-list,
-  .shell > .details > .settings-page,
-  .shell > .details > .channel-settings,
-  .new-chat-dialog[open] > form {
-    animation: page-appear 150ms ease-out;
+  .shell > .mobile-sidebar > .searchable-list {
+    animation: page-appear var(--elo-motion-enter) var(--elo-ease-out);
   }
 }
 
@@ -709,6 +705,7 @@
   }
   .mobile-tabbar button:active {
     transform: none;
+    scale: none;
   }
   .mobile-tabbar button:active .tab-symbol > .ui-icon {
     transform: scale(0.92);

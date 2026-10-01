@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import { ScreenHeader } from "./ScreenHeader";
 import { EmptyState } from "./EmptyState";
 import {
@@ -33,9 +34,9 @@ export function Members({
 }) {
   const [selected, setSelected] = useState<string | null>(null);
   const page = useRef<HTMLElement>(null);
-  const selectedMember = stream.members.find((m) => m.identity_id === selected);
   const canManage = stream.can_manage_members === true && !stream.forked;
   const members = visibleMembers(view, stream, "");
+  const selectedMember = members.find((m) => m.identity_id === selected);
   useEffect(() => {
     page.current?.focus();
   }, []);
@@ -92,6 +93,7 @@ export function Members({
                     {!hideAvatars && (
                       <span className="avatar">
                         {senderInitials(view, member.identity_id, stream)}
+                        <OnlineIndicator identity={member.identity_id} chat={stream} />
                       </span>
                     )}
                     <span className="member-copy">

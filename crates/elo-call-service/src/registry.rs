@@ -30,7 +30,6 @@ pub struct Limits {
     pub screens: usize,
     pub participant_ttl: u64,
     pub empty_grace: u64,
-    pub ring_timeout: u64,
     pub max_duration: u64,
     pub rooms: usize,
 }
@@ -42,7 +41,6 @@ impl Default for Limits {
             screens: 1,
             participant_ttl: 30,
             empty_grace: 15,
-            ring_timeout: 45,
             max_duration: 12 * 3600,
             rooms: 1024,
         }
@@ -68,7 +66,6 @@ pub struct ActiveCall {
     pub started_by: IdentityId,
     pub config_id: RecordId,
     pub participants: BTreeMap<IdentityId, Participant>,
-    pub ringing: bool,
     pub key_epoch: u64,
     #[serde(skip)]
     empty_since: Option<u64>,
@@ -107,6 +104,7 @@ pub enum Event {
     Signal {
         scope: Scope,
         call_id: String,
+        epoch: u64,
         from: RecordId,
         to: RecordId,
         ciphertext: String,
@@ -127,7 +125,6 @@ impl Registry {
             || limits.screens > limits.participants
             || limits.participant_ttl < 10
             || limits.empty_grace == 0
-            || limits.ring_timeout == 0
             || limits.max_duration == 0
             || limits.rooms == 0
         {
@@ -211,7 +208,6 @@ impl Registry {
                         started_by: identity,
                         config_id: command.config_id,
                         participants: BTreeMap::from([(identity, participant)]),
-                        ringing: *kind == CallKind::Direct,
                         key_epoch: 1,
                         empty_since: None,
                     },
@@ -239,11 +235,6 @@ impl Registry {
                             if call.participants.len() >= self.limits.participants {
                                 return Err(CallError::Full);
                             }
-                            if call.kind == CallKind::Direct
-                                && (!call.ringing || identity == call.started_by)
-                            {
-                                return Err(CallError::Ended);
-                            }
                             call.participants.insert(
                                 identity,
                                 Participant {
@@ -257,28 +248,13 @@ impl Registry {
                                 },
                             );
                             call.key_epoch += 1;
-                            if call.kind == CallKind::Direct {
-                                call.ringing = false;
-                            }
                         }
                         call.empty_since = None;
-                    }
-                    Operation::Decline { .. } => {
-                        if call.kind != CallKind::Direct
-                            || !call.ringing
-                            || identity == call.started_by
-                        {
-                            return Err(CallError::Invalid);
-                        }
-                        return Ok(vec![self.end(scope).ok_or(CallError::Ended)?]);
                     }
                     Operation::Leave { .. } => {
                         Self::participant(call, identity, command.credential_id)?;
                         call.participants.remove(&identity);
                         call.key_epoch += 1;
-                        if call.kind == CallKind::Direct {
-                            return Ok(vec![self.end(scope).ok_or(CallError::Ended)?]);
-                        }
                         if call.participants.is_empty() {
                             return Ok(vec![self.end(scope).ok_or(CallError::Ended)?]);
                         }
@@ -315,9 +291,15 @@ impl Registry {
                         participant.media = *state;
                         participant.last_seen = now;
                     }
-                    Operation::Signal { to, ciphertext, .. } => {
+                    Operation::Signal {
+                        epoch,
+                        to,
+                        ciphertext,
+                        ..
+                    } => {
                         Self::participant(call, identity, command.credential_id)?;
-                        if *to == command.credential_id
+                        if *epoch != call.key_epoch
+                            || *to == command.credential_id
                             || !call.participants.values().any(|p| p.credential_id == *to)
                         {
                             return Err(CallError::Unauthorized);
@@ -325,6 +307,7 @@ impl Registry {
                         return Ok(vec![Event::Signal {
                             scope,
                             call_id: call.call_id.clone(),
+                            epoch: call.key_epoch,
                             from: command.credential_id,
                             to: *to,
                             ciphertext: ciphertext.clone(),
@@ -420,8 +403,6 @@ impl Registry {
                 room.empty_since.get_or_insert(now);
             }
             if now.saturating_sub(room.started_at) >= self.limits.max_duration
-                || room.ringing && now.saturating_sub(room.started_at) >= self.limits.ring_timeout
-                || room.kind == CallKind::Direct && room.participants.len() < count
                 || room
                     .empty_since
                     .is_some_and(|since| now.saturating_sub(since) >= self.limits.empty_grace)

@@ -6,6 +6,7 @@ import { knownPeople, findPeople } from "./directMessages";
 import { ScreenHeader } from "./ScreenHeader";
 import { FloatingSearch, SearchField } from "./Search";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import { EmptyState } from "./EmptyState";
 import { BlockUserAction } from "./BlockedUsers";
 import { ServiceRequestDialog } from "./ServiceRequests";
@@ -75,8 +76,9 @@ export function Contacts({
                 <li key={person.id}>
                   <div className="dm-person contact-row">
                     {!hideAvatars && (
-                      <span className="avatar" aria-hidden="true">
+                      <span className="avatar">
                         {person.initials}
+                        <OnlineIndicator identity={person.id} />
                       </span>
                     )}
                     <span className="dm-person-copy">

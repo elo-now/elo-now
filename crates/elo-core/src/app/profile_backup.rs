@@ -111,6 +111,59 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 impl ClientApp {
+    /// Called exclusively after a completed, authenticated live pairing import.
+    /// Ordinary backup import intentionally leaves every compartment a follower.
+    pub(super) fn activate_linked_owner_controls(&mut self) -> Result<()> {
+        self.activate_linked_owner_compartment()?;
+        if let Some(spaces) = &mut self.spaces {
+            for child in spaces.children_mut().values_mut() {
+                child.activate_linked_owner_compartment()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_linked_owner_compartment(&mut self) -> Result<()> {
+        let authorities = self
+            .authorities
+            .0
+            .iter()
+            .filter(|authority| {
+                authority.is_owner_managed()
+                    && authority.can_manage(self.session.credential().id())
+                    && self.authorities.space_ready(authority)
+                    && self.team.as_ref().is_some_and(|team| {
+                        team.scope.space == authority.space()
+                            && team.scope.stream == authority.stream()
+                            && self.pins.iter().any(|pin| {
+                                pin.space == authority.space()
+                                    && pin.stream == authority.stream()
+                                    && pin.root == team.scope.root
+                            })
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous_mode = self.session.controller_mode;
+        let previous_spaces = self.session.controller_spaces.clone();
+        let previous_eligibility = self.session.owner_grant_eligible;
+        let activated: Result<()> = (|| {
+            // A currently ordinary member may be promoted later. This marker
+            // comes from the authenticated live exchange, never a backup.
+            self.session.allow_live_owner_grants()?;
+            for authority in &authorities {
+                self.session.activate_linked_owner_controller(authority)?;
+            }
+            self.persist_vault()
+        })();
+        if activated.is_err() {
+            self.session.controller_mode = previous_mode;
+            self.session.controller_spaces = previous_spaces;
+            self.session.owner_grant_eligible = previous_eligibility;
+        }
+        activated
+    }
+
     pub fn profile_path(&self) -> &Path {
         &self.directory
     }

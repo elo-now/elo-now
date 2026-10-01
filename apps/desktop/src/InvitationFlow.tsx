@@ -17,6 +17,7 @@ import { EmptyState } from "./EmptyState";
 import { SpaceJoinRequests } from "./SpaceJoinRequests";
 import { PullToRefresh } from "./PullToRefresh";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import { useToast } from "./Toast";
 import { QrParts } from "./invitationTransport";
 import { profileName, type View, type Stream } from "./model";
@@ -1146,6 +1147,7 @@ export function InvitationFlow({
                       >
                         <span className="avatar">
                           {entry.name.slice(0, 2).toUpperCase()}
+                          <OnlineIndicator identity={entry.identity} />
                         </span>
                         <span className="member-copy">
                           <strong>{entry.name}</strong>
@@ -1330,7 +1332,7 @@ export function InvitationFlow({
 function Person({ name, identity }: { name: string; identity: string }) {
   return (
     <div className="invitation-person">
-      <span className="avatar">{name.slice(0, 2).toUpperCase()}</span>
+      <span className="avatar">{name.slice(0, 2).toUpperCase()}<OnlineIndicator identity={identity} /></span>
       <strong>{name}</strong>
       <code>
         {identity.slice(0, 8)} · {identity.slice(-8)}

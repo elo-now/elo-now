@@ -16,8 +16,177 @@ pub struct CreateRequest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn owner_creation() -> (Session, CreateCommand) {
+        let (owner, _) = Session::create().unwrap();
+        let request_id = "ab".repeat(16);
+        let root = field(owner.credential().record().body(), "root_public_key").unwrap();
+        let genesis = SpaceGenesis {
+            v: 2,
+            kind: "space.genesis".into(),
+            nonce: request_id.clone(),
+            issuer_identity: owner.identity_id(),
+            owners: vec![Owner {
+                identity_id: owner.identity_id(),
+                root_public_key: root.into(),
+            }],
+            controller_credential_id: owner.credential().id(),
+        };
+        let genesis =
+            SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), owner.signing_key())
+                .unwrap();
+        let mut authority = Authority::new(
+            genesis.bytes(),
+            genesis.id().to_string().parse().unwrap(),
+            &root_key(root).unwrap(),
+            owner.credential().clone(),
+            StreamId::from_bytes(record::hex(&request_id).unwrap()),
+        )
+        .unwrap();
+        let config = StreamConfig {
+            v: 2,
+            kind: "stream.config".into(),
+            nonce: request_id.clone(),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            sequence: 1,
+            previous_config_id: None,
+            controller_credential_id: owner.credential().id(),
+            members: vec![Member {
+                identity_id: owner.identity_id(),
+                identity_type: "HUMAN".into(),
+                root_public_key: root.into(),
+                capabilities: vec![
+                    Capability::Read,
+                    Capability::Post,
+                    Capability::ShareHistory,
+                    Capability::Manage,
+                ],
+                credential_ids: vec![owner.credential().id()],
+                external: false,
+            }],
+            owner_credential_ids: vec![owner.credential().id()],
+            action: ConfigAction {
+                operation: "create".into(),
+                actor_identity: owner.identity_id(),
+                request_record_id: None,
+            },
+            chat_kind: Some(ChatKind::Chat),
+            recovery: None,
+        };
+        authority
+            .apply_config(config.sign(owner.signing_key()).unwrap())
+            .unwrap();
+        let command = CreateCommand {
+            v: 2,
+            kind: "space.create".into(),
+            host: "https://host.example.test/spaces/v1/create".into(),
+            request_id,
+            issued: 100,
+            name: "Team".into(),
+            contact_email: "owner@example.test".into(),
+            message_lifetime_seconds: 86400,
+            require_approval: true,
+            authority: Some(authority.call_proof().unwrap()),
+        };
+        (owner, command)
+    }
+
+    #[test]
+    fn owner_creation_binds_version_device_request_and_initial_configuration() {
+        let (owner, command) = owner_creation();
+        let mut authority = verify_creation_authority(&command, owner.credential())
+            .unwrap()
+            .unwrap();
+        let mut request = CreateRequest {
+            record: STANDARD.encode(
+                SignedRecord::sign(&serde_json::to_vec(&command).unwrap(), owner.signing_key())
+                    .unwrap()
+                    .bytes(),
+            ),
+            credential: STANDARD.encode(owner.credential().record().bytes()),
+            work: 0,
+        };
+        request.solve_work().unwrap();
+        verify_create(&request, &command.host, command.issued).unwrap();
+        let (foreign, _) = Session::create().unwrap();
+        assert!(verify_creation_authority(&command, foreign.credential()).is_err());
+        let mut changed = command.clone();
+        changed.request_id = "cd".repeat(16);
+        assert!(verify_creation_authority(&changed, owner.credential()).is_err());
+        changed = command.clone();
+        changed.v = 1;
+        assert!(verify_creation_authority(&changed, owner.credential()).is_err());
+        changed.authority = None;
+        assert!(
+            verify_creation_authority(&changed, owner.credential())
+                .unwrap()
+                .is_none()
+        );
+        changed.v = 2;
+        assert!(verify_creation_authority(&changed, owner.credential()).is_err());
+        let mut next = authority.head().unwrap().clone();
+        next.sequence += 1;
+        next.previous_config_id = authority.head_id();
+        next.nonce = "cd".repeat(16);
+        authority
+            .apply_config(next.sign(owner.signing_key()).unwrap())
+            .unwrap();
+        changed.authority = Some(authority.call_proof().unwrap());
+        assert!(verify_creation_authority(&changed, owner.credential()).is_err());
+    }
+
+    #[test]
+    fn creation_response_preserves_the_owner_scope_and_pins_a_separate_transport_signer() {
+        let (owner, command) = owner_creation();
+        let authority = verify_creation_authority(&command, owner.credential())
+            .unwrap()
+            .unwrap();
+        let (transport, _) = Session::create().unwrap();
+        let address = space_service::SpaceAddress {
+            url: "https://host.example.test/team/v1/spaces".into(),
+            scope: team::TeamScope {
+                space: authority.space(),
+                stream: authority.stream(),
+                controller: owner.credential().id(),
+                root: field(owner.credential().record().body(), "root_public_key")
+                    .unwrap()
+                    .into(),
+            },
+            message_lifetime_seconds: 86400,
+            service_credential: Some(STANDARD.encode(transport.credential().record().bytes())),
+        };
+        address.validate(false).unwrap();
+        verify_created_address(&address, &authority).unwrap();
+        for case in 0..6 {
+            let mut changed = address.clone();
+            match case {
+                0 => changed.scope.space = SpaceId::from_bytes([1; 32]),
+                1 => changed.scope.stream = StreamId::from_bytes([1; 16]),
+                2 => changed.scope.controller = transport.credential().id(),
+                3 => {
+                    changed.scope.root =
+                        field(transport.credential().record().body(), "root_public_key")
+                            .unwrap()
+                            .into()
+                }
+                4 => changed.service_credential = None,
+                _ => {
+                    changed.service_credential =
+                        Some(STANDARD.encode(owner.credential().record().bytes()))
+                }
+            }
+            assert!(
+                verify_created_address(&changed, &authority).is_err(),
+                "case {case}"
+            );
+        }
+        let mut malformed = address;
+        malformed.service_credential = Some("invalid".into());
+        assert!(malformed.validate(false).is_err());
+    }
 
     #[test]
     fn creation_work_is_bound_to_the_signed_command_and_credential() {
@@ -90,6 +259,8 @@ pub struct CreateCommand {
     pub message_lifetime_seconds: u64,
     #[serde(default = "default_require_approval")]
     pub require_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<crate::authority::CallAuthorityProof>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,8 +303,10 @@ pub fn verify_create(
     signed.verify_signature(credential.key())?;
     let command: CreateCommand = signed.decode()?;
     record::hex::<16>(&command.request_id)?;
-    if command.v != 1
-        || command.kind != "space.create"
+    if !matches!(
+        (command.v, command.authority.is_some()),
+        (1, false) | (2, true)
+    ) || command.kind != "space.create"
         || command.host != expected_host
         || current.abs_diff(command.issued) > 120_000
         || !record::valid_display_name(&command.name)
@@ -142,7 +315,71 @@ pub fn verify_create(
     }
     space_service::validate_contact_email(&command.contact_email)?;
     space_service::validate_message_lifetime(command.message_lifetime_seconds)?;
+    verify_creation_authority(&command, &credential)?;
     Ok((command, credential))
+}
+pub(crate) fn verify_creation_authority(
+    command: &CreateCommand,
+    credential: &VerifiedCredential,
+) -> Result<Option<Authority>> {
+    if !matches!(
+        (command.v, command.authority.is_some()),
+        (1, false) | (2, true)
+    ) {
+        return Err("Invalid Space creation authority version.".into());
+    }
+    let Some(proof) = &command.authority else {
+        return Ok(None);
+    };
+    let genesis = decode_record(&proof.genesis)?;
+    let stream = StreamId::from_bytes(record::hex::<16>(&command.request_id)?);
+    let authority = proof.verify(genesis.id().to_string().parse()?, stream)?;
+    let body: SpaceGenesis = authority.genesis().decode()?;
+    let head = authority.head()?;
+    if !authority.is_owner_managed()
+        || body.nonce != command.request_id
+        || body.issuer_identity != credential.identity()
+        || body.owners.len() != 1
+        || body.owners[0].identity_id != credential.identity()
+        || body.owners[0].root_public_key != field(credential.record().body(), "root_public_key")?
+        || authority.initial_controller().id() != credential.id()
+        || head.sequence != 1
+        || head.controller_credential_id != credential.id()
+        || head.members.len() != 1
+        || head.members[0].identity_id != credential.identity()
+        || head.members[0].credential_ids != vec![credential.id()]
+    {
+        return Err("Space creation authority does not match its owner and request.".into());
+    }
+    Ok(Some(authority))
+}
+fn verify_created_address(
+    address: &space_service::SpaceAddress,
+    authority: &Authority,
+) -> Result<()> {
+    if address.scope.space != authority.space()
+        || address.scope.stream != authority.stream()
+        || address.scope.controller != authority.initial_controller().id()
+        || address.scope.root
+            != field(
+                authority.initial_controller().record().body(),
+                "root_public_key",
+            )?
+    {
+        return Err("Space hosting response changed General authority.".into());
+    }
+    let service = address
+        .service_signer()?
+        .ok_or("Space hosting response omitted its service credential.")?;
+    if authority
+        .head()?
+        .members
+        .iter()
+        .any(|member| member.credential_ids.contains(&service.id()))
+    {
+        return Err("The Space hosting service cannot be a General participant.".into());
+    }
+    Ok(())
 }
 pub fn seal_creation(
     credential: &VerifiedCredential,
@@ -196,7 +433,7 @@ impl ClientApp {
         space_service::validate_contact_email(contact_email)?;
         space_service::validate_message_lifetime(message_lifetime_seconds)?;
         let command = CreateCommand {
-            v: 1,
+            v: 2,
             kind: "space.create".into(),
             host: host.into(),
             request_id: request_id.into(),
@@ -205,6 +442,7 @@ impl ClientApp {
             contact_email: contact_email.into(),
             message_lifetime_seconds,
             require_approval,
+            authority: Some(self.owner_general_creation(request_id)?),
         };
         Ok(CreateRequest {
             record: STANDARD.encode(
@@ -232,6 +470,9 @@ impl ClientApp {
             message_lifetime_seconds,
             require_approval,
         )?;
+        let command: CreateCommand = decode_record(&request.record)?.decode()?;
+        let authority = verify_creation_authority(&command, self.session.credential())?
+            .ok_or("Missing owner-managed Space authority.")?;
         let request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
             request.solve_work()?;
             Ok(request)
@@ -291,6 +532,7 @@ impl ClientApp {
         {
             return Err("Space hosting response changed server.".into());
         }
+        verify_created_address(&invite.address, &authority)?;
         Ok(link.into())
     }
 }

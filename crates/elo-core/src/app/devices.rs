@@ -15,6 +15,27 @@ struct Job {
 }
 
 impl ClientApp {
+    pub fn can_link_device(&self) -> bool {
+        if !self.session.credential().can_issue_companion() {
+            return false;
+        }
+        if self.session.credential().authorizing_device().is_none() {
+            return true;
+        }
+        let authorized = |client: &ClientApp| {
+            client.authorities.0.iter().any(|authority| {
+                client.team.as_ref().is_some_and(|team| {
+                    team.scope.space == authority.space() && team.scope.stream == authority.stream()
+                }) && authority.is_owner_managed()
+                    && client.require_controller(authority).is_ok()
+            })
+        };
+        authorized(self)
+            || self
+                .spaces
+                .as_ref()
+                .is_some_and(|spaces| spaces.children().values().any(authorized))
+    }
     fn device_names(&self) -> Result<BTreeMap<RecordId, String>> {
         let path = self.directory.join("device-names.age");
         if !path.try_exists()? {
@@ -133,7 +154,7 @@ impl ClientApp {
             }
         }
         Ok(
-            json!({"devices":devices.into_values().collect::<Vec<_>>(), "unavailable":unavailable,"pending":self.pending_devices()?.jobs.len(),"can_link":self.session.credential().authorizing_device().is_none()}),
+            json!({"devices":devices.into_values().collect::<Vec<_>>(), "unavailable":unavailable,"pending":self.pending_devices()?.jobs.len(),"can_link":self.can_link_device()}),
         )
     }
     pub async fn revoke_linked_device(&self, encoded: &str) -> Result<Value> {
@@ -189,6 +210,31 @@ impl ClientApp {
         self.retry_device_revocations(true).await?;
         self.linked_devices().await
     }
+    fn device_revocation_body(
+        &self,
+        address: &space_service::SpaceAddress,
+        proof: &str,
+    ) -> Result<Value> {
+        let mut body = json!({"proof":proof});
+        if address.service_credential.is_some() {
+            let mut clients = vec![self];
+            if let Some(spaces) = &self.spaces {
+                clients.extend(spaces.children().values());
+            }
+            let authority = clients
+                .into_iter()
+                .flat_map(|client| &client.authorities.0)
+                .find(|authority| {
+                    authority.is_owner_managed()
+                        && authority.space() == address.scope.space
+                        && authority.stream() == address.scope.stream
+                })
+                .ok_or("General is unavailable. Refresh the Space and try again.")?;
+            body["authority_head"] = json!(authority.head_id().ok_or("Missing General head.")?);
+        }
+        Ok(body)
+    }
+
     pub(super) async fn retry_device_revocations(&self, immediate: bool) -> Result<()> {
         let mut pending = self.pending_devices()?;
         let current = now()?.as_millis() as u64;
@@ -215,7 +261,10 @@ impl ClientApp {
             let target = crate::identity::DeviceRevocation::verify(&decode_record(&job.proof)?)?;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(if immediate { 12 } else { 2 }),
-                self.call_space(&job.address, "device_revoke", json!({"proof":job.proof})),
+                async {
+                    let body = self.device_revocation_body(&job.address, &job.proof)?;
+                    self.call_space(&job.address, "device_revoke", body).await
+                },
             )
             .await;
             if !matches!(result, Ok(Ok(ref result)) if result["revoked"] == json!(target.id())) {
@@ -230,6 +279,79 @@ impl ClientApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn device_revocations_bind_the_current_public_general_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save(
+                temp.path().join("profile"),
+                "synthetic revocation head password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        let request = record::random_hex::<16>().unwrap();
+        let proof = app.owner_general_creation(&request).unwrap();
+        let genesis = decode_record(&proof.genesis).unwrap();
+        let general = proof
+            .verify(
+                genesis.id().to_string().parse().unwrap(),
+                request.parse().unwrap(),
+            )
+            .unwrap();
+        let mut address = space_service::SpaceAddress {
+            service_credential: Some(STANDARD.encode(app.session.credential().record().bytes())),
+            url: "https://space.invalid/team/v1/spaces".into(),
+            scope: team::TeamScope {
+                space: general.space(),
+                stream: general.stream(),
+                root: app.pins[0].root.clone(),
+                controller: general.initial_controller().id(),
+            },
+            message_lifetime_seconds: 86400,
+        };
+        let mut pin = app.pins[0].clone();
+        pin.space = general.space();
+        pin.stream = general.stream();
+        pin.personal_seed = Some(false);
+        app.pins.push(pin);
+        app.authorities.0.push(general);
+        let initial = app
+            .device_revocation_body(&address, "signed proof")
+            .unwrap();
+        assert_eq!(
+            initial["authority_head"],
+            json!(app.authorities.0[1].head_id())
+        );
+        let mut config = app.authorities.0[1].head().unwrap().clone();
+        config.sequence += 1;
+        config.previous_config_id = app.authorities.0[1].head_id();
+        config.nonce = record::random_hex::<16>().unwrap();
+        config.action.operation = "replace".into();
+        app.authorities.0[1]
+            .apply_config(config.sign(app.session.signing_key()).unwrap())
+            .unwrap();
+        let retry = app
+            .device_revocation_body(&address, "signed proof")
+            .unwrap();
+        assert_ne!(retry["authority_head"], initial["authority_head"]);
+        assert_eq!(retry["proof"], "signed proof");
+        address.scope.stream = StreamId::from_bytes([19; 16]);
+        assert!(
+            app.device_revocation_body(&address, "signed proof")
+                .is_err()
+        );
+        address.service_credential = None;
+        assert_eq!(
+            app.device_revocation_body(&address, "signed proof")
+                .unwrap(),
+            json!({"proof":"signed proof"})
+        );
+        app.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn offline_revocation_stays_encrypted_and_pending_after_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -245,6 +367,7 @@ mod tests {
             .unwrap();
         let retired = app.session.companion(draft.card()).unwrap();
         app.call_host = Some(space_service::SpaceAddress {
+            service_credential: None,
             url: "http://127.0.0.1:9/team/v1/spaces".into(),
             scope: app.team_scope().unwrap(),
             message_lifetime_seconds: 86400,

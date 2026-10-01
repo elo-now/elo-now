@@ -153,3 +153,67 @@ describe("call control transport", () => {
     await rejected;
   });
 });
+
+it("bounds signing, closes the old socket, and never sends a late signature after recovery", async () => {
+  vi.useFakeTimers();
+  const sockets: Socket[] = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    onopen?: () => void;
+    onmessage?: (event: { data: string }) => void;
+    onclose?: () => void;
+    constructor() {
+      sockets.push(this);
+      queueMicrotask(() => this.onopen?.());
+    }
+    send = vi.fn((_value: string) =>
+      queueMicrotask(() =>
+        this.onmessage?.({
+          data: JSON.stringify({ type: "result", call: null }),
+        }),
+      ),
+    );
+    close = vi.fn(() => {
+      this.readyState = 3;
+      this.onclose?.();
+    });
+  }
+  vi.stubGlobal("WebSocket", Socket);
+  const native = vi.fn(async (_request: Record<string, unknown>) => ({
+    command: "signed",
+  }));
+  const control = new Control(
+    "https://private.example/calls/v1",
+    "me",
+    vi.fn(),
+    vi.fn(),
+    native,
+  );
+  const initial = control.command({} as Stream, { type: "subscribe" });
+  await vi.advanceTimersByTimeAsync(0);
+  await initial;
+  let release!: (value: { command: string }) => void;
+  native.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  const old = control.command({} as Stream, { type: "leave" });
+  const rejected = expect(old).rejects.toThrow("unavailable");
+  await vi.advanceTimersByTimeAsync(12000);
+  await rejected;
+  expect(sockets[0].close).toHaveBeenCalledOnce();
+  const fresh = control.command({} as Stream, { type: "subscribe" });
+  await vi.advanceTimersByTimeAsync(0);
+  await fresh;
+  expect(sockets).toHaveLength(2);
+  release({ command: "old leave signature" });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(sockets[0].send).toHaveBeenCalledOnce();
+  expect(sockets[1].send).toHaveBeenCalledExactlyOnceWith(
+    JSON.stringify({ command: "signed" }),
+  );
+  control.close();
+});

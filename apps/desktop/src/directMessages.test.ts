@@ -94,6 +94,37 @@ describe("DM people", () => {
     );
     expect(people.map((p) => p.id)).toEqual(["one", "two"]);
   });
+  it("excludes the General service even when saved as a contact or known through another Space", () => {
+    const data = view([
+      chat("Conversation", ["service", "person"], {
+        member_names: { service: "Renamed service", person: "elo.now" },
+      }),
+    ]);
+    data.all_streams = [
+      chat("Renamed General", ["service"], {
+        is_general: true,
+        controller: "service-device",
+      }),
+    ];
+    data.contacts = [
+      { id: "service", name: "Saved service name" },
+      { id: "person", name: "elo.now" },
+    ];
+    const before = structuredClone(data);
+    const people = knownPeople(data);
+    expect(people.map((person) => person.id)).toEqual(["person"]);
+    expect(people[0].name).toBe("elo.now");
+    expect(data).toEqual(before);
+  });
+  it("does not treat a private chat called General or its owner as a service", () => {
+    const data = view([
+      chat("General", ["owner"], {
+        controller: "owner-device",
+        member_names: { owner: "elo.now" },
+      }),
+    ]);
+    expect(knownPeople(data).map((person) => person.id)).toEqual(["owner"]);
+  });
   it("uses the other person for a one-to-one title and bounds Unicode names", () => {
     const data = view([]);
     expect(

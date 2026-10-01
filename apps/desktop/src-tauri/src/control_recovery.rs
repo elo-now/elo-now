@@ -164,7 +164,9 @@ pub async fn control_task(
             let result = client
                 .control_recovery_confirm(&pending["package"], &confirmation, &words)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string());
+            crate::realtime::refresh(&app, Some(client));
+            let result = result?;
             state.control_recovery = None;
             state.view_revision = state.view_revision.wrapping_add(1);
             Ok(result)

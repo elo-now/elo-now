@@ -17,6 +17,7 @@ use std::{
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 pub mod biometric;
+mod owner_grants;
 const MAX_VAULT: usize = 256 * 1024;
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -54,6 +55,8 @@ struct Secrets {
     controller_mode: ControllerMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     controller_spaces: Option<Vec<SpaceId>>,
+    #[serde(default)]
+    owner_grant_eligible: Option<bool>,
     transfer_nonce: String,
 }
 impl Drop for Secrets {
@@ -75,6 +78,7 @@ pub struct Session {
     pub(crate) peers: Vec<PeerDescriptor>,
     pub(crate) controller_mode: ControllerMode,
     pub(crate) controller_spaces: Option<Vec<SpaceId>>,
+    pub(crate) owner_grant_eligible: bool,
     transfer_nonce: String,
 }
 impl Drop for Session {
@@ -150,6 +154,7 @@ impl Session {
             peers: vec![],
             controller_mode: ControllerMode::Follower,
             controller_spaces: Some(vec![]),
+            owner_grant_eligible: true,
             transfer_nonce: record::random_hex::<32>().map_err(|_| VaultError::Invalid)?,
         })
     }
@@ -183,6 +188,7 @@ impl Session {
             peers: vec![],
             controller_mode: ControllerMode::Follower,
             controller_spaces: Some(vec![]),
+            owner_grant_eligible: true,
             transfer_nonce: record::random_hex::<32>().map_err(|_| VaultError::Invalid)?,
         };
         next.inherit_history(self)?;
@@ -233,6 +239,8 @@ impl Session {
             peers: vec![],
             controller_mode: ControllerMode::Follower,
             controller_spaces: Some(vec![]),
+            owner_grant_eligible: self.owner_grant_eligible
+                && self.controller_mode != ControllerMode::Retired,
             transfer_nonce: self.transfer_nonce.clone(),
         }
     }
@@ -283,8 +291,24 @@ impl Session {
         }
         self.activate_new_space_controller(authority.space())
     }
+    /// Only a completed live device-link exchange may call this. Opening or
+    /// restoring a backup must never infer local control from a signed roster.
+    pub(crate) fn activate_linked_owner_controller(
+        &mut self,
+        authority: &crate::authority::Authority,
+    ) -> Result<()> {
+        if self.controller_mode == ControllerMode::Retired
+            || !authority.is_owner_managed()
+            || !authority.can_manage(self.credential.id())
+        {
+            return Err(VaultError::Invalid);
+        }
+        self.allow_live_owner_grants()?;
+        self.activate_new_space_controller(authority.space())
+    }
     pub fn retire_controller(&mut self) {
         self.controller_mode = ControllerMode::Retired;
+        self.owner_grant_eligible = false;
     }
     fn plaintext(&self) -> Result<Zeroizing<Vec<u8>>> {
         let seed = Zeroizing::new(self.key.to_bytes());
@@ -307,6 +331,7 @@ impl Session {
             peers: self.peers.clone(),
             controller_mode: self.controller_mode,
             controller_spaces: self.controller_spaces.clone(),
+            owner_grant_eligible: Some(self.owner_grant_eligible),
             transfer_nonce: self.transfer_nonce.clone(),
         };
         let plaintext =
@@ -400,6 +425,9 @@ impl Session {
             peers: std::mem::take(&mut secrets.peers),
             controller_mode: secrets.controller_mode,
             controller_spaces: secrets.controller_spaces.take(),
+            owner_grant_eligible: secrets
+                .owner_grant_eligible
+                .unwrap_or(secrets.controller_mode == ControllerMode::Active),
             transfer_nonce: secrets.transfer_nonce.clone(),
         })
     }
@@ -450,6 +478,7 @@ impl Session {
         let mut session = Self::open(ciphertext, passphrase, expected)?;
         session.controller_mode = ControllerMode::Follower;
         session.controller_spaces = Some(vec![]);
+        session.owner_grant_eligible = false;
         session.transfer_nonce = record::random_hex::<32>().map_err(|_| VaultError::Invalid)?;
         Ok(session)
     }
@@ -628,6 +657,7 @@ impl Session {
         )
         .map_err(|_| VaultError::Invalid)?;
         self.controller_mode = ControllerMode::Retired;
+        self.owner_grant_eligible = false;
         let ciphertext = self.seal(passphrase)?;
         write_private(path, &ciphertext, true)?;
         Ok(ticket)
@@ -660,6 +690,164 @@ impl Session {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    fn owner_authority(
+        owner: &Session,
+        root: &SigningKey,
+        version: u64,
+    ) -> crate::authority::Authority {
+        use crate::authority::*;
+        let root_key = encode_hex(root.verifying_key().as_bytes());
+        let genesis = SpaceGenesis {
+            v: version,
+            kind: "space.genesis".into(),
+            nonce: record::random_hex::<16>().unwrap(),
+            issuer_identity: owner.identity_id(),
+            owners: vec![Owner {
+                identity_id: owner.identity_id(),
+                root_public_key: root_key.clone(),
+            }],
+            controller_credential_id: owner.credential().id(),
+        };
+        let genesis = record::SignedRecord::sign(
+            &serde_json::to_vec(&genesis).unwrap(),
+            if version == 2 {
+                owner.signing_key()
+            } else {
+                root
+            },
+        )
+        .unwrap();
+        let mut authority = Authority::new(
+            genesis.bytes(),
+            genesis.id().to_string().parse().unwrap(),
+            &root.verifying_key(),
+            owner.credential().clone(),
+            crate::ids::StreamId::from_bytes([42; 16]),
+        )
+        .unwrap();
+        let config = StreamConfig {
+            v: version,
+            kind: "stream.config".into(),
+            nonce: record::random_hex::<16>().unwrap(),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            sequence: 1,
+            previous_config_id: None,
+            controller_credential_id: owner.credential().id(),
+            members: vec![Member {
+                identity_id: owner.identity_id(),
+                identity_type: "HUMAN".into(),
+                root_public_key: root_key,
+                capabilities: vec![
+                    Capability::Read,
+                    Capability::Post,
+                    Capability::ShareHistory,
+                    Capability::Manage,
+                ],
+                credential_ids: vec![owner.credential().id()],
+                external: false,
+            }],
+            owner_credential_ids: vec![owner.credential().id()],
+            action: ConfigAction {
+                operation: "create".into(),
+                actor_identity: owner.identity_id(),
+                request_record_id: None,
+            },
+            chat_kind: None,
+            recovery: None,
+        };
+        authority
+            .apply_config(config.sign(owner.signing_key()).unwrap())
+            .unwrap();
+        authority
+    }
+
+    #[test]
+    fn live_link_control_requires_exact_owner_admission_and_never_revives_backups_or_retired_modes()
+    {
+        let (original, card) = Session::create().unwrap();
+        let root = card.recover_root(original.identity_id()).unwrap();
+        let mut companion = original.linked_companion().unwrap();
+        let mut authority = owner_authority(&original, &root, 2);
+        assert!(
+            companion
+                .activate_linked_owner_controller(&authority)
+                .is_err()
+        );
+        authority.add_credential(companion.credential().clone());
+        let mut admitted = authority.head().unwrap().clone();
+        admitted.sequence += 1;
+        admitted.previous_config_id = authority.head_id();
+        admitted.nonce = record::random_hex::<16>().unwrap();
+        admitted.action.operation = "device.updated".into();
+        admitted.members[0]
+            .credential_ids
+            .push(companion.credential().id());
+        admitted.members[0].credential_ids.sort();
+        admitted.owner_credential_ids = admitted.members[0].credential_ids.clone();
+        authority
+            .apply_config(admitted.sign(original.signing_key()).unwrap())
+            .unwrap();
+        companion
+            .activate_linked_owner_controller(&authority)
+            .unwrap();
+        assert!(companion.can_control(authority.space()));
+        assert!(!companion.can_control(crate::ids::SpaceId::from_bytes([42; 32])));
+
+        let password: SecretString = "synthetic linked owner vault password".into();
+        let sealed = companion.seal(password.clone()).unwrap();
+        let restored =
+            Session::restore_backup(&sealed, password.clone(), companion.identity_id()).unwrap();
+        assert!(restored.controller_mode() == ControllerMode::Follower);
+        assert!(!restored.can_control(authority.space()));
+        assert!(
+            Session::open(&sealed, password, companion.identity_id())
+                .unwrap()
+                .can_control(authority.space())
+        );
+
+        let mut retired = authority.head().unwrap().clone();
+        retired.sequence += 1;
+        retired.previous_config_id = authority.head_id();
+        retired.nonce = record::random_hex::<16>().unwrap();
+        retired.controller_credential_id = companion.credential().id();
+        retired.members[0].credential_ids = vec![companion.credential().id()];
+        retired.owner_credential_ids = retired.members[0].credential_ids.clone();
+        authority
+            .apply_config(retired.sign(companion.signing_key()).unwrap())
+            .unwrap();
+        assert!(authority.can_manage(companion.credential().id()));
+        assert!(!authority.can_manage(original.credential().id()));
+        let proof = crate::identity::DeviceRevocation::issue_from_device(
+            companion.credential(),
+            companion.signing_key(),
+            original.credential(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::identity::DeviceRevocation::verify_request(&proof, companion.credential())
+                .unwrap()
+                .id(),
+            original.credential().id()
+        );
+
+        let mut legacy = original.companion(&card).unwrap();
+        let legacy_authority = owner_authority(&legacy, &root, 1);
+        assert!(legacy_authority.can_manage(legacy.credential().id()));
+        assert!(
+            legacy
+                .activate_linked_owner_controller(&legacy_authority)
+                .is_err()
+        );
+        companion.retire_controller();
+        assert!(
+            companion
+                .activate_linked_owner_controller(&authority)
+                .is_err()
+        );
+        assert!(companion.controller_mode() == ControllerMode::Retired);
+    }
 
     #[test]
     fn new_password_policy_does_not_lock_out_existing_vaults() {

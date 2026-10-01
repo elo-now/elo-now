@@ -443,57 +443,6 @@ impl Engine {
         fence.last_used = now;
         Some(fence.head)
     }
-    pub fn wake_recipients(&self, call: &ActiveCall) -> Vec<calls::wake::Recipient> {
-        let Some(fence) = self.fences.get(&call.scope) else {
-            return vec![];
-        };
-        if fence.blocked || fence.head != call.config_id {
-            return vec![];
-        }
-        let Some(authority) = &fence.authority else {
-            return vec![];
-        };
-        let Ok(head) = authority.head() else {
-            return vec![];
-        };
-        let recipients: Vec<_> = head
-            .members
-            .iter()
-            .filter(|m| m.identity_id != call.started_by)
-            .flat_map(|m| {
-                m.credential_ids.iter().filter_map(|id| {
-                    calls::require_member(authority, *id).ok().map(|identity| {
-                        calls::wake::Recipient {
-                            identity,
-                            credential: *id,
-                        }
-                    })
-                })
-            })
-            .collect();
-        if recipients.len() > 16 {
-            vec![]
-        } else {
-            recipients
-        }
-    }
-    pub fn background_decline(&mut self, id: &str, recipient: IdentityId) -> Vec<Event> {
-        let scope = self.fences.keys().find_map(|scope| {
-            let call = self.registry.presence(scope)?;
-            (call.call_id == id
-                && call.kind == calls::CallKind::Direct
-                && call.ringing
-                && self
-                    .wake_recipients(call)
-                    .iter()
-                    .any(|r| r.identity == recipient))
-            .then_some(*scope)
-        });
-        scope
-            .and_then(|scope| self.registry.end(scope))
-            .into_iter()
-            .collect()
-    }
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.pending)
     }

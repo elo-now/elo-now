@@ -703,6 +703,7 @@ async fn run(
             state.recovery_qr = None;
             state.control_recovery = None;
             state.client = Some(client);
+            crate::realtime::activate(app, state.client.as_ref().unwrap());
             app.state::<crate::background_history::BackgroundHistory>()
                 .resume();
             #[cfg(desktop)]
@@ -746,7 +747,9 @@ async fn run(
         "device_revoke" => {
             let client = state.client.as_ref().ok_or("The profile is locked")?;
             confirm_device_removal(&v)?;
-            return client.revoke_linked_device(text(&v, "credential")?).await;
+            let result = client.revoke_linked_device(text(&v, "credential")?).await;
+            crate::realtime::refresh(app, Some(client));
+            return result;
         }
         "pair_start" => {
             let client = state.client.as_ref().ok_or("The profile is locked")?;
@@ -773,7 +776,7 @@ async fn run(
                 pair_source,
                 ..
             } = &mut *state;
-            let client = client.as_ref().ok_or("The profile is locked")?;
+            let client = client.as_mut().ok_or("The profile is locked")?;
             pair_source
                 .as_mut()
                 .ok_or("Create a device code first")?
@@ -828,6 +831,7 @@ async fn run(
             }
             state.pair_target = None;
             state.client = Some(client);
+            crate::realtime::activate(app, state.client.as_ref().unwrap());
             app.state::<crate::background_history::BackgroundHistory>()
                 .resume();
             #[cfg(desktop)]
@@ -934,6 +938,7 @@ async fn run(
                 crate::push::suspend(app, Some(client)).await?;
             }
             let client = state.client.take().ok_or("The profile is locked")?;
+            crate::realtime::clear(app);
             #[cfg(desktop)]
             crate::desktop_activity::clear(app);
             client.close().await?;

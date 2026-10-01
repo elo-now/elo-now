@@ -50,8 +50,10 @@
       ]
     },
     "allow-operate",
+    "allow-realtime-context",
     "allow-push-task",
     "allow-native-call-media",
+    "allow-native-call-state",
     "allow-choose-attachment",
     "allow-stage-attachment",
     "allow-discard-exchange",

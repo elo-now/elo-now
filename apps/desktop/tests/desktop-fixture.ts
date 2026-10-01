@@ -243,7 +243,7 @@ Object.assign(window, {
       );
       return id;
     },
-    async backgroundMessage() {
+    async backgroundMessage(live = false) {
       const id = `background-${sequence++}`;
       general.rows.push({
         id,
@@ -260,7 +260,7 @@ Object.assign(window, {
       view.revision = (view.revision ?? 0) + 1;
       await emit(
         "desktop-sync",
-        structuredClone({ view, identity: view.identity, result: {} }),
+        structuredClone({ view, identity: view.identity, result: live ? { received_messages: [id] } : {} }),
       );
       return id;
     },

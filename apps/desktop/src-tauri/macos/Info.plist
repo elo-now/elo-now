@@ -5,8 +5,8 @@
     <key>ITSAppUsesNonExemptEncryption</key>
     <true/>
     <key>NSCameraUsageDescription</key>
-    <string>elo.now uses your camera when you turn on video in a call.</string>
+    <string>elo.now uses your camera when you turn on video in a chat session.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>elo.now uses your microphone so people in your call can hear you.</string>
+    <string>elo.now uses your microphone during chat sessions you choose to start or join.</string>
 </dict>
 </plist>

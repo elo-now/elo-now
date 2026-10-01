@@ -42,8 +42,6 @@ targets:
       - path: assets
         buildPhase: resources
         type: folder
-      - path: ../../call-ringtones
-        buildPhase: resources
       - path: LaunchScreen.storyboard
     info:
       path: elo-desktop_iOS/Info.plist
@@ -51,13 +49,13 @@ targets:
         FirebaseMessagingAutoInitEnabled: false
         FirebaseMessagingInstallationIdEnabled: true
         FirebaseAnalyticsCollectionEnabled: false
-        UIBackgroundModes: [remote-notification, voip, audio]
+        UIBackgroundModes: [remote-notification, audio]
         NSFaceIDUsageDescription: Use Face ID to unlock your encrypted elo profile on this device.
         NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.
         NSPhotoLibraryAddUsageDescription: Save images from your conversations or your password-protected recovery QR image to Photos.
-        NSCameraUsageDescription: Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
+        NSCameraUsageDescription: Enable video in chat sessions, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.
         NSLocalNetworkUsageDescription: Connect to a Space server you choose on your local network.
-        NSMicrophoneUsageDescription: Use your microphone during audio and video calls.
+        NSMicrophoneUsageDescription: Use your microphone during chat sessions you choose to start or join.
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations:
@@ -71,8 +69,8 @@ targets:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
-        CFBundleShortVersionString: 1.0.3
-        CFBundleVersion: "1103"
+        CFBundleShortVersionString: 1.0.5
+        CFBundleVersion: "1114"
         CFBundleURLTypes:
           - CFBundleURLName: now.elo
             CFBundleURLSchemes: [elo]
@@ -81,7 +79,6 @@ targets:
       properties:
         application-identifier: $(DEVELOPMENT_TEAM).$(PRODUCT_BUNDLE_IDENTIFIER)
         aps-environment: development
-        com.apple.developer.devicecheck.appattest-environment: production
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

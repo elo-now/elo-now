@@ -37,6 +37,10 @@
 body {
   margin: 0;
 }
+body,
+#root {
+  background-color: var(--elo-background);
+}
 .notification-opening {
   position: fixed;
   inset: 0;
@@ -519,9 +523,16 @@ h2 {
   margin: 8px 0;
   font-size: var(--elo-type-message);
 }
-.attachment-container { min-width: 0; }
-.attachment-preview-pending { min-height: 4em; }
-.attachment-preview { max-width: min(100%, 360px); min-width: 0; }
+.attachment-container {
+  min-width: 0;
+}
+.attachment-preview-pending {
+  min-height: 4em;
+}
+.attachment-preview {
+  max-width: min(100%, 360px);
+  min-width: 0;
+}
 .attachment-preview img {
   display: block;
   max-width: 100%;
@@ -666,7 +677,8 @@ h2 {
   display: flex;
   gap: 8px;
 }
-.composer:not([data-composer-expanded]):not([data-message-expiry]) .composer-expiry {
+.composer:not([data-composer-expanded]):not([data-message-expiry])
+  .composer-expiry {
   display: none;
 }
 .composer .composer-expiry button {
@@ -2598,7 +2610,7 @@ button {
 }
 @media (prefers-reduced-motion: no-preference) {
   .toast {
-    animation: toast-enter 180ms ease-out both;
+    animation: toast-enter var(--elo-motion-enter) var(--elo-ease-out) both;
   }
   .toast[data-leaving="true"] {
     animation: toast-leave 160ms ease-in both;
@@ -2606,7 +2618,7 @@ button {
   @keyframes toast-enter {
     from {
       opacity: 0;
-      transform: translate(-50%, -10px);
+      transform: translate(-50%, -4px);
     }
     to {
       opacity: 1;
@@ -2620,7 +2632,7 @@ button {
     }
     to {
       opacity: 0;
-      transform: translate(-50%, -8px);
+      transform: translate(-50%, -4px);
     }
   }
 }
@@ -2678,22 +2690,46 @@ button {
 @media (prefers-reduced-motion: no-preference) {
   button {
     transition:
-      transform 120ms ease-out,
-      background-color 160ms ease-out,
-      color 160ms ease-out;
+      scale var(--elo-motion-fast) var(--elo-ease-out),
+      background-color var(--elo-motion-fast) var(--elo-ease-out),
+      color var(--elo-motion-fast) var(--elo-ease-out);
   }
   button:active:not(:disabled) {
-    transform: scale(0.98);
+    /* Keep positioned controls' existing transforms intact. */
+    scale: 0.98;
   }
   .theme-toggle:active:not(:disabled) .ui-icon {
     transform: rotate(15deg);
   }
   .theme-toggle .ui-icon {
-    transition: transform 160ms ease-out;
+    transition: transform var(--elo-motion-enter) var(--elo-ease-out);
   }
-  .dialog[open]:not(.new-chat-dialog),
-  .scrim > .dialog:not(.new-chat-dialog) {
-    animation: panel-appear 180ms ease-out;
+  .dialog[open]:not(
+      .page-surface,
+      .new-chat-dialog,
+      .message-collection,
+      .call-dialog,
+      .anchored-dialog
+    ),
+  .scrim > .dialog:not(.page-surface, .new-chat-dialog, .call-dialog) {
+    animation: panel-appear var(--elo-motion-enter) var(--elo-ease-out);
+  }
+  .desktop-workspace-menu,
+  .auth-menu-list {
+    animation: menu-appear var(--elo-motion-fast) var(--elo-ease-out);
+  }
+  /* Animate only reading surfaces. Headers, navigation and the page background
+     stay opaque; refreshing existing children does not restart this animation. */
+  .shell > .conversation > .searchable-list,
+  .shell > .details > :is(.settings-page, .channel-settings),
+  .contacts-page > .contacts-viewport,
+  .thread-view > .searchable-list,
+  .invitation-page > .invitation-scroll,
+  .members-page > .members-panel,
+  .message-stream > .stream-viewport,
+  :is(.page-surface[open], .desktop-page)
+    > :is(form, .page-content, .message-collection-list) {
+    animation: page-appear var(--elo-motion-enter) var(--elo-ease-out);
   }
   .unlock,
   .conversation,
@@ -2704,7 +2740,7 @@ button {
   @keyframes panel-appear {
     from {
       opacity: 0;
-      transform: translateY(8px);
+      transform: translateY(4px);
     }
     to {
       opacity: 1;
@@ -2712,6 +2748,16 @@ button {
     }
   }
   @keyframes page-appear {
+    from {
+      opacity: 0.92;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes menu-appear {
     from {
       opacity: 0;
     }
@@ -3132,47 +3178,6 @@ button {
   min-height: 96px;
   resize: vertical;
   margin-bottom: 12px;
-}
-
-.ringtone-picker {
-  display: flex;
-  align-items: stretch;
-  gap: calc(12px * var(--elo-ui-scale));
-}
-.ringtone-select {
-  position: relative;
-  display: grid;
-  flex: 1;
-  min-width: 0;
-}
-.ringtone-picker .ringtone-select > .ringtone-select-input {
-  appearance: none;
-  -webkit-appearance: none;
-  background-image: none;
-  width: 100%;
-  min-width: 0;
-  margin: 0;
-  padding-inline-end: calc(44px * var(--elo-ui-scale));
-}
-.ringtone-chevron {
-  position: absolute;
-  top: 50%;
-  inset-inline-end: calc(12px * var(--elo-ui-scale));
-  transform: translateY(-50%);
-  color: var(--elo-muted);
-  pointer-events: none;
-}
-.ringtone-picker > .ringtone-preview {
-  display: grid;
-  place-items: center;
-  flex: 0 0 max(var(--elo-control-height), calc(44px * var(--elo-ui-scale)));
-  min-height: var(--elo-control-height);
-  padding: 0;
-  margin: 0;
-}
-.ringtone-picker svg {
-  width: calc(20px * var(--elo-ui-scale));
-  height: calc(20px * var(--elo-ui-scale));
 }
 
 .linked-device-row small {

@@ -103,4 +103,20 @@ replace independent assessment or physical-device acceptance.
 
 ## Hosted General trust boundary
 
-The hosting service is both the membership controller and an authorized reader of General. On publisher-operated hosting this includes 9bits, not only a Space owner. Its device vault and unlock secret are available on the VPS, so VPS access can expose General content present in a replica or backup. Encrypting operational backups reduces off-site exposure but does not remove this live-server capability. Independent private chats have their own recipient lists. Removing the operator from General content requires a protocol change separating configuration authority from message recipients; it is not achieved by disabling routine downloads.
+Legacy version-1 hosted General gives the enrollment service READ capability and an age private key. On publisher-operated hosting this includes 9bits. Its device vault and unlock secret are available on the VPS, so VPS access can expose General content present in a replica or backup. Encrypting operational backups does not remove this live-server capability. Independent private chats have their own recipient lists. Existing deployed Spaces retain this boundary until a coordinated replacement; a source update does not revoke their old keys.
+
+New version-2 hosted General separates a public-only hosting service from owner
+devices. The real owner creates its signed genesis. The host keeps public authority,
+administrative evidence, routing metadata and a separate response-signing key, but
+no General reader credential or content private key. An exact previously admitted
+owner device signs membership changes after verifying signed administrative intent.
+Its configuration commits the ordered administration history, preventing the host
+from dropping a prior decision to replay an old grant. The host serializes updates
+with an expected-head comparison; clients still detect conflicting signed branches.
+
+An approved linked owner device has independent keys and can keep managing General
+after the original device is revoked. Restoring a backup does not activate this role.
+This does not change version-1 private-chat control or provide automatic recovery
+after losing every owner device. Joining without approval remains a bearer-link
+policy: the host knows these tokens and can join under an ordinary profile, as can
+any other token holder. Require owner approval when that distinction matters.

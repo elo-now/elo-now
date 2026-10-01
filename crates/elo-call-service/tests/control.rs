@@ -34,7 +34,6 @@ fn concurrent_start_intents_share_one_call_and_identity_uses_only_one_device() {
         registry.apply(&f.authority, &peer_start, NOW).unwrap();
         assert_eq!(registry.presence(&scope).unwrap().call_id, id);
         assert_eq!(registry.presence(&scope).unwrap().participants.len(), 2);
-        assert!(!registry.presence(&scope).unwrap().ringing);
         registry.apply(&f.authority, &peer_start, NOW + 1).unwrap();
         let other_device = f.command(&f.peer_device, Operation::Join { call_id: id }, NOW);
         assert!(matches!(
@@ -124,34 +123,220 @@ fn media_leases_participant_limits_and_timeouts_are_enforced() {
 }
 
 #[test]
-fn direct_decline_leave_and_ring_timeout_end_the_call() {
-    for action in [0, 1, 2] {
-        let f = Fixture::new(true);
-        let mut registry = Registry::new(Limits::default()).unwrap();
-        let command = f.command(&f.owner, start(CallKind::Direct), NOW);
-        registry.apply(&f.authority, &command, NOW).unwrap();
-        let scope = Scope::from(&command);
-        let id = registry.presence(&scope).unwrap().call_id.clone();
-        let events = match action {
-            0 => registry
-                .apply(
-                    &f.authority,
-                    &f.command(&f.peer, Operation::Decline { call_id: id }, NOW),
-                    NOW,
-                )
-                .unwrap(),
-            1 => registry
-                .apply(
-                    &f.authority,
-                    &f.command(&f.owner, Operation::Leave { call_id: id }, NOW),
-                    NOW,
-                )
-                .unwrap(),
-            _ => registry.tick(NOW + 45),
-        };
-        assert!(matches!(events[0], Event::Ended { .. }));
-        assert!(registry.presence(&scope).is_none());
+fn direct_session_waits_for_a_deliberate_join_without_a_ring_deadline() {
+    let f = Fixture::new(true);
+    let mut registry = Registry::new(Limits::default()).unwrap();
+    let command = f.command(&f.owner, start(CallKind::Direct), NOW);
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let scope = Scope::from(&command);
+    let id = registry.presence(&scope).unwrap().call_id.clone();
+    for elapsed in (15..=180).step_by(15) {
+        registry
+            .apply(
+                &f.authority,
+                &f.command(
+                    &f.owner,
+                    Operation::Heartbeat {
+                        call_id: id.clone(),
+                    },
+                    NOW + elapsed,
+                ),
+                NOW + elapsed,
+            )
+            .unwrap();
+        assert!(registry.tick(NOW + elapsed).is_empty());
+        assert_eq!(registry.presence(&scope).unwrap().participants.len(), 1);
     }
+    let state = serde_json::to_value(registry.presence(&scope).unwrap()).unwrap();
+    assert!(state.get("ringing").is_none());
+    assert!(
+        serde_json::from_value::<Operation>(serde_json::json!({
+            "type":"decline", "call_id":id,
+        }))
+        .is_err()
+    );
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.peer,
+                Operation::Join {
+                    call_id: id.clone(),
+                },
+                NOW + 181,
+            ),
+            NOW + 181,
+        )
+        .unwrap();
+    let session = registry.presence(&scope).unwrap();
+    assert_eq!(session.call_id, id);
+    assert_eq!(session.participants.len(), 2);
+    assert_eq!(session.key_epoch, 2);
+}
+
+#[test]
+fn direct_leave_keeps_the_other_participant_and_allows_rejoining() {
+    let f = Fixture::new(true);
+    let mut registry = Registry::new(Limits::default()).unwrap();
+    let command = f.command(&f.owner, start(CallKind::Direct), NOW);
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let scope = Scope::from(&command);
+    let id = registry.presence(&scope).unwrap().call_id.clone();
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.peer,
+                Operation::Join {
+                    call_id: id.clone(),
+                },
+                NOW,
+            ),
+            NOW,
+        )
+        .unwrap();
+    let events = registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.owner,
+                Operation::Leave {
+                    call_id: id.clone(),
+                },
+                NOW + 1,
+            ),
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(matches!(events.as_slice(), [Event::Presence { .. }]));
+    let session = registry.presence(&scope).unwrap();
+    assert_eq!(session.participants.len(), 1);
+    assert!(session.participants.contains_key(&f.peer.identity_id()));
+    assert_eq!(session.key_epoch, 3);
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.owner,
+                Operation::Join {
+                    call_id: id.clone(),
+                },
+                NOW + 2,
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    assert_eq!(registry.presence(&scope).unwrap().key_epoch, 4);
+    for (epoch, accepted) in [(2, false), (3, false), (4, true)] {
+        let result = registry.apply(
+            &f.authority,
+            &f.command(
+                &f.owner,
+                Operation::Signal {
+                    call_id: id.clone(),
+                    epoch,
+                    to: f.peer.credential().id(),
+                    ciphertext: "aGVsbG8=".into(),
+                },
+                NOW + 2,
+            ),
+            NOW + 2,
+        );
+        if accepted {
+            assert!(matches!(
+                result.unwrap().as_slice(),
+                [Event::Signal { epoch: 4, .. }]
+            ));
+        } else {
+            assert!(matches!(result, Err(CallError::Unauthorized)));
+        }
+    }
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.peer,
+                Operation::Leave {
+                    call_id: id.clone(),
+                },
+                NOW + 3,
+            ),
+            NOW + 3,
+        )
+        .unwrap();
+    let events = registry
+        .apply(
+            &f.authority,
+            &f.command(&f.owner, Operation::Leave { call_id: id }, NOW + 4),
+            NOW + 4,
+        )
+        .unwrap();
+    assert!(matches!(events.as_slice(), [Event::Ended { .. }]));
+    assert!(registry.presence(&scope).is_none());
+}
+
+#[test]
+fn direct_network_loss_keeps_the_room_until_every_participant_expires_and_grace_passes() {
+    let f = Fixture::new(true);
+    let mut registry = Registry::new(Limits::default()).unwrap();
+    let command = f.command(&f.owner, start(CallKind::Direct), NOW);
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let scope = Scope::from(&command);
+    let id = registry.presence(&scope).unwrap().call_id.clone();
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.peer,
+                Operation::Join {
+                    call_id: id.clone(),
+                },
+                NOW,
+            ),
+            NOW,
+        )
+        .unwrap();
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.owner,
+                Operation::Heartbeat {
+                    call_id: id.clone(),
+                },
+                NOW + 20,
+            ),
+            NOW + 20,
+        )
+        .unwrap();
+    assert!(matches!(
+        registry.tick(NOW + 30).as_slice(),
+        [Event::Presence { .. }]
+    ));
+    let session = registry.presence(&scope).unwrap();
+    assert_eq!(session.participants.len(), 1);
+    assert!(session.participants.contains_key(&f.owner.identity_id()));
+    assert_eq!(session.key_epoch, 3);
+    registry.tick(NOW + 50);
+    assert!(registry.presence(&scope).unwrap().participants.is_empty());
+    // A new deliberate join can recover a temporarily empty session.
+    registry
+        .apply(
+            &f.authority,
+            &f.command(&f.peer, Operation::Join { call_id: id }, NOW + 60),
+            NOW + 60,
+        )
+        .unwrap();
+    assert!(registry.tick(NOW + 65).is_empty());
+    assert_eq!(registry.presence(&scope).unwrap().participants.len(), 1);
+    registry.tick(NOW + 90);
+    assert!(registry.presence(&scope).unwrap().participants.is_empty());
+    assert!(registry.tick(NOW + 104).is_empty());
+    assert!(matches!(
+        registry.tick(NOW + 105).as_slice(),
+        [Event::Ended { .. }]
+    ));
+    assert!(registry.presence(&scope).is_none());
 }
 
 #[test]
@@ -201,6 +386,7 @@ fn hosted_space_contexts_do_not_share_presence_or_signals() {
     let outsider = f.command(
         &f.third,
         Operation::Signal {
+            epoch: 2,
             call_id: id,
             to: f.owner.credential().id(),
             ciphertext: "aGVsbG8=".into(),
@@ -487,53 +673,24 @@ fn an_idle_live_subscription_retains_authority_until_the_subscriber_disconnects(
         )
         .unwrap();
     let started = engine.execute(prepared, NOW + 181).unwrap();
-    assert!(started.call.unwrap().ringing);
+    assert_eq!(started.call.unwrap().participants.len(), 1);
     assert!(engine.authorized(scope, f.peer.credential().id()));
     engine.maintain(NOW + 400).unwrap();
-    assert!(!engine.authorized(scope, f.peer.credential().id()));
-}
-
-#[test]
-fn background_decline_only_ends_a_current_ring_addressed_to_the_recipient() {
-    let f = Fixture::new(true);
-    let root = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(
-        &root.path().join("calls.sqlite"),
-        AUDIENCE.into(),
-        Limits::default(),
-    )
-    .unwrap();
-    let prepared = engine
-        .prepare(
-            f.request(&f.owner, start(CallKind::Direct), NOW, true),
-            None,
-            NOW,
-        )
+    // Detecting the last expired participant starts the empty-session grace.
+    // Its public authority remains available until that grace finishes.
+    assert!(
+        engine
+            .registry
+            .presence(&scope)
+            .unwrap()
+            .participants
+            .is_empty()
+    );
+    assert!(engine.authorized(scope, f.peer.credential().id()));
+    engine
+        .maintain(NOW + 400 + Limits::default().empty_grace)
         .unwrap();
-    let call = engine.execute(prepared, NOW).unwrap().call.unwrap();
-    assert_eq!(engine.wake_recipients(&call).len(), 2);
-    assert!(
-        engine
-            .background_decline(&call.call_id, f.owner.identity_id())
-            .is_empty()
-    );
-    assert!(
-        engine
-            .background_decline(&call.call_id, f.third.identity_id())
-            .is_empty()
-    );
-    assert_eq!(
-        engine
-            .background_decline(&call.call_id, f.peer.identity_id())
-            .len(),
-        1
-    );
-    assert!(engine.registry.presence(&call.scope).is_none());
-    assert!(
-        engine
-            .background_decline(&call.call_id, f.peer.identity_id())
-            .is_empty()
-    );
+    assert!(!engine.authorized(scope, f.peer.credential().id()));
 }
 
 #[test]

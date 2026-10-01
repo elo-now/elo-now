@@ -28,6 +28,9 @@
   --elo-radius-button: 6px;
   --elo-radius-panel: 16px;
   --elo-space-unit: 8px;
+  --elo-motion-fast: 100ms;
+  --elo-motion-enter: 140ms;
+  --elo-ease-out: cubic-bezier(0.2, 0.75, 0.25, 1);
 }
 :root[data-ui-scale="compact"] {
   --elo-type-message: var(--elo-type-label);

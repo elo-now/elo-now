@@ -4,6 +4,8 @@ const mocks = vi.hoisted(() => ({
   setKey: vi.fn(async () => {}),
   setE2EEEnabled: vi.fn(async () => {}),
   connect: vi.fn(async () => {}),
+  disconnect: vi.fn(async () => {}),
+  terminate: vi.fn(),
   startAudio: vi.fn(async () => {}),
   publishTrack: vi.fn(async () => {}),
   unpublishTrack: vi.fn(async () => {}),
@@ -13,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("livekit-client/e2ee-worker?worker", () => ({
   default: class {
-    terminate() {}
+    terminate = mocks.terminate;
   },
 }));
 
@@ -33,6 +35,7 @@ vi.mock("livekit-client", () => ({
     }
     setE2EEEnabled = mocks.setE2EEEnabled;
     connect = mocks.connect;
+    disconnect = mocks.disconnect;
     startAudio = mocks.startAudio;
   },
   RoomEvent: {
@@ -57,7 +60,9 @@ vi.mock("livekit-client", () => ({
 }));
 
 import { GroupMedia } from "./livekit";
-import type { MediaTile } from "./types";
+import { Calls } from "./controller";
+import type { Stream, View } from "../model";
+import type { ActiveCall, MediaTile } from "./types";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -225,4 +230,121 @@ it("stops the screen clone before waiting for provider unpublication", async () 
     ),
   ).rejects.toThrow("network");
   expect(stop).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])(
+  "shares the pending teardown and its result with repeated stops (reject=%s)",
+  async (reject) => {
+    const tiles = vi.fn();
+    const media = new GroupMedia(tiles, vi.fn());
+    const failure = new Error("disconnect failed");
+    let finish!: () => void;
+    mocks.disconnect.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve, rejectStop) => {
+          finish = () => (reject ? rejectStop(failure) : resolve());
+        }),
+    );
+    const first = media.stop();
+    const second = media.stop();
+    const results = Promise.allSettled([first, second]);
+    expect(mocks.disconnect).toHaveBeenCalledOnce();
+    expect(mocks.terminate).not.toHaveBeenCalled();
+    finish();
+    const expected = reject
+      ? { status: "rejected", reason: failure }
+      : { status: "fulfilled", value: undefined };
+    expect(await results).toEqual([expected, expected]);
+    expect(second).toBe(first);
+    expect(media.stop()).toBe(first);
+    expect(mocks.terminate).toHaveBeenCalledOnce();
+    expect(tiles).toHaveBeenCalledExactlyOnceWith([]);
+  },
+);
+
+it("waits for failed connection cleanup before connecting a later admission", async () => {
+  const calls = new Calls();
+  const chat = {
+    space_context: "host",
+    space: "space",
+    stream: "chat",
+    head: "head",
+    can_post: true,
+    members: [
+      { identity_id: "me", credential_ids: ["a"], capabilities: ["POST"] },
+    ],
+  } as unknown as Stream;
+  const call = (epoch: number): ActiveCall => ({
+    call_id: `call-${epoch}`,
+    scope: {
+      hosting_space_id: "host",
+      conversation: { space_id: "space", stream_id: "chat" },
+    },
+    config_id: "head",
+    key_epoch: epoch,
+    kind: "group",
+    initial_media: "audio",
+    started_by: "me",
+    started_at: 1,
+    participants: {
+      me: {
+        identity_id: "me",
+        credential_id: "a",
+        media: {
+          audio_muted: false,
+          video_published: false,
+          screen_published: false,
+        },
+      },
+    },
+  });
+  const capture = {
+    getTracks: () => [],
+    getAudioTracks: () => [],
+    getVideoTracks: () => [],
+  } as unknown as MediaStream;
+  Object.assign(calls, {
+    view: {
+      identity: "me",
+      credential: "a",
+      streams: [chat],
+      spaces: [{ id: "host", managed: true, status: "joined" }],
+    } as unknown as View,
+    capture,
+    command: async () => ({
+      media: { epoch: calls.snapshot.active?.key_epoch },
+    }),
+  });
+  const controller = calls as unknown as {
+    presence(call: ActiveCall): Promise<void>;
+  };
+  let finish!: () => void;
+  mocks.disconnect.mockImplementationOnce(
+    () => new Promise<void>((resolve) => (finish = resolve)),
+  );
+  mocks.connect.mockRejectedValueOnce(new Error("connection failed"));
+  calls.snapshot = { ...calls.snapshot, active: call(1), chat };
+  await controller.presence(call(1));
+  await vi.waitFor(() => expect(mocks.disconnect).toHaveBeenCalledOnce());
+  const leaving = calls.leave();
+  let left = false;
+  void leaving.then(() => {
+    left = true;
+  });
+  // A later admission can finish while the failed room is still disconnecting.
+  Object.assign(calls, { capture });
+  calls.snapshot = { ...calls.snapshot, active: call(2), chat };
+  await controller.presence(call(2));
+  for (let turn = 0; turn < 100; turn++) await Promise.resolve();
+  const leftBeforeCleanup = left;
+  const connectionsBeforeCleanup = mocks.connect.mock.calls.length;
+  finish();
+  await leaving;
+  await vi.waitFor(() => expect(calls.snapshot.phase).toBe("connected"));
+  expect(mocks.connect).toHaveBeenCalledTimes(2);
+  expect(calls.snapshot.active?.call_id).toBe("call-2");
+  expect(calls.snapshot.error).toBeUndefined();
+  calls.dispose();
+  expect(leftBeforeCleanup).toBe(false);
+  expect(connectionsBeforeCleanup).toBe(1);
 });

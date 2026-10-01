@@ -68,7 +68,7 @@ async function layout() {
         mirror: tile.local && tile.source === "camera",
       };
     });
-  const key = JSON.stringify([media?.session, frames]);
+  const key = JSON.stringify([media?.session, media?.revision, frames]);
   if (!busy && performance.now() >= retryAfter && key !== last) {
     busy = true;
     try {
@@ -91,7 +91,7 @@ async function layout() {
       retryAfter = performance.now() + 1000;
       if (!bindings.size) {
         current = undefined;
-        last = JSON.stringify([undefined, []]);
+        last = JSON.stringify([undefined, undefined, []]);
       }
       document.documentElement.classList.remove("native-call-video");
       previewCutout([]);
@@ -101,7 +101,11 @@ async function layout() {
   }
   if (document.documentElement.classList.contains("native-call-video"))
     previewCutout(visible);
-  if (bindings.size || busy || last !== JSON.stringify([undefined, []]))
+  if (
+    bindings.size ||
+    busy ||
+    last !== JSON.stringify([undefined, undefined, []])
+  )
     frame = requestAnimationFrame(() => void layout());
 }
 export function NativeVideo({ tile, name }: { tile: MediaTile; name: string }) {
@@ -118,7 +122,7 @@ export function NativeVideo({ tile, name }: { tile: MediaTile; name: string }) {
       }
       if (!frame) frame = requestAnimationFrame(() => void layout());
     };
-  }, [tile.native?.session, tile.native?.track]);
+  }, [tile.native?.session, tile.native?.track, tile.native?.revision]);
   return (
     <div className="call-tile call-native-video" data-source={tile.source}>
       <div ref={ref} className="native-video-frame" aria-label={name} />

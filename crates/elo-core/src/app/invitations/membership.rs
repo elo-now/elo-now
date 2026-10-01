@@ -97,7 +97,7 @@ impl ClientApp {
             // A restart may interrupt the gap between the authority commit and
             // activating its durable deliveries. Never commit a draft here or
             // send an obsolete snapshot after another membership change.
-            if self.require_controller(current).is_err()
+            if self.require_private_chat_controller(current).is_err()
                 || current.is_forked()
                 || current.recovery_id().is_some()
                 || !current.has_membership_approval(draft.proof)
@@ -210,7 +210,7 @@ impl ClientApp {
         let key = record::encode_hex(&record::hex::<16>(field(&v, "request_id")?)?);
         let people = selection(&v, self.session.identity_id())?;
         let index = self.authority_index(&v)?;
-        self.require_controller(&self.authorities.0[index])?;
+        self.require_private_chat_controller(&self.authorities.0[index])?;
         if !self.session.peers().iter().any(|p| p.write_token.is_some()) {
             return Err("This Space has no messaging connection.".into());
         }

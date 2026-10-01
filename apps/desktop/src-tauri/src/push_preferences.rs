@@ -11,8 +11,6 @@ pub struct Preferences {
     v: u8,
     identity: String,
     pub enabled: bool,
-    pub calls_enabled: bool,
-    pub call_ringtone: String,
 }
 
 impl Preferences {
@@ -21,8 +19,6 @@ impl Preferences {
             v: 1,
             identity: identity.into(),
             enabled: false,
-            calls_enabled: false,
-            call_ringtone: "classic".into(),
         }
     }
 
@@ -36,12 +32,15 @@ impl Preferences {
         }
         let bytes =
             vault::read_private(&path).map_err(|_| "Cannot read notification preferences")?;
-        let value: Self =
+        let mut stored: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "Invalid notification preferences")?;
-        if value.v != 1
-            || value.identity != identity
-            || !["classic", "chime", "pulse", "silent"].contains(&value.call_ringtone.as_str())
-        {
+        if let Some(fields) = stored.as_object_mut() {
+            fields.remove("calls_enabled");
+            fields.remove("call_ringtone");
+        }
+        let value: Self =
+            serde_json::from_value(stored).map_err(|_| "Invalid notification preferences")?;
+        if value.v != 1 || value.identity != identity {
             return Err("Notification preferences do not match this profile".into());
         }
         Ok(Some(value))
@@ -79,8 +78,6 @@ mod tests {
         std::fs::create_dir(&second).unwrap();
         let mut prefs = Preferences::new("profile-a");
         prefs.enabled = true;
-        prefs.calls_enabled = true;
-        prefs.call_ringtone = "chime".into();
         prefs.save(&first).unwrap();
         let registration = root.path().join("push-registration.json");
         std::fs::write(&registration, b"synthetic registration").unwrap();
@@ -91,11 +88,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_opt_out_and_call_only_opt_out_survive_reopening() {
+    fn explicit_opt_out_survives_reopening() {
         let root = tempfile::tempdir().unwrap();
         let mut prefs = Preferences::new("profile-a");
         prefs.enabled = true;
-        prefs.calls_enabled = false;
         prefs.save(root.path()).unwrap();
         assert_eq!(
             Preferences::load(root.path(), "profile-a").unwrap(),
@@ -109,10 +105,31 @@ mod tests {
         assert!(!should_resume(reopened.enabled, true, true, true, 50, 0));
         let value: serde_json::Value =
             serde_json::from_slice(&vault::read_private(&root.path().join(FILE)).unwrap()).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(value.as_object().unwrap().len(), 3);
         for secret in ["token", "owner", "route", "password"] {
             assert!(value.get(secret).is_none());
         }
+    }
+
+    #[test]
+    fn retired_ringing_preferences_do_not_reset_message_notification_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        vault::write_private(
+            &root.path().join(FILE),
+            br#"{"v":1,"identity":"profile-a","enabled":true,"calls_enabled":true,"call_ringtone":"chime"}"#,
+            true,
+        )
+        .unwrap();
+        let prefs = Preferences::load(root.path(), "profile-a")
+            .unwrap()
+            .unwrap();
+        assert!(prefs.enabled);
+        assert!(Preferences::load(root.path(), "profile-b").is_err());
+        prefs.save(root.path()).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&vault::read_private(&root.path().join(FILE)).unwrap()).unwrap();
+        assert!(stored.get("calls_enabled").is_none());
+        assert!(stored.get("call_ringtone").is_none());
     }
 
     #[test]

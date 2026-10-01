@@ -1,4 +1,4 @@
-//! Hosting provisions independent mailboxes and General service identities.
+//! Hosting provisions independent mailboxes and owner-managed General authority.
 //! The replica remains a ciphertext store; no user recovery secret is accepted.
 use super::*;
 use crate::attachments::{AttachmentStorage, AttachmentStorageConfig};
@@ -31,6 +31,13 @@ mod account_deletion;
 mod backup;
 mod calls;
 mod lifecycle;
+mod service;
+use elo_core::public_space::PublicSpaceService;
+use service::HostedService;
+#[cfg(test)]
+mod owner_managed_tests;
+#[cfg(test)]
+mod realtime_tests;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +89,12 @@ struct Reservation {
     #[serde(default = "space_host::default_require_approval")]
     require_approval: bool,
     mailbox: MailboxDescriptor,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority: Option<elo_core::authority::CallAuthorityProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_evidence: Option<elo_core::public_space::AdminEvidence>,
     #[serde(default)]
     invitation: Option<String>,
     #[serde(default)]
@@ -110,7 +122,7 @@ struct HostedSpace {
     replica: ReplicaStore,
     transport: Router,
     serving: RwLock<bool>,
-    client: Mutex<Option<ClientApp>>,
+    client: Mutex<Option<HostedService>>,
     command_slots: Semaphore,
     config: ServiceConfig,
     mailbox: elo_core::ids::MailboxId,
@@ -234,7 +246,7 @@ impl Host {
         &self,
         id: &str,
         reservation: &Reservation,
-        prepared: Option<ClientApp>,
+        prepared: Option<HostedService>,
     ) -> Result<Arc<HostedSpace>> {
         let path = self.config.root.join("spaces").join(id);
         let config: ServiceConfig = serde_json::from_slice(&Zeroizing::new(vault::read_private(
@@ -265,14 +277,30 @@ impl Host {
         let client = match prepared {
             // New provisioning has already authenticated and persisted this profile.
             Some(client) => client,
-            None => {
+            None if reservation.authority.is_some() => {
+                if !reservation.password.is_empty()
+                    || path.join("profile").exists()
+                    || path.join("service-recovery.age").exists()
+                {
+                    return Err("Public-only Space contains an unexpected profile.".into());
+                }
+                let service =
+                    PublicSpaceService::open(path.join("public-service"), self.allow_loopback)?;
+                if config.address.service_credential.as_deref()
+                    != Some(service.transport_credential().as_str())
+                {
+                    return Err("Hosted Space transport signer mismatch.".into());
+                }
+                HostedService::Public(Box::new(service))
+            }
+            None => HostedService::Legacy(Box::new(
                 ClientApp::open(
                     path.join("profile"),
                     reservation.password.clone().into(),
                     self.allow_loopback,
                 )
-                .await?
-            }
+                .await?,
+            )),
         };
         client.set_attachment_storage_available(self.attachment_storage.is_some())?;
         if serde_json::to_value(client.team_scope()?)?
@@ -384,12 +412,25 @@ impl Host {
     ) -> Result<(String, Reservation)> {
         self.provision_from_network(command, creator, None).await
     }
+    #[cfg(test)]
     async fn provision_from_network(
         &self,
         command: &CreateCommand,
         creator: IdentityId,
         network: Option<String>,
     ) -> Result<(String, Reservation)> {
+        self.provision_from_network_inner(command, creator, network, None)
+            .await
+    }
+    async fn provision_from_network_inner(
+        &self,
+        command: &CreateCommand,
+        creator: IdentityId,
+        network: Option<String>,
+        creation_evidence: Option<elo_core::public_space::AdminEvidence>,
+    ) -> Result<(String, Reservation)> {
+        // Never allocate a new server-owned profile, including through internal callers.
+        require_owner_managed_creation(command)?;
         let id = reservation_id(creator, &command.request_id);
         let path = self.config.root.join("spaces").join(&id);
         if self
@@ -471,7 +512,13 @@ impl Host {
                 message_lifetime_seconds: command.message_lifetime_seconds,
                 require_approval: command.require_approval,
                 mailbox: MailboxDescriptor::random()?,
-                password: record::random_hex::<32>()?,
+                password: if command.authority.is_some() {
+                    String::new()
+                } else {
+                    record::random_hex::<32>()?
+                },
+                authority: command.authority.clone(),
+                creation_evidence,
                 invitation: None,
                 invitation_issued: 0,
                 reserved_at: current()?,
@@ -501,6 +548,8 @@ impl Host {
             || reservation.contact_email.as_deref() != Some(&command.contact_email)
             || reservation.message_lifetime_seconds != command.message_lifetime_seconds
             || reservation.require_approval != command.require_approval
+            || serde_json::to_value(&reservation.authority)?
+                != serde_json::to_value(&command.authority)?
         {
             return Err("Creation request cannot be changed.".into());
         }
@@ -527,30 +576,51 @@ impl Host {
                     read_token: Some(reservation.mailbox.read_token.clone()),
                     write_token: Some(reservation.mailbox.write_token.clone()),
                 };
-                // Only General's service holds a sending capability. New members
-                // receive the full Space descriptor in their encrypted reply.
-                let draft = ProfileDraft::new()?.with_peer(
-                    PeerDescriptor {
-                        read_token: None,
-                        ..peer.clone()
-                    },
-                    self.allow_loopback,
-                )?;
-                self.save_service_recovery(&path, &draft)?;
-                let client = draft
-                    .save_named(
-                        profile,
-                        reservation.password.clone().into(),
-                        "General",
-                        "elo.now",
-                    )
-                    .await?;
+                let client = if let Some(proof) = &reservation.authority {
+                    let directory = path.join("public-service");
+                    if directory.exists() {
+                        private_directory(&directory)?;
+                        std::fs::remove_dir_all(&directory)?;
+                    }
+                    HostedService::Public(Box::new(PublicSpaceService::create(
+                        directory,
+                        proof.clone(),
+                        &[creator],
+                        reservation.contact_email.clone(),
+                        self.allow_loopback,
+                        reservation.creation_evidence.clone(),
+                    )?))
+                } else {
+                    // Only General's service holds a sending capability. New members
+                    // receive the full Space descriptor in their encrypted reply.
+                    let draft = ProfileDraft::new()?.with_peer(
+                        PeerDescriptor {
+                            read_token: None,
+                            ..peer.clone()
+                        },
+                        self.allow_loopback,
+                    )?;
+                    self.save_service_recovery(&path, &draft)?;
+                    let client = draft
+                        .save_named(
+                            profile,
+                            reservation.password.clone().into(),
+                            "General",
+                            "elo.now",
+                        )
+                        .await?;
+                    HostedService::Legacy(Box::new(client))
+                };
                 let config = ServiceConfig {
                     name: reservation.name.clone(),
                     address: SpaceAddress {
                         url: format!("{}/spaces/{id}/team/v1/spaces", self.config.public_url),
                         scope: client.team_scope()?,
                         message_lifetime_seconds: reservation.message_lifetime_seconds,
+                        service_credential: match &client {
+                            HostedService::Public(service) => Some(service.transport_credential()),
+                            HostedService::Legacy(_) => None,
+                        },
                     },
                     owners: vec![creator],
                     contact_email: reservation.contact_email.clone(),
@@ -592,6 +662,12 @@ impl Host {
         Ok((id, reservation))
     }
 }
+fn require_owner_managed_creation(command: &CreateCommand) -> Result<()> {
+    if command.v != 2 || command.authority.is_none() {
+        return Err("Owner-managed Space creation requires an updated app.".into());
+    }
+    Ok(())
+}
 async fn create(
     State(host): State<Arc<Host>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
@@ -609,6 +685,7 @@ async fn create(
         current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
+    require_owner_managed_creation(&command).map_err(|_| StatusCode::UPGRADE_REQUIRED)?;
     if credential.authorizing_device().is_some() {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -628,10 +705,14 @@ async fn create(
         .try_lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let (_, reservation) = host
-        .provision_from_network(
+        .provision_from_network_inner(
             &command,
             credential.identity(),
             Some(creation_network(peer.map(|peer| peer.0.0.ip()), &headers)),
+            Some(elo_core::public_space::AdminEvidence {
+                record: request.record.clone(),
+                credential: request.credential.clone(),
+            }),
         )
         .await
         .map_err(|e| {
@@ -1100,7 +1181,33 @@ async fn replica_request(
     space.transport.clone().oneshot(request).await.unwrap()
 }
 
+impl elo_core::realtime::Resolver for Host {
+    fn resolve<'a>(
+        &'a self,
+        replica: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ReplicaStore>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let id = replica
+                .strip_prefix("/spaces/")?
+                .strip_suffix("/replica/")?;
+            id.parse::<ObjectId>().ok()?;
+            let space = self.spaces.read().await.get(id).cloned()?;
+            if !*space.serving.read().await {
+                return None;
+            }
+            Some(space.replica.clone())
+        })
+    }
+}
+
 fn app(host: Arc<Host>) -> Router {
+    let realtime = elo_core::realtime::Server::new(
+        &host.config.public_url,
+        elo_core::realtime::HOST_PATH,
+        host.clone(),
+    )
+    .router();
     Router::new()
         .route(elo_core::client_policy::PATH, get(client_policy))
         .route("/spaces/v1/create", post(create))
@@ -1112,7 +1219,10 @@ fn app(host: Arc<Host>) -> Router {
             elo_core::app::account_deletion::STATUS_PATH,
             post(account_deletion::status),
         )
-        .route("/spaces/{id}/team/v1/spaces", post(command))
+        .route(
+            "/spaces/{id}/team/v1/spaces",
+            post(command).layer(DefaultBodyLimit::max(2 * record::MAX_RECORD)),
+        )
         .route(
             "/spaces/{id}/attachments/v1/upload",
             axum::routing::put(attachment_upload).layer(DefaultBodyLimit::disable()),
@@ -1125,13 +1235,15 @@ fn app(host: Arc<Host>) -> Router {
         .layer(DefaultBodyLimit::max(space_host::CREATE_LIMIT))
         .fallback(replica_request)
         .with_state(host)
+        .merge(realtime)
 }
 async fn client_policy(State(host): State<Arc<Host>>) -> impl IntoResponse {
     // No identity, device ID or authentication is needed for discovery.
     // Unknown additive fields must be ignored by clients of this v1 schema.
     let mut value = serde_json::to_value(&host.config.client_policy).unwrap();
     value["api"] = json!({"hosting":[1],"replica":[1],"calls":[1],"notifications":[1]});
-    value["security"] = json!({"mailbox_request_proof":2,"retention_access":2,"voip_ownership":1,"space_creation_work":1});
+    value["security"] =
+        json!({"mailbox_request_proof":2,"retention_access":2,"space_creation_work":1});
     ([(header::CACHE_CONTROL, "no-store")], Json(value))
 }
 pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<()> {
@@ -1264,6 +1376,38 @@ mod tests {
         client.begin_space_setup().await.unwrap();
         client
     }
+    pub(super) async fn creation_command(
+        path: &FilePath,
+        name: &str,
+    ) -> (
+        CreateCommand,
+        IdentityId,
+        elo_core::public_space::AdminEvidence,
+    ) {
+        let owner = profile(path).await;
+        let endpoint = "https://host.example.test/spaces/v1/create";
+        let request = owner
+            .hosted_create_request(
+                endpoint,
+                &"11".repeat(16),
+                name,
+                "owner@example.test",
+                86400,
+                true,
+            )
+            .unwrap();
+        let (command, credential) =
+            space_host::verify_create(&request, endpoint, current().unwrap()).unwrap();
+        owner.close().await.unwrap();
+        (
+            command,
+            credential.identity(),
+            elo_core::public_space::AdminEvidence {
+                record: request.record,
+                credential: request.credential,
+            },
+        )
+    }
     pub(super) async fn close_host(host: Arc<Host>) {
         for (_, space) in std::mem::take(&mut *host.spaces.write().await) {
             Arc::try_unwrap(space)
@@ -1331,17 +1475,8 @@ mod tests {
             attachment_storage: None,
             recovery_recipient: None,
         };
-        let command = CreateCommand {
-            v: 1,
-            kind: "space.create".into(),
-            host: "https://host.example.test/spaces/v1/create".into(),
-            request_id: "11".repeat(16),
-            issued: current().unwrap(),
-            name: "Capacity test".into(),
-            contact_email: "owner@example.test".into(),
-            message_lifetime_seconds: 86400,
-            require_approval: true,
-        };
+        let (command, creator, evidence) =
+            creation_command(&temp.path().join("creator"), "Capacity test").await;
         let host = Host::open(config.clone(), false).await.unwrap();
         for id in ["11", "22"] {
             let error = host
@@ -1419,7 +1554,7 @@ mod tests {
             assert_eq!(error.to_string(), "Hosting capacity reached.");
         }
         let other = creation_network(Some("192.0.2.2".parse().unwrap()), &HeaderMap::new());
-        host.provision_from_network(&command, "77".repeat(32).parse().unwrap(), Some(other))
+        host.provision_from_network_inner(&command, creator, Some(other), Some(evidence))
             .await
             .unwrap();
         close_host(host).await;
@@ -1581,7 +1716,7 @@ mod tests {
         let pending = source.poll().await.unwrap();
         let request = &pending["requests"][0];
         source
-            .accept(&owner, request["id"].as_str().unwrap())
+            .accept(&mut owner, request["id"].as_str().unwrap())
             .await
             .unwrap();
         target.poll().await.unwrap();
@@ -1591,8 +1726,8 @@ mod tests {
             .unwrap();
         assert!(linked.password_matches(&PASSWORD.into()));
         assert!(
-            PairSource::new(&linked).await.is_err(),
-            "companions cannot delegate again"
+            PairSource::new(&linked).await.is_ok(),
+            "an admitted owner device can link another device"
         );
         linked.enable_spaces().await.unwrap();
         assert_eq!(linked.identity_id(), owner.identity_id());
@@ -1694,7 +1829,7 @@ mod tests {
                 .unwrap()["name"],
             "New device"
         );
-        assert_eq!(linked.linked_devices().await.unwrap()["can_link"], false);
+        assert_eq!(linked.linked_devices().await.unwrap()["can_link"], true);
         let retired = roster["devices"]
             .as_array()
             .unwrap()
@@ -1734,13 +1869,27 @@ mod tests {
                 &target,
             )
             .unwrap();
-            let service = host.spaces.read().await.values().next().unwrap().clone();
+            let view = owner.view().await.unwrap();
+            let general = view["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|stream| stream["is_general"] == true)
+                .unwrap();
+            let service = host
+                .spaces
+                .read()
+                .await
+                .values()
+                .find(|service| json!(service.config.address.scope.space) == general["space"])
+                .unwrap()
+                .clone();
             let nonce = record::random_hex::<16>().unwrap();
             let command = SignedRecord::sign(
                 &serde_json::to_vec(&json!({
                     "v":1,"kind":"space.command","space":service.config.address.scope.space,
                     "nonce":nonce,"issued":super::current().unwrap(),"action":"device_revoke",
-                    "body":{"proof":STANDARD.encode(proof.bytes())}
+                    "body":{"authority_head":general["head"],"proof":STANDARD.encode(proof.bytes())}
                 }))
                 .unwrap(),
                 unadmitted.signing_key(),
@@ -1775,7 +1924,7 @@ mod tests {
             let rejected: Value = serde_json::from_slice(&plain).unwrap();
             assert_eq!(
                 rejected["error"],
-                "Join this Space using an invitation first."
+                "This device is no longer admitted to the Space."
             );
             assert!(host.revocations.get(retired_id).unwrap().is_none());
         }
@@ -1861,10 +2010,21 @@ mod tests {
         struct ReadOutageStorage {
             inner: Arc<dyn AttachmentStorage>,
             unavailable: std::sync::atomic::AtomicBool,
+            reject_uploads: std::sync::atomic::AtomicBool,
         }
         #[async_trait::async_trait]
         impl AttachmentStorage for ReadOutageStorage {
             async fn put(&self, space: &str, object: &str, body: Body, size: u64) -> Result<()> {
+                if self
+                    .reject_uploads
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Provider upload timeout",
+                    )
+                    .into());
+                }
                 self.inner.put(space, object, body, size).await
             }
             async fn get(
@@ -1911,6 +2071,7 @@ mod tests {
         let storage = Arc::new(ReadOutageStorage {
             inner: host.attachment_storage.as_ref().unwrap().clone(),
             unavailable: std::sync::atomic::AtomicBool::new(false),
+            reject_uploads: std::sync::atomic::AtomicBool::new(false),
         });
         Arc::get_mut(&mut host).unwrap().attachment_storage = Some(storage.clone());
         let task = tokio::spawn(axum::serve(listener, app(host.clone())).into_future());
@@ -1950,12 +2111,35 @@ mod tests {
         let input = temp.path().join("family-photo.txt");
         let content = b"ciphertext belongs in external attachment storage".repeat(500);
         std::fs::write(&input, &content).unwrap();
+        let activity = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        // Rejected display metadata must never appear in a remote placeholder.
+        for name in [
+            "../private.txt".to_owned(),
+            "unsafe\nname.txt".into(),
+            "x".repeat(256),
+        ] {
+            let observed = activity.clone();
+            assert!(owner
+                .operate_attachment_transfer_with_activity(
+                    json!({
+                        "op":"attachment_upload", "space":general["space"], "stream":general["stream"],
+                        "path":input, "name":name
+                    }),
+                    elo_core::app::AttachmentCancellation::default(),
+                    |_, _| {},
+                    move |event| observed.lock().unwrap().push(json!(event)),
+                )
+                .await
+                .is_err());
+            assert!(activity.lock().unwrap().is_empty());
+        }
         // Cancel from the first emitted ciphertext bytes, not before starting.
         // The independent cancellation handle must stop without committing a row.
         let cancellation = elo_core::app::AttachmentCancellation::default();
         let cancel_upload = cancellation.clone();
+        let observed = activity.clone();
         let cancelled = owner
-            .operate_attachment_transfer(
+            .operate_attachment_transfer_with_activity(
                 json!({
                     "op":"attachment_upload", "space":general["space"], "stream":general["stream"],
                     "path":input, "name":"family-photo.txt"
@@ -1966,6 +2150,7 @@ mod tests {
                         cancel_upload.cancel();
                     }
                 },
+                move |event| observed.lock().unwrap().push(json!(event)),
             )
             .await;
         assert!(
@@ -1974,6 +2159,16 @@ mod tests {
                 .to_string()
                 .contains("Attachment transfer cancelled")
         );
+        {
+            let events = activity.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["state"], "uploading");
+            assert_eq!(events[0]["name"], "family-photo.txt");
+            assert_eq!(events[0]["size_bytes"], content.len());
+            assert!(events[0]["created_at_ms"].as_u64().unwrap() > 0);
+            assert_eq!(events[1]["state"], "cancelled");
+            assert_eq!(events[0]["attachment_id"], events[1]["attachment_id"]);
+        }
         let cancelled_history = owner
             .operate(json!({"op":"history_page", "space":general["space"],
             "stream":general["stream"], "expected_identity":owner.identity_id()}))
@@ -2019,8 +2214,12 @@ mod tests {
         }
 
         owner.enable_paged_views();
+        activity.lock().unwrap().clear();
+        let observed = activity.clone();
+        let cancellation = elo_core::app::AttachmentCancellation::default();
+        let late_cancel = cancellation.clone();
         let uploaded = owner
-            .operate_attachment_transfer(
+            .operate_attachment_transfer_with_activity(
                 json!({
                     "op":"attachment_upload",
                     "space":general["space"],
@@ -2030,12 +2229,35 @@ mod tests {
                     "expected_identity":owner.identity_id(),
                     "expected_space":view["active_space"]
                 }),
-                elo_core::app::AttachmentCancellation::default(),
+                cancellation,
                 |_, _| {},
+                move |event| {
+                    if matches!(&event, elo_core::app::AttachmentActivity::Ready { .. }) {
+                        // A cancellation racing the committed result must never
+                        // produce a second terminal state or lose the message.
+                        late_cancel.cancel();
+                    }
+                    observed.lock().unwrap().push(json!(event));
+                },
             )
             .await
             .unwrap();
         let record = uploaded["result"]["record"].as_str().unwrap().to_owned();
+        {
+            let events = activity.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["state"], "uploading");
+            assert_eq!(events[1]["state"], "ready");
+            assert_eq!(
+                events[0]["attachment_id"],
+                uploaded["result"]["attachment_id"]
+            );
+            assert_eq!(
+                events[1]["attachment_id"],
+                uploaded["result"]["attachment_id"]
+            );
+            assert_eq!(events[1]["record"], record);
+        }
         assert_eq!(uploaded["view"]["identity"], json!(owner.identity_id()));
         assert_eq!(uploaded["view"]["active_space"], view["active_space"]);
         assert_eq!(uploaded["view"]["paged"], true);
@@ -2209,6 +2431,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(second_output).unwrap(), content);
+        activity.lock().unwrap().clear();
+        let observed = activity.clone();
+        storage
+            .reject_uploads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed_upload = owner
+            .operate_attachment_transfer_with_activity(
+                json!({
+                    "op":"attachment_upload", "space":general["space"], "stream":general["stream"],
+                    "path":input, "name":"unavailable-upload.txt"
+                }),
+                elo_core::app::AttachmentCancellation::default(),
+                |_, _| {},
+                move |event| observed.lock().unwrap().push(json!(event)),
+            )
+            .await;
+        assert!(failed_upload.is_err());
+        {
+            let events = activity.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["state"], "uploading");
+            assert_eq!(events[1]["state"], "interrupted");
+            assert_eq!(events[0]["attachment_id"], events[1]["attachment_id"]);
+        }
+        let failed_history = owner
+            .operate(json!({"op":"history_page", "space":general["space"],
+                "stream":general["stream"], "expected_identity":owner.identity_id()}))
+            .await
+            .unwrap();
+        assert!(
+            failed_history["history"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["body"]["filename"] != "unavailable-upload.txt")
+        );
         task.abort();
         let _ = task.await;
         let cached_request = json!({"space":general["space"],"stream":general["stream"],"record":record,
@@ -2279,10 +2537,13 @@ mod tests {
             .await
             .unwrap();
         let invite = owner.operate(json!({"op":"space_invite","id":space,"body":{"lifetime":86400,"require_approval":false}})).await.unwrap()["result"]["link"].clone();
-        let joined = guest
+        let pending = guest
             .operate(json!({"op":"space_join","link":invite}))
             .await
             .unwrap();
+        assert_eq!(pending["view"]["spaces"][0]["status"], "pending");
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        let joined = guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         assert_eq!(joined["view"]["spaces"][0]["status"], "joined");
         let chat = joined["view"]["streams"]
             .as_array()
@@ -2566,7 +2827,8 @@ mod tests {
         )
         .unwrap();
         let changed = CreateCommand {
-            v: 1,
+            authority: reservation.authority,
+            v: 2,
             kind: "space.create".into(),
             host: format!("{base}/spaces/v1/create"),
             request_id: reservation.request_id,
@@ -2600,14 +2862,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(preview["preview"]["require_approval"], false);
-        let joined = guest
+        let pending = guest
             .operate(json!({"op":"space_join","link":invitation}))
             .await
             .unwrap();
+        assert_eq!(pending["view"]["spaces"][0]["status"], "pending");
+        let mut owner = ClientApp::open(temp.path().join("owner"), PASSWORD.into(), true)
+            .await
+            .unwrap();
+        owner.enable_spaces().await.unwrap();
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        let joined = guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         assert_eq!(joined["view"]["spaces"][0]["status"], "joined");
         assert_eq!(joined["view"]["spaces"][0]["role"], "member");
         assert_eq!(joined["view"]["space_setup"], false);
         guest.close().await.unwrap();
+        owner.close().await.unwrap();
         task.abort();
         let _ = task.await;
         close_host(host).await;
@@ -2877,6 +3147,45 @@ mod tests {
         owner.operate(json!({"op":"space_role_change","id":space,"body":{"revision":0,"kind":"make_owner","target":guest.identity_id()}})).await.unwrap();
         guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         assert_eq!(guest.view().await.unwrap()["spaces"][0]["role"], "owner");
+        // A promoted owner from another profile must publish admission without
+        // requiring the original owner to come online or refresh its General.
+        let mut third = profile(&temp.path().join("third")).await;
+        let invite = guest
+            .operate(json!({"op":"space_invite","id":space,"body":{"lifetime":86400,"require_approval":true}}))
+            .await
+            .unwrap();
+        let pending = third
+            .operate(json!({"op":"space_join","link":invite["result"]["link"]}))
+            .await
+            .unwrap();
+        assert_eq!(pending["view"]["spaces"][0]["status"], "pending");
+        let management = guest
+            .operate(json!({"op":"space_manage","id":space,"body":{}}))
+            .await
+            .unwrap();
+        let request = management["result"]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["identity"] == json!(third.identity_id()))
+            .unwrap();
+        guest
+            .operate(
+                json!({"op":"space_decide","id":space,"body":{"id":request["id"],"approve":true}}),
+            )
+            .await
+            .unwrap();
+        let admitted = third.operate(json!({"op":"space_refresh"})).await.unwrap();
+        assert_eq!(admitted["view"]["spaces"][0]["status"], "joined");
+        assert!(
+            admitted["view"]["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stream| stream["is_general"] == true && stream["space"] == space),
+            "the promoted owner independently admits the third profile to General"
+        );
+        third.close().await.unwrap();
         owner.operate(json!({"op":"space_role_change","id":space,"body":{"revision":1,"kind":"transfer_primary","target":guest.identity_id()}})).await.unwrap();
         let status = guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         let request = &status["view"]["space_role_requests"][0];

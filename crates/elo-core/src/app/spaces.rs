@@ -270,6 +270,7 @@ impl ClientApp {
             }
             self.ensure_peer(peer)?;
             let address = SpaceAddress {
+                service_credential: team.service_credential.clone(),
                 url: team.url.replace("/team/v1/enroll", "/team/v1/spaces"),
                 scope: team.scope.clone(),
                 message_lifetime_seconds: team.message_lifetime_seconds,
@@ -328,6 +329,7 @@ impl ClientApp {
             )?))?
         } else {
             let address = self.team.as_ref().map(|team| SpaceAddress {
+                service_credential: team.service_credential.clone(),
                 url: team.url.replace("/team/v1/enroll", "/team/v1/spaces"),
                 scope: team.scope.clone(),
                 message_lifetime_seconds: team.message_lifetime_seconds,
@@ -546,6 +548,7 @@ impl ClientApp {
         // No reusable enrollment token is stored in a joined Space. Future
         // discovery accepts only the pinned administrator's signed membership.
         self.configure_team(team::TeamDescriptor {
+            service_credential: address.service_credential.clone(),
             v: 1,
             url: address.url.replace("/team/v1/spaces", "/team/v1/enroll"),
             token: "00".repeat(32),
@@ -655,6 +658,9 @@ impl Spaces {
     }
     pub(super) fn children(&self) -> &BTreeMap<String, ClientApp> {
         &self.children
+    }
+    pub(super) fn children_mut(&mut self) -> &mut BTreeMap<String, ClientApp> {
+        &mut self.children
     }
     fn selected_child_id(&self) -> Result<Option<&str>> {
         let id = self
@@ -1120,13 +1126,9 @@ impl Spaces {
                     child.accept_space_enrollment(enrollment).await?;
                     if let Some(genesis) = &self.catalog.personal_genesis {
                         let signed = decode_record(genesis)?;
-                        let body: SpaceGenesis = signed.decode()?;
-                        if root.session.can_control(signed.id().to_string().parse()?)
-                            && !child.pins.iter().any(|pin| {
-                                body.owners
-                                    .iter()
-                                    .any(|owner| pin.root == owner.root_public_key)
-                            })
+                        let personal_space = signed.id().to_string().parse()?;
+                        if root.session.can_control(personal_space)
+                            && !child.pins.iter().any(|pin| pin.space == personal_space)
                         {
                             child.seed_personal_chat(genesis).await?;
                         }
@@ -1311,6 +1313,27 @@ impl Spaces {
         let id = self
             .add_joined(root, invite.address.clone(), response)
             .await?;
+        // Control is granted only in this locally initiated creation path, not
+        // while importing a roster into an ordinary restored profile.
+        let created = root.owner_general_creation(&intent.request_id)?;
+        let expected = created.verify(invite.address.scope.space, invite.address.scope.stream)?;
+        if let Some(child) = self.children.get_mut(&id) {
+            let authority = child
+                .authorities
+                .0
+                .iter()
+                .find(|a| a.space() == expected.space() && a.stream() == expected.stream())
+                .ok_or("General unavailable.")?;
+            if authority.genesis().id() != expected.genesis().id()
+                || !authority.can_manage(child.session.credential().id())
+            {
+                return Err("Invalid Space ownership.".into());
+            }
+            child
+                .session
+                .activate_new_space_controller(expected.space())?;
+            child.persist_vault()?;
+        }
         self.catalog.active = Some(id.clone());
         self.catalog.creation.as_mut().unwrap().space = Some(id);
         self.save(root)?;
@@ -1339,6 +1362,17 @@ impl Spaces {
     ) -> Result<bool> {
         let Some(address) = entry.address else {
             return Ok(false);
+        };
+        // Foreground discovery keeps its short read-only deadline. Membership
+        // commits run during regular synchronization or an explicit decision.
+        let owner_sync_failed = if foreground {
+            false
+        } else if entry.root {
+            root.sync_owner_general(&address).await.is_err()
+        } else if let Some(child) = self.children.get_mut(&entry.id) {
+            child.sync_owner_general(&address).await.is_err()
+        } else {
+            false
         };
         // Only the read-only network request is cancellable. Verified
         // enrollment, revocation and local journal commits finish normally.
@@ -1401,7 +1435,7 @@ impl Spaces {
         {
             e.requests = manage["requests"].as_array().map(Vec::len).unwrap_or(0);
         }
-        Ok(false)
+        Ok(owner_sync_failed)
     }
     pub(super) fn history_clients<'a>(
         &'a self,
@@ -1423,15 +1457,17 @@ impl Spaces {
             .collect();
         (self.catalog.active.clone(), clients)
     }
-    pub(super) async fn operate_attachment_transfer<F>(
+    pub(super) async fn operate_attachment_transfer<F, A>(
         &mut self,
         root: &mut ClientApp,
         v: &Value,
         cancellation: AttachmentCancellation,
         progress: F,
+        activity: A,
     ) -> Result<Value>
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
+        A: Fn(AttachmentActivity) + Send + Sync + 'static,
     {
         if v.get("expected_identity")
             .is_some_and(|id| id != &json!(root.identity_id()))
@@ -1457,8 +1493,14 @@ impl Spaces {
             .ok_or("Attachments are not available in this Space.")?;
         let result = if entry.root {
             if op == "attachment_upload" {
-                root.upload_attachment_observed(&address, v, cancellation, progress)
-                    .await?
+                root.upload_attachment_observed_with_activity(
+                    &address,
+                    v,
+                    cancellation,
+                    progress,
+                    activity,
+                )
+                .await?
             } else {
                 root.download_attachment_observed(&address, v, cancellation, progress)
                     .await?
@@ -1467,7 +1509,13 @@ impl Spaces {
             let child = self.children.get_mut(&id).ok_or("Space unavailable.")?;
             if op == "attachment_upload" {
                 child
-                    .upload_attachment_observed(&address, v, cancellation, progress)
+                    .upload_attachment_observed_with_activity(
+                        &address,
+                        v,
+                        cancellation,
+                        progress,
+                        activity,
+                    )
                     .await?
             } else {
                 child
@@ -1653,6 +1701,33 @@ impl Spaces {
                     .clone()
                     .ok_or("This Space has no invitation service.")?;
                 let action = op.strip_prefix("space_").ok_or("Invalid action.")?;
+                let entry_root = entry.root;
+                let mut body = v["body"].clone();
+                if address.service_credential.is_some()
+                    && matches!(
+                        action,
+                        "invite" | "revoke" | "decide" | "role_change" | "role_decide"
+                    )
+                {
+                    let client = if entry_root {
+                        &*root
+                    } else {
+                        self.children.get(id).ok_or("Space unavailable.")?
+                    };
+                    let authority = client
+                        .authorities
+                        .0
+                        .iter()
+                        .find(|a| {
+                            a.space() == address.scope.space && a.stream() == address.scope.stream
+                        })
+                        .ok_or("General unavailable.")?;
+                    body["authority_head"] = json!(authority.head_id());
+                    if action == "invite" {
+                        body["id"] = json!(record::random_hex::<16>()?);
+                        body["token"] = json!(record::random_hex::<32>()?);
+                    }
+                }
                 if matches!(
                     op,
                     "space_decide" | "space_role_change" | "space_role_decide" | "space_delete"
@@ -1666,7 +1741,47 @@ impl Spaces {
                         client.invalidate_membership_checks().await;
                     }
                 }
-                result["result"] = root.call_space(&address, action, v["body"].clone()).await?;
+                let response = root.call_space(&address, action, body.clone()).await;
+                result["result"] = match response {
+                    Err(error)
+                        if address.service_credential.is_some()
+                            && body.get("authority_head").is_some()
+                            && error.to_string()
+                                == "General permissions have changed. Refresh and try again." =>
+                    {
+                        // Another owner device may have committed since our last
+                        // poll. Retry once after verifying its signed head; keep
+                        // the user's exact intent and role revision unchanged.
+                        let client = if entry_root {
+                            &mut *root
+                        } else {
+                            self.children.get_mut(id).ok_or("Space unavailable.")?
+                        };
+                        client.sync_owner_general(&address).await?;
+                        let authority = client
+                            .authorities
+                            .0
+                            .iter()
+                            .find(|a| {
+                                a.space() == address.scope.space
+                                    && a.stream() == address.scope.stream
+                            })
+                            .ok_or("General unavailable.")?;
+                        body["authority_head"] = json!(authority.head_id());
+                        root.call_space(&address, action, body).await?
+                    }
+                    response => response?,
+                };
+                if matches!(
+                    op,
+                    "space_decide" | "space_role_change" | "space_role_decide"
+                ) {
+                    if entry_root {
+                        root.sync_owner_general(&address).await?;
+                    } else if let Some(child) = self.children.get_mut(id) {
+                        child.sync_owner_general(&address).await?;
+                    }
+                }
                 if matches!(
                     result["result"]["status"].as_str(),
                     Some("deleted" | "removed")
@@ -2231,6 +2346,7 @@ mod tests {
         let config = ServiceConfig {
             name: "Permission test".into(),
             address: SpaceAddress {
+                service_credential: None,
                 url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
                 scope: server.team_scope().unwrap(),
                 message_lifetime_seconds: 86400,
@@ -2466,6 +2582,7 @@ mod tests {
                 root: false,
                 status: "pending".into(),
                 address: Some(SpaceAddress {
+                    service_credential: None,
                     url: format!("http://{address}/spaces/{pending}/team/v1/spaces"),
                     scope: scope.clone(),
                     message_lifetime_seconds: 86_400,
@@ -2490,6 +2607,7 @@ mod tests {
         // Even this Space's stalled status endpoint must not delay receiving
         // a tapped invitation. Normal discovery still refreshes that status.
         user.spaces.as_mut().unwrap().catalog.entries[1].address = Some(SpaceAddress {
+            service_credential: None,
             url: format!("http://{address}/spaces/{}/team/v1/spaces", scope.space),
             scope,
             message_lifetime_seconds: 86_400,
@@ -2572,6 +2690,7 @@ mod tests {
                 owner: false,
                 contact_email: None,
                 address: Some(SpaceAddress {
+                    service_credential: None,
                     url: format!("http://{address}/spaces/{id}/team/v1/spaces"),
                     scope: team::TeamScope {
                         space: id.parse().unwrap(),
@@ -2658,6 +2777,7 @@ mod tests {
             .await
             .unwrap();
         let address = SpaceAddress {
+            service_credential: None,
             url: "http://127.0.0.1:9/team/v1/spaces".into(),
             scope: team::TeamScope {
                 space: id.parse().unwrap(),
@@ -2934,6 +3054,7 @@ mod tests {
             configurations.push(ServiceConfig {
                 name: name.into(),
                 address: SpaceAddress {
+                    service_credential: None,
                     url: service_url,
                     scope: server.team_scope().unwrap(),
                     message_lifetime_seconds: 86_400,
@@ -2987,6 +3108,7 @@ mod tests {
             .join_default_space(
                 a.peer.clone(),
                 team::TeamDescriptor {
+                    service_credential: None,
                     v: 1,
                     url: a.address.url.replace("/spaces", "/enroll"),
                     token: "fe".repeat(32),

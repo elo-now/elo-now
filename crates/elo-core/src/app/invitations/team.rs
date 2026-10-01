@@ -19,6 +19,8 @@ pub struct TeamDescriptor {
     pub token: String,
     pub scope: TeamScope,
     pub message_lifetime_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_credential: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +69,16 @@ impl TeamDescriptor {
         if root_key(&self.scope.root)?.is_weak() {
             return Err("Invalid team key.".into());
         }
+        if let Some(encoded) = &self.service_credential {
+            if encoded.len() > 8192 {
+                return Err("Invalid Space service credential.".into());
+            }
+            let signed = decode_record(encoded)?;
+            VerifiedCredential::verify(
+                signed.bytes(),
+                &root_key(field(signed.body(), "root_public_key")?)?,
+            )?;
+        }
         Ok(())
     }
 }
@@ -100,6 +112,9 @@ impl ClientApp {
         &mut self,
         reply: EnrollmentReply,
     ) -> Result<()> {
+        if reply.v == 2 {
+            return self.accept_owner_general(&reply.packet).await;
+        }
         if reply.v != 1 {
             return Err("Unsupported Space enrollment.".into());
         }
@@ -124,7 +139,11 @@ impl ClientApp {
             space: authority.space(),
             stream: authority.stream(),
             root: self.pins[0].root.clone(),
-            controller: authority.controller().id(),
+            controller: if authority.is_owner_managed() {
+                authority.initial_controller().id()
+            } else {
+                authority.controller().id()
+            },
         })
     }
     pub(super) fn team_joined(&self) -> bool {
@@ -132,7 +151,11 @@ impl ClientApp {
             self.authorities.0.iter().any(|a| {
                 a.space() == team.scope.space
                     && a.stream() == team.scope.stream
-                    && a.controller().id() == team.scope.controller
+                    && (if a.is_owner_managed() {
+                        a.initial_controller().id()
+                    } else {
+                        a.controller().id()
+                    }) == team.scope.controller
                     && a.head().is_ok_and(|h| {
                         h.members.iter().any(|m| {
                             m.identity_id == self.session.identity_id()
@@ -624,6 +647,7 @@ mod tests {
             write_token: Some(mailbox.write_token.clone()),
         };
         let descriptor = TeamDescriptor {
+            service_credential: None,
             v: 1,
             url: "http://127.0.0.1:9/team/v1/enroll".into(),
             token: "ab".repeat(32),
@@ -812,6 +836,7 @@ mod tests {
         maya.ensure_peer(peer).unwrap();
         let scope = server.team_scope().unwrap();
         let descriptor = TeamDescriptor {
+            service_credential: None,
             v: 1,
             url: "http://127.0.0.1:9/team/v1/enroll".into(),
             token: "ab".repeat(32),

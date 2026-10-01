@@ -1,12 +1,15 @@
 //! Short, session-local permission leases. No background polling or disk cache.
 use super::*;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 const LEASE: Duration = Duration::from_secs(30);
 const FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_ENTRIES: usize = 64;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Key {
     address: String,
     credential: RecordId,
@@ -54,12 +57,53 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
+type ScopeKeys = BTreeMap<(SpaceId, StreamId), Key>;
+
+#[derive(Clone, Default)]
 pub(super) struct MembershipChecks {
     // Sharing the lock across the request coalesces concurrent misses. The
     // native app already serializes mutations within one Space client.
-    entries: tokio::sync::Mutex<Vec<Entry>>,
-    generation: std::sync::atomic::AtomicU64,
+    entries: Arc<tokio::sync::Mutex<Vec<Entry>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    snapshot_keys: Arc<RwLock<Option<ScopeKeys>>>,
+    focused: Arc<RwLock<Option<(SpaceId, StreamId)>>>,
+}
+
+#[derive(Default)]
+pub(super) struct MembershipSnapshot {
+    checks: MembershipChecks,
+    // None is exclusively a standalone client without a host. A hosted client
+    // whose key cannot be captured has no matching key and fails closed.
+    keys: Option<ScopeKeys>,
+}
+
+impl MembershipSnapshot {
+    pub(super) fn allows(&self, space: SpaceId, stream: StreamId) -> bool {
+        let Ok(current) = self.checks.snapshot_keys.try_read() else {
+            return false;
+        };
+        let Some(keys) = &self.keys else {
+            return current.is_none();
+        };
+        let Some(key) = keys.get(&(space, stream)) else {
+            return false;
+        };
+        if current.as_ref().and_then(|keys| keys.get(&(space, stream))) != Some(key) {
+            return false;
+        }
+        let Ok(entries) = self.checks.entries.try_lock() else {
+            return false;
+        };
+        entries
+            .iter()
+            .any(|entry| entry.key == *key && entry.outcome.is_ok() && entry.started.fresh(LEASE))
+    }
+
+    pub(super) fn prioritize(&self, scope: Option<(SpaceId, StreamId)>) {
+        if let Ok(mut focused) = self.checks.focused.try_write() {
+            *focused = scope;
+        }
+    }
 }
 
 pub(super) struct MembershipProbe {
@@ -70,6 +114,29 @@ pub(super) struct MembershipProbe {
 }
 
 impl ClientApp {
+    pub(super) fn membership_snapshot(&self) -> MembershipSnapshot {
+        let keys = self.call_host.as_ref().map(|_| {
+            self.authorities
+                .0
+                .iter()
+                .filter_map(|authority| {
+                    self.membership_key(authority)
+                        .ok()
+                        .map(|key| ((key.space, key.stream), key))
+                })
+                .collect::<ScopeKeys>()
+        });
+        // Publishing new permission keys also invalidates older immutable live
+        // snapshots, even while an old positive lease remains in the cache.
+        if let Ok(mut current) = self.membership_checks.snapshot_keys.write() {
+            *current = keys.clone();
+        }
+        MembershipSnapshot {
+            checks: self.membership_checks.clone(),
+            keys,
+        }
+    }
+
     fn membership_key(&self, authority: &Authority) -> Result<Key> {
         let address = self.call_host.as_ref().ok_or("Space unavailable.")?;
         let head = authority
@@ -95,10 +162,27 @@ impl ClientApp {
     // Piggyback small head checks on the existing Space status sync. No extra
     // timer or HTTP request, and no repeated roster in these confirmations.
     pub(super) fn membership_probe(&self) -> Result<MembershipProbe> {
+        let focused = self
+            .membership_checks
+            .focused
+            .try_read()
+            .ok()
+            .and_then(|f| *f);
+        let focus = self
+            .authorities
+            .0
+            .iter()
+            .find(|authority| focused == Some((authority.space(), authority.stream())));
+        // The shared cache and existing status request remain bounded to 64
+        // chats. Put the visible conversation first without adding traffic.
         let keys = self
             .authorities
             .0
             .iter()
+            .filter(|authority| focused != Some((authority.space(), authority.stream())));
+        let keys = focus
+            .into_iter()
+            .chain(keys)
             .take(MAX_ENTRIES)
             .map(|a| self.membership_key(a))
             .collect::<Result<Vec<_>>>()?;
@@ -237,6 +321,244 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[tokio::test]
+    async fn live_snapshots_share_permission_expiry_invalidation_and_current_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save(
+                temp.path().join("profile"),
+                "synthetic live membership password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        let scope = realtime::Scope {
+            space_context: String::new(),
+            space: app.authorities.0[0].space(),
+            stream: app.authorities.0[0].stream(),
+        };
+        let seal = |snapshot: &realtime::Snapshot| {
+            snapshot.seal(&scope, realtime::Payload::Presence { active: true }, 1_000)
+        };
+        let standalone = app.realtime_snapshot();
+        assert!(seal(&standalone).is_ok());
+        app.call_host = Some(SpaceAddress {
+            service_credential: None,
+            // Every successful publication below uses only a seeded status
+            // response. This unreachable host must never be contacted by seal.
+            url: "https://unreachable.invalid/team/v1/spaces".into(),
+            scope: app.team_scope().unwrap(),
+            message_lifetime_seconds: 86400,
+        });
+        let captured = app.realtime_snapshot();
+        assert!(
+            seal(&captured).is_err(),
+            "a hosted cache miss denies publication"
+        );
+        assert!(
+            seal(&standalone).is_err(),
+            "old standalone snapshots cannot bypass hosting"
+        );
+        let head = app.authorities.0[0].head_id().unwrap();
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"head":head}]}),
+        )
+        .await
+        .unwrap();
+        let (_, envelope) = seal(&captured).unwrap();
+        let opened = captured
+            .open(
+                "",
+                &envelope,
+                app.identity_id(),
+                app.session.credential().id(),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            opened.expires_at_ms, 61_000,
+            "event TTL is independent of the publication lease"
+        );
+        {
+            let _busy = app.membership_checks.entries.lock().await;
+            assert!(
+                seal(&captured).is_err(),
+                "contention fails closed without waiting"
+            );
+        }
+        let start = app.membership_checks.entries.lock().await[0]
+            .started
+            .monotonic;
+        assert!(seal(&captured).is_ok());
+        assert_eq!(
+            app.membership_checks.entries.lock().await[0]
+                .started
+                .monotonic,
+            start
+        );
+        expire(&app).await;
+        assert!(
+            seal(&captured).is_err(),
+            "the previously captured snapshot observes expiry"
+        );
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"head":head}]}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            seal(&captured).is_ok(),
+            "an existing status sync renews the shared lease"
+        );
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"error":"Access removed."}]}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            seal(&captured).is_err(),
+            "a cached denial cannot authorize live content"
+        );
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"head":head}]}),
+        )
+        .await
+        .unwrap();
+        app.invalidate_membership_checks().await;
+        assert!(
+            seal(&captured).is_err(),
+            "invalidation reaches old snapshots immediately"
+        );
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"head":head}]}),
+        )
+        .await
+        .unwrap();
+        assert!(seal(&captured).is_ok());
+
+        let mut next = app.authorities.0[0].head().unwrap().clone();
+        next.sequence += 1;
+        next.previous_config_id = Some(head);
+        next.nonce = record::random_hex::<16>().unwrap();
+        next.action.operation = "device.updated".into();
+        app.authorities.0[0]
+            .apply_config(next.sign(app.session.signing_key()).unwrap())
+            .unwrap();
+        let updated = app.realtime_snapshot();
+        assert!(
+            seal(&captured).is_err(),
+            "a new configuration invalidates the old captured key"
+        );
+        assert!(
+            seal(&updated).is_err(),
+            "the previous configuration's lease is not reusable"
+        );
+        app.accept_membership_probe(
+            app.membership_probe().unwrap(),
+            &json!({"chat_heads":[{"head":app.authorities.0[0].head_id()}]}),
+        )
+        .await
+        .unwrap();
+        assert!(seal(&updated).is_ok());
+        assert!(seal(&captured).is_err());
+
+        app.call_host.as_mut().unwrap().scope.stream = StreamId::from_bytes([255; 16]);
+        let invalid_host = app.realtime_snapshot();
+        assert!(
+            seal(&invalid_host).is_err(),
+            "an invalid hosted key must not become standalone"
+        );
+        assert!(seal(&updated).is_err());
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_focus_prioritizes_the_existing_sixty_four_chat_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save(
+                temp.path().join("profile"),
+                "synthetic focused membership password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        app.call_host = Some(SpaceAddress {
+            service_credential: None,
+            url: "https://unreachable.invalid/team/v1/spaces".into(),
+            scope: app.team_scope().unwrap(),
+            message_lifetime_seconds: 86400,
+        });
+        let general = app.authorities.0[0].clone();
+        let root = root_key(
+            general.genesis().body()["owners"][0]["root_public_key"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        for index in 1..=MAX_ENTRIES {
+            let stream = StreamId::from_bytes([index as u8; 16]);
+            let mut authority = Authority::new(
+                general.genesis().bytes(),
+                general.space(),
+                &root,
+                app.session.credential().clone(),
+                stream,
+            )
+            .unwrap();
+            let mut config = general.head().unwrap().clone();
+            config.stream_id = stream;
+            config.chat_kind = Some(ChatKind::Chat);
+            config.nonce = record::random_hex::<16>().unwrap();
+            authority
+                .apply_config(config.sign(app.session.signing_key()).unwrap())
+                .unwrap();
+            app.authorities.0.push(authority);
+        }
+        let last = app.authorities.0.last().unwrap();
+        let scope = realtime::Scope {
+            space_context: String::new(),
+            space: last.space(),
+            stream: last.stream(),
+        };
+        let ordinary = app.membership_probe().unwrap();
+        assert_eq!(ordinary.requests.len(), MAX_ENTRIES);
+        assert!(
+            ordinary
+                .requests
+                .iter()
+                .all(|request| request["stream"] != json!(scope.stream))
+        );
+        let snapshot = app.realtime_snapshot();
+        snapshot.prioritize_membership_focus(Some(&scope));
+        let focused = app.membership_probe().unwrap();
+        assert_eq!(focused.requests.len(), MAX_ENTRIES);
+        assert_eq!(focused.requests[0]["stream"], json!(scope.stream));
+        let response = json!({"chat_heads":focused.requests.iter().map(|request| json!({"head":request["head"]})).collect::<Vec<_>>()});
+        app.accept_membership_probe(focused, &response)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.membership_checks.entries.lock().await.len(),
+            MAX_ENTRIES
+        );
+        assert!(
+            snapshot
+                .seal(&scope, realtime::Payload::Typing { active: true }, 1_000)
+                .is_ok()
+        );
+        snapshot.prioritize_membership_focus(None);
+        assert_eq!(app.membership_probe().unwrap().requests, ordinary.requests);
+        app.close().await.unwrap();
+    }
+
     async fn fixture() -> (
         tempfile::TempDir,
         ClientApp,
@@ -259,6 +581,7 @@ mod tests {
         let head = authority.head_id().unwrap();
         let space = authority.space();
         app.call_host = Some(SpaceAddress {
+            service_credential: None,
             url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
             scope: app.team_scope().unwrap(),
             message_lifetime_seconds: 86400,

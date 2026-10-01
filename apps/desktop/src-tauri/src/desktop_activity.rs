@@ -18,6 +18,19 @@ use crate::notification_counts::Counts;
 pub(crate) struct Activity {
     counts: Mutex<(Counts, Option<u64>)>,
     background: AtomicBool,
+    realtime_spaces: Mutex<std::collections::VecDeque<String>>,
+    wake: tokio::sync::Notify,
+}
+
+pub(crate) fn realtime_changed(app: &tauri::AppHandle, space: &str) {
+    if hidden(app)
+        && let Ok(mut spaces) = app.state::<Activity>().realtime_spaces.lock()
+        && spaces.len() < 64
+        && !spaces.iter().any(|queued| queued == space)
+    {
+        spaces.push_back(space.to_owned());
+        app.state::<Activity>().wake.notify_one();
+    }
 }
 
 fn label(count: u64) -> Option<String> {
@@ -45,6 +58,9 @@ pub(crate) fn update(app: &tauri::AppHandle, result: &Value) {
 }
 
 pub(crate) fn clear(app: &tauri::AppHandle) {
+    if let Ok(mut spaces) = app.state::<Activity>().realtime_spaces.lock() {
+        spaces.clear();
+    }
     *app.state::<Activity>()
         .counts
         .lock()
@@ -207,7 +223,11 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
         let mut schedule = Schedule::new(Instant::now());
         let mut identity = String::new();
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let activity = app.state::<Activity>();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                _ = activity.wake.notified() => {},
+            }
             if !hidden(&app) || crate::release_policy::required(&app) {
                 schedule = Schedule::new(Instant::now());
                 continue;
@@ -227,7 +247,14 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
                 identity = current;
                 schedule = Schedule::new(Instant::now());
             }
-            let Some(message) = schedule.due(Instant::now()) else {
+            let work = activity.realtime_spaces.lock().ok().and_then(|mut spaces| {
+                let next = schedule.take_work(Instant::now(), &mut spaces);
+                if !spaces.is_empty() {
+                    activity.wake.notify_one();
+                }
+                next
+            });
+            let Some((message, hinted)) = work else {
                 continue;
             };
             let op = if message {
@@ -240,12 +267,24 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
                 state,
                 json!({
                     "op":op, "foreground":true, "expected_identity":identity,
-                    "receive_only":message && schedule.first_receive,
+                    "receive_only":message && (schedule.first_receive || hinted.is_some()),
+                    "target_space":hinted,
                     "_desktop_background":true,
                 }),
             )
             .await;
-            schedule.completed(message, result.as_ref().ok(), Instant::now());
+            if let Some(space) = hinted {
+                // A receive-only hint cannot postpone the periodic full send
+                // or membership/discovery pass, even under continuous traffic.
+                if result.as_ref().is_ok_and(|result| {
+                    result["result"]["more"] == true
+                        && result["result"]["retry"].as_u64().unwrap_or(0) == 0
+                }) {
+                    realtime_changed(&app, &space);
+                }
+            } else {
+                schedule.completed(message, result.as_ref().ok(), Instant::now());
+            }
             if let Ok(result) = result {
                 let _ = app.emit("desktop-sync", result);
             }
@@ -269,6 +308,15 @@ impl Schedule {
     fn due(&self, now: Instant) -> Option<bool> {
         let message = self.first_receive || self.next[0] <= self.next[1];
         (self.next[usize::from(!message)] <= now).then_some(message)
+    }
+    fn take_work(
+        &self,
+        now: Instant,
+        hints: &mut std::collections::VecDeque<String>,
+    ) -> Option<(bool, Option<String>)> {
+        self.due(now)
+            .map(|message| (message, None))
+            .or_else(|| hints.pop_front().map(|space| (true, Some(space))))
     }
     fn completed(&mut self, message: bool, result: Option<&Value>, now: Instant) {
         let index = usize::from(!message);
@@ -349,6 +397,33 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuous_live_hints_preserve_periodic_send_and_membership_refresh() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start);
+        let mut hints = std::collections::VecDeque::new();
+        let mut messages = 0;
+        let mut invitations = 0;
+        let mut received_hints = 0;
+        for second in 0..=61 {
+            if hints.is_empty() {
+                hints.push_back("busy-space".to_owned());
+            }
+            let time = start + Duration::from_secs(second);
+            let (message, hint) = schedule.take_work(time, &mut hints).unwrap();
+            if hint.is_some() {
+                received_hints += 1;
+            } else {
+                assert_eq!(hints.len(), 1, "maintenance preserves the queued hint");
+                messages += usize::from(message);
+                invitations += usize::from(!message);
+                schedule.completed(message, Some(&json!({"result":{},"delivery":{}})), time);
+            }
+        }
+        assert!(received_hints > 50);
+        assert_eq!(messages, 4);
+        assert_eq!(invitations, 3);
+    }
     fn stream(space: &str, count: u64, muted: bool) -> Value {
         json!({"space_context":space,"space":space,"stream":"general", "unread_count":count,"muted":muted,"rows":[]})
     }

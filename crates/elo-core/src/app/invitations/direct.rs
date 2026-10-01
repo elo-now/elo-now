@@ -261,7 +261,7 @@ impl ClientApp {
             .iter()
             .position(|pin| pin.stream == draft.stream)
             .ok_or("DM not found.")?;
-        self.require_controller(&self.authorities.0[index])?;
+        self.require_private_chat_controller(&self.authorities.0[index])?;
         let mut bundle =
             self.offer_bundle(index, &json!({"post":true,"reusable":true}), 86_400_000)?;
         let mut offer: shared::Offer = decode_record(&bundle.invitation)?.decode()?;

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import { DirectOnlineIndicator } from "./useRealtime";
 import { EmptyState } from "./EmptyState";
 import { t } from "./i18n";
 import { chatSections, chatIconName } from "./chatGroups";
@@ -142,18 +143,22 @@ export function ChatList({
 function ChatGlyph({ chat, identity }: { chat: Stream; identity: string }) {
   const icon = chatIconName(chat, identity);
   return (
-    <span
-      className="channel-glyph"
-      role="img"
-      aria-label={t(
-        icon === "people"
-          ? "chat.groupDirect"
-          : icon === "person"
-            ? "chat.direct"
-            : "chat.named",
+    <span className="channel-glyph">
+      <span
+        role="img"
+        aria-label={t(
+          icon === "people"
+            ? "chat.groupDirect"
+            : icon === "person"
+              ? "chat.direct"
+              : "chat.named",
+        )}
+      >
+        <Icon name={icon} />
+      </span>
+      {icon === "person" && (
+        <DirectOnlineIndicator chat={chat} identity={identity} />
       )}
-    >
-      <Icon name={icon} />
     </span>
   );
 }

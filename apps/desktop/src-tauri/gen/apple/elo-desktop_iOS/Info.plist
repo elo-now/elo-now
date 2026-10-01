@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.3</string>
+	<string>1.0.5</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -28,7 +28,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>1103</string>
+	<string>1114</string>
 	<key>FirebaseAnalyticsCollectionEnabled</key>
 	<false/>
 	<key>FirebaseMessagingAutoInitEnabled</key>
@@ -38,13 +38,13 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Use video calls, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.</string>
+	<string>Enable video in chat sessions, take photos or videos to share, set a profile photo or scan elo invitations and profile codes.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID to unlock your encrypted elo profile on this device.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to a Space server you choose on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Use your microphone during audio and video calls.</string>
+	<string>Use your microphone during chat sessions you choose to start or join.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save images from your conversations or your password-protected recovery QR image to Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
@@ -52,7 +52,6 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
-		<string>voip</string>
 		<string>audio</string>
 	</array>
 	<key>UILaunchStoryboardName</key>

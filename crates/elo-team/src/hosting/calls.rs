@@ -238,10 +238,13 @@ mod tests {
             .await
             .unwrap()["result"]["link"]
             .clone();
-        let joined = guest
+        let pending = guest
             .operate(json!({"op":"space_join","link":invite}))
             .await
             .unwrap();
+        assert_eq!(pending["view"]["spaces"][0]["status"], "pending");
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        let joined = guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         assert_eq!(
             admit(
                 State(host.clone()),

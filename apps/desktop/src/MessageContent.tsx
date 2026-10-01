@@ -11,6 +11,7 @@ import {
   t,
 } from "./i18n";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import {
   messageCreatedAt,
   senderInitials,
@@ -49,8 +50,9 @@ export function MessageContent({
   return (
     <>
       {!hideAvatars && (
-        <div className="avatar" aria-hidden="true">
+        <div className="avatar">
           {senderInitials(view, row.body.issuer_identity, chat)}
+          <OnlineIndicator identity={row.body.issuer_identity} chat={chat} />
         </div>
       )}
       <div className="message-content">

@@ -4,7 +4,7 @@ import { useBackSwipe } from "./useBackSwipe";
 import { ParticipantTitle } from "./ParticipantTitle";
 import { Icon } from "./Icon";
 import { t } from "./i18n";
-import { navigateBackWithFade } from "./navigationFade";
+import { navigateBack } from "./navigation";
 import { useDesktopLayout } from "./PageSurface";
 
 /** Shared location header for every unlocked screen. */
@@ -34,7 +34,7 @@ export function ScreenHeader({
     onBack && !(desktop && desktopRoot)
       ? () => {
           const source = header.current;
-          void navigateBackWithFade(
+          navigateBack(
             onBack,
             () =>
               !!source?.isConnected &&

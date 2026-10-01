@@ -24,7 +24,7 @@ impl ClientApp {
     /// The signed update preserves every participant, permission and recovery proof.
     pub(super) async fn ensure_chat_kind(&mut self, index: usize) -> Result<()> {
         let authority = &self.authorities.0[index];
-        self.require_controller(authority)?;
+        self.require_private_chat_controller(authority)?;
         if authority.head()?.chat_kind.is_some() {
             return Ok(());
         }
@@ -75,7 +75,8 @@ impl ClientApp {
         let mut recovered = false;
         for a in self.authorities.0.iter() {
             let genesis: SpaceGenesis = a.genesis().decode()?;
-            if genesis.owners.len() != 1
+            if a.is_owner_managed()
+                || genesis.owners.len() != 1
                 || genesis.owners[0].identity_id != self.session.identity_id()
                 || self.require_controller(a).is_err()
             {

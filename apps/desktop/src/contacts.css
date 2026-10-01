@@ -48,8 +48,3 @@
   width: calc(var(--elo-type-label) * 1.4);
   height: calc(var(--elo-type-label) * 1.4);
 }
-@media (prefers-reduced-motion: no-preference) {
-  .contacts-viewport {
-    animation: page-appear 150ms ease-out;
-  }
-}

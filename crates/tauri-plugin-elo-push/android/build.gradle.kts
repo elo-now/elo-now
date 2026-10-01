@@ -18,7 +18,7 @@ abstract class GenerateNotificationResources : DefaultTask() {
     @TaskAction
     fun generate() {
         val copy = JsonSlurper().parse(catalog.get().asFile) as Map<*, *>
-        val names = mapOf("notification_message" to "notifications.nativeMessage", "notification_invitation" to "notifications.nativeInvitation", "notification_activity" to "notifications.nativeActivity", "notification_channel_messages" to "notifications.channelMessages", "notification_channel_invitations" to "notifications.channelInvitations")
+        val names = mapOf("notification_message" to "notifications.nativeMessage", "notification_invitation" to "notifications.nativeInvitation", "notification_activity" to "notifications.nativeActivity", "notification_channel_messages" to "notifications.channelMessages", "notification_channel_invitations" to "notifications.channelInvitations", "notification_chat_session" to "calls.nativeOngoing", "notification_channel_chat_sessions" to "calls.nativeChannel")
         val file = outputDirectory.get().file("values/notification_strings.xml").asFile
         file.parentFile.mkdirs()
         file.writeText("<resources>\n" + names.entries.joinToString("\n") { (name, key) ->
@@ -41,7 +41,6 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.google.firebase:firebase-installations")
-    implementation("androidx.core:core-telecom:1.0.1")
     implementation("androidx.core:core-ktx:1.19.1")
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")
     testImplementation("junit:junit:4.13.2")

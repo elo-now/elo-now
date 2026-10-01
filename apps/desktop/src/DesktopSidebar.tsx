@@ -13,6 +13,7 @@ import {
   invitationCount,
   notificationCount,
   profileName,
+  generalServiceIdentities,
   type Stream,
   type View,
 } from "./model";
@@ -21,6 +22,7 @@ import type { Calls } from "./calls/controller";
 import { scopeKey } from "./calls/types";
 import { t } from "./i18n";
 import { ProfileAvatar } from "./ProfileEditor";
+import { DirectOnlineIndicator } from "./useRealtime";
 import { unreadStreamEntries } from "./streamFeed";
 
 type Props = {
@@ -74,8 +76,9 @@ function ChatRow({
       onClick={() => onOpen(chat)}
     >
       {direct ? (
-        <span className="desktop-dm-avatar" aria-hidden="true">
+        <span className="desktop-dm-avatar">
           {initials(chat.name)}
+          <DirectOnlineIndicator chat={chat} identity={identity} />
         </span>
       ) : (
         <Icon name="hash" />
@@ -149,9 +152,12 @@ export function DesktopSidebar({
   );
   const name = profileName(view) || t("profile.yourProfile");
   const unreadMessages = unreadStreamEntries(view).length;
+  const services = generalServiceIdentities(view);
   const memberCount = new Set(
     view.streams.flatMap((chat) =>
-      chat.members.map((member) => member.identity_id),
+      chat.members
+        .filter((member) => !services.has(member.identity_id))
+        .map((member) => member.identity_id),
     ),
   ).size;
   const memberCountLabel = t(

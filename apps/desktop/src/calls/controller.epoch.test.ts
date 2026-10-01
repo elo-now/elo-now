@@ -56,7 +56,6 @@ const call = (epoch: number): ActiveCall => ({
   key_epoch: epoch,
   kind: "group",
   initial_media: "video",
-  ringing: false,
   started_by: "me",
   started_at: 1,
   participants: {

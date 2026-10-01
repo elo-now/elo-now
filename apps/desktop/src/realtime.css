@@ -1,0 +1,65 @@
+.avatar,
+.desktop-dm-avatar,
+.profile-avatar,
+.channel-glyph {
+  position: relative;
+}
+.online-indicator {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--elo-background);
+  border-radius: 50%;
+  background: #35a55b;
+  pointer-events: none;
+}
+.profile-avatar:has(> .online-indicator) {
+  overflow: visible;
+}
+.profile-avatar:has(> .online-indicator) > img {
+  border-radius: inherit;
+}
+.channel-glyph > [role="img"]:first-child {
+  display: flex;
+}
+.typing-indicator {
+  flex-shrink: 0;
+  padding: 4px var(--elo-page-inset);
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  line-height: 1.4;
+}
+.shell[data-mobile="false"] .typing-indicator {
+  width: calc(100% - 2 * var(--desktop-content-inset));
+  max-width: calc(
+    var(--desktop-content-width) - 2 * var(--desktop-content-inset)
+  );
+  margin-inline: auto;
+  padding-inline: calc(14px * var(--desktop-density));
+}
+.remote-upload-tile {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 12px;
+  border: 1px solid var(--elo-line);
+  border-radius: 12px;
+  background: var(--elo-background);
+}
+.remote-upload-tile > svg {
+  flex-shrink: 0;
+}
+.remote-upload-details {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.remote-upload-details small,
+.remote-upload-details > span {
+  color: var(--elo-muted);
+}

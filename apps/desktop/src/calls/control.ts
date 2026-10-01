@@ -162,13 +162,27 @@ export class Control {
       .then(async () => {
         if (this.closed) throw new Error("ended");
         // Sign before opening so proof generation cannot consume the authentication window.
-        const signed = await this.native({
-          ...requestContext(chat, this.identity),
-          op: "call_authorization",
-          audience: this.url,
-          include_proof: true,
-          operation,
-        });
+        let signingTimeout: ReturnType<typeof setTimeout> | undefined;
+        let signed: any;
+        try {
+          signed = await Promise.race([
+            this.native({
+              ...requestContext(chat, this.identity),
+              op: "call_authorization",
+              audience: this.url,
+              include_proof: true,
+              operation,
+            }),
+            new Promise<never>((_resolve, reject) => {
+              signingTimeout = setTimeout(() => {
+                this.socket?.close();
+                reject(new Error("unavailable"));
+              }, 12000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(signingTimeout);
+        }
         await this.connect();
         const socket = this.socket;
         if (this.closed) throw new Error("ended");

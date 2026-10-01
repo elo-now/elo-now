@@ -1,4 +1,3 @@
-import { isRingtone, type Ringtone } from "./calls/ringtone";
 import { isMotif, motifImage, type Motif } from "./motifs";
 import { readCustomMotif, type CustomMotif } from "./customMotif";
 
@@ -17,7 +16,6 @@ export type UserPreferences = {
   colorOverrides: Partial<Record<"light" | "dark", Partial<Palette>>>;
   hideAvatars: boolean;
   highlightMyMessages: boolean;
-  callRingtone: Ringtone;
   motif: Motif;
   motifOpacity: number;
   customMotif: CustomMotif | null;
@@ -32,7 +30,6 @@ export const defaultPreferences: UserPreferences = {
   colorOverrides: {},
   hideAvatars: false,
   highlightMyMessages: false,
-  callRingtone: "classic",
   motif: "elo",
   motifOpacity: 0.14,
   customMotif: null,
@@ -164,9 +161,6 @@ export function readPreferences(): UserPreferences {
       colorOverrides: value.colorOverrides ?? {},
       hideAvatars: value.hideAvatars === true,
       highlightMyMessages: value.highlightMyMessages === true,
-      callRingtone: isRingtone(value.callRingtone)
-        ? value.callRingtone
-        : defaultPreferences.callRingtone,
       motif:
         isMotif(value.motif) && (value.motif !== "custom" || customMotif)
           ? value.motif

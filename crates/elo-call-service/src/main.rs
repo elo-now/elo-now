@@ -30,8 +30,6 @@ struct Config {
     media: Option<elo_call_service::media::Config>,
     #[serde(default = "default_connections")]
     max_connections: usize,
-    #[serde(default)]
-    wake: Option<elo_call_service::wake::Config>,
 }
 fn default_connections() -> usize {
     128
@@ -92,20 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(elo_call_service::media::Provider::new)
         .transpose()?
         .map(Arc::new);
-    let mut service =
-        Service::with_media(engine, Arc::new(admission), config.max_connections, media);
-    if let Some(config) = config.wake {
-        service = service.with_wake(elo_call_service::wake::Delivery::new(config)?);
-    }
-    let wake_worker = service.clone();
-    let delivery = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            wake_worker.deliver_wakes().await;
-        }
-    });
+    let service = Service::with_media(engine, Arc::new(admission), config.max_connections, media);
     let worker = service.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -122,7 +107,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .await;
     task.abort();
-    delivery.abort();
     let _ = task.await;
     result?;
     Ok(())

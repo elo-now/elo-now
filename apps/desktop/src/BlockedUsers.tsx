@@ -11,10 +11,13 @@ import { t } from "./i18n";
 import { Icon } from "./Icon";
 import { EmptyState } from "./EmptyState";
 import { useToast } from "./Toast";
-import type { View } from "./model";
+import { generalServiceIdentities, type View } from "./model";
 
 type Person = { identity: string; name: string };
-const BlockContext = createContext<((person: Person) => void) | null>(null);
+const BlockContext = createContext<{
+  choose: (person: Person) => void;
+  services: ReadonlySet<string>;
+} | null>(null);
 export function BlockingProvider({
   view,
   onChange,
@@ -28,6 +31,7 @@ export function BlockingProvider({
   const [working, setWorking] = useState(false);
   const pending = useRef(false);
   const { reportError, notify } = useToast();
+  const services = generalServiceIdentities(view);
   const blocked = !!view.blocked_users?.some(
     (p) => p.identity === person?.identity,
   );
@@ -35,7 +39,11 @@ export function BlockingProvider({
   latest.current = view.identity;
   useEffect(() => setPerson(null), [view.identity, view.active_space]);
   const apply = async () => {
-    if (!person || pending.current) return;
+    if (
+      !person ||
+      (services.has(person.identity) && !blocked) ||
+      pending.current
+    ) return;
     const identity = view.identity;
     pending.current = true;
     setWorking(true);
@@ -68,9 +76,9 @@ export function BlockingProvider({
     if (!pending.current) setPerson(null);
   };
   return (
-    <BlockContext.Provider value={setPerson}>
+    <BlockContext.Provider value={{ choose: setPerson, services }}>
       {children}
-      {person && (
+      {person && (!services.has(person.identity) || blocked) && (
         <ActionDialog
           className="blocking-dialog"
           title={t(blocked ? "blocking.unblockName" : "blocking.blockName", {
@@ -119,8 +127,8 @@ export function BlockUserAction({
   menu?: boolean;
   onSelect?: () => void;
 }) {
-  const choose = useContext(BlockContext);
-  if (!choose) return null;
+  const context = useContext(BlockContext);
+  if (!context || (context.services.has(identity) && !blocked)) return null;
   return (
     <button
       type="button"
@@ -130,7 +138,7 @@ export function BlockUserAction({
         name,
       })}
       onClick={() => {
-        choose({ identity, name });
+        context.choose({ identity, name });
         onSelect?.();
       }}
     >

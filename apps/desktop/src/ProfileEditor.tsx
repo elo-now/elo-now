@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import { OnlineIndicator, useRealtimePresentation } from "./useRealtime";
 import { ProfileNameField, checkedProfileName } from "./ProfileName";
 import { t } from "./i18n";
 import { useToast } from "./Toast";
@@ -7,8 +8,9 @@ import { useToast } from "./Toast";
 export type ProfilePresentation = { name: string; avatar: string | null };
 
 export function ProfileAvatar({ name, avatar }: ProfilePresentation) {
+  const { view } = useRealtimePresentation();
   return (
-    <span className="profile-avatar" aria-hidden="true">
+    <span className="profile-avatar">
       {avatar ? (
         <img src={avatar} alt="" />
       ) : name ? (
@@ -22,6 +24,7 @@ export function ProfileAvatar({ name, avatar }: ProfilePresentation) {
       ) : (
         <Icon name="person" />
       )}
+      {view && <OnlineIndicator identity={view.identity} />}
     </span>
   );
 }

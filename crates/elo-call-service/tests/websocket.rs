@@ -111,6 +111,7 @@ async fn simultaneous_starts_share_a_room_signals_are_targeted_and_host_revocati
         f.request(
             &f.owner,
             Operation::Signal {
+                epoch: 2,
                 call_id: id.clone(),
                 to: f.peer.credential().id(),
                 ciphertext: "aGVsbG8=".into(),

@@ -10,6 +10,7 @@ pub(crate) struct Counts {
 }
 
 impl Counts {
+    #[cfg(any(all(mobile, feature = "mobile-push"), test))]
     pub(crate) const fn new() -> Self {
         Self {
             identity: String::new(),

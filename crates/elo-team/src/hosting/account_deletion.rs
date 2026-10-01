@@ -5,6 +5,8 @@ use elo_core::app::account_deletion::{self as protocol, Action, Outcome, OwnedSp
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Job {
+    #[serde(default)]
+    proof: Option<elo_core::public_space::AdminEvidence>,
     identity: IdentityId,
     id: String,
     requested_at: u64,
@@ -193,7 +195,7 @@ impl Host {
             let mut guard = space.client.lock().await;
             let client = guard.as_mut().ok_or("Space unavailable.")?;
             client
-                .erase_service_account(&space.config, job.identity)
+                .erase_service_account(&space.config, job.identity, job.proof.as_ref())
                 .await?;
             let _transport = space.serving.write().await;
             space
@@ -294,6 +296,10 @@ pub(super) async fn request(
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let time = current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let job = Job {
+            proof: Some(elo_core::public_space::AdminEvidence {
+                record: request.record.clone(),
+                credential: request.credential.clone(),
+            }),
             identity: credential.identity(),
             id: record::random_hex::<16>().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
             requested_at: time,
@@ -361,10 +367,13 @@ mod tests {
             .unwrap();
         assert_eq!(sole.status, Status::Blocked);
         assert!(!sole.owned_spaces[0].other_members);
-        let joined = member
+        let pending = member
             .operate(json!({"op":"space_join","link":invite}))
             .await
             .unwrap();
+        assert_eq!(pending["view"]["spaces"][0]["status"], "pending");
+        owner.operate(json!({"op":"space_refresh"})).await.unwrap();
+        let joined = member.operate(json!({"op":"space_refresh"})).await.unwrap();
         let chat = joined["view"]["streams"]
             .as_array()
             .unwrap()

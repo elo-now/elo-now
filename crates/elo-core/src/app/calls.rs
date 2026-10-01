@@ -5,29 +5,43 @@ impl ClientApp {
     /// New content requires a recent, nonce-bound signed answer from the pinned
     /// host. Local evidence of unknown permissions always overrides that lease.
     pub(super) async fn require_fresh_membership(&self, authority: &Authority) -> Result<()> {
+        if self
+            .invalidate_membership_from_waiting(Some(authority))
+            .await?
+        {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
+        self.check_host_membership(authority).await
+    }
+
+    pub(super) async fn invalidate_membership_from_waiting(
+        &self,
+        selected: Option<&Authority>,
+    ) -> Result<bool> {
         // A valid signature from a known participant referring to an unknown
         // config is a reason to stop, even before the host's head check.
+        let authorities = selected.map_or(self.authorities.0.as_slice(), std::slice::from_ref);
         let mut after = String::new();
         for page in 0..128 {
             let waiting = self.store.waiting_objects(after).await?;
             for (_, bytes) in &waiting {
                 if let Ok(record) = crypto::open_object(bytes, self.session.age_identity()) {
                     let body = record.body();
-                    if body["space_id"] == json!(authority.space())
-                        && body["stream_id"] == json!(authority.stream())
-                        && let (Some(issuer), Some(config)) = (
-                            body["issuer_credential"]
-                                .as_str()
-                                .and_then(|id| id.parse().ok()),
-                            body["config_id"].as_str().and_then(|id| id.parse().ok()),
-                        )
-                        && authority.config(config).is_err()
+                    if let Some(authority) = authorities.iter().find(|authority| {
+                        body["space_id"] == json!(authority.space())
+                            && body["stream_id"] == json!(authority.stream())
+                    }) && let (Some(issuer), Some(config)) = (
+                        body["issuer_credential"]
+                            .as_str()
+                            .and_then(|id| id.parse().ok()),
+                        body["config_id"].as_str().and_then(|id| id.parse().ok()),
+                    ) && authority.config(config).is_err()
                         && authority
                             .credential(issuer)
                             .is_ok_and(|c| record.verify_signature(c.key()).is_ok())
                     {
                         self.invalidate_membership_checks().await;
-                        return Err("Chat permissions need to be refreshed.".into());
+                        return Ok(true);
                     }
                 }
             }
@@ -36,11 +50,11 @@ impl ClientApp {
             }
             if page == 127 {
                 self.invalidate_membership_checks().await;
-                return Err("Chat permissions need to be refreshed.".into());
+                return Ok(true);
             }
             after = waiting.last().unwrap().0.to_string();
         }
-        self.check_host_membership(authority).await
+        Ok(false)
     }
     /// Permission changes must reach the host before local delivery can expose
     /// them. Call admission never bootstraps a private head from a caller's proof.
@@ -121,6 +135,7 @@ impl ClientApp {
                     authority,
                     &self.session,
                     field(request, "call_id")?,
+                    request["epoch"].as_u64().ok_or("Invalid session epoch.")?,
                     recipient,
                     payload,
                     time,
@@ -132,6 +147,7 @@ impl ClientApp {
                     authority,
                     &self.session,
                     field(request, "call_id")?,
+                    request["epoch"].as_u64().ok_or("Invalid session epoch.")?,
                     field(request, "ciphertext")?,
                     time,
                 )?;
@@ -169,6 +185,12 @@ mod freshness_tests {
         let authority = app.authorities.0[0].clone();
         let body = json!({"v":1,"kind":"chat.message","space_id":authority.space(),"stream_id":authority.stream(),"config_id":"ef".repeat(32),"issuer_credential":app.session.credential().id()});
         let unknown = crate::identity::generate_signing_key().unwrap();
+        let scope = realtime::Scope {
+            space_context: String::new(),
+            space: authority.space(),
+            stream: authority.stream(),
+        };
+        let mut live = None;
         for (seq, key) in [(1, &unknown), (2, app.session.signing_key())] {
             let record = SignedRecord::sign(&serde_json::to_vec(&body).unwrap(), key).unwrap();
             let cipher =
@@ -194,6 +216,7 @@ mod freshness_tests {
             app.store.defer_inbox(item, false).await.unwrap();
             if seq == 1 {
                 app.call_host = Some(space_service::SpaceAddress {
+                    service_credential: None,
                     url: "http://127.0.0.1:9/team/v1/spaces".into(),
                     scope: app.team_scope().unwrap(),
                     message_lifetime_seconds: 86400,
@@ -209,8 +232,23 @@ mod freshness_tests {
                     app.require_fresh_membership(&authority).await.is_ok(),
                     "an untrusted signature must not claim a config update"
                 );
+                assert!(!app.invalidate_membership_from_waiting(None).await.unwrap());
+                let snapshot = app.realtime_snapshot();
+                assert!(
+                    snapshot
+                        .seal(&scope, realtime::Payload::Typing { active: true }, 1_000)
+                        .is_ok()
+                );
+                live = Some(snapshot);
             }
         }
+        assert!(app.invalidate_membership_from_waiting(None).await.unwrap());
+        assert!(
+            live.unwrap()
+                .seal(&scope, realtime::Payload::Typing { active: true }, 1_000)
+                .is_err(),
+            "verified pending config evidence invalidates already captured live snapshots"
+        );
         let before = app.store.stats().await.unwrap();
         let error=app.operate(json!({"op":"send","space":authority.space(),"stream":authority.stream(),"text":"Must not encrypt","created_at":"2026-09-23T10:00:00Z"})).await.unwrap_err();
         assert!(

@@ -171,7 +171,7 @@ impl SignedRecord {
             && !(body.get("v").and_then(Value::as_u64) == Some(2)
                 && matches!(
                     body.get("kind").and_then(Value::as_str),
-                    Some("device.credential" | "device.revoked")
+                    Some("device.credential" | "device.revoked" | "space.genesis" | "stream.config" | "space.create")
                 ))
         {
             return Err(RecordError::Unsupported);

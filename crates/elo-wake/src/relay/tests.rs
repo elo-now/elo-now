@@ -940,307 +940,106 @@ async fn blocked_identity_cannot_wake_through_new_scopes_or_devices_and_queued_a
 }
 
 #[tokio::test]
-async fn native_calls_require_current_recipient_policy_and_never_reappear_after_end() {
-    use elo_core::{
-        calls::wake::{Notice as Ring, Recipient},
-        ids::RecordId,
-    };
-    let root = tempfile::tempdir().unwrap();
+async fn retiring_incoming_call_tokens_preserves_ordinary_notification_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("wake.sqlite");
     let provider = Arc::new(Fake::default());
-    let private_key = "e".repeat(64);
-    let relay = Relay::open(&root.path().join("wake.sqlite"), provider.clone())
-        .unwrap()
-        .with_calls(zeroize::Zeroizing::new(private_key.clone()), None)
-        .unwrap();
-    let (route, owner, _, scope) = setup(&relay, &provider).await;
+    let relay = Relay::open(&path, provider.clone()).unwrap();
+    let (route, owner, key, scope) = setup(&relay, &provider).await;
     allow(&relay, &route, &owner, &scope, 1, true).await;
-    let identity = relay
-        .database()
-        .unwrap()
-        .query_row(
-            "SELECT identity FROM route_accounts WHERE route=?",
-            [&route],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap()
-        .parse()
-        .unwrap();
-    let sender = elo_core::vault::Session::create().unwrap().0.identity_id();
-    let credential = RecordId::from_bytes([1; 32]);
-    let head = RecordId::from_bytes([2; 32]);
-    let configure = |enabled, token: &str| calls::Registration {
-        enabled,
-        platform: "android".into(),
-        token: token.into(),
-        subscriptions: vec![calls::Subscription {
-            call_scope: "3".repeat(64),
-            notification_scope: scope.clone(),
-            credential: credential.to_string(),
-            head: head.to_string(),
-            target: URL_SAFE_NO_PAD.encode([7u8; 100]),
-        }],
-    };
-    let mut unproved_ios = configure(true, &"f".repeat(64));
-    unproved_ios.platform = "ios".into();
-    assert_eq!(
-        calls::register(
-            State(relay.clone()),
-            Path(route.clone()),
-            headers(&owner),
-            Json(unproved_ios)
-        )
-        .await
-        .unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        calls::register(
-            State(relay.clone()),
-            Path(route.clone()),
-            headers(&owner),
-            Json(configure(true, "different-device-token"))
-        )
-        .await
-        .unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    calls::register(
+    wake(
         State(relay.clone()),
         Path(route.clone()),
-        headers(&owner),
-        Json(configure(true, "synthetic-device-token")),
+        headers(&key),
+        Json(wake_input(2, &scope)),
     )
     .await
     .unwrap();
-    let ring = |n| Ring::Ring {
-        call_id: format!("{n:032x}"),
-        scope: "3".repeat(64),
-        head,
-        caller: sender,
-        recipients: vec![Recipient {
-            identity,
-            credential,
-        }],
-        expires: now().unwrap() as u64 + 45,
-        video: true,
-    };
-    assert_eq!(
-        calls::event(State(relay.clone()), headers(&owner), Json(ring(1)))
-            .await
-            .unwrap_err(),
-        StatusCode::UNAUTHORIZED
-    );
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(1)))
-        .await
-        .unwrap();
-    assert!(calls::deliver(&relay).await.unwrap());
-    let sent = || {
-        provider
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|n| matches!(n, Notice::Call { .. }))
-            .count()
-    };
-    assert_eq!(sent(), 1);
-    assert!(!calls::deliver(&relay).await.unwrap());
-    // Old registrations from before the ownership requirement cannot ring.
-    relay
-        .database()
-        .unwrap()
-        .execute(
-            "UPDATE call_devices SET platform='ios',token=? WHERE route=?",
-            params!["f".repeat(64), route],
-        )
-        .unwrap();
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(100)))
-        .await
-        .unwrap();
-    assert_eq!(
-        relay
-            .database()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM call_queue WHERE call_id=?",
-                [format!("{:032x}", 100)],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-        0
-    );
-    // Enrollment permits only the exact attested token. Rotating it invalidates delivery.
+    let retired = [
+        "call_queue",
+        "call_subscriptions",
+        "call_devices",
+        "call_declines",
+        "call_events",
+        "voip_bindings",
+        "voip_challenges",
+        "voip_keys",
+    ];
     {
         let db = relay.database().unwrap();
-        db.execute(
-            "INSERT INTO voip_keys VALUES('synthetic-key',?,X'00',1,?)",
-            params![identity.to_string(), now().unwrap()],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO voip_bindings VALUES(?,?,'synthetic-key')",
-            params![route, "f".repeat(64)],
-        )
-        .unwrap();
+        for table in retired {
+            db.execute_batch(&format!(
+                "CREATE TABLE {table}(token TEXT); INSERT INTO {table} VALUES('synthetic-retired-token');"
+            ))
+            .unwrap();
+        }
     }
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(101)))
-        .await
-        .unwrap();
-    assert_eq!(
-        relay
-            .database()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM call_queue WHERE call_id=?",
-                [format!("{:032x}", 101)],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-        1
-    );
-    relay
-        .database()
-        .unwrap()
-        .execute("DELETE FROM voip_bindings", [])
-        .unwrap();
-    assert!(calls::deliver(&relay).await.unwrap());
-    assert_eq!(sent(), 1);
-    calls::register(
-        State(relay.clone()),
-        Path(route.clone()),
-        headers(&owner),
-        Json(configure(true, "synthetic-device-token")),
+    drop(relay);
+    let relay = Relay::open(&path, provider.clone()).unwrap();
+    {
+        let db = relay.database().unwrap();
+        for table in retired {
+            assert!(
+                !db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+            );
+        }
+        assert!(row(&db, &route).unwrap().unwrap().active);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM queue", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    due(&relay);
+    assert!(relay.deliver_due().await.unwrap());
+    assert!(provider.sent.lock().unwrap().iter().any(|notice| matches!(notice,
+        Notice::Wake { registration, scope: delivered, .. } if registration == &route && delivered == &scope
+    )));
+}
+
+#[tokio::test]
+async fn retired_incoming_call_and_voip_endpoints_are_not_exposed() {
+    use std::future::IntoFuture;
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Relay::open(
+        &directory.path().join("wake.sqlite"),
+        Arc::new(Fake::default()),
     )
-    .await
     .unwrap();
-    calls::event(
-        State(relay.clone()),
-        headers(&private_key),
-        Json(Ring::End {
-            call_id: format!("{:032x}", 1),
-        }),
-    )
-    .await
-    .unwrap();
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(1)))
-        .await
-        .unwrap();
-    assert!(!calls::deliver(&relay).await.unwrap());
-    // Muting after queueing prevents delivery, not just future subscriptions.
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(2)))
-        .await
-        .unwrap();
-    allow(&relay, &route, &owner, &scope, 2, false).await;
-    calls::deliver(&relay).await.unwrap();
-    assert_eq!(sent(), 1);
-    allow(&relay, &route, &owner, &scope, 3, true).await;
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(3)))
-        .await
-        .unwrap();
-    let tag = elo_core::app::push_sender::sender_tag(&route, sender);
-    relay
-        .database()
-        .unwrap()
-        .execute(
-            "INSERT INTO blocked_senders VALUES(?,?)",
-            params![route, tag],
-        )
-        .unwrap();
-    calls::deliver(&relay).await.unwrap();
-    assert_eq!(sent(), 1);
-    relay
-        .database()
-        .unwrap()
-        .execute("DELETE FROM blocked_senders", [])
-        .unwrap();
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(4)))
-        .await
-        .unwrap();
-    calls::register(
-        State(relay.clone()),
-        Path(route.clone()),
-        headers(&owner),
-        Json(configure(false, "")),
-    )
-    .await
-    .unwrap();
-    assert!(!calls::deliver(&relay).await.unwrap());
-    assert_eq!(sent(), 1);
-    calls::register(
-        State(relay.clone()),
-        Path(route.clone()),
-        headers(&owner),
-        Json(configure(true, "synthetic-device-token")),
-    )
-    .await
-    .unwrap();
-    calls::event(State(relay.clone()), headers(&private_key), Json(ring(5)))
-        .await
-        .unwrap();
-    calls::deliver(&relay).await.unwrap();
-    let ticket = provider
-        .sent
-        .lock()
-        .unwrap()
-        .iter()
-        .rev()
-        .find_map(|n| {
-            if let Notice::Call { ticket, .. } = n {
-                Some(ticket.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let router = relay.clone().router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, relay.router()).into_future());
     let http = reqwest::Client::new();
-    let url = format!("http://{address}/v1/routes/{route}/calls/{:032x}", 5);
+    for (method, path) in [
+        (reqwest::Method::PUT, "/v1/routes/retired/calls"),
+        (reqwest::Method::GET, "/v1/routes/retired/calls/session"),
+        (reqwest::Method::DELETE, "/v1/routes/retired/calls/session"),
+        (reqwest::Method::POST, "/v1/routes/retired/voip/challenge"),
+        (reqwest::Method::POST, "/v1/routes/retired/voip/proof"),
+        (reqwest::Method::POST, "/internal/calls/event"),
+        (reqwest::Method::POST, "/internal/calls/declined"),
+    ] {
+        assert_eq!(
+            http.request(method, format!("{endpoint}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
     assert_eq!(
-        http.delete(&url)
-            .bearer_auth(&owner)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::GONE
-    );
-    assert_eq!(
-        http.delete(&url)
-            .bearer_auth(&ticket)
+        http.get(format!("{endpoint}/wake/health"))
             .send()
             .await
             .unwrap()
             .status(),
         StatusCode::NO_CONTENT
-    );
-    let status = calls::status(
-        State(relay.clone()),
-        Path((route.clone(), format!("{:032x}", 5))),
-        headers(&ticket),
-    )
-    .await
-    .unwrap()
-    .0;
-    assert_eq!(status["ringing"], false);
-    assert_eq!(
-        calls::declined(State(relay.clone()), headers(&private_key))
-            .await
-            .unwrap()
-            .0["declined"][0][1],
-        identity.to_string()
-    );
-    assert_eq!(
-        http.post(format!("http://{address}/internal/calls/event"))
-            .bearer_auth(&private_key)
-            .json(&ring(6))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
     );
     server.abort();
 }

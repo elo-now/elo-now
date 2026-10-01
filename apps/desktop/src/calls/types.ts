@@ -21,7 +21,6 @@ export type ActiveCall = {
   config_id: string;
   participants: Record<string, Participant>;
   key_epoch: number;
-  ringing: boolean;
   started_by: string;
   started_at: number;
 };
@@ -52,6 +51,7 @@ export type MediaTile = {
   speaking?: boolean;
   native?: {
     session: string;
+    revision: number;
     track: string;
     render: (frames: unknown[]) => Promise<unknown>;
   };
@@ -59,8 +59,6 @@ export type MediaTile = {
   detach?: (element: HTMLMediaElement) => void;
 };
 export type Snapshot = {
-  nativeAnswer?: { id: string; cancel: () => void };
-  nativeAnswerChecked?: boolean;
   active?: ActiveCall;
   chat?: Stream;
   phase: "idle" | "connecting" | "connected" | "reconnecting";
@@ -68,7 +66,6 @@ export type Snapshot = {
   tiles: MediaTile[];
   error?: string;
   changingMedia?: boolean;
-  incoming?: { call: ActiveCall; chat: Stream };
   available: Record<string, ActiveCall>;
 };
 export const muted: MediaState = {

@@ -118,6 +118,7 @@ body:has(.shell[data-mobile="false"]) .toast {
 }
 .desktop-workspace-trigger:active:not(:disabled) {
   transform: none;
+  scale: none;
 }
 .desktop-workspace-trigger:focus-visible {
   outline-offset: -3px;
@@ -478,7 +479,6 @@ body:has(.shell[data-mobile="false"]) .toast {
   scrollbar-width: thin;
   scrollbar-gutter: stable;
   background: transparent;
-  animation: none;
 }
 .shell[data-mobile="false"]
   :is(.page-content, .settings-page, .channel-settings)

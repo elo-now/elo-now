@@ -1,11 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type {
-  MediaAccess,
-  MediaAdapter,
-  MediaState,
-  MediaTile,
-  SignalPayload,
-} from "./types";
+import type { ActiveCall, MediaAdapter, MediaState, MediaTile } from "./types";
 
 export const usesNativePeer = () =>
   isTauri() && /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -21,60 +15,39 @@ const request =
 export async function nativeMediaPermission(identity: string, video: boolean) {
   await request(identity)({ op: "permissions", video });
 }
-export async function takeIncomingControl(identity: string, id: string) {
-  await request(identity)({ op: "handoff", id });
-}
-export async function nativeIncomingAction(
-  identity: string,
-  callId: string,
-  op: "answer" | "decline",
-) {
-  return (await request(identity)({ op, call_id: callId })).handled === true;
-}
-
-/** The native peer owns capture/playback. Only authenticated signaling crosses IPC. */
+/** Native signaling and capture remain active independently of WebView timers. */
 export class NativePeer implements MediaAdapter {
   readonly id: string;
   private stopped = false;
   private ready: Promise<void>;
   private timer?: ReturnType<typeof setTimeout>;
-  private disconnected?: ReturnType<typeof setTimeout>;
   private queue: Promise<unknown> = Promise.resolve();
   private revision = -1;
   private connection = "new";
+  private remote = "";
+  private lastCall = "";
   private speakerMuted = false;
   private invoke: NativeRequest;
   private streams = new Map<string, MediaStream>();
   constructor(
-    access: MediaAccess,
     private local: string,
-    private remote: string,
     identity: string,
-    private send: (signal: SignalPayload) => Promise<void>,
     private tiles: (tiles: MediaTile[]) => void,
-    private failure: () => void,
+    private failure: (reason?: string) => void,
     private connected: () => void,
+    private presence: (call: ActiveCall) => void,
     transport?: NativeRequest,
     context?: Record<string, unknown>,
-    managedId?: string,
   ) {
-    this.id = managedId ?? crypto.randomUUID();
+    this.id = crypto.randomUUID();
     this.invoke = transport ?? request(identity);
-    this.ready = (
-      managedId
-        ? Promise.resolve()
-        : this.invoke({
-            op: "start",
-            id: this.id,
-            ice_servers: access.ice_servers,
-            context,
-          })
-    ).then(async () => {
-      if (this.stopped) {
-        await this.invoke({ op: "stop", id: this.id });
-        return;
-      }
-      void this.poll();
+    this.ready = this.invoke({
+      op: "start",
+      id: this.id,
+      ice_servers: [],
+      context,
+    }).then(async () => {
+      if (!this.stopped) void this.poll();
     });
   }
   private async poll() {
@@ -82,19 +55,21 @@ export class NativePeer implements MediaAdapter {
     try {
       const state = await this.invoke({ op: "poll", id: this.id });
       if (this.stopped) return;
-      for (const signal of state.signals as SignalPayload[]) {
-        await this.send(signal);
-        if (this.stopped) return;
+      const remote = state.remote ?? "";
+      if (remote !== this.remote) {
+        this.remote = remote;
+        this.revision = -1;
+      }
+      if (state.call) {
+        const serialized = JSON.stringify(state.call);
+        if (this.lastCall !== serialized) {
+          this.lastCall = serialized;
+          this.presence(state.call);
+        }
       }
       if (this.connection !== state.connection) {
         this.connection = state.connection;
-        clearTimeout(this.disconnected);
         if (state.connection === "connected") this.connected();
-        else if (state.connection === "disconnected")
-          this.disconnected = setTimeout(() => {
-            if (!this.stopped && this.connection === "disconnected")
-              this.failure();
-          }, 4000);
         else if (["failed", "closed"].includes(state.connection))
           this.failure();
       }
@@ -121,6 +96,7 @@ export class NativePeer implements MediaAdapter {
                 credential: track.local ? this.local : this.remote,
                 native: {
                   session: this.id,
+                  revision: state.revision,
                   render: (frames: unknown[]) =>
                     this.command({ op: "render", frames }),
                   track: track.id,
@@ -132,8 +108,14 @@ export class NativePeer implements MediaAdapter {
         for (const id of this.streams.keys())
           if (!live.has(id)) this.streams.delete(id);
       }
-    } catch {
-      if (!this.stopped) this.failure();
+    } catch (error) {
+      if (!this.stopped)
+        this.failure(
+          error === "ended" ||
+            (error instanceof Error && error.message === "ended")
+            ? "ended"
+            : "unavailable",
+        );
     } finally {
       if (!this.stopped) this.timer = setTimeout(() => void this.poll(), 150);
     }
@@ -147,12 +129,6 @@ export class NativePeer implements MediaAdapter {
     const work = this.queue.then(() => this.command(command));
     this.queue = work.catch(() => {});
     return work.then(() => {});
-  }
-  offer(restart = false) {
-    return this.serial({ op: "offer", restart });
-  }
-  signal(signal: SignalPayload) {
-    return this.serial({ op: "signal", signal });
   }
   async update(state: MediaState) {
     await this.serial({
@@ -168,7 +144,6 @@ export class NativePeer implements MediaAdapter {
   async stop() {
     this.stopped = true;
     clearTimeout(this.timer);
-    clearTimeout(this.disconnected);
     this.tiles([]);
     this.streams.clear();
     // A pending start must finish before its matching stop; never close a successor.

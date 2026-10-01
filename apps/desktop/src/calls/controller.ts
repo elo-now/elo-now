@@ -23,9 +23,8 @@ import {
   NativePeer,
   nativeMediaPermission,
   usesNativePeer,
-  takeIncomingControl,
-  nativeIncomingAction,
 } from "./nativePeer";
+import { nativeCallState } from "./sessionActivity";
 export class Calls {
   snapshot: Snapshot = {
     phase: "idle",
@@ -43,11 +42,20 @@ export class Calls {
   private listeners = new Set<() => void>();
   private capture?: MediaStream;
   private nativeDirect = false;
-  private managedIncoming?: string;
+  private nativeActivity?: {
+    identity: string;
+    sessionId: string;
+    activation: string;
+    context: Record<string, unknown>;
+  };
+  private activityQueue: Promise<void> = Promise.resolve();
+  private sessionWork = new Set<Promise<void>>();
+  private refreshBeforeStart = false;
   private mediaStopping: Promise<void> = Promise.resolve();
   private speakerMuted = false;
   private screen?: MediaStream;
   private mediaChanging = false;
+  private pendingMediaAdmission?: number;
   private adapter?: MediaAdapter;
   private epoch = 0;
   private mediaGeneration = 0;
@@ -77,7 +85,7 @@ export class Calls {
       this.connections.delete(endpoint);
     }
     this.subscribed.clear();
-    this.change({ available: {}, incoming: undefined });
+    this.change({ available: {} });
   };
   activate() {
     this.disposed = false;
@@ -96,14 +104,6 @@ export class Calls {
   };
   getSnapshot = () => this.snapshot;
   dismissError = () => this.change({ error: undefined });
-  setNativeAnswer = (nativeAnswer: Snapshot["nativeAnswer"]) => {
-    if (this.snapshot.nativeAnswer?.id !== nativeAnswer?.id)
-      this.change({ nativeAnswer });
-  };
-  setNativeAnswerChecked = (nativeAnswerChecked: boolean) => {
-    if (this.snapshot.nativeAnswerChecked !== nativeAnswerChecked)
-      this.change({ nativeAnswerChecked });
-  };
   private change(update: Partial<Snapshot>) {
     this.snapshot = { ...this.snapshot, ...update };
     this.listeners.forEach((fn) => fn());
@@ -119,16 +119,10 @@ export class Calls {
       clearTimeout(this.subscriptionRetry);
       this.subscriptionRetry = undefined;
       this.endpoints.clear();
-      this.change({ available: {}, incoming: undefined, error: undefined });
+      this.change({ available: {}, error: undefined });
     }
     this.view = view ?? undefined;
     if (!view) return;
-    const incoming = this.snapshot.incoming;
-    if (incoming) {
-      const chat = this.chatFor(incoming.call);
-      if (!chat || !this.canRing(incoming.call, chat))
-        this.change({ incoming: undefined });
-    }
     if (this.snapshot.active && !this.chatFor(this.snapshot.active))
       void this.leave("chat_unavailable");
     const active = this.snapshot.active;
@@ -168,16 +162,6 @@ export class Calls {
   private chatFor(call: ActiveCall) {
     return this.chats().find((chat) => scopeKey(chat) === callKey(call));
   }
-  private canRing(call: ActiveCall, chat: Stream) {
-    return (
-      !updateRequired() &&
-      call.kind === "direct" &&
-      call.ringing &&
-      !chat.muted &&
-      call.started_by !== this.view?.identity &&
-      !this.view?.blocked_users?.some((b) => b.identity === call.started_by)
-    );
-  }
   private async connection(chat: Stream) {
     if (!this.view || this.disposed) throw new Error("ended");
     const identity = this.view.identity;
@@ -208,17 +192,12 @@ export class Calls {
         this.view.identity,
         (event) => this.receiveEvent(event),
         () => {
-          const incoming = this.snapshot.incoming;
-          if (
-            incoming &&
-            this.endpoints.get(incoming.chat.space_context!) === endpoint
-          )
-            this.change({ incoming: undefined });
           for (const chat of this.chats())
             if (this.endpoints.get(chat.space_context!) === endpoint)
               this.subscribed.delete(scopeKey(chat));
           // A connection to an unrelated deployment must not interrupt this call.
           if (
+            !this.nativeDirect &&
             this.snapshot.chat &&
             this.endpoints.get(this.snapshot.chat.space_context!) === endpoint
           )
@@ -261,6 +240,7 @@ export class Calls {
           continue;
         attempts++;
         try {
+          const previous = this.snapshot.available[key];
           const result = await this.command(chat, { type: "subscribe" });
           if (this.disposed || this.view?.identity !== identity) return;
           if (
@@ -273,6 +253,11 @@ export class Calls {
           this.subscribed.set(key, chat.head);
           this.subscriptionBackoff.delete(key);
           if (result.call) await this.presence(result.call);
+          else if (previous && this.snapshot.available[key] === previous) {
+            const available = { ...this.snapshot.available };
+            delete available[key];
+            this.change({ available });
+          }
         } catch (error) {
           if (this.disposed || this.view?.identity !== identity) return;
           this.subscriptionBackoff.set(key, Date.now() + 10000);
@@ -354,11 +339,7 @@ export class Calls {
       const available = { ...this.snapshot.available };
       for (const [key, call] of Object.entries(available))
         if (matches(call)) delete available[key];
-      const incoming = this.snapshot.incoming;
-      this.change({
-        available,
-        incoming: incoming && matches(incoming.call) ? undefined : incoming,
-      });
+      this.change({ available });
       if (this.snapshot.active && matches(this.snapshot.active))
         await this.leave(event.type);
     } else if (event.type === "signal") await this.signal(event);
@@ -402,8 +383,6 @@ export class Calls {
         delete available[key];
         this.change({ available });
       }
-      if (this.snapshot.incoming?.call.call_id === call.call_id)
-        this.change({ incoming: undefined });
       if (this.snapshot.active?.call_id === call.call_id)
         await this.leave("call_empty");
       return;
@@ -414,12 +393,7 @@ export class Calls {
     this.change({
       available: { ...this.snapshot.available, [callKey(call)]: call },
     });
-    if (!this.snapshot.active) {
-      if (this.canRing(call, chat)) this.change({ incoming: { call, chat } });
-      else if (this.snapshot.incoming?.call.call_id === call.call_id)
-        this.change({ incoming: undefined });
-      return;
-    }
+    if (!this.snapshot.active) return;
     if (call.call_id !== this.snapshot.active.call_id) return;
     if (
       call.participants[this.view.identity]?.credential_id !==
@@ -427,7 +401,14 @@ export class Calls {
     )
       return this.leave("participant_removed");
     this.change({ active: call, chat });
-    if (this.managedIncoming) return; // Rust owns the peer and its signaling.
+    // Start presence can arrive before native activation and the signed media
+    // grant. Do not request a provider token with the initial muted permissions.
+    if (this.pendingMediaAdmission === this.generation) return;
+    if (this.nativeDirect && this.adapter instanceof NativePeer) {
+      // Native signaling owns membership changes and preserves capture in the background.
+      this.epoch = call.key_epoch;
+      return;
+    }
     if (this.epoch === call.key_epoch) return;
     const stopping = this.stopMedia();
     const generation = this.mediaGeneration;
@@ -450,10 +431,44 @@ export class Calls {
     await stopping;
     if (generation !== this.mediaGeneration || !this.view) return;
     if (call.kind === "direct") {
+      const tiles = (tiles: import("./types").MediaTile[]) => {
+        if (generation === this.mediaGeneration) this.change({ tiles });
+      };
+      const connected = () => {
+        if (generation === this.mediaGeneration) this.mediaConnected();
+      };
+      if (this.nativeDirect) {
+        const peer = new NativePeer(
+          this.view.credential,
+          this.view.identity,
+          tiles,
+          (reason = "unavailable") => {
+            if (generation === this.mediaGeneration) this.fail(reason);
+          },
+          connected,
+          (current) => {
+            if (generation === this.mediaGeneration)
+              void this.presence(current);
+          },
+          undefined,
+          {
+            ...requestContext(chat, this.view.identity),
+            call_id: call.call_id,
+            activation: this.nativeActivity?.activation,
+          },
+        );
+        this.adapter = peer;
+        await peer.setSpeakerMuted(this.speakerMuted);
+        await peer.update(this.snapshot.media);
+        return;
+      }
       const remote = Object.values(call.participants).find(
         (p) => p.credential_id !== this.view!.credential,
       );
-      if (!remote) return;
+      if (!remote) {
+        this.mediaConnected();
+        return;
+      }
       const access = (
         await this.command(chat, {
           type: "connect_media",
@@ -461,37 +476,19 @@ export class Calls {
         })
       ).media;
       if (generation !== this.mediaGeneration) return;
-      if (!access) throw new Error("unavailable");
-      const callbacks = [
-        (payload: SignalPayload) =>
-          this.sendSignal(remote.credential_id, payload, generation),
-        (tiles: import("./types").MediaTile[]) => {
-          if (generation === this.mediaGeneration) this.change({ tiles });
-        },
+      if (!access || access.epoch !== call.key_epoch)
+        throw new Error("unavailable");
+      const peer = new PeerMedia(
+        access,
+        remote.credential_id,
+        (payload) => this.sendSignal(remote.credential_id, payload, generation),
+        tiles,
         () => {
           if (generation === this.mediaGeneration) this.beginReconnect();
         },
-        () => {
-          if (generation === this.mediaGeneration) this.mediaConnected();
-        },
-      ] as const;
-      const peer = this.nativeDirect
-        ? new NativePeer(
-            access,
-            this.view.credential,
-            remote.credential_id,
-            this.view.identity,
-            ...callbacks,
-            undefined,
-            {
-              ...requestContext(chat, this.view.identity),
-              call_id: call.call_id,
-            },
-          )
-        : new PeerMedia(access, remote.credential_id, ...callbacks);
+        connected,
+      );
       this.adapter = peer;
-      if (peer instanceof NativePeer)
-        await peer.setSpeakerMuted(this.speakerMuted);
       await peer.update(this.snapshot.media, this.capture!, this.screen);
       if (generation !== this.mediaGeneration) return;
       for (const payload of this.pendingSignals.splice(0)) {
@@ -549,6 +546,7 @@ export class Calls {
       ...requestContext(chat, this.view.identity),
       op: "call_encrypt_signal",
       call_id: active.call_id,
+      epoch: active.key_epoch,
       to,
       payload,
     });
@@ -556,12 +554,13 @@ export class Calls {
     await this.command(chat, {
       type: "signal",
       call_id: active.call_id,
+      epoch: active.key_epoch,
       to,
       ciphertext: sealed.ciphertext,
     });
   }
   private async signal(event: Result) {
-    if (this.managedIncoming) return;
+    if (this.nativeDirect) return;
     const generation = this.mediaGeneration;
     const { active, chat } = this.snapshot;
     if (
@@ -569,6 +568,7 @@ export class Calls {
       !chat ||
       !this.view ||
       event.call_id !== active.call_id ||
+      event.epoch !== active.key_epoch ||
       !Object.values(active.participants).some(
         (p) => p.credential_id === event.from,
       )
@@ -578,6 +578,7 @@ export class Calls {
       ...requestContext(chat, this.view.identity),
       op: "call_open_signal",
       call_id: active.call_id,
+      epoch: active.key_epoch,
       ciphertext: event.ciphertext,
     });
     if (generation !== this.mediaGeneration || !this.view) return;
@@ -585,6 +586,7 @@ export class Calls {
       signal.from !== event.from ||
       signal.to !== this.view.credential ||
       signal.config_id !== active.config_id ||
+      signal.epoch !== active.key_epoch ||
       this.nonces.has(signal.nonce)
     )
       return;
@@ -712,67 +714,82 @@ export class Calls {
         throw error;
     }
   }
-  async start(chat: Stream, video = false, existing?: ActiveCall) {
+  async start(chat: Stream, existing?: ActiveCall) {
     if (this.snapshot.active || this.snapshot.phase !== "idle" || !this.view)
       return;
     if (updateRequired()) {
-      this.change({ error: "updateRequired", incoming: undefined });
+      this.change({ error: "updateRequired" });
       return;
     }
     const joined = existing?.participants[this.view.identity];
-    if (joined && joined.credential_id !== this.view.credential) {
-      this.change({ error: "already_joined", incoming: undefined });
+    if (
+      !this.refreshBeforeStart &&
+      joined &&
+      joined.credential_id !== this.view.credential
+    ) {
+      this.change({ error: "already_joined" });
       return;
     }
     this.change({
       error: undefined,
       phase: "connecting",
       chat,
-      incoming: undefined,
-      nativeAnswer: undefined,
     });
     const generation = ++this.generation;
+    this.pendingMediaAdmission = generation;
+    const identity = this.view.identity;
     let capture: MediaStream | undefined;
+    let finishAdmission: (() => void) | undefined;
     try {
-      if (chat.chat_kind !== "direct") {
+      // A cancelled Start may still need to leave the session it just created.
+      // Finish that cleanup before admitting this device again to the same call.
+      while (this.sessionWork.size) await Promise.all([...this.sessionWork]);
+      if (generation !== this.generation) return;
+      if (this.refreshBeforeStart) {
+        const result = await this.command(chat, { type: "subscribe" });
+        if (generation !== this.generation) return;
+        existing = result.call;
+        if (existing && !this.validate(existing))
+          throw new Error("unauthorized");
+        const available = { ...this.snapshot.available };
+        if (existing) available[scopeKey(chat)] = existing;
+        else delete available[scopeKey(chat)];
+        this.change({ available });
+        this.refreshBeforeStart = false;
+      }
+      const joined = existing?.participants[identity];
+      if (joined && joined.credential_id !== this.view?.credential)
+        throw new Error("already_joined");
+      const direct = existing
+        ? existing.kind === "direct"
+        : chat.chat_kind === "direct" && chat.members.length === 2;
+      if (!direct) {
         const sdk = await import("livekit-client");
         if (!sdk.isE2EESupported()) throw new Error("encryption_unavailable");
       }
-      this.nativeDirect =
-        usesNativePeer() &&
-        (existing
-          ? existing.kind === "direct"
-          : chat.chat_kind === "direct" && chat.members.length === 2);
+      this.nativeDirect = usesNativePeer() && direct;
       if (this.nativeDirect) {
-        await nativeMediaPermission(this.view.identity, video);
+        await nativeMediaPermission(identity, false);
         capture = new MediaStream();
       } else
         capture = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true },
-          video: video
-            ? {
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30, max: 30 },
-              }
-            : false,
+          video: false,
         });
       if (generation !== this.generation) {
         capture.getTracks().forEach((t) => t.stop());
         return;
       }
       this.capture = capture;
+      finishAdmission = this.beginSessionWork();
       const result = await this.command(
         chat,
         existing
           ? { type: "join", call_id: existing.call_id }
           : {
               type: "start",
-              kind:
-                chat.chat_kind === "direct" && chat.members.length === 2
-                  ? "direct"
-                  : "group",
-              initial_media: video ? "video" : "audio",
+              kind: direct ? "direct" : "group",
+              initial_media: "audio",
             },
       );
       if (generation !== this.generation) {
@@ -790,16 +807,33 @@ export class Calls {
         chat,
         media: {
           audio_muted: false,
-          video_published: video,
+          video_published: false,
           screen_published: false,
         },
       });
+      this.nativeActivity = {
+        identity,
+        sessionId: result.call.call_id,
+        activation: crypto.randomUUID(),
+        context: requestContext(chat, identity),
+      };
+      await this.setNativeActivity(true, false);
+      if (generation !== this.generation) return;
       const published = await this.command(chat, {
         type: "media",
         call_id: result.call.call_id,
         state: this.snapshot.media,
       });
-      await this.presence(published.call ?? result.call);
+      if (generation !== this.generation) return;
+      this.pendingMediaAdmission = undefined;
+      const admitted = published.call ?? result.call;
+      const current = this.getSnapshot().active;
+      await this.presence(
+        current?.call_id === admitted.call_id &&
+          current.key_epoch > admitted.key_epoch
+          ? current
+          : admitted,
+      );
     } catch (error) {
       capture?.getTracks().forEach((t) => t.stop());
       if (generation !== this.generation) return;
@@ -821,56 +855,11 @@ export class Calls {
           delete available[scopeKey(chat)];
         this.change({ available });
       }
+    } finally {
+      if (this.pendingMediaAdmission === generation)
+        this.pendingMediaAdmission = undefined;
+      finishAdmission?.();
     }
-  }
-  async answer() {
-    const incoming = this.snapshot.incoming;
-    if (
-      !incoming ||
-      !this.view ||
-      this.snapshot.nativeAnswer ||
-      this.snapshot.phase !== "idle"
-    )
-      return;
-    const identity = this.view.identity;
-    if (usesNativePeer()) {
-      this.setNativeAnswer({
-        id: incoming.call.call_id,
-        cancel: () => {
-          void this.decline();
-        },
-      });
-      try {
-        if (
-          await nativeIncomingAction(identity, incoming.call.call_id, "answer")
-        )
-          return;
-      } catch (error) {
-        this.setNativeAnswer(undefined);
-        this.change({ error: callErrorCode(error) });
-        return;
-      }
-      this.setNativeAnswer(undefined);
-    }
-    if (
-      this.view?.identity === identity &&
-      this.snapshot.incoming?.call.call_id === incoming.call.call_id
-    )
-      await this.start(incoming.chat, false, incoming.call);
-  }
-  async decline() {
-    const incoming = this.snapshot.incoming;
-    const id = incoming?.call.call_id ?? this.snapshot.nativeAnswer?.id;
-    this.change({ incoming: undefined, nativeAnswer: undefined });
-    if (id && this.view && usesNativePeer())
-      await nativeIncomingAction(this.view.identity, id, "decline").catch(
-        () => {},
-      );
-    if (incoming)
-      await this.command(incoming.chat, {
-        type: "decline",
-        call_id: incoming.call.call_id,
-      });
   }
   async toggle(kind: "audio" | "video" | "screen") {
     const { active, chat } = this.snapshot;
@@ -924,6 +913,10 @@ export class Calls {
       if (!state.screen_published) {
         this.screen?.getTracks().forEach((t) => t.stop());
         this.screen = undefined;
+      }
+      if (kind === "video") {
+        await this.setNativeActivity(true, state.video_published);
+        if (generation !== this.generation) return;
       }
       this.change({ media: state, error: undefined });
     } catch (error) {
@@ -1032,134 +1025,6 @@ export class Calls {
   isNativeDirect() {
     return this.nativeDirect;
   }
-  /** Attach the UI to a call already admitted/connected by native CallKit Answer. */
-  async adoptIncoming(
-    value: {
-      id: string;
-      call_id: string;
-      phase: "connecting" | "connected";
-      call?: ActiveCall | null;
-    },
-    cancel: () => void,
-  ) {
-    if (!this.view || !usesNativePeer() || this.disposed) return;
-    if (this.snapshot.active && this.snapshot.active.call_id !== value.call_id)
-      return;
-    if (!value.call) {
-      this.managedIncoming = value.id;
-      this.change({
-        incoming: undefined,
-        nativeAnswer: { id: value.call_id, cancel },
-      });
-      return;
-    }
-    const call = value.call;
-    const chat = this.chats().find((item) => scopeKey(item) === callKey(call));
-    if (
-      !chat ||
-      !this.validate(call) ||
-      call.participants[this.view.identity]?.credential_id !==
-        this.view.credential
-    )
-      return;
-    if (this.adapter && this.managedIncoming === value.id) {
-      this.change({
-        active: call,
-        phase: value.phase,
-        media: call.participants[this.view.identity].media,
-      });
-      await this.takeIncomingControl(value.id, call, chat, value.phase);
-      return;
-    }
-    const identity = this.view.identity;
-    const stopping = this.stopMedia();
-    const generation = this.mediaGeneration;
-    await stopping;
-    if (
-      !this.view ||
-      this.view.identity !== identity ||
-      generation !== this.mediaGeneration ||
-      this.disposed
-    )
-      return;
-    this.managedIncoming = value.id;
-    this.nativeDirect = true;
-    this.epoch = call.key_epoch;
-    this.capture = new MediaStream();
-    const remote = Object.values(call.participants).find(
-      (p) => p.credential_id !== this.view!.credential,
-    );
-    if (!remote) return;
-    this.change({
-      active: call,
-      chat,
-      phase: value.phase,
-      incoming: undefined,
-      nativeAnswer: undefined,
-      available: { ...this.snapshot.available, [callKey(call)]: call },
-      media: call.participants[this.view.identity].media,
-    });
-    this.adapter = new NativePeer(
-      {
-        provider: "p2p",
-        url: "",
-        token: "",
-        epoch: call.key_epoch,
-        ice_servers: [],
-      },
-      this.view.credential,
-      remote.credential_id,
-      this.view.identity,
-      (payload) => this.sendSignal(remote.credential_id, payload, generation),
-      (tiles) => {
-        if (generation === this.mediaGeneration) this.change({ tiles });
-      },
-      () => {
-        if (generation === this.mediaGeneration)
-          this.managedIncoming
-            ? this.fail("unavailable")
-            : this.beginReconnect();
-      },
-      () => {
-        if (generation === this.mediaGeneration) this.mediaConnected();
-      },
-      undefined,
-      undefined,
-      value.id,
-    );
-    await this.takeIncomingControl(value.id, call, chat, value.phase);
-  }
-  private async takeIncomingControl(
-    id: string,
-    call: ActiveCall,
-    chat: Stream,
-    phase: string,
-  ) {
-    if (phase !== "connected" || !this.view || this.managedIncoming !== id)
-      return;
-    try {
-      // Authenticate the foreground socket before relinquishing the native one.
-      const current = await this.command(chat, {
-        type: "heartbeat",
-        call_id: call.call_id,
-      });
-      if (
-        !current.call ||
-        current.call.call_id !== call.call_id ||
-        !this.validate(current.call) ||
-        !this.view ||
-        this.managedIncoming !== id
-      )
-        return;
-      await takeIncomingControl(this.view.identity, id);
-      if (this.managedIncoming === id) this.managedIncoming = undefined;
-    } catch {
-      /* Keep the native owner if the foreground connection is not ready. */
-    }
-  }
-  async finishManagedIncoming() {
-    if (this.managedIncoming) await this.leave("native_end");
-  }
   setSpeakerMuted(muted: boolean) {
     this.speakerMuted = muted;
     void this.adapter?.setSpeakerMuted?.(muted).catch(() => {
@@ -1182,14 +1047,50 @@ export class Calls {
     // Reconnect can request another stop before the previous native stop has
     // returned. A replacement must wait for both, even when adapter is empty.
     const stopping = old?.stop();
-    this.mediaStopping = Promise.all([this.mediaStopping, stopping]).then(
-      () => {},
-    );
+    this.mediaStopping = Promise.allSettled([
+      this.mediaStopping,
+      stopping,
+    ]).then(([, current]) => {
+      // Report this teardown's failure after all previous cleanup settles.
+      // A failure already reported by an earlier stop must not block rejoining.
+      if (current.status === "rejected") throw current.reason;
+    });
     await this.mediaStopping;
+  }
+  private setNativeActivity(active: boolean, camera = false) {
+    const context = this.nativeActivity;
+    if (!context) return Promise.resolve();
+    if (!active) this.nativeActivity = undefined;
+    const work = this.activityQueue
+      .catch(() => {})
+      .then(() => nativeCallState({ ...context, active, camera }));
+    this.activityQueue = work;
+    return work;
+  }
+  private beginSessionWork() {
+    let resolve!: () => void;
+    const work = new Promise<void>((done) => {
+      resolve = done;
+    });
+    this.sessionWork.add(work);
+    return () => {
+      this.sessionWork.delete(work);
+      resolve();
+    };
+  }
+  async nativeSessionEnded(sessionId: string, activation: string) {
+    if (
+      this.nativeActivity?.sessionId === sessionId &&
+      this.nativeActivity.activation === activation
+    )
+      await this.leave("native_end");
   }
   async leave(reason = "user") {
     const { active, chat } = this.snapshot;
+    const identity = this.view?.identity;
+    if (active || this.sessionWork.size) this.refreshBeforeStart = true;
     ++this.generation;
+    this.pendingMediaAdmission = undefined;
     this.clearReconnect();
     this.capture?.getTracks().forEach((t) => t.stop());
     this.capture = undefined;
@@ -1198,11 +1099,9 @@ export class Calls {
     this.key = undefined;
     this.speakerMuted = false;
     this.nativeDirect = false;
-    this.managedIncoming = undefined;
     this.nonces.clear();
     this.change({
       active: undefined,
-      nativeAnswer: undefined,
       chat: undefined,
       phase: "idle",
       changingMedia: false,
@@ -1210,14 +1109,31 @@ export class Calls {
       tiles: [],
     });
     const stopping = this.stopMedia();
+    const finishLeave =
+      active && chat && !this.disposed ? this.beginSessionWork() : undefined;
     const leaving =
       active && chat && !this.disposed
         ? this.command(chat, {
             type: "leave",
             call_id: active.call_id,
-          }).catch(() => {})
+          })
+            .then(async (result) => {
+              if (this.view?.identity !== identity || this.disposed) return;
+              if (result.call) await this.presence(result.call);
+              else if (
+                this.snapshot.available[scopeKey(chat)]?.call_id ===
+                active.call_id
+              ) {
+                const available = { ...this.snapshot.available };
+                delete available[scopeKey(chat)];
+                this.change({ available });
+              }
+            })
+            .catch(() => {})
+            .finally(() => finishLeave?.())
         : undefined;
-    await Promise.all([stopping, leaving]);
+    const activity = this.setNativeActivity(false).catch(() => {});
+    await Promise.all([stopping, leaving, activity]);
     if (updateRequired()) this.policyChanged();
   }
   private fail(code: string) {
@@ -1235,8 +1151,7 @@ export class Calls {
     this.change({ phase: "connected" });
   }
   private beginReconnect() {
-    if (!this.snapshot.active || this.disposed) return;
-    if (this.managedIncoming) return; // The native control transport owns this lease.
+    if (!this.snapshot.active || this.disposed || this.nativeDirect) return;
     if (!this.reconnectExpiry) {
       const generation = this.generation;
       // Stop media until fresh signed admission is confirmed. Keep capture only
@@ -1261,7 +1176,7 @@ export class Calls {
     const generation = this.generation;
     try {
       const { active, chat } = this.snapshot;
-      if (active && chat) {
+      if (active && chat && !this.nativeDirect) {
         try {
           const result = await this.command(chat, {
             type: "heartbeat",

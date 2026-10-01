@@ -26,96 +26,50 @@ import { ActionDialog } from "../ActionDialog";
 import { t } from "../i18n";
 import type { Stream, View } from "../model";
 import { Calls } from "./controller";
-import { useNativeCalls } from "./useNativeCalls";
 import { callErrorCopy } from "./errors";
 import { scopeKey, type MediaTile } from "./types";
-import { callRinger, unlockRingtoneAudio, type Ringtone } from "./ringtone";
 import "./calls.css";
 import { NativeVideo } from "./NativeVideo";
-export function useCalls(
-  view: View | null | undefined,
-  ringtone: Ringtone = "classic",
-) {
+import { listenNativeSessionEnd } from "./sessionActivity";
+export function useCalls(view: View | null | undefined) {
   const [calls] = useState(() => new Calls());
-  const nativeRinging = useNativeCalls(calls, view, ringtone);
   useEffect(() => {
     calls.activate();
     return () => calls.dispose();
   }, [calls]);
   useEffect(() => calls.update(view), [calls, view]);
   useEffect(() => {
-    document.addEventListener("pointerdown", unlockRingtoneAudio, true);
-    document.addEventListener("keydown", unlockRingtoneAudio, true);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenNativeSessionEnd((sessionId, activation) => {
+      if (!disposed) void calls.nativeSessionEnded(sessionId, activation);
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
     return () => {
-      document.removeEventListener("pointerdown", unlockRingtoneAudio, true);
-      document.removeEventListener("keydown", unlockRingtoneAudio, true);
-      callRinger.stop();
+      disposed = true;
+      unlisten?.();
     };
-  }, []);
-  useEffect(() => {
-    const update = () => {
-      const state = calls.getSnapshot();
-      callRinger.update(
-        state.incoming?.call.call_id,
-        ringtone,
-        state.phase !== "idle" || nativeRinging.current,
-      );
-    };
-    update();
-    return calls.subscribe(update);
-  }, [calls, ringtone]);
+  }, [calls]);
   return calls;
 }
 export function CallButton({ calls, chat }: { calls: Calls; chat: Stream }) {
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
-  const [choose, setChoose] = useState(false);
   const existing = state.available[scopeKey(chat)];
   return (
-    <>
-      <button
-        type="button"
-        className="icon call-trigger"
-        aria-label={t(existing ? "calls.join" : "calls.start")}
-        disabled={
-          !chat.can_post ||
-          !!state.active ||
-          !!state.nativeAnswer ||
-          state.phase !== "idle"
-        }
-        onClick={() => setChoose(true)}
-      >
-        <Phone size={22} />
-        {existing && <span className="call-indicator" />}
-      </button>
-      {choose && (
-        <ActionDialog
-          title={t(existing ? "calls.join" : "calls.start")}
-          onClose={() => setChoose(false)}
-        >
-          <div className="call-choice">
-            <button
-              onClick={() => {
-                setChoose(false);
-                void calls.start(chat, false, existing);
-              }}
-            >
-              <Phone size={20} />
-              {t("calls.audio")}
-            </button>
-            <button
-              className="secondary"
-              onClick={() => {
-                setChoose(false);
-                void calls.start(chat, true, existing);
-              }}
-            >
-              <Video size={20} />
-              {t("calls.video")}
-            </button>
-          </div>
-        </ActionDialog>
-      )}
-    </>
+    <button
+      type="button"
+      className="icon call-trigger"
+      aria-label={t(existing ? "calls.join" : "calls.start")}
+      disabled={!chat.can_post || !!state.active || state.phase !== "idle"}
+      onClick={() => void calls.start(chat, existing)}
+    >
+      <Phone size={22} />
+      {existing && <span className="call-indicator" />}
+    </button>
   );
 }
 function Tile({
@@ -470,20 +424,16 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
   };
   return (
     <>
-      {!active && (state.nativeAnswer || state.phase === "connecting") && (
+      {!active && state.phase === "connecting" && (
         <section className="call-dock" aria-label={t("calls.active")}>
           <div className="call-dock-title" role="status" aria-live="polite">
-            <span>{t("calls.connecting")}</span>
+            <span>{t("calls.establishing")}</span>
           </div>
           <button
             type="button"
             className="icon call-leave"
             aria-label={t("calls.leave")}
-            onClick={() =>
-              state.nativeAnswer
-                ? state.nativeAnswer.cancel()
-                : void calls.leave()
-            }
+            onClick={() => void calls.leave()}
           >
             <PhoneOff />
           </button>
@@ -635,28 +585,6 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
           <div className="call-controls">{controls(true)}</div>
         </ActionDialog>
       )}
-      {state.incoming &&
-        !active &&
-        !state.nativeAnswer &&
-        state.nativeAnswerChecked !== false && (
-          <ActionDialog
-            title={t("calls.incoming")}
-            onClose={() => void calls.decline()}
-          >
-            <p className="call-status">{state.incoming.chat.name}</p>
-            <div className="dialog-buttons">
-              <button
-                className="secondary"
-                onClick={() => void calls.decline()}
-              >
-                {t("calls.decline")}
-              </button>
-              <button onClick={() => void calls.answer()}>
-                {t("calls.answer")}
-              </button>
-            </div>
-          </ActionDialog>
-        )}
       {state.error && (
         <ActionDialog
           title={t(callErrorCopy(state.error).title)}

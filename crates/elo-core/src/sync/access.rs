@@ -16,7 +16,7 @@ const REQUEST_WINDOW: u64 = 120_000;
 const GRANT_WINDOW: u64 = 600_000;
 
 #[derive(Clone)]
-pub(super) struct Signer {
+pub(crate) struct Signer {
     pub actor: crate::retention_access::Actor,
     key: SigningKey,
     credential: String,

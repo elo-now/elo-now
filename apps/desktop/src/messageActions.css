@@ -288,10 +288,11 @@
 }
 @media (prefers-reduced-motion: no-preference) {
   .dialog.anchored-dialog[open] {
-    animation: page-appear 120ms ease-out;
+    /* Position is measured on open: fading must not move the anchor geometry. */
+    animation: menu-appear var(--elo-motion-fast) var(--elo-ease-out);
   }
   .message-collection-list {
-    animation: page-appear 150ms ease-out;
+    animation: page-appear var(--elo-motion-enter) var(--elo-ease-out);
   }
 }
 .dialog.status-popover {

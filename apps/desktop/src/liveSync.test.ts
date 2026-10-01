@@ -51,6 +51,50 @@ test("unlocked foreground sync starts once and adapts to the open conversation",
   expect(deliver).toHaveBeenCalledTimes(4);
 });
 
+test("connected realtime replaces short idle polling with a safety pass and preserves disconnect fallback", async () => {
+  context.conversation = true;
+  context.realtimeConnected = true;
+  const deliver = vi.fn(async () => result());
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  await vi.advanceTimersByTimeAsync(59_999);
+  expect(deliver).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  context.realtimeConnected = false;
+  worker.changed();
+  await vi.advanceTimersByTimeAsync(4_000);
+  expect(deliver).toHaveBeenCalledTimes(3);
+});
+
+test("realtime bursts coalesce by Space and always request receive-only delivery", async () => {
+  context.realtimeConnected = true;
+  const deliver = vi.fn(async () => result());
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  for (let i = 0; i < 25; i++) worker.requestRemote("work");
+  worker.requestRemote("friends");
+  await vi.advanceTimersByTimeAsync(100);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenNthCalledWith(2, "sync_live", false, true, "work");
+  expect(deliver).toHaveBeenNthCalledWith(3, "sync_live", false, true, "friends");
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(deliver).toHaveBeenCalledTimes(3);
+});
+
+test("a signalled Space backlog remains targeted with bounded catch-up pacing", async () => {
+  const deliver = vi.fn(async () => ({ ...result(), result: { more: deliver.mock.calls.length === 2 } }));
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  worker.requestRemote("work");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(249);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenNthCalledWith(3, "sync_live", false, true, "work");
+});
+
 test("a foreground priority operation holds queued discovery until it finishes", async () => {
   context.invitations = true;
   context.busy = true;

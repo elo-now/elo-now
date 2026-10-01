@@ -10,6 +10,13 @@ const screenshots = process.env.DESKTOP_SCREENSHOTS;
 if (screenshots) await mkdir(screenshots, { recursive: true });
 const errors = [], checks = [];
 const check = async (name, fn) => { await fn(); checks.push(name); };
+async function settlePageMotion(page) {
+  await page.evaluate(async () => {
+    await Promise.all(document.getAnimations()
+      .filter(animation => animation.animationName === 'page-appear')
+      .map(animation => animation.finished.catch(() => {})));
+  });
+}
 async function openPage(width, height, theme = 'light', mobile = false, platform = '', paged = false) {
   const context = await browser.newContext({ viewport: { width, height }, hasTouch: mobile });
   const page = await context.newPage(); page.setDefaultTimeout(5000);
@@ -24,6 +31,7 @@ async function menu(page, name) {
   await page.locator('.desktop-workspace-trigger').click();
   await page.locator('.desktop-workspace-menu').getByRole('button', { name, exact: true }).click();
   await page.getByRole('heading', { name, exact: true }).waitFor({ state: 'visible' });
+  await settlePageMotion(page);
 }
 async function editProfile(page) {
   await page.locator('.desktop-workspace-trigger').click();
@@ -67,6 +75,7 @@ async function assertPane(page) {
   assert.ok(geometry.visible[0].bottom <= geometry.height + 1, 'Page extends below the window');
 }
 async function contentGeometry(page) {
+  await settlePageMotion(page);
   return page.evaluate(() => {
     const visible = node => node.checkVisibility() && getComputedStyle(node).visibility === 'visible';
     const pane = [...document.querySelectorAll('.shell .content-pane')].find(visible);
@@ -84,8 +93,9 @@ try {
       let reference;
       for (const name of ['Contacts', 'Buzz', 'Reminders', 'Notifications', 'Invitations', 'Settings']) {
         if (name === 'Contacts' || name === 'Buzz') {
-          await page.locator('.desktop-sidebar').getByRole('button', { name, exact: true }).click();
+          await page.locator('.desktop-sidebar').getByRole('button', { name: name === 'Buzz' ? /^Buzz(?:,|$)/ : name, exact: name !== 'Buzz' }).click();
         } else await menu(page, name);
+        await settlePageMotion(page);
         await assertPane(page);
         if (name === 'Contacts') {
           await headerSearch(page, 'Search contacts');
@@ -492,6 +502,7 @@ try {
     assert.ok(Math.abs(accept.y - remove.y) < 2 && remove.x - accept.x - accept.width <= 16);
     assert.ok(Math.abs(bounds.x + bounds.width - remove.x - remove.width) < 2);
     await row.getByRole('button', {name:'Accept', exact:true}).click();
+    await page.getByRole('dialog', { name: 'Accept this device?', exact: true }).getByRole('button', { name: 'Accept', exact: true }).click();
     const done = page.locator('[data-device-screen="done"]').getByRole('button', {name:'Done', exact:true});
     await done.waitFor();
     assert.equal(await done.evaluate(node => getComputedStyle(node).backgroundColor), await page.locator('button').first().evaluate(node => { const probe = document.createElement('button'); node.parentElement.append(probe); const color = getComputedStyle(probe).backgroundColor; probe.remove(); return color; }));
@@ -580,7 +591,7 @@ try {
     assert.equal(await page.locator('#desktop-page-outlet > *').count(), 0);
     await context.close();
   });
-  await check('Phone drawer preserves the first tap after swipe and shows call presence; Members is first in More', async () => {
+  await check('Phone drawer preserves the first tap after swipe and shows session presence; Members is first in More', async () => {
     const { page, context } = await openPage(390, 844, 'light', true);
     await page.locator('.channel-list button').filter({ has: page.getByText('General', { exact: true }) }).click();
     const header = page.locator('.conversation .screen-header');
@@ -607,15 +618,18 @@ try {
     });
     assert.equal(await drawer.getAttribute('data-open'), 'true');
     assert.equal(await tab.evaluate(node => getComputedStyle(node, '::after').content), 'none');
+    await page.evaluate(() => {
+      window.__sessionCaptureRequested = false;
+      navigator.mediaDevices.getUserMedia = () => {
+        window.__sessionCaptureRequested = true;
+        // This layout check stops at permission admission; session transport has its own tests.
+        return new Promise(() => {});
+      };
+    });
     // Browsers need not send a compatibility click after a cancelled swipe.
-    // The following fresh physical tap must still open the chooser immediately.
+    // The following fresh physical tap must still start session admission.
     await call.tap();
-    await page.getByRole('heading', { name: 'Start call', exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Video call', exact: true }).waitFor();
-    await page.keyboard.press('Escape');
-    await call.locator('.call-indicator').evaluate(node => node.remove());
-    await tab.tap();
-    assert.equal(await tab.evaluate(node => getComputedStyle(node, '::after').content), 'none');
+    await page.waitForFunction(() => window.__sessionCaptureRequested);
     await context.close();
   });
   await check('Logout hides chats after native cleanup failure and permits a fresh unlock', async () => {
@@ -639,7 +653,7 @@ try {
 } catch (error) {
   for (const context of browser.contexts()) for (const page of context.pages()) {
     await screenshot(page, 'failure');
-    console.error(await page.locator('.shell').evaluate(node => ({ attributes: Object.fromEntries([...node.attributes].map(a => [a.name, a.value])), outlet: document.querySelector('#desktop-page-outlet')?.innerHTML.slice(0, 1500) })));
+    console.error(await page.locator('.shell').evaluate(node => ({ attributes: Object.fromEntries([...node.attributes].map(a => [a.name, a.value])), outlet: document.querySelector('#desktop-page-outlet')?.innerHTML.slice(0, 1500) }), { timeout: 500 }).catch(() => 'App shell is not mounted'));
   }
   throw error;
 } finally { await browser.close(); }

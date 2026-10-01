@@ -22,6 +22,7 @@ export class GroupMedia implements MediaAdapter {
     { source: MediaStreamTrack; clone: MediaStreamTrack }
   >();
   private stopped = false;
+  private stopping?: Promise<void>;
   private remoteTiles = new Map<string, RemoteTile>();
   constructor(
     private tiles: (value: MediaTile[]) => void,
@@ -157,8 +158,13 @@ export class GroupMedia implements MediaAdapter {
       }
     }
   }
-  async stop() {
-    if (this.stopped) return;
+  stop() {
+    // Leave can race with cleanup started by a failed connection. Every caller
+    // must await that same cleanup, including its rejection, before replacing it.
+    this.stopping ??= this.stopOnce();
+    return this.stopping;
+  }
+  private async stopOnce() {
     this.stopped = true;
     for (const track of this.published.values()) track.clone.stop();
     try {

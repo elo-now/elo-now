@@ -12,6 +12,55 @@ async fn profile(path: PathBuf) -> ClientApp {
         .unwrap()
 }
 
+#[tokio::test]
+async fn owner_managed_general_rejects_legacy_membership_and_private_chat_sources() {
+    let temp = TempDir::new().unwrap();
+    let mut app = profile(temp.path().join("profile")).await;
+    let personal = app.pins[0].clone();
+    let request = record::random_hex::<16>().unwrap();
+    let proof = app.owner_general_creation(&request).unwrap();
+    let genesis = decode_record(&proof.genesis).unwrap();
+    let space = genesis.id().to_string().parse().unwrap();
+    let general = proof.verify(space, request.parse().unwrap()).unwrap();
+    let mut pin = personal.clone();
+    pin.space = general.space();
+    pin.stream = general.stream();
+    pin.personal_seed = Some(false);
+    app.session
+        .activate_new_space_controller(general.space())
+        .unwrap();
+    let general_head = general.head_id();
+    let general_space = general.space();
+    let general_stream = general.stream();
+    app.authorities.0.insert(0, general);
+    app.pins.insert(0, pin);
+    let other = crate::vault::Session::create().unwrap().0.identity_id();
+    for operation in [
+        json!({"op":"invitation_create", "post":true, "automatic":false}),
+        json!({"op":"contact_add_members", "request_id":"a1".repeat(16), "people":[other]}),
+        json!({"op":"remove_member", "fingerprint":other}),
+    ] {
+        let mut operation = operation;
+        operation["space"] = json!(general_space);
+        operation["stream"] = json!(general_stream);
+        let error = app.operate(operation).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Manage General members from Space settings."
+        );
+        assert_eq!(app.authorities.0[0].head_id(), general_head);
+    }
+    app.create_chat("Private chat", None, ChatKind::Chat)
+        .await
+        .unwrap();
+    let created = app.authorities.0.last().unwrap();
+    assert!(!created.is_owner_managed());
+    assert_eq!(created.space(), personal.space);
+    assert_ne!(created.stream(), personal.stream);
+    assert_eq!(created.head().unwrap().v, 1);
+    app.close().await.unwrap();
+}
+
 // Exercise the normal signed configuration importer with a real foreign chat.
 async fn share(owner: &mut ClientApp, guest: &mut ClientApp, output: &Path) {
     let a = &mut owner.authorities.0[0];
@@ -610,6 +659,7 @@ async fn personal_seed_stays_hidden_after_device_updates_without_hiding_real_cha
     let ordinary = app.pins[1].clone();
     let foreign = profile(temp.path().join("foreign")).await;
     let descriptor = team::TeamDescriptor {
+        service_credential: None,
         v: 1,
         url: "http://127.0.0.1:9/team/v1/enroll".into(),
         token: "ab".repeat(32),

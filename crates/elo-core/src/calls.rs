@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub const COMMAND_TTL: u64 = 60;
-pub mod wake;
 pub const MAX_SIGNAL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,9 +53,6 @@ pub enum Operation {
     Join {
         call_id: String,
     },
-    Decline {
-        call_id: String,
-    },
     Leave {
         call_id: String,
     },
@@ -72,6 +68,7 @@ pub enum Operation {
     },
     Signal {
         call_id: String,
+        epoch: u64,
         to: RecordId,
         ciphertext: String,
     },
@@ -82,7 +79,6 @@ impl Operation {
         match self {
             Self::Subscribe | Self::Start { .. } => None,
             Self::Join { call_id }
-            | Self::Decline { call_id }
             | Self::Leave { call_id }
             | Self::Heartbeat { call_id }
             | Self::ConnectMedia { call_id }
@@ -94,8 +90,11 @@ impl Operation {
         if let Some(id) = self.call_id() {
             record::hex::<16>(id)?;
         }
-        if let Self::Signal { ciphertext, .. } = self {
-            if ciphertext.len() > MAX_SIGNAL_BYTES * 2 {
+        if let Self::Signal {
+            epoch, ciphertext, ..
+        } = self
+        {
+            if *epoch == 0 || ciphertext.len() > MAX_SIGNAL_BYTES * 2 {
                 return Err(RecordError::Framing);
             }
             let bytes = STANDARD.decode(ciphertext).map_err(|_| RecordError::Json)?;
@@ -296,6 +295,7 @@ pub struct Signal {
     pub scope: CallScope,
     pub config_id: RecordId,
     pub call_id: String,
+    pub epoch: u64,
     pub from: RecordId,
     pub to: RecordId,
     pub nonce: String,
@@ -308,6 +308,7 @@ pub fn seal_signal(
     authority: &Authority,
     session: &Session,
     call_id: &str,
+    epoch: u64,
     to: RecordId,
     payload: SignalPayload,
     now: u64,
@@ -315,6 +316,9 @@ pub fn seal_signal(
     require_member(authority, session.credential().id())?;
     require_member(authority, to)?;
     record::hex::<16>(call_id)?;
+    if epoch == 0 {
+        return Err(RecordError::Authority);
+    }
     payload.validate()?;
     let signal = Signal {
         v: 1,
@@ -325,6 +329,7 @@ pub fn seal_signal(
         },
         config_id: authority.head_id().ok_or(RecordError::Authority)?,
         call_id: call_id.into(),
+        epoch,
         from: session.credential().id(),
         to,
         nonce: record::random_hex::<16>()?,
@@ -352,6 +357,7 @@ pub fn open_signal(
     authority: &Authority,
     session: &Session,
     call_id: &str,
+    epoch: u64,
     ciphertext: &str,
     now: u64,
 ) -> Result<Signal> {
@@ -369,6 +375,8 @@ pub fn open_signal(
     if signal.v != 1
         || signal.kind != "call.signal"
         || signal.call_id != call_id
+        || epoch == 0
+        || signal.epoch != epoch
         || signal.scope.space_id != authority.space()
         || signal.scope.stream_id != authority.stream()
         || Some(signal.config_id) != authority.head_id()

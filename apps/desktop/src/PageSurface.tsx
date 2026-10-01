@@ -40,7 +40,8 @@ export function PageSurface({
   const page = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   useToastHost(dialog);
-  useEffect(() => {
+  // Resolve the portal and open modal pages before the browser can paint a gap.
+  useLayoutEffect(() => {
     if (desktop) setHost(document.getElementById("desktop-page-outlet"));
     else {
       const node = dialog.current;
@@ -93,7 +94,7 @@ export function PageSurface({
   return (
     <dialog
       ref={dialog}
-      className={`dialog ${className}`}
+      className={`dialog page-surface ${className}`}
       aria-label={title}
       onCancel={(event) => {
         event.preventDefault();

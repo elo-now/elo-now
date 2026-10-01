@@ -20,7 +20,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { version as configuredVersion } from "../src-tauri/tauri.conf.json";
 const LicenseSettings = lazy(() => import("./LicenseSettings"));
 import { ColorPicker } from "./ColorPicker";
-import { RingtonePicker } from "./calls/RingtonePicker";
 import { MotifPicker } from "./MotifPicker";
 import { DevicesSettings, RecoverySettings } from "./ProfileDevices";
 import { t } from "./i18n";
@@ -678,10 +677,6 @@ function AppearanceSettings({
         <span>{t("scale.system")}</span>
         <span>{t("scale.large")}</span>
       </div>
-      <RingtonePicker
-        value={preferences.callRingtone}
-        onChange={(callRingtone) => onChange({ ...preferences, callRingtone })}
-      />
       <MotifPicker
         value={preferences.motif}
         onChange={(motif) => onChange(selectMotif(preferences, motif))}

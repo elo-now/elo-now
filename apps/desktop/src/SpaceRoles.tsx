@@ -2,6 +2,7 @@ import { useDesktopLayout } from "./PageSurface";
 import { SpaceContactInput } from "./SpaceContact";
 import { FloatingSearch, SearchField } from "./Search";
 import { Icon } from "./Icon";
+import { OnlineIndicator } from "./useRealtime";
 import { EmptyState } from "./EmptyState";
 import "./contacts.css";
 import "./newChat.css";
@@ -132,7 +133,7 @@ export function SpaceMembers({
           <li key={member.identity}>
             <div className="dm-person contact-row">
               {!hideAvatars && (
-                <span className="avatar" aria-hidden="true">
+                <span className="avatar">
                   {member.name
                     .trim()
                     .split(/\s+/)
@@ -140,6 +141,7 @@ export function SpaceMembers({
                     .map((part) => [...part][0] ?? "")
                     .join("")
                     .toUpperCase()}
+                  <OnlineIndicator identity={member.identity} />
                 </span>
               )}
               <span className="dm-person-copy">

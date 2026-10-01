@@ -40,7 +40,8 @@ Store links become available after the respective store approves and releases th
 
 - **Spaces:** switch between organizations, join by invitation or QR, and keep each Space's conversations separate. Owners can approve join requests.
 - **Conversations:** channels, group and direct messages, replies, reactions, pins, encrypted file and photo attachments, and search. Each Space has a General channel.
-- **Calls:** voice and video calls, optional background incoming calls on mobile, and screen sharing on desktop.
+- **Live activity:** faster message synchronization, typing indicators, online status and attachment upload previews while connected. Durable synchronization catches up after reconnecting.
+- **Calls:** joinable audio/video sessions in chats, full-screen video, and screen sharing on desktop.
 - **Buzz:** catch up on unread messages. Mute a conversation to exclude it from Buzz and message notifications.
 - **Notifications:** optional mobile system notifications, quiet follow-up alerts while messages remain unread, and links to the relevant conversation.
 - **Your profile:** password or supported biometric unlocking, device linking, recovery codes and password-protected recovery QR images.
@@ -93,7 +94,9 @@ background. Files already saved on a device remain available there.
 
 The design uses Ed25519 signatures, the age encryption format and HTTPS transport. A storage Replica does not need participants' decryption keys to deliver their messages. Passwords, recovery secrets and server administrator credentials do not belong in a source repository or notification payload.
 
-These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. The General enrollment service holds a key that can decrypt General messages. On publisher-operated hosting, that operator is 9bits: General is not end-to-end encrypted against the hosting operator. This service role does not grant access to independent private conversations.
+These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. Legacy version-1 Spaces gave the General enrollment service a key that could decrypt General messages. That service role did not grant access to independent private conversations.
+
+Version 1.0.5 uses owner-managed version-2 General for newly created Spaces. Its host has no General content key; approved owner devices sign membership changes. This requires matching clients and a fresh hosting deployment; existing Spaces are not converted. Open invitation links still allow any token holder, including the host, to join. See the [General trust boundary](THREAT_MODEL.md#hosted-general-trust-boundary).
 
 Newly linked and recovered devices receive independent keys. To link a device, show the QR from **Devices → +**, scan it on the new device, then choose **Accept** on the original device. The new device opens the transferred profile with the same password. Keep this QR private. An unlocked, admitted device can revoke another device through **Delete** and confirmation. Server confirmation is required, private-chat controllers must update recipient keys, and copies already on a device cannot be erased. These protocol changes require matching app and server versions; see the [threat model](THREAT_MODEL.md) for rollout boundaries and remaining risks.
 

@@ -5,6 +5,8 @@ limit_req_zone $binary_remote_addr zone=elo_operator:1m rate=2r/s;
 limit_req_zone $binary_remote_addr zone=elo_hosted_replica:1m rate=20r/s;
 limit_req_zone $binary_remote_addr zone=elo_attachments:1m rate=5r/s;
 limit_req_zone $binary_remote_addr zone=elo_accounts:1m rate=2r/s;
+limit_req_zone $binary_remote_addr zone=elo_realtime_connect:1m rate=2r/s;
+limit_conn_zone $binary_remote_addr zone=elo_realtime_sockets:1m;
 log_format elo_hosting_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';
 server {
     listen 8444 ssl;
@@ -27,6 +29,23 @@ server {
     proxy_next_upstream off;
     proxy_connect_timeout 5s;
     proxy_read_timeout 35s;
+    location = /hosting/v1/realtime {
+        limit_req zone=elo_realtime_connect burst=12 nodelay;
+        limit_req_status 429;
+        limit_conn elo_realtime_sockets 64;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_next_upstream off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 35s;
+        proxy_pass http://127.0.0.1:18900;
+    }
     location ~ "^/accounts/v1/deletion(/status)?$" {
         client_max_body_size 32k;
         limit_req zone=elo_accounts burst=8 nodelay;

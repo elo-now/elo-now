@@ -161,6 +161,10 @@ async fn bounded(State(slots): State<Arc<Semaphore>>, request: Request, next: Ne
 }
 /// The origin is operator configuration, never a Host or Forwarded header.
 pub fn router(store: ReplicaStore, public_origin: &str) -> Router {
+    let realtime = crate::realtime::standalone(store.clone(), public_origin);
+    transport_router(store, public_origin).merge(realtime)
+}
+fn transport_router(store: ReplicaStore, public_origin: &str) -> Router {
     let origin = reqwest::Url::parse(public_origin)
         .expect("validated replica public origin")
         .origin()
@@ -207,7 +211,7 @@ pub fn space_router(
 ) -> Router {
     Router::new().nest(
         &format!("/spaces/{reservation}/replica"),
-        router(store, public_origin),
+        transport_router(store, public_origin),
     )
 }
 async fn create_child(

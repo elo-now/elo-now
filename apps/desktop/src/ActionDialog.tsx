@@ -2,7 +2,7 @@ import { UpdateBanner } from "./UpdateGate";
 import { PageContent } from "./PageContent";
 import { PageSurface, useDesktopLayout } from "./PageSurface";
 import { ScreenHeader } from "./ScreenHeader";
-import { useEffect, useRef, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { useToastHost } from "./Toast";
 import { Icon } from "./Icon";
 import { t } from "./i18n";
@@ -52,7 +52,7 @@ function ModalActionDialog({
   const desktop = useDesktopLayout();
   const ref = useRef<HTMLDialogElement>(null);
   useToastHost(ref);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dialog = ref.current!;
     const opener = document.activeElement;
     dialog.showModal();

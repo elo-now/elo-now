@@ -57,6 +57,8 @@ const MAX_EXCHANGE: usize = 12 * 1024 * 1024;
 // Leave room for age framing below the shared ciphertext bound.
 const MAX_READ_STATE: usize = 14 * 1024 * 1024;
 pub mod account_deletion;
+mod attachment_activity;
+pub use attachment_activity::AttachmentActivity;
 mod attachments;
 mod blocking;
 mod calls;
@@ -79,6 +81,7 @@ mod profile;
 pub use invitations::{push, team};
 pub mod control_recovery;
 pub mod profile_backup;
+pub mod realtime;
 mod recovery;
 pub mod recovery_qr;
 pub mod space_host;
@@ -625,7 +628,7 @@ impl ClientApp {
                     && team.scope.stream == p.stream
                     && team.scope.root == p.root
             });
-            streams.push(json!({"name":p.name.clone(),"is_general":is_general,"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":a.genesis().body()["owners"],"rows":rows,"unread_count":unread_count,"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
+            streams.push(json!({"name":p.name.clone(),"is_general":is_general,"owner_managed":a.is_owner_managed(),"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":if a.is_owner_managed() { json!(a.head()?.members.iter().filter(|member| member.capabilities.contains(&Capability::Manage)).map(|member| Owner { identity_id: member.identity_id, root_public_key: member.root_public_key.clone() }).collect::<Vec<_>>()) } else { a.genesis().body()["owners"].clone() },"rows":rows,"unread_count":unread_count,"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":!is_general && self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
         }
         // A one-to-one title belongs to the other participant. Derive it from
         // verified names without rewriting historical signed chat records.
@@ -645,7 +648,7 @@ impl ClientApp {
         }
         for stream in &mut streams {
             if let Some(team) = &self.team {
-                if stream["stream"] == json!(team.scope.stream) {
+                if stream["stream"] == json!(team.scope.stream) && stream["owner_managed"] != true {
                     if let Some(authority) = self
                         .authorities
                         .0
@@ -813,6 +816,22 @@ impl ClientApp {
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
+        self.operate_attachment_transfer_with_activity(v, cancellation, progress, |_| {})
+            .await
+    }
+    /// Activity callbacks must enqueue best-effort delivery without blocking or
+    /// returning transport failures to the attachment operation.
+    pub async fn operate_attachment_transfer_with_activity<F, A>(
+        &mut self,
+        v: Value,
+        cancellation: AttachmentCancellation,
+        progress: F,
+        activity: A,
+    ) -> Result<Value>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+        A: Fn(AttachmentActivity) + Send + Sync + 'static,
+    {
         if !matches!(
             v["op"].as_str(),
             Some("attachment_upload" | "attachment_download")
@@ -821,7 +840,7 @@ impl ClientApp {
         }
         let mut spaces = self.spaces.take().ok_or("Join a Space first.")?;
         let result = spaces
-            .operate_attachment_transfer(self, &v, cancellation, progress)
+            .operate_attachment_transfer(self, &v, cancellation, progress, activity)
             .await;
         self.spaces = Some(spaces);
         result
@@ -1263,6 +1282,13 @@ impl ClientApp {
                 } else {
                     sync.once(now()?).await?
                 };
+                if report.waiting_for_proof > 0
+                    && self.invalidate_membership_from_waiting(None).await.is_err()
+                {
+                    // Live publication fails closed if pending permission
+                    // evidence cannot be inspected; durable receive still succeeds.
+                    self.invalidate_membership_checks().await;
+                }
                 if !receive_only {
                     self.send_wakes().await;
                 }
@@ -1667,7 +1693,7 @@ impl ClientApp {
     }
     fn require_controller(&self, a: &Authority) -> Result<()> {
         if !self.session.can_control(a.space())
-            || a.controller().id() != self.session.credential().id()
+            || !a.can_manage(self.session.credential().id())
             || !self.authorities.space_ready(a)
         {
             return Err("controller unavailable, retired, restored follower, or forked".into());

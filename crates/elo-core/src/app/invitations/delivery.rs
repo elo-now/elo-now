@@ -810,7 +810,7 @@ impl ClientApp {
                     return Err("Wrong invitation mailbox.".into());
                 }
                 let i = self.incoming_scope(&packet, &json!({}))?;
-                self.require_controller(&self.authorities.0[i])?;
+                self.require_private_chat_controller(&self.authorities.0[i])?;
                 self.active_offer(state, bundle)?;
                 let (_, c, _) = candidate(&packet, time)?;
                 if self.authorities.0[i]

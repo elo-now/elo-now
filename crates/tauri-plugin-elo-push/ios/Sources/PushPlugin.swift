@@ -9,13 +9,11 @@ import Tauri
 import UIKit
 import UserNotifications
 
-private struct VoipOwnershipArgs: Decodable { let identity: String; let nonce: String }
 private struct NativeMediaArgs: Decodable { let payload: String }
-private struct CallListenerArgs: Decodable { let channel: Channel }
-private struct CallConfigureArgs: Decodable { let enabled: Bool; let registration: String; let endpoint: String; let labels: [String:String]; let ringtone: String? }
-private struct CallActionArgs: Decodable { let action: String; let callId: String; let event:String? }
+private struct CallStateArgs: Decodable { let active: Bool; let sessionId: String; let camera: Bool }
 private struct PushRegisterArgs: Decodable { let registration: String; let background: Bool? }
 private struct PushAckArgs: Decodable { let opened: String?; let wake: String? }
+private struct PushStatusListenerArgs: Decodable { let channel: Channel }
 private struct PushReconcileArgs: Decodable {
     let registration: String
     let unread: Bool
@@ -69,13 +67,6 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             self?.configure()
         }
     }
-    @objc func voipOwnership(_ invoke: Invoke) throws {
-        let args = try invoke.parseArgs(VoipOwnershipArgs.self)
-        Task { @MainActor in
-            do { invoke.resolve(try await VoipOwnership.proof(identity: args.identity, nonce: args.nonce)) }
-            catch { invoke.reject("Could not verify this device for incoming calls. Try again.") }
-        }
-    }
     @objc func nativeMedia(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(NativeMediaArgs.self)
         guard args.payload.utf8.count <= 196608,
@@ -90,12 +81,21 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         }
     }
 
+    @objc func setCallState(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(CallStateArgs.self)
+        Task { @MainActor in
+            do {
+                try ChatSessionAudio.shared.set(active: args.active, id: args.sessionId)
+                invoke.resolve()
+            } catch { invoke.reject("unavailable") }
+        }
+    }
+
     // Tao 0.35 supplies the delegate methods but does not declare protocol
     // conformance. Firebase refuses to install its APNs callbacks without it.
     // Keep Tao's delegate and lifecycle methods; only supply the missing marker.
     @discardableResult private func configure() -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
-        _ = IncomingCalls.shared
         // Anchor the gzip category used by Firebase heartbeat headers. A global
         // -ObjC flag loads duplicate Tauri/SwiftRs objects from plugin archives.
         // Referencing this exported constant retains just its category object.
@@ -133,7 +133,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         try? statusChannel?.send([:] as [String: Bool])
     }
     @objc func statusListener(_ invoke: Invoke) throws {
-        let args = try invoke.parseArgs(CallListenerArgs.self)
+        let args = try invoke.parseArgs(PushStatusListenerArgs.self)
         DispatchQueue.main.async { self.statusChannel = args.channel; invoke.resolve() }
     }
     @objc func register(_ invoke: Invoke) throws {
@@ -260,38 +260,8 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         }
         invoke.resolve()
     }
-    @objc func callConfigure(_ invoke: Invoke) throws {
-        let args = try invoke.parseArgs(CallConfigureArgs.self)
-        DispatchQueue.main.async { [self] in
-            guard args.registration == prefs.string(forKey:"elo.push.registration"),URL(string:args.endpoint)?.scheme == "https" else { invoke.reject("Invalid call registration");return }
-            let token = IncomingCalls.shared.configure(enabled:args.enabled,registration:args.registration,endpoint:args.endpoint,labels:args.labels,ringtone:args.ringtone)
-            invoke.resolve(["token":token ?? ""])
-        }
-    }
-    @objc func callStatus(_ invoke: Invoke) {
-        DispatchQueue.main.async { invoke.resolve(["incoming":IncomingCalls.shared.status() ?? [:]]) }
-    }
-    @objc func callListener(_ invoke: Invoke) throws {
-        let args = try invoke.parseArgs(CallListenerArgs.self)
-        DispatchQueue.main.async { IncomingCalls.shared.answerListener = args.channel; invoke.resolve() }
-    }
-    @objc func callAction(_ invoke: Invoke) throws {
-        let args = try invoke.parseArgs(CallActionArgs.self)
-        DispatchQueue.main.async {
-            if args.action == "answer" { invoke.resolve(["handled": IncomingCalls.shared.answerFromApp(args.callId)]); return }
-            if args.action == "decline" { invoke.resolve(["handled": IncomingCalls.shared.declineFromApp(args.callId)]); return }
-            if args.action == "answering" { IncomingCalls.shared.answering(args.callId) }
-            if args.action == "connected" { IncomingCalls.shared.connected(args.callId) }
-            if args.action == "ack" { IncomingCalls.shared.acknowledge(args.callId,event:args.event) }
-            if args.action == "end" { IncomingCalls.shared.end(args.callId) }
-            if args.action == "unlock" { IncomingCalls.shared.requestUnlock(args.callId) }
-            invoke.resolve()
-        }
-    }
     @objc func disable(_ invoke: Invoke) {
         DispatchQueue.main.async { [self] in
-            IncomingCalls.shared.disable()
-            NativeMedia.shared.stopAll()
             waiting?.reject("Notification setup was cancelled.")
             waiting = nil
             registrationAttempt = nil

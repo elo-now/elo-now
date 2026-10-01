@@ -6,6 +6,9 @@ use crate::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 pub mod revocations;
+pub const MAX_COMPANION_DEPTH: usize = 4;
+pub const MAX_CREDENTIAL_BYTES: usize = 8 * 1024;
+const MAX_ENCODED_CREDENTIAL: usize = MAX_CREDENTIAL_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,11 +28,15 @@ pub struct VerifiedCredential {
     record: SignedRecord,
     body: DeviceCredential,
     key: VerifyingKey,
+    delegation_depth: usize,
 }
 impl VerifiedCredential {
     /// `trusted_root` is an out-of-band anchor, never inferred from this record.
     pub fn verify(bytes: &[u8], trusted_root: &VerifyingKey) -> Result<Self> {
-        let record = SignedRecord::parse(bytes)?;
+        Self::verify_at_depth(bytes, trusted_root, 0)
+    }
+    fn verify_at_depth(bytes: &[u8], trusted_root: &VerifyingKey, depth: usize) -> Result<Self> {
+        let record = SignedRecord::parse_bounded(bytes, MAX_CREDENTIAL_BYTES)?;
         let body: DeviceCredential = record.decode()?;
         if !matches!(body.v, 1 | 2) || body.kind != "device.credential" {
             return Err(RecordError::Unsupported);
@@ -40,28 +47,27 @@ impl VerifiedCredential {
         {
             return Err(RecordError::Authority);
         }
-        match (body.v, &body.authorizing_device) {
-            (1, None) => record.verify_signature(trusted_root)?,
+        let delegation_depth = match (body.v, &body.authorizing_device) {
+            (1, None) => {
+                record.verify_signature(trusted_root)?;
+                0
+            }
             (2, Some(encoded)) => {
                 use base64::Engine;
-                if encoded.len() > 4096 {
+                if depth >= MAX_COMPANION_DEPTH || encoded.len() > MAX_ENCODED_CREDENTIAL {
                     return Err(RecordError::Framing);
                 }
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(encoded)
                     .map_err(|_| RecordError::Json)?;
-                let parent = SignedRecord::parse(&bytes)?;
-                let parent_body: DeviceCredential = parent.decode()?;
-                // One level only: a companion cannot create another device.
-                // Reject before recursion, including oversized/cyclic chains.
-                if parent_body.v != 1 || parent_body.authorizing_device.is_some() {
-                    return Err(RecordError::Authority);
-                }
-                let parent = Self::verify(&bytes, trusted_root)?;
+                // Each link has its own signature and the same pinned root.
+                // A bounded chain proves authorship, never host admission.
+                let parent = Self::verify_at_depth(&bytes, trusted_root, depth + 1)?;
                 record.verify_signature(parent.key())?;
+                parent.delegation_depth + 1
             }
             _ => return Err(RecordError::Unsupported),
-        }
+        };
         let key = VerifyingKey::from_bytes(&record::hex(&body.signing_public_key)?)
             .map_err(|_| RecordError::Signature)?;
         if key.is_weak() {
@@ -72,7 +78,12 @@ impl VerifiedCredential {
         if recipient.to_string() != body.age_recipient {
             return Err(RecordError::Json);
         }
-        Ok(Self { record, body, key })
+        Ok(Self {
+            record,
+            body,
+            key,
+            delegation_depth,
+        })
     }
     pub fn id(&self) -> RecordId {
         self.record.id()
@@ -102,6 +113,10 @@ impl VerifiedCredential {
                 .expect("validated immutable device authorization")
                 .id()
         })
+    }
+    /// Structural chain capacity only; current owner admission is checked separately.
+    pub fn can_issue_companion(&self) -> bool {
+        self.delegation_depth < MAX_COMPANION_DEPTH
     }
     /// Proves device authorship only. Config/capability/audience admission is separate.
     pub fn verify_chat(&self, record: &SignedRecord) -> Result<record::ChatMessage> {
@@ -135,7 +150,7 @@ impl DeviceCredential {
         )?;
         VerifiedCredential::verify(record.bytes(), &root.verifying_key())
     }
-    /// The already unlocked original device authorizes distinct companion keys.
+    /// An unlocked admitted device authorizes distinct companion keys.
     /// Hosts must check the authorizer is still admitted before new enrollment.
     pub fn issue_companion(
         authorizer: &VerifiedCredential,
@@ -144,8 +159,7 @@ impl DeviceCredential {
         recipient: &age::x25519::Recipient,
     ) -> Result<VerifiedCredential> {
         use base64::Engine;
-        if authorizer.authorizing_device().is_some()
-            || authorizer.key() != &authorizing_key.verifying_key()
+        if !authorizer.can_issue_companion() || authorizer.key() != &authorizing_key.verifying_key()
         {
             return Err(RecordError::Authority);
         }
@@ -269,7 +283,7 @@ impl DeviceRevocation {
         match (body.v, body.authorizing_device) {
             (1, None) => signed.verify_signature(&root)?,
             (2, Some(encoded)) => {
-                if encoded.len() > 8192 {
+                if encoded.len() > MAX_ENCODED_CREDENTIAL {
                     return Err(RecordError::Framing);
                 }
                 let bytes = base64::engine::general_purpose::STANDARD

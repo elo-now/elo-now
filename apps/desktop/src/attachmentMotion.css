@@ -1,0 +1,14 @@
+/* Dimensions remain in normal flow; only decoded image pixels are revealed. */
+.attachment-preview .attachment-image {
+  opacity: 0;
+  transition: opacity var(--elo-motion-enter, 140ms)
+    var(--elo-ease-out, ease-out);
+}
+.attachment-preview .attachment-image[data-preview-ready="true"] {
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .attachment-preview .attachment-image {
+    transition: none;
+  }
+}

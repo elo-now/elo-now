@@ -1,4 +1,5 @@
-//! Single-controller, pinned-genesis authority. No clock-based revocation claims.
+//! Pinned-genesis authority with explicit controller and owner-device versions.
+//! No clock-based revocation claims.
 use crate::{
     identity::VerifiedCredential,
     ids::{IdentityId, RecordId, SpaceId, StreamId},
@@ -132,11 +133,22 @@ impl Authority {
         if genesis.id().to_string() != pinned_space.to_string() {
             return Err(RecordError::Authority);
         }
-        genesis.verify_signature(pinned_root)?;
         let body: SpaceGenesis = genesis.decode()?;
+        match body.v {
+            1 => genesis.verify_signature(pinned_root)?,
+            2 => {
+                if controller.identity() != IdentityId::of_root_key(pinned_root.as_bytes())
+                    || controller.record().body()["root_public_key"]
+                        != record::encode_hex(pinned_root.as_bytes())
+                {
+                    return Err(RecordError::Authority);
+                }
+                genesis.verify_signature(controller.key())?;
+            }
+            _ => return Err(RecordError::Authority),
+        }
         record::hex::<16>(&body.nonce)?;
-        if body.v != 1
-            || body.kind != "space.genesis"
+        if body.kind != "space.genesis"
             || body.issuer_identity != IdentityId::of_root_key(pinned_root.as_bytes())
             || body.controller_credential_id != controller.id()
             || !record::sorted_unique(
@@ -210,6 +222,22 @@ impl Authority {
     }
     pub fn is_forked(&self) -> bool {
         self.forked
+    }
+    /// Version 2 pins the first device and delegates later updates only through
+    /// the exact owner credentials in the preceding signed configuration.
+    pub fn is_owner_managed(&self) -> bool {
+        self.body.v == 2
+    }
+    /// This is authority permission, independent of a device's local vault mode.
+    pub fn can_manage(&self, credential: RecordId) -> bool {
+        !self.is_forked()
+            && self.head().is_ok_and(|head| {
+                if self.is_owner_managed() {
+                    head.owner_credential_ids.contains(&credential)
+                } else {
+                    head.controller_credential_id == credential
+                }
+            })
     }
     pub fn credential(&self, id: RecordId) -> Result<&VerifiedCredential> {
         self.credentials.get(&id).ok_or(RecordError::Authority)
@@ -285,7 +313,7 @@ impl Authority {
     }
     fn validate_config(&self, c: &StreamConfig) -> Result<()> {
         record::hex::<16>(&c.nonce)?;
-        if c.v != 1
+        if c.v != self.body.v
             || c.kind != "stream.config"
             || c.space_id != self.space()
             || c.stream_id != self.stream
@@ -344,15 +372,43 @@ impl Authority {
         if all.len() > record::MAX_CHAT_CREDENTIALS {
             return Err(RecordError::Authority);
         }
-        let mut owners = BTreeSet::new();
-        for owner in &self.body.owners {
-            let member = c
-                .members
+        let owner_members = if self.is_owner_managed() && c.sequence > 1 {
+            c.members
                 .iter()
-                .find(|m| m.identity_id == owner.identity_id)
-                .ok_or(RecordError::Authority)?;
-            if member.root_public_key != owner.root_public_key
-                || member.identity_type != "HUMAN"
+                .filter(|m| m.capabilities.contains(&Capability::Manage))
+                .collect::<Vec<_>>()
+        } else {
+            self.body
+                .owners
+                .iter()
+                .map(|owner| {
+                    c.members
+                        .iter()
+                        .find(|m| {
+                            m.identity_id == owner.identity_id
+                                && m.root_public_key == owner.root_public_key
+                        })
+                        .ok_or(RecordError::Authority)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        if owner_members.is_empty()
+            || (self.is_owner_managed()
+                && c.sequence == 1
+                && c.members.iter().any(|m| {
+                    m.capabilities.contains(&Capability::Manage)
+                        && !self
+                            .body
+                            .owners
+                            .iter()
+                            .any(|owner| owner.identity_id == m.identity_id)
+                }))
+        {
+            return Err(RecordError::Authority);
+        }
+        let mut owners = BTreeSet::new();
+        for member in owner_members {
+            if member.identity_type != "HUMAN"
                 || ![
                     Capability::Read,
                     Capability::Post,
@@ -367,7 +423,8 @@ impl Authority {
             owners.extend(member.credential_ids.iter().copied());
         }
         if c.owner_credential_ids != owners.into_iter().collect::<Vec<_>>()
-            || !c.owner_credential_ids.contains(&c.controller_credential_id)
+            || ((!self.is_owner_managed() || c.sequence == 1)
+                && !c.owner_credential_ids.contains(&c.controller_credential_id))
         {
             return Err(RecordError::Authority);
         }
@@ -570,7 +627,7 @@ impl Authority {
         key: &SigningKey,
     ) -> Result<Vec<u8>> {
         let mut next = self.clone();
-        if self.controller().key() == &key.verifying_key() {
+        if !self.is_owner_managed() && self.controller().key() == &key.verifying_key() {
             next.cached_checkpoint = Some(self.sign_checkpoint(key)?);
         }
         next.seal_snapshot(recipient)

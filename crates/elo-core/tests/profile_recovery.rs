@@ -312,7 +312,7 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     assert!(
         source
             .approve(
-                &app,
+                &mut app,
                 selected["id"].as_str().unwrap(),
                 selected["code"].as_str().unwrap(),
                 &card
@@ -367,14 +367,24 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     assert!(!destination.exists());
     assert!(
         source
-            .approve(&app, request["id"].as_str().unwrap(), "wrong code", &card)
+            .approve(
+                &mut app,
+                request["id"].as_str().unwrap(),
+                "wrong code",
+                &card
+            )
             .await
             .is_err()
     );
     lose_ack.store(true, Ordering::SeqCst);
     assert!(
         source
-            .approve(&app, request["id"].as_str().unwrap(), &comparison, &card)
+            .approve(
+                &mut app,
+                request["id"].as_str().unwrap(),
+                &comparison,
+                &card
+            )
             .await
             .is_err()
     );
@@ -383,7 +393,12 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
         .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
         .unwrap();
     source
-        .approve(&app, request["id"].as_str().unwrap(), &comparison, &card)
+        .approve(
+            &mut app,
+            request["id"].as_str().unwrap(),
+            &comparison,
+            &card,
+        )
         .await
         .unwrap();
     let objects_after: i64 = db
@@ -398,7 +413,7 @@ async fn pairing_is_scoped_explicit_retryable_and_retrievable_without_the_source
     assert!(
         source
             .approve(
-                &app,
+                &mut app,
                 &"ff".repeat(32),
                 other.summary().unwrap()["code"].as_str().unwrap(),
                 &card

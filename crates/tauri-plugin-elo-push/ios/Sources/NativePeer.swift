@@ -28,6 +28,20 @@ import WebRTC
     init(id: String, servers: [[String: Any]]) throws {
         self.id = id
         super.init()
+        pc = try makeConnection(servers)
+        let session = RTCAudioSession.sharedInstance()
+        session.useManualAudio = false
+        session.isAudioEnabled = true
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        do {
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
+        } catch { pc.close(); throw MediaError.unavailable }
+        audio = Self.factory.audioTrack(with: Self.factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)), trackId: "microphone")
+        audio?.isEnabled = false
+    }
+    private func makeConnection(_ servers: [[String: Any]]) throws -> RTCPeerConnection {
+        guard servers.count <= 16 else { throw MediaError.invalid }
         let config = RTCConfiguration()
         config.sdpSemantics = .unifiedPlan
         config.bundlePolicy = .maxBundle
@@ -39,17 +53,20 @@ import WebRTC
             return RTCIceServer(urlStrings: urls, username: value["username"] as? String, credential: value["credential"] as? String)
         }
         guard let peer = Self.factory.peerConnection(with: config, constraints: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil), delegate: self) else { throw MediaError.unavailable }
-        pc = peer
-        let session = RTCAudioSession.sharedInstance()
-        session.useManualAudio = IncomingCalls.shared.ownsAudio
-        session.isAudioEnabled = !IncomingCalls.shared.ownsAudio || IncomingCalls.shared.audioActive
-        session.lockForConfiguration()
-        defer { session.unlockForConfiguration() }
-        do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
-        } catch { peer.close(); throw MediaError.unavailable }
-        audio = Self.factory.audioTrack(with: Self.factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)), trackId: "microphone")
-        audio?.isEnabled = false
+        return peer
+    }
+    /// A new membership epoch must discard all old SDP/ICE and remote tracks.
+    /// Keep local capture so a camera or microphone is never restarted implicitly.
+    func reset(servers: [[String: Any]]) throws {
+        try live()
+        let previous = pc
+        pc = nil
+        previous?.close()
+        channels.removeAll(); candidates.removeAll(); signals.removeAll()
+        acceptedOffer = nil; acceptedAnswer = nil
+        connection = "new"; revision += 1
+        do { pc = try makeConnection(servers) }
+        catch { stop(); throw error }
     }
     enum MediaError: Error { case invalid, unavailable, ended, permission }
     static func permission(video: Bool) async throws {
@@ -58,7 +75,11 @@ import WebRTC
             guard await AVCaptureDevice.requestAccess(for: .video) else { throw MediaError.permission }
         }
     }
-    private func live() throws { if stopped { throw MediaError.ended } }
+    private func live() throws { if stopped || pc == nil { throw MediaError.ended } }
+    private func live(_ expected: RTCPeerConnection) throws {
+        try live()
+        if pc !== expected { throw MediaError.ended }
+    }
     private func emit(_ signal: [String: Any]) {
         guard !stopped else { return }
         guard signals.count < 256 else { stop(); connection = "failed"; return }
@@ -116,6 +137,7 @@ import WebRTC
     }
     func offer(restart: Bool) async throws {
         try live()
+        let expected = pc!
         if channels.isEmpty {
             let settings = RTCRtpTransceiverInit(); settings.direction = .sendRecv
             channels = [RTCRtpMediaType.audio, .video, .video].compactMap { pc.addTransceiver(of: $0, init: settings) }
@@ -129,7 +151,8 @@ import WebRTC
                     if let sdp = sdp { continuation.resume(returning: sdp) } else { continuation.resume(throwing: error ?? MediaError.unavailable) }
                 }
             }
-            try live(); try await local(offer)
+            try live(expected); try await local(offer)
+            try live(expected)
         }
         if pc.signalingState == .haveLocalOffer, let sdp = pc.localDescription {
             emit(["type": "offer", "sdp": sdp.sdp])
@@ -137,23 +160,27 @@ import WebRTC
     }
     private func local(_ sdp: RTCSessionDescription) async throws {
         try live()
+        let expected = pc!
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            pc.setLocalDescription(sdp) { error in
+            expected.setLocalDescription(sdp) { error in
                 if let error = error { continuation.resume(throwing: error) } else { continuation.resume() }
             }
         }
-        try live()
+        try live(expected)
     }
     private func add(_ candidate: RTCIceCandidate) async throws {
+        try live()
+        let expected = pc!
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            pc.add(candidate) { error in
+            expected.add(candidate) { error in
                 if let error = error { continuation.resume(throwing: error) } else { continuation.resume() }
             }
         }
-        try live()
+        try live(expected)
     }
     func signal(_ value: [String: Any]) async throws {
         try live()
+        let expected = pc!
         switch value["type"] as? String {
         case "request_offer": try await offer(restart: true)
         case "ice":
@@ -177,10 +204,11 @@ import WebRTC
                     if let error = error { continuation.resume(throwing: error) } else { continuation.resume() }
                 }
             }
-            try live()
+            try live(expected)
             if answering { acceptedAnswer = raw } else { acceptedOffer = raw }
             let pending = candidates; candidates.removeAll()
-            for candidate in pending { try await add(candidate) }
+            for candidate in pending { try live(expected); try await add(candidate) }
+            try live(expected)
             if !answering {
                 if channels.isEmpty {
                     // WebRTC documents nil before negotiation, but its header marks mid
@@ -199,7 +227,8 @@ import WebRTC
                         if let sdp = sdp { continuation.resume(returning: sdp) } else { continuation.resume(throwing: error ?? MediaError.unavailable) }
                     }
                 }
-                try live(); try await local(answer)
+                try live(expected); try await local(answer)
+                try live(expected)
                 if let sdp = pc.localDescription { emit(["type": "answer", "sdp": sdp.sdp]) }
             }
             revision += 1
@@ -227,7 +256,7 @@ import WebRTC
         stopped = true
         audio?.isEnabled = false
         capturer?.stopCapture(); capturer = nil; camera = nil; audio = nil
-        pc?.close()
+        let previous = pc; pc = nil; previous?.close()
         channels.removeAll(); candidates.removeAll(); signals.removeAll()
         connection = "closed"; revision += 1
     }
@@ -241,16 +270,20 @@ import WebRTC
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {}
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
         Task { @MainActor [weak self] in
-            guard let self = self, !self.stopped else { return }
+            guard let self = self, !self.stopped, self.pc === peerConnection else { return }
             self.connection = [.new: "new", .connecting: "connecting", .connected: "connected", .disconnected: "disconnected", .failed: "failed", .closed: "closed"][newState] ?? "failed"
         }
     }
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
         Task { @MainActor [weak self] in
-            self?.emit(["type": "ice", "candidate": candidate.sdp, "sdp_mid": candidate.sdpMid as Any? ?? NSNull(), "sdp_mline_index": Int(candidate.sdpMLineIndex)])
+            guard let self = self, !self.stopped, self.pc === peerConnection else { return }
+            self.emit(["type": "ice", "candidate": candidate.sdp, "sdp_mid": candidate.sdpMid as Any? ?? NSNull(), "sdp_mline_index": Int(candidate.sdpMLineIndex)])
         }
     }
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didStartReceivingOn transceiver: RTCRtpTransceiver) {
-        Task { @MainActor [weak self] in self?.revision += 1 }
+        Task { @MainActor [weak self] in
+            guard let self = self, !self.stopped, self.pc === peerConnection else { return }
+            self.revision += 1
+        }
     }
 }

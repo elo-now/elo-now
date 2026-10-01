@@ -26,6 +26,9 @@ pub(super) struct CheckpointEvidence {
 
 impl Authority {
     pub(super) fn current_checkpoint(&self) -> Option<&SignedRecord> {
+        if self.is_owner_managed() {
+            return None;
+        }
         self.cached_checkpoint.as_ref().filter(|r| {
             !self.is_forked()
                 && r.decode::<Checkpoint>()
@@ -36,7 +39,10 @@ impl Authority {
     pub(crate) fn accept_cached_checkpoint(&mut self, record: SignedRecord) -> Result<()> {
         let body: Checkpoint = record.decode()?;
         let expected = self.head_id().ok_or(RecordError::Authority)?;
-        if self.is_forked() || body.config_id != expected || body.sequence != self.head()?.sequence
+        if self.is_owner_managed()
+            || self.is_forked()
+            || body.config_id != expected
+            || body.sequence != self.head()?.sequence
         {
             return Err(RecordError::Authority);
         }
@@ -82,7 +88,8 @@ impl Authority {
     }
 
     pub(crate) fn sign_checkpoint(&self, key: &SigningKey) -> Result<SignedRecord> {
-        if self.is_forked()
+        if self.is_owner_managed()
+            || self.is_forked()
             || self.checkpoint_evidence.is_some()
             || self.controller().key() != &key.verifying_key()
         {
@@ -126,7 +133,9 @@ impl Authority {
         signed: SignedRecord,
         config: SignedRecord,
     ) -> Result<()> {
-        if self.head.is_some() || self.checkpoint_evidence.is_some() {
+        // Version 2 requires the preceding owner roster. A current signer alone
+        // cannot attest its own admission through a legacy compact checkpoint.
+        if self.is_owner_managed() || self.head.is_some() || self.checkpoint_evidence.is_some() {
             return Err(RecordError::Authority);
         }
         let c: StreamConfig = config.decode()?;
