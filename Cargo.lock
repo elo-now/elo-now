@@ -6222,7 +6222,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-elo-privacy"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "serde_json",
  "tauri",
@@ -6231,7 +6231,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-elo-push"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "serde",
  "serde_json",
