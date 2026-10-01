@@ -1,7 +1,7 @@
 import { mergeHistory } from "./messageHistory";
 import { messageIdentity, type MessageRow } from "./messageThreads";
 
-export type SendReceipt = { id: string; logical_time: number };
+export type SendReceipt = { id: string; logical_time: number; expires_at_ms?: number };
 type Echo = { key: string; scope: string; row: MessageRow };
 type Draft = {
   scope: string;
@@ -11,6 +11,7 @@ type Draft = {
   createdAt: string;
   logicalTime: number;
   thread?: string;
+  expiresAt?: number;
 };
 
 /** Transient UI state only. Durable queuing and authorization stay in the core. */
@@ -45,7 +46,7 @@ export class OutgoingMessages {
             issuer_credential: draft.credential,
             created_at: draft.createdAt,
             logical_time: draft.logicalTime,
-            payload: { text: draft.text, thread_root: draft.thread },
+            payload: { text: draft.text, thread_root: draft.thread, expires_at_ms: draft.expiresAt },
           },
         },
       },
@@ -65,6 +66,7 @@ export class OutgoingMessages {
                   body: {
                     ...echo.row.body,
                     logical_time: receipt.logical_time,
+                    payload: { ...echo.row.body.payload, expires_at_ms: receipt.expires_at_ms ?? draft.expiresAt },
                   },
                 },
               }

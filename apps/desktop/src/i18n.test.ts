@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { t, warningText, formatTimestamp, formatFileSize } from "./i18n";
+import { t, warningText, formatTimestamp, formatFileSize, formatAttachmentExpiry } from "./i18n";
 
 describe("English presentation without changing user data", () => {
+  it("shows an attachment deadline in the reader's time zone without the year", () => {
+    const time = Date.parse("2026-09-30T23:30:00Z");
+    expect(formatAttachmentExpiry(time, "UTC")).toBe("Sep 30, 23:30");
+    expect(formatAttachmentExpiry(time, "Europe/Warsaw")).toBe("Oct 1, 01:30");
+  });
   it("inserts user values literally and requires every named value", () => {
     expect(t("preview.recipient", { recipient: "A {count} <B>" })).toBe(
       "Recipient: A {count} <B>",

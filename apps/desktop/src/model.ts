@@ -105,9 +105,10 @@ export type Stream = {
       deleted_record_id?: string;
       issuer_credential?: string;
       kind: string;
+      expired?: boolean;
       issuer_identity: string;
       created_at?: string;
-      payload?: { text: string; sender_name?: string; thread_root?: string };
+      payload?: { text?: string; sender_name?: string; thread_root?: string; expires_at_ms?: number | null; expiry_hours?: 1 | 12 | 24 | null };
       locator?: {
         message_record_id: string;
         body_object_id: string;
@@ -306,7 +307,7 @@ export function searchMessages(
   return rows.filter(
     (row) =>
       row.body.kind === "chat.message" &&
-      row.body.payload?.text.toLocaleLowerCase().includes(term),
+      row.body.payload?.text?.toLocaleLowerCase().includes(term),
   );
 }
 

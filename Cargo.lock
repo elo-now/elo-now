@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "elo-call-service"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "elo-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "age",
  "clap",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "elo-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "age",
  "axum",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "elo-desktop"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "age",
  "arboard",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "elo-team"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "age",
  "async-trait",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "elo-wake"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "appattest",
  "axum",

@@ -235,6 +235,9 @@ impl SignedRecord {
 #[serde(deny_unknown_fields)]
 pub struct TextPayload {
     pub text: String,
+    /// Sender-signed deadline, independent of transport retention on replicas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
     /// The original record in this chat, never the immediately preceding reply.
@@ -260,6 +263,11 @@ pub enum MessageAction {
     Delete {
         target: RecordId,
     },
+    Expiry {
+        target: RecordId,
+        /// None cancels the deadline; otherwise count from this event's clock.
+        hours: Option<u8>,
+    },
 }
 pub fn reaction_choices() -> &'static [String] {
     static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -271,15 +279,17 @@ pub fn reaction_choices() -> &'static [String] {
 impl MessageAction {
     pub fn target(&self) -> RecordId {
         match self {
-            Self::Reaction { target, .. } | Self::Pin { target, .. } | Self::Delete { target } => {
-                *target
-            }
+            Self::Reaction { target, .. }
+            | Self::Pin { target, .. }
+            | Self::Delete { target }
+            | Self::Expiry { target, .. } => *target,
         }
     }
     fn valid(&self) -> bool {
         match self {
             Self::Reaction { emoji, .. } => reaction_choices().contains(emoji),
             Self::Pin { .. } | Self::Delete { .. } => true,
+            Self::Expiry { hours, .. } => hours.is_none_or(|h| matches!(h, 1 | 12 | 24)),
         }
     }
 }
@@ -345,6 +355,11 @@ impl ChatMessage {
             return Err(RecordError::Unsupported);
         }
         hex::<16>(&self.nonce)?;
+        if self.payload.expires_at_ms.is_some_and(|expires| {
+            expires == 0 || expires > MAX_INTEGER || self.kind == "chat.action"
+        }) {
+            return Err(RecordError::Json);
+        }
         if !sorted_unique(&self.audience, 1, MAX_CHAT_MEMBERS)
             || !sorted_unique(&self.recipient_credentials, 1, MAX_CHAT_CREDENTIALS)
             || self.parents.len() > 16

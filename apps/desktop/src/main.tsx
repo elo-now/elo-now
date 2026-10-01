@@ -54,10 +54,13 @@ import {
 import { MessageContent } from "./MessageContent";
 import { reminderProfileMatches, watchReminderActions } from "./reminders";
 import { ComposerInput } from "./ComposerInput";
+import { ComposerExpiry } from "./ComposerExpiry";
+import type { MessageExpiryHours } from "./messageExpiry";
+import { useExpiringView } from "./useMessageExpiry";
 import { ThreadView } from "./ThreadView";
 import { MessageBubble, ThreadLink } from "./MessageBubble";
 import { UnavailableMessage } from "./UnavailableMessage";
-import { AttachmentButton, type AttachmentProgress } from "./AttachmentButton";
+import { AttachmentButton, attachmentFailure, type AttachmentProgress, type AttachmentUnavailable } from "./AttachmentButton";
 import {
   clearAttachmentPreviews,
   loadAttachmentPreview,
@@ -436,6 +439,7 @@ function App() {
     useState<SelectedAttachment | null>(null);
   const [attachmentTransfer, setAttachmentTransfer] =
     useState<AttachmentTransferState>();
+  const [attachmentStates, setAttachmentStates] = useState<Record<string, AttachmentUnavailable>>({});
   const uploadingAttachment = attachmentTransfer?.kind === "upload";
   const downloadingAttachment =
     attachmentTransfer?.kind === "download"
@@ -537,13 +541,16 @@ function App() {
       document.removeEventListener("visibilitychange", update);
     };
   }, [preferences, theme]);
-  const [view, storeView] = useState<View | null>(null),
+  const [storedView, storeView] = useState<View | null>(null),
     [selected, setSelected] = useState(""),
     [busy, setBusy] = useState(false),
     [syncSummary, setSyncSummary] = useState(""),
     [text, setText] = useState(""),
     [action, setAction] = useState<Action | null>(null),
     [values, setValues] = useState<Record<string, string | boolean>>({});
+  const view = useExpiringView(storedView);
+  const [messageExpiry, setMessageExpiry] = useState<MessageExpiryHours>();
+  useEffect(() => setMessageExpiry(undefined), [view?.identity, view?.active_space, selected]);
   const setView: React.Dispatch<React.SetStateAction<View | null>> = (next) =>
     storeView((current) =>
       typeof next === "function"
@@ -842,7 +849,7 @@ function App() {
     }
     return r;
   };
-  const sendText = (value: string, thread?: string) => {
+  const sendText = (value: string, thread?: string, expiry?: MessageExpiryHours) => {
     if (!view || !stream)
       return Promise.reject(new Error("The profile is locked"));
     const createdAt = recordTimestamp();
@@ -860,6 +867,7 @@ function App() {
         createdAt,
         logicalTime,
         thread,
+        expiresAt: expiry ? Date.now() + expiry * 3_600_000 : undefined,
       },
       async () => {
         const result = await call({
@@ -868,6 +876,7 @@ function App() {
           stream: stream.stream,
           text: value,
           created_at: createdAt,
+          expires_in_hours: expiry,
           ...(thread ? { reply_to: thread } : {}),
         });
         return result.sent!;
@@ -930,6 +939,7 @@ function App() {
   };
   useEffect(() => {
     clearAttachmentPreviews();
+    setAttachmentStates({});
   }, [view?.identity, view?.credential]);
   const downloadAttachment = (row: MessageRow) => {
     if (downloadingAttachment) return;
@@ -989,6 +999,9 @@ function App() {
         }
       } catch (error) {
         await invoke("discard_exchange", { path: output }).catch(() => {});
+        const state = attachmentFailure(error);
+        if (state && currentView.current?.identity === view?.identity)
+          setAttachmentStates((current) => ({ ...current, [row.id]: state }));
         if (!String(error).includes(ATTACHMENT_TRANSFER_CANCELLED)) {
           reportError(error);
         }
@@ -1684,6 +1697,7 @@ function App() {
             onStatus={setMessageStatus}
             onFile={downloadAttachment}
             downloadingAttachment={downloadingAttachment}
+            attachmentStates={attachmentStates}
             attachmentProgress={
               attachmentTransfer?.kind === "download"
                 ? attachmentTransfer
@@ -1705,10 +1719,10 @@ function App() {
             onNewer={threadHistory.loadNewer}
             onRetry={threadHistory.retry}
             onOlder={threadHistory.loadMore}
-            onSend={async (text) => {
+            onSend={async (text, expiry) => {
               let sent = false;
               await perform(async () => {
-                await sendText(text, selectedThread.rootId);
+                await sendText(text, selectedThread.rootId, expiry);
                 sent = true;
               });
               return sent;
@@ -2094,10 +2108,6 @@ function App() {
               {messageRows.map((r, index) => {
                 const entry = timeline[index];
                 const isNew = isNewMessage(messageRows, index, sessionUnread);
-                const attachmentExpired =
-                  r.body.kind === "file.shared" &&
-                  r.body.attachment?.expires_at_ms != null &&
-                  r.body.attachment.expires_at_ms <= Date.now();
                 if (entry.placeholder && entry.thread)
                   return (
                     <article
@@ -2162,7 +2172,7 @@ function App() {
                       >
                         {r.body.kind === "deleted" ? (
                           <p className="deleted-message">
-                            {t("messageActions.deleted")}
+                            {t(r.body.expired ? "messageActions.expired" : "messageActions.deleted")}
                           </p>
                         ) : r.body.kind === "unavailable" ? (
                           <UnavailableMessage
@@ -2198,7 +2208,7 @@ function App() {
                                 : undefined
                             }
                             disabled={busy}
-                            expired={attachmentExpired}
+                            serverState={attachmentStates[r.id]}
                             download={
                               downloadingAttachment === r.id
                                 ? attachmentTransfer
@@ -2278,6 +2288,7 @@ function App() {
           </div>
           <form
             className="composer"
+            data-message-expiry={messageExpiry}
             onSubmit={(e) => {
               e.preventDefault();
               if (
@@ -2297,7 +2308,9 @@ function App() {
                     setMessageTarget(undefined);
                     setOwnSendRevision((revision) => revision + 1);
                     try {
-                      await sendText(text);
+                      await sendText(text, undefined, messageExpiry);
+                      if (currentConversationScope.current === conversationScope)
+                        setMessageExpiry(undefined);
                     } catch (error) {
                       if (
                         currentConversationScope.current === conversationScope
@@ -2490,7 +2503,8 @@ function App() {
               }
               maxLength={16384}
             />
-            <div>
+            <div className="composer-actions">
+              <ComposerExpiry value={messageExpiry} onChange={setMessageExpiry} disabled={busy || !stream?.can_post} />
               <button
                 type="button"
                 className="composer-attach"

@@ -17,10 +17,6 @@ type Cleanup = {
 const size = (bytes: number) =>
   `${new Intl.NumberFormat(locale, { maximumFractionDigits: 2 }).format(bytes / 1024 ** 2)} MiB`;
 
-const retentionValue = (
-  retention: AttachmentSettings["policy"]["retention"],
-) => (retention === "never" ? "never" : String(retention.days));
-
 export function SpaceAttachments({
   identity,
   space,
@@ -83,24 +79,25 @@ export function SpaceAttachments({
           </label>
           <select
             id="space-attachment-retention"
-            value={retentionValue(value.policy.retention)}
+            value={value.policy.retention.hours}
             disabled={busy}
             onChange={(event) => {
               const selected = event.target.value;
               setPreview(undefined);
               void run(async () => {
                 await request("space_attachment_retention", {
-                  days: selected === "never" ? null : Number(selected),
+                  hours: Number(selected),
                 });
                 await onChanged();
                 notify(t("spaces.attachments.retentionSaved"));
               });
             }}
           >
-            <option value="never">{t("spaces.attachments.never")}</option>
-            {[1, 7, 30, 90, 365].map((option) => (
+            {[1, 12, 24].map((option) => (
               <option key={option} value={option}>
-                {t("spaces.attachments.days", { days: option })}
+                {option === 1
+                  ? t("spaces.attachments.oneHour")
+                  : t("spaces.attachments.hours", { hours: option })}
               </option>
             ))}
           </select>

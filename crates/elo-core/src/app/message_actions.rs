@@ -7,14 +7,25 @@ use std::collections::BTreeSet;
 type Version = (u64, RecordId);
 #[derive(Default)]
 pub(super) struct Projection {
+    now_ms: u64,
     reactions: BTreeMap<(RecordId, String, IdentityId), (Version, bool)>,
     pins: BTreeMap<RecordId, (Version, bool)>,
     deletions: BTreeSet<(RecordId, IdentityId)>,
+    expiry: BTreeMap<(RecordId, IdentityId), BTreeMap<Version, Option<u8>>>,
 }
 impl Projection {
     /// Call only with records whose signatures and historical authority passed.
     pub(super) fn new(records: &[(SignedRecord, String)]) -> Self {
-        let mut state = Self::default();
+        Self::at(
+            records,
+            now().map(|time| time.as_millis() as u64).unwrap_or(0),
+        )
+    }
+    fn at(records: &[(SignedRecord, String)], now_ms: u64) -> Self {
+        let mut state = Self {
+            now_ms,
+            ..Self::default()
+        };
         for (record, _) in records {
             if record.body()["kind"] != "chat.action" {
                 continue;
@@ -47,6 +58,13 @@ impl Projection {
                 Some(MessageAction::Delete { target }) => {
                     state.deletions.insert((target, chat.issuer_identity));
                 }
+                Some(MessageAction::Expiry { target, hours }) => {
+                    state
+                        .expiry
+                        .entry((target, chat.issuer_identity))
+                        .or_default()
+                        .insert(version, hours);
+                }
                 None => {}
             }
         }
@@ -55,6 +73,9 @@ impl Projection {
     /// A signed deletion is effective only for the original author's record.
     /// Retain claims received before the body/locator; delivery order is irrelevant.
     pub(super) fn is_deleted(&self, record: &SignedRecord) -> bool {
+        if self.is_expired(record) {
+            return true;
+        }
         let body = record.body();
         let target = if body["kind"] == "chat.locator" {
             body["locator"]["message_record_id"]
@@ -76,19 +97,72 @@ impl Projection {
         let body = record.body();
         if self.is_deleted(record) {
             // Keep timeline/thread position, but no text, file keys or capabilities.
-            json!({"kind":"deleted", "issuer_identity":body["issuer_identity"],
+            json!({"kind":"deleted", "expired":self.is_expired(record), "issuer_identity":body["issuer_identity"],
                 "issuer_credential":body["issuer_credential"],
                 "created_at":body["created_at"], "logical_time":history_reader::record_presentation_time(record),
                 "deleted_record_id":if body["kind"] == "chat.locator" { body["locator"]["message_record_id"].clone() } else { json!(record.id()) },
                 "payload":{"thread_root":body["payload"]["thread_root"]}})
-        } else if body["kind"] == "chat.locator" {
-            json!({"kind":"unavailable", "issuer_identity":body["issuer_identity"],
-                "issuer_credential":body["issuer_credential"], "created_at":body["created_at"],
-                "logical_time":body["logical_time"], "payload":{"thread_root":body["payload"]["thread_root"]},
-                "locator":body["locator"]})
         } else {
-            body.clone()
+            let mut projected = if body["kind"] == "chat.locator" {
+                json!({"kind":"unavailable", "issuer_identity":body["issuer_identity"],
+                "issuer_credential":body["issuer_credential"], "created_at":body["created_at"],
+                "logical_time":body["logical_time"], "payload":{"thread_root":body["payload"]["thread_root"],"expires_at_ms":body["payload"]["expires_at_ms"]},
+                "locator":body["locator"]})
+            } else {
+                body.clone()
+            };
+            if matches!(body["kind"].as_str(), Some("chat.message" | "chat.locator")) {
+                let (deadline, hours) = self.expiry(record);
+                projected["payload"]["expires_at_ms"] = json!(deadline);
+                projected["payload"]["expiry_hours"] = json!(hours);
+            }
+            projected
         }
+    }
+    /// Only the author can change a deadline. Replay in signed order, including
+    /// events delivered before the message, and never accept edits after expiry.
+    fn expiry(&self, record: &SignedRecord) -> (Option<u64>, Option<u8>) {
+        let body = record.body();
+        let mut deadline = body["payload"]["expires_at_ms"].as_u64();
+        let clock = body["logical_time"].as_u64().unwrap_or(0);
+        let mut hours = deadline.and_then(|d| {
+            let duration = d.saturating_sub(clock);
+            [1u8, 12, 24]
+                .into_iter()
+                .find(|h| duration.abs_diff(u64::from(*h) * 3_600_000) < 1000)
+        });
+        let target = if body["kind"] == "chat.locator" {
+            body["locator"]["message_record_id"]
+                .as_str()
+                .and_then(|id| id.parse().ok())
+        } else {
+            Some(record.id())
+        };
+        let author = body["issuer_identity"]
+            .as_str()
+            .and_then(|id| id.parse().ok());
+        if let Some(events) = target.zip(author).and_then(|key| self.expiry.get(&key)) {
+            for ((changed_at, _), choice) in events {
+                if *changed_at <= clock {
+                    continue;
+                }
+                if deadline.is_some_and(|expires| *changed_at >= expires) {
+                    break;
+                }
+                hours = *choice;
+                deadline = hours.map(|h| changed_at.saturating_add(u64::from(h) * 3_600_000));
+            }
+        }
+        (deadline, hours)
+    }
+    fn is_expired(&self, record: &SignedRecord) -> bool {
+        matches!(
+            record.body()["kind"].as_str(),
+            Some("chat.message" | "chat.locator")
+        ) && self
+            .expiry(record)
+            .0
+            .is_some_and(|expires| expires <= self.now_ms)
     }
     pub(super) fn pinned(&self) -> BTreeSet<RecordId> {
         self.pins
@@ -126,7 +200,23 @@ impl ClientApp {
         let action: MessageAction = serde_json::from_value(v["action"].clone())?;
         let originals = self.originals(authority).await?;
         let target = self.message_record(authority, action.target()).await?;
-        if matches!(action, MessageAction::Delete { .. }) {
+        if matches!(action, MessageAction::Expiry { .. }) {
+            if target.body()["issuer_identity"] != json!(self.session.identity_id())
+                || target.body()["kind"] != "chat.message"
+            {
+                return Err("message_expiry_author_only".into());
+            }
+            if let MessageAction::Expiry {
+                hours: Some(hours), ..
+            } = &action
+                && !matches!(hours, 1 | 12 | 24)
+            {
+                return Err("message_expiry_invalid".into());
+            }
+            if Projection::new(&originals).is_deleted(&target) {
+                return Err("message_expiry_unavailable".into());
+            }
+        } else if matches!(action, MessageAction::Delete { .. }) {
             if target.body()["issuer_identity"] != json!(self.session.identity_id())
                 || !matches!(
                     target.body()["kind"].as_str(),
@@ -143,7 +233,14 @@ impl ClientApp {
             .iter()
             .filter_map(|(r, _)| r.body()["logical_time"].as_u64())
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(target.body()["logical_time"].as_u64().unwrap_or(0));
+        let logical_time = record::next_message_time(highest, u64::try_from(time.as_millis())?);
+        if matches!(action, MessageAction::Expiry { .. })
+            && Projection::at(&originals, logical_time).is_deleted(&target)
+        {
+            return Err("message_expiry_unavailable".into());
+        }
         let signed = authority.prepare_chat(
             ChatMessage {
                 v: 1,
@@ -156,11 +253,12 @@ impl ClientApp {
                 config_id: authority.head_id().ok_or("Missing configuration.")?,
                 audience: vec![],
                 recipient_credentials: vec![],
-                logical_time: record::next_message_time(highest, u64::try_from(time.as_millis())?),
+                logical_time,
                 created_at: field(v, "created_at")?.into(),
                 parents: vec![],
                 payload: TextPayload {
                     text: String::new(),
+                    expires_at_ms: None,
                     sender_name: None,
                     thread_root: None,
                     action: Some(action),
@@ -215,8 +313,11 @@ impl ClientApp {
             if read.reminders.len() >= 100 {
                 return Err("Finish a reminder before adding another.".into());
             }
-            self.message_record(&self.authorities.0[index], record)
-                .await?;
+            let authority = &self.authorities.0[index];
+            let message = self.message_record(authority, record).await?;
+            if Projection::new(&self.originals(authority).await?).is_deleted(&message) {
+                return Err("This message was deleted.".into());
+            }
             read.reminders.push(Reminder {
                 stream,
                 record,
@@ -291,6 +392,177 @@ mod tests {
             "ACCEPTED".into(),
         )
     }
+    #[test]
+    fn expiry_edits_are_author_only_ordered_and_cannot_reopen_an_expired_message() {
+        let mut chat = SignedRecord::parse(include_bytes!(
+            "../../../../protocol/fixtures/chat-message-v1.record.bin"
+        ))
+        .unwrap()
+        .chat()
+        .unwrap();
+        chat.payload.expires_at_ms = Some(10_000);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let original = chat.sign(&key).unwrap();
+        let edit = |clock, author, hours| {
+            let mut action = chat.clone();
+            action.kind = "chat.action".into();
+            action.logical_time = clock;
+            action.issuer_identity = author;
+            action.payload.text.clear();
+            action.payload.expires_at_ms = None;
+            action.payload.action = Some(MessageAction::Expiry {
+                target: original.id(),
+                hours,
+            });
+            (action.sign(&key).unwrap(), "ACCEPTED".into())
+        };
+        let foreign = edit(900, IdentityId::from_bytes([99; 32]), None);
+        assert!(Projection::at(std::slice::from_ref(&foreign), 10_000).is_deleted(&original));
+        let extend = edit(1000, chat.issuer_identity, Some(12));
+        let shorten = edit(2000, chat.issuer_identity, Some(1));
+        let cancel = edit(3000, chat.issuer_identity, None);
+        for events in [
+            vec![
+                extend.clone(),
+                shorten.clone(),
+                cancel.clone(),
+                foreign.clone(),
+            ],
+            vec![
+                cancel.clone(),
+                foreign,
+                shorten.clone(),
+                extend.clone(),
+                cancel.clone(),
+            ],
+        ] {
+            let projection = Projection::at(&events, 99_999_999);
+            assert!(!projection.is_deleted(&original));
+            assert!(projection.body(&original)["payload"]["expires_at_ms"].is_null());
+            // A locator must get the same edited deadline as the full message.
+            let mut locator = original.body().clone();
+            locator["kind"] = json!("chat.locator");
+            locator["locator"] = json!({"message_record_id":original.id()});
+            let locator = SignedRecord::sign(&serde_json::to_vec(&locator).unwrap(), &key).unwrap();
+            assert_eq!(projection.body(&locator)["kind"], "unavailable");
+            assert!(projection.body(&locator)["payload"]["expires_at_ms"].is_null());
+        }
+        let projection = Projection::at(&[shorten.clone(), extend], 3000);
+        assert_eq!(
+            projection.body(&original)["payload"]["expires_at_ms"],
+            3_602_000
+        );
+        assert_eq!(projection.body(&original)["payload"]["expiry_hours"], 1);
+        let too_late = edit(10_000, chat.issuer_identity, None);
+        assert!(Projection::at(&[too_late], 10_000).is_deleted(&original));
+        let too_late = edit(3_602_000, chat.issuer_identity, None);
+        assert!(Projection::at(&[shorten, too_late], 3_602_000).is_deleted(&original));
+        assert!(
+            Projection::at(&[cancel, deletion(&original, chat.issuer_identity)], 4000)
+                .is_deleted(&original)
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_expiry_persists_cancellation_and_rejects_invalid_choices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("profile");
+        let mut app = super::super::performance::profile(path.clone()).await;
+        let chat = app.view().await.unwrap()["streams"][0].clone();
+        let mut request = json!({"op":"send", "space":chat["space"], "stream":chat["stream"],
+            "text":"Keep after cancelling expiry", "created_at":"2026-10-01T12:00:00Z", "expires_in_hours":1});
+        let sent = app.operate(request.clone()).await.unwrap();
+        let id = sent["sent"]["id"].clone();
+        request["op"] = json!("message_action");
+        request["action"] = json!({"type":"expiry", "target":id, "hours":2});
+        assert_eq!(
+            app.operate(request.clone()).await.unwrap_err().to_string(),
+            "message_expiry_invalid"
+        );
+        for choice in [json!(12), json!(24), Value::Null] {
+            request["action"]["hours"] = choice.clone();
+            let response = app.operate(request.clone()).await.unwrap();
+            let rows = response["view"]["streams"][0]["rows"].as_array().unwrap();
+            let row = rows.iter().find(|row| row["id"] == id).unwrap();
+            assert_eq!(row["body"]["payload"]["expiry_hours"], choice);
+            if choice.is_null() {
+                assert!(row["body"]["payload"]["expires_at_ms"].is_null());
+            } else {
+                assert!(
+                    row["body"]["payload"]["expires_at_ms"].as_u64().unwrap()
+                        > sent["sent"]["expires_at_ms"].as_u64().unwrap()
+                );
+            }
+        }
+        let originals = app.originals(&app.authorities.0[0]).await.unwrap();
+        let original = originals
+            .iter()
+            .find(|(record, _)| json!(record.id()) == id)
+            .unwrap();
+        assert!(
+            original.0.body()["payload"]["expires_at_ms"].is_number(),
+            "Never rewrite the signed original"
+        );
+        app.close().await.unwrap();
+        let mut app = ClientApp::open(path, "synthetic performance password".into(), false)
+            .await
+            .unwrap();
+        let page = app
+            .operate(json!({"op":"history_page", "space":chat["space"], "stream":chat["stream"]}))
+            .await
+            .unwrap();
+        let rows = page["history"]["rows"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(
+            row["body"]["payload"]["text"],
+            "Keep after cancelling expiry"
+        );
+        assert!(row["body"]["payload"]["expires_at_ms"].is_null());
+        app.close().await.unwrap();
+    }
+
+    #[test]
+    fn expiry_hides_content_on_every_reader_without_an_online_sender() {
+        let original = SignedRecord::parse(include_bytes!(
+            "../../../../protocol/fixtures/chat-message-v1.record.bin"
+        ))
+        .unwrap();
+        let mut chat = original.chat().unwrap();
+        chat.payload.expires_at_ms = Some(10_000);
+        let signed = chat
+            .sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+            .unwrap();
+        assert!(!Projection::at(&[], 9_999).is_deleted(&signed));
+        for current in [10_000, 100_000] {
+            let projection = Projection::at(&[], current);
+            assert!(projection.is_deleted(&signed));
+            let body = projection.body(&signed);
+            assert_eq!(body["kind"], "deleted");
+            assert_eq!(body["expired"], true);
+            assert!(body["payload"]["text"].is_null());
+            assert!(body["access"].is_null());
+            assert_eq!(body["issuer_identity"], original.body()["issuer_identity"]);
+        }
+        assert!(!Projection::at(&[], 100_000).is_deleted(&original));
+        let mut locator = signed.body().clone();
+        locator["kind"] = json!("chat.locator");
+        locator["payload"]["text"] = json!("");
+        locator["locator"] = json!({"message_record_id":signed.id()});
+        let locator = SignedRecord::sign(
+            &serde_json::to_vec(&locator).unwrap(),
+            &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            Projection::at(&[], 9_999).body(&locator)["payload"]["expires_at_ms"],
+            10_000
+        );
+        let expired = Projection::at(&[], 10_000).body(&locator);
+        assert_eq!(expired["expired"], true);
+        assert!(expired["locator"].is_null());
+        assert_eq!(expired["deleted_record_id"], json!(signed.id()));
+    }
+
     #[test]
     fn author_deletion_is_irreversible_and_projects_text_files_and_locators_without_content() {
         let original = SignedRecord::parse(include_bytes!(

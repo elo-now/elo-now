@@ -3,6 +3,8 @@ import { Icon } from "./Icon";
 import { ScreenHeader } from "./ScreenHeader";
 import { MessageContent } from "./MessageContent";
 import { ComposerInput } from "./ComposerInput";
+import { ComposerExpiry } from "./ComposerExpiry";
+import type { MessageExpiryHours } from "./messageExpiry";
 import { EmptyState } from "./EmptyState";
 import { PullToRefresh } from "./PullToRefresh";
 import { t, messageDayKey, formatMessageDay } from "./i18n";
@@ -17,7 +19,7 @@ import type { MessageStatusSelection } from "./MessageStatus";
 import type { MessageRow, MessageThread } from "./messageThreads";
 import { messageIdentity } from "./messageThreads";
 import { UnavailableMessage } from "./UnavailableMessage";
-import { AttachmentButton, type AttachmentProgress } from "./AttachmentButton";
+import { AttachmentButton, type AttachmentProgress, type AttachmentUnavailable } from "./AttachmentButton";
 
 export function ThreadView({
   view,
@@ -36,6 +38,7 @@ export function ThreadView({
   onFile,
   downloadingAttachment,
   attachmentProgress,
+  attachmentStates,
   onCancelAttachment,
   composeRevision,
   target,
@@ -62,11 +65,12 @@ export function ThreadView({
   onBack: () => void;
   onRefresh: () => Promise<void>;
   onRead: (ids: string[]) => void;
-  onSend: (text: string) => Promise<boolean>;
+  onSend: (text: string, expiry?: MessageExpiryHours) => Promise<boolean>;
   onStatus: (selection: MessageStatusSelection) => void;
   onFile: (row: MessageRow) => void;
   downloadingAttachment?: string;
   attachmentProgress?: AttachmentProgress;
+  attachmentStates?: Record<string, AttachmentUnavailable>;
   onCancelAttachment: () => void;
   composeRevision: number;
   target?: { id: string; key: number };
@@ -84,6 +88,7 @@ export function ThreadView({
 }) {
   const [seen, setSeen] = useState(new Set<string>());
   const [ownSendRevision, setOwnSendRevision] = useState(0);
+  const [messageExpiry, setMessageExpiry] = useState<MessageExpiryHours>();
   const [scrollTarget, setScrollTarget] = useState(target);
   const composer = useRef<HTMLTextAreaElement>(null);
   const posting = useRef(false);
@@ -101,7 +106,8 @@ export function ThreadView({
     setScrollTarget(undefined);
     setOwnSendRevision((value) => value + 1);
     try {
-      if (!(await onSend(submitted))) onDraft(submitted);
+      if (!(await onSend(submitted, messageExpiry))) onDraft(submitted);
+      else setMessageExpiry(undefined);
     } finally {
       posting.current = false;
     }
@@ -183,6 +189,7 @@ export function ThreadView({
               onFile={onFile}
               downloadingAttachment={downloadingAttachment}
               attachmentProgress={attachmentProgress}
+              serverState={attachmentStates?.[row.id]}
               onCancelAttachment={onCancelAttachment}
               onRequestMessage={onRequestMessage}
               onUnavailable={onUnavailable}
@@ -208,6 +215,7 @@ export function ThreadView({
       </div>
       <form
         className="composer"
+        data-message-expiry={messageExpiry}
         onSubmit={(event) => {
           event.preventDefault();
           void submit();
@@ -224,7 +232,8 @@ export function ThreadView({
           disabled={busy || !canReply}
           maxLength={16384}
         />
-        <div>
+        <div className="composer-actions">
+          <ComposerExpiry value={messageExpiry} onChange={setMessageExpiry} disabled={busy || !canReply} />
           <button
             aria-label={t("composer.send")}
             title={t("composer.send")}
@@ -251,6 +260,7 @@ function ThreadMessage({
   onFile,
   downloadingAttachment,
   attachmentProgress,
+  serverState,
   onCancelAttachment,
   onRequestMessage,
   onUnavailable,
@@ -268,6 +278,7 @@ function ThreadMessage({
   onFile: (row: MessageRow) => void;
   downloadingAttachment?: string;
   attachmentProgress?: AttachmentProgress;
+  serverState?: AttachmentUnavailable;
   onCancelAttachment: () => void;
   onRequestMessage: (row: MessageRow) => Promise<void>;
   onUnavailable: () => void;
@@ -305,7 +316,7 @@ function ThreadMessage({
           onStatus={row.body.kind === "unavailable" ? undefined : onStatus}
         >
           {row.body.kind === "deleted" ? (
-            <p className="deleted-message">{t("messageActions.deleted")}</p>
+            <p className="deleted-message">{t(row.body.expired ? "messageActions.expired" : "messageActions.deleted")}</p>
           ) : row.body.kind === "unavailable" ? (
             <UnavailableMessage
               disabled={busy}
@@ -317,6 +328,7 @@ function ThreadMessage({
           ) : (
             <AttachmentButton
               row={row}
+              serverState={serverState}
               context={view.active_space ? {
                 expected_identity: view.identity, expected_space: view.active_space,
                 space: chat.space, stream: chat.stream,

@@ -4,6 +4,19 @@ import { emit } from "@tauri-apps/api/event";
 import type { View, Stream } from "../src/model";
 import { clearAttachmentPreviews } from "../src/attachmentPreview";
 const params = new URLSearchParams(location.search);
+if (params.has("composer-blur")) {
+  // Reproduce WebKit losing textarea focus before a chip's click arrives.
+  // This must also work when no expiry is selected or the last one is cleared.
+  document.addEventListener("pointerdown", (event) => {
+    if (
+      event.target instanceof Element &&
+      event.target.closest(".composer-expiry button") &&
+      document.activeElement instanceof HTMLTextAreaElement
+    ) {
+      document.activeElement.blur();
+    }
+  }, true);
+}
 mockWindows("main");
 localStorage.clear();
 localStorage.setItem("elo.appearance", params.get("theme") ?? "light");
@@ -153,7 +166,7 @@ const management = {
     policy: {
       max_space_bytes: 209715200,
       max_file_bytes: 5242880,
-      retention: "never",
+      retention: { hours: 1 },
     },
   },
   members: Object.entries(names).map(([identity, name]) => ({
@@ -205,7 +218,7 @@ Object.assign(window, {
       transfers.forEach((transfer) => transfer.resolve());
       transfers.clear();
     },
-    async ownMessage(kind: string) {
+    async ownMessage(kind: string, options: { expiresAt?: number; attachmentExpiresAt?: number; text?: string } = {}) {
       const id = `own-${sequence++}`;
       general.rows.push({
         id,
@@ -216,7 +229,11 @@ Object.assign(window, {
           created_at: new Date().toISOString(),
           ...(kind === "file.shared"
             ? { filename: params.has("inline-images") ? "photo.jpg" : "sample.pdf", size_bytes: 2048 }
-            : { payload: { text: "Own deletion fixture" } }),
+            : { payload: { text: options.text ?? "Own deletion fixture", expires_at_ms: options.expiresAt } }),
+          ...(options.attachmentExpiresAt == null ? {} : { attachment: {
+            id: "fixture-attachment", object_id: "fixture-object", name: "photo.jpg", mime: "image/jpeg",
+            plaintext_size: 2048, encrypted_size: 2200, created_at_ms: Date.now(), expires_at_ms: options.attachmentExpiresAt,
+          } }),
         },
       });
       view.revision = (view.revision ?? 0) + 1;
@@ -438,6 +455,16 @@ mockIPC(
         row.reactions = [];
       }
       let result: object = {};
+      if (request.op === "message_action" && request.action?.type === "expiry" && stream) {
+        const row = stream.rows.find((row) => row.id === request.action.target);
+        if (!row || row.body.issuer_identity !== view.identity || row.body.kind !== "chat.message")
+          throw new Error("message_expiry_author_only");
+        const hours = request.action.hours;
+        row.body.payload = { ...row.body.payload,
+          expires_at_ms: hours == null ? null : Date.now() + hours * 3_600_000,
+          expiry_hours: hours,
+        };
+      }
       let sent: { id: string; logical_time: number } | undefined;
       let created: string | undefined;
       if (request.op === "mark_read" && stream) {
@@ -462,7 +489,9 @@ mockIPC(
             logical_time: sent.logical_time,
             issuer_identity: "alex",
             created_at: new Date().toISOString(),
-            payload: { text: request.text, thread_root: request.reply_to },
+            payload: { text: request.text, thread_root: request.reply_to,
+              expiry_hours: request.expires_in_hours ?? null,
+              expires_at_ms: request.expires_in_hours ? Date.now() + request.expires_in_hours * 3_600_000 : undefined },
           },
         });
       }
@@ -486,6 +515,10 @@ mockIPC(
         result = { link: "elo://space/v1#test" };
       }
       if (request.op === "space_manage") result = management;
+      if (request.op === "space_attachment_retention") {
+        management.attachments.policy.retention = { hours: request.body.hours };
+        result = { policy: management.attachments.policy };
+      }
       if (request.op === "space_attachment_cleanup_preview")
         result = {
           files: 0,

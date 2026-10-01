@@ -327,7 +327,7 @@
     border-radius: 14px;
     flex-wrap: wrap;
   }
-  .composer:focus-within {
+  .composer[data-composer-expanded] {
     border-color: var(--elo-accent);
   }
   .composer textarea {
@@ -369,6 +369,15 @@
   .composer > .composer-attachment + textarea {
     flex-basis: calc(100% - 88px);
   }
+  .composer[data-composer-expanded] > textarea,
+  .composer[data-message-expiry] > textarea {
+    flex-basis: 100%;
+  }
+  .shell .composer[data-composer-expanded] > .composer-actions,
+  .shell .composer[data-message-expiry] > .composer-actions {
+    flex: 0 0 100%;
+    padding-left: calc(var(--elo-input-inset) - 3px);
+  }
   .composer button:not(.attachment-cancel) {
     width: 44px;
     min-height: var(--elo-control-height);
@@ -377,6 +386,13 @@
     border-radius: 12px;
     display: grid;
     place-items: center;
+  }
+  .composer .composer-expiry button {
+    width: auto;
+    min-width: 44px;
+    min-height: 32px;
+    padding: 4px 12px;
+    border-radius: 999px;
   }
   .settings-header {
     display: flex;

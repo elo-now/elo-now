@@ -41,6 +41,18 @@ export function formatFileSize(bytes: number): string {
   return `${new Intl.NumberFormat(locale, { maximumFractionDigits }).format(value)} ${units[unit]}`;
 }
 
+/** Attachment deadlines use the reader's time zone without a year or seconds. */
+export function formatAttachmentExpiry(value: number, timeZone?: string): string {
+  return new Intl.DateTimeFormat(locale, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone,
+  }).format(value);
+}
+
 /** Unknown backend warnings must remain visible instead of being discarded. */
 export function warningText(
   code: string | undefined,

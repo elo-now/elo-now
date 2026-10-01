@@ -76,6 +76,19 @@ Files are encrypted on the sender's device before upload. The hosting operator c
 
 Calls use a separate authorization and control service. Direct calls try an authenticated WebRTC connection between devices and can use a TURN relay when a direct route is unavailable. Group calls use a LiveKit media server (SFU). The messaging Replica does not store call audio or video. The app discovers the call service through its configured Space endpoint; server placement is the hosting operator's choice.
 
+### Message and attachment expiry
+
+Text messages can expire after **1, 12 or 24 hours**. Choose a duration in the
+composer, or use your sent message's **Delete after** menu to change it or select
+**No expiry** before it expires. A changed duration starts when saved. The chat
+shows the deadline; updated clients replace expired text with **Message expired**.
+This does not erase external copies or rewrite encrypted records and backups.
+
+New attachments expire on the server after **1 hour** by default. Space owners
+can choose **12 or 24 hours** for future uploads. Attachment tiles show the
+deadline and then **Expired**; physical storage cleanup is retried in the
+background. Files already saved on a device remain available there.
+
 ### Security, with clear boundaries
 
 The design uses Ed25519 signatures, the age encryption format and HTTPS transport. A storage Replica does not need participants' decryption keys to deliver their messages. Passwords, recovery secrets and server administrator credentials do not belong in a source repository or notification payload.

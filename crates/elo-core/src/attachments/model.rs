@@ -8,8 +8,26 @@ pub const ATTACHMENT_CHUNK_BYTES: u32 = 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentRetention {
-    Never,
-    Days(u32),
+    Hours(u32),
+}
+
+// Import only the old policy, never rewrite deadlines in signed descriptors or
+// stored objects. Future uploads in existing Spaces use the new one-hour default.
+fn read_retention<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AttachmentRetention, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum StoredRetention {
+        Never,
+        Days(u32),
+        Hours(u32),
+    }
+    match StoredRetention::deserialize(deserializer)? {
+        StoredRetention::Hours(hours @ (1 | 12 | 24)) => Ok(AttachmentRetention::Hours(hours)),
+        StoredRetention::Never | StoredRetention::Days(1..) => Ok(AttachmentRetention::Hours(1)),
+        _ => Err(serde::de::Error::custom("Invalid attachment retention.")),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +36,7 @@ pub struct AttachmentPolicy {
     pub enabled: bool,
     pub max_file_bytes: u64,
     pub max_space_bytes: u64,
+    #[serde(deserialize_with = "read_retention")]
     pub retention: AttachmentRetention,
 }
 
@@ -27,7 +46,7 @@ impl Default for AttachmentPolicy {
             enabled: true,
             max_file_bytes: MAX_ATTACHMENT_FILE_SIZE,
             max_space_bytes: MAX_SPACE_ATTACHMENT_STORAGE,
-            retention: AttachmentRetention::Never,
+            retention: AttachmentRetention::Hours(1),
         }
     }
 }
@@ -36,7 +55,7 @@ impl AttachmentPolicy {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_file_bytes != MAX_ATTACHMENT_FILE_SIZE
             || self.max_space_bytes != MAX_SPACE_ATTACHMENT_STORAGE
-            || matches!(self.retention, AttachmentRetention::Days(0))
+            || !matches!(self.retention, AttachmentRetention::Hours(1 | 12 | 24))
         {
             return Err("Invalid attachment policy.");
         }
@@ -45,9 +64,8 @@ impl AttachmentPolicy {
 
     pub fn expires_at(&self, created_at_ms: u64) -> Option<u64> {
         match self.retention {
-            AttachmentRetention::Never => None,
-            AttachmentRetention::Days(days) => {
-                created_at_ms.checked_add(u64::from(days).checked_mul(86_400_000)?)
+            AttachmentRetention::Hours(hours) => {
+                created_at_ms.checked_add(u64::from(hours).checked_mul(3_600_000)?)
             }
         }
     }
@@ -133,15 +151,53 @@ mod tests {
         assert!(policy.validate().is_ok());
         assert_eq!(policy.max_file_bytes, 5 * 1024 * 1024);
         assert_eq!(policy.max_space_bytes, 50_000_000);
-        assert_eq!(policy.expires_at(1), None);
+        assert_eq!(policy.expires_at(1), Some(3_600_001));
     }
 
     #[test]
     fn retention_uses_attachment_creation_time() {
-        let policy = AttachmentPolicy {
-            retention: AttachmentRetention::Days(30),
-            ..AttachmentPolicy::default()
-        };
-        assert_eq!(policy.expires_at(1_000), Some(2_592_001_000));
+        for hours in [1, 12, 24] {
+            let policy = AttachmentPolicy {
+                retention: AttachmentRetention::Hours(hours),
+                ..AttachmentPolicy::default()
+            };
+            assert!(policy.validate().is_ok());
+            assert_eq!(
+                policy.expires_at(1_000),
+                Some(1_000 + u64::from(hours) * 3_600_000)
+            );
+            assert_eq!(policy.expires_at(u64::MAX), None);
+        }
+        for hours in [0, 2, 25, u32::MAX] {
+            assert!(
+                AttachmentPolicy {
+                    retention: AttachmentRetention::Hours(hours),
+                    ..AttachmentPolicy::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn existing_space_policies_default_to_one_hour_for_future_uploads() {
+        for old in [serde_json::json!("never"), serde_json::json!({"days":30})] {
+            let mut value = serde_json::to_value(AttachmentPolicy::default()).unwrap();
+            value["retention"] = old;
+            let policy: AttachmentPolicy = serde_json::from_value(value).unwrap();
+            assert_eq!(policy.retention, AttachmentRetention::Hours(1));
+        }
+        for hours in [1, 12, 24] {
+            let policy = AttachmentPolicy {
+                retention: AttachmentRetention::Hours(hours),
+                ..AttachmentPolicy::default()
+            };
+            assert_eq!(
+                serde_json::from_value::<AttachmentPolicy>(serde_json::to_value(&policy).unwrap())
+                    .unwrap(),
+                policy
+            );
+        }
     }
 }

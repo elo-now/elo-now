@@ -4,7 +4,12 @@ import {
   MessageReactions,
 } from "./MessageActions";
 import type { ReactNode } from "react";
-import { formatMessageTime, formatTimestamp, t } from "./i18n";
+import {
+  formatMessageTime,
+  formatTimestamp,
+  formatAttachmentExpiry,
+  t,
+} from "./i18n";
 import { Icon } from "./Icon";
 import {
   messageCreatedAt,
@@ -119,6 +124,20 @@ export function MessageContent({
           )}
         </div>
         {children}
+        {["chat.message", "unavailable"].includes(row.body.kind) &&
+          row.body.payload?.expires_at_ms != null && (
+            <div className="message-expiry">
+              <time
+                dateTime={new Date(
+                  row.body.payload.expires_at_ms,
+                ).toISOString()}
+              >
+                {t("messageActions.expiresAt", {
+                  date: formatAttachmentExpiry(row.body.payload.expires_at_ms),
+                })}
+              </time>
+            </div>
+          )}
         {chat && !row.local_echo && row.body.kind !== "deleted" && (
           <MessageReactions chat={chat} row={row} />
         )}

@@ -1,4 +1,4 @@
-import { formatFileSize, t } from "./i18n";
+import { formatAttachmentExpiry, formatFileSize, t } from "./i18n";
 import type { MessageRow } from "./messageThreads";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -16,10 +16,23 @@ export type AttachmentProgress = {
   cancelling: boolean;
 };
 
+export type AttachmentUnavailable = "expired" | "removed" | "unavailable";
+export function attachmentFailure(
+  error: unknown,
+): AttachmentUnavailable | undefined {
+  const message = String(error);
+  if (message.includes("This attachment has expired on the server."))
+    return "expired";
+  if (message.includes("This attachment was removed from the server."))
+    return "removed";
+  if (message.includes("This attachment is no longer available on the server."))
+    return "unavailable";
+}
+
 export function AttachmentButton({
   row,
   disabled,
-  expired = false,
+  serverState,
   download,
   onDownload,
   onCancel,
@@ -27,7 +40,7 @@ export function AttachmentButton({
 }: {
   row: MessageRow;
   disabled?: boolean;
-  expired?: boolean;
+  serverState?: AttachmentUnavailable;
   download?: AttachmentProgress;
   onDownload: () => void;
   onCancel: () => void;
@@ -55,6 +68,28 @@ export function AttachmentButton({
   const previewResolved =
     cachedPreview !== undefined || (preview !== null && preview.key === key);
   const active = !!download;
+  const expiresAt = row.body.attachment?.expires_at_ms;
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (expiresAt == null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const update = () => {
+      clearTimeout(timer);
+      const current = Date.now();
+      setNow(current);
+      if (expiresAt > current)
+        timer = setTimeout(
+          update,
+          Math.min(expiresAt - current, 2_147_483_647),
+        );
+    };
+    update();
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [expiresAt]);
   useEffect(() => {
     if (!request || active) return;
     let cancelled = false;
@@ -107,20 +142,31 @@ export function AttachmentButton({
     row.body.attachment?.plaintext_size ?? row.body.size_bytes ?? 0,
   );
   const unavailable =
-    expired ||
-    (row.body.attachment?.expires_at_ms != null &&
-      row.body.attachment.expires_at_ms <= Date.now());
+    serverState ??
+    (expiresAt != null && expiresAt <= now ? "expired" : undefined);
+  const expiry = unavailable ? (
+    <small
+      className="attachment-expiry"
+      title={t("file.serverCopyUnavailable")}
+    >
+      {t(`file.${unavailable}`)}
+    </small>
+  ) : expiresAt != null && Number.isFinite(new Date(expiresAt).getTime()) ? (
+    <small className="attachment-expiry">
+      <time dateTime={new Date(expiresAt).toISOString()}>
+        {t("file.expiresAt", { date: formatAttachmentExpiry(expiresAt) })}
+      </time>
+    </small>
+  ) : null;
   const percent =
     download && download.total > 0
       ? Math.min(100, Math.round((download.received / download.total) * 100))
       : undefined;
   const content = (
     <>
-      <span className="attachment-name">
-        {unavailable ? t("file.expired", { filename }) : filename}
-      </span>
+      <span className="attachment-name">{filename}</span>
       <small>{size}</small>
-      {unavailable && <small>{t("file.serverCopyUnavailable")}</small>}
+      {expiry}
     </>
   );
   if (previewUrl) {
@@ -170,6 +216,7 @@ export function AttachmentButton({
             }
           }}
         />
+        {expiry}
       </div>
     );
   }
@@ -221,7 +268,7 @@ export function AttachmentButton({
     <div ref={container} className="attachment-container">
       <button
         className="attachment"
-        disabled={disabled || unavailable}
+        disabled={disabled || !!unavailable}
         aria-label={t("file.downloadLabel", { filename, size })}
         onClick={onDownload}
       >

@@ -441,6 +441,7 @@ mod tests {
                     created_at: "2026-09-13T12:00:00Z".into(),
                     parents: vec![],
                     payload: TextPayload {
+                        expires_at_ms: None,
                         text: if action.is_some() {
                             String::new()
                         } else {

@@ -27,7 +27,7 @@ export type SpaceManagement = {
       enabled: boolean;
       max_file_bytes: number;
       max_space_bytes: number;
-      retention: "never" | { days: number };
+      retention: { hours: number };
     };
     used_bytes: number;
     reserved_bytes: number;

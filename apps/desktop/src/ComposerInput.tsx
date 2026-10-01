@@ -14,11 +14,19 @@ export function ComposerInput({
 }) {
   const localRef = useRef<HTMLTextAreaElement>(null);
   const input = inputRef ?? localRef;
+  const setExpanded = (expanded: boolean) => {
+    const form = input.current?.form;
+    if (!form) return;
+    if (expanded) form.dataset.composerExpanded = "true";
+    else delete form.dataset.composerExpanded;
+  };
   const resize = () => {
     const node = input.current;
     if (!node || !node.getClientRects().length) return;
     const style = getComputedStyle(node);
-    const minimum = Number.parseFloat(style.minHeight);
+    const minimum =
+      Number.parseFloat(style.minHeight) *
+      (node.form?.dataset.composerExpanded === "true" ? 3 : 1);
     const maximum = Math.max(
       minimum,
       (window.visualViewport?.height ?? window.innerHeight) / 3,
@@ -38,11 +46,13 @@ export function ComposerInput({
     const node = input.current;
     if (!node) return;
     let width = node.getBoundingClientRect().width;
+    let resizeFrame = 0;
     const observer = new ResizeObserver(() => {
       const next = node.getBoundingClientRect().width;
       if (next !== width) {
         width = next;
-        resize();
+        cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(resize);
       }
     });
     observer.observe(node);
@@ -50,11 +60,54 @@ export function ComposerInput({
     viewport?.addEventListener("resize", resize);
     window.addEventListener("resize", resize);
     document.fonts.addEventListener("loadingdone", resize);
+    const form = node.form;
+    let outsidePointer = false;
+    let finishFrame = 0;
+    const finishEditing = () => {
+      cancelAnimationFrame(finishFrame);
+      finishFrame = requestAnimationFrame(() => {
+        setExpanded(false);
+        resize();
+      });
+    };
+    // WebKit can blur the textarea without focusing the tapped button. Keep
+    // the editing layout until the user actually leaves this composer, so a
+    // chip cannot move or disappear between touch-down and click.
+    const focusChanged = (event: FocusEvent) => {
+      const inside = event.target instanceof Node && !!form?.contains(event.target);
+      if (inside) {
+        cancelAnimationFrame(finishFrame);
+        setExpanded(true);
+        resize();
+      } else if (!outsidePointer) finishEditing();
+    };
+    const pointerDown = (event: PointerEvent) => {
+      cancelAnimationFrame(finishFrame);
+      outsidePointer = event.target instanceof Node && !form?.contains(event.target);
+    };
+    const pointerFinished = () => {
+      if (outsidePointer) {
+        outsidePointer = false;
+        // Wait until the click target is fixed before moving the message list.
+        finishEditing();
+      }
+    };
+    document.addEventListener("focusin", focusChanged);
+    document.addEventListener("pointerdown", pointerDown, true);
+    document.addEventListener("click", pointerFinished, true);
+    document.addEventListener("pointercancel", pointerFinished, true);
     return () => {
       observer.disconnect();
+      cancelAnimationFrame(finishFrame);
+      cancelAnimationFrame(resizeFrame);
       viewport?.removeEventListener("resize", resize);
       window.removeEventListener("resize", resize);
       document.fonts.removeEventListener("loadingdone", resize);
+      document.removeEventListener("focusin", focusChanged);
+      document.removeEventListener("pointerdown", pointerDown, true);
+      document.removeEventListener("click", pointerFinished, true);
+      document.removeEventListener("pointercancel", pointerFinished, true);
+      if (form) delete form.dataset.composerExpanded;
     };
   }, [input]);
   return (
@@ -62,6 +115,15 @@ export function ComposerInput({
       {...props}
       ref={input}
       rows={1}
+      onFocus={(event) => {
+        props.onFocus?.(event);
+        setExpanded(true);
+        resize();
+      }}
+      onBlur={(event) => {
+        props.onBlur?.(event);
+        requestAnimationFrame(resize);
+      }}
       onKeyDown={(event) => {
         props.onKeyDown?.(event);
         if (

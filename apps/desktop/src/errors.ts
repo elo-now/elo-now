@@ -9,6 +9,10 @@ const sourceMessageKeys = new Map<string, MessageKey>(
 );
 
 const known: Record<string, MessageKey> = {
+  attachment_retention_invalid: "error.attachmentRetention",
+  message_expiry_invalid: "error.messageExpiry",
+  message_expiry_author_only: "error.messageExpiryAuthor",
+  message_expiry_unavailable: "error.messageExpiryUnavailable",
   profile_password_weak: "error.passwordWeak",
   file_export_failed: "error.fileExport",
   profile_logout_notifications_pending: "profile.logoutNotificationsPending",

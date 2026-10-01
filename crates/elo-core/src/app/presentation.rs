@@ -207,8 +207,16 @@ mod tests {
         app.close().await.unwrap();
     }
     async fn insert(app: &ClientApp, index: usize, sequence: u64) -> RecordId {
-        let a = &app.authorities.0[index];
         let record = message(app, index, sequence);
+        store_message(app, index, sequence, record).await
+    }
+    async fn store_message(
+        app: &ClientApp,
+        index: usize,
+        sequence: u64,
+        record: SignedRecord,
+    ) -> RecordId {
+        let a = &app.authorities.0[index];
         let recipients = record
             .chat()
             .unwrap()
@@ -237,6 +245,53 @@ mod tests {
             .await
             .unwrap();
         record.id()
+    }
+    #[tokio::test]
+    async fn expired_message_is_a_placeholder_in_history_threads_and_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("profile");
+        let mut app = profile(path.clone()).await;
+        let mut body = message(&app, 0, 1).chat().unwrap();
+        body.payload.expires_at_ms = Some(1);
+        body.payload.text = "Expired synthetic secret".into();
+        let record = app.authorities.0[0]
+            .prepare_chat(body, app.session.signing_key())
+            .unwrap();
+        let id = store_message(&app, 0, 1, record).await;
+        let pin = app.pins[0].clone();
+        for restart in [false, true] {
+            if restart {
+                app.close().await.unwrap();
+                app = ClientApp::open(path.clone(), "synthetic performance password".into(), false)
+                    .await
+                    .unwrap();
+            }
+            app.enable_paged_views();
+            let base = json!({"op":"history_page","space":pin.space,"stream":pin.stream});
+            for extra in [
+                json!({}),
+                json!({"records":[id]}),
+                json!({"thread":id,"around":id}),
+            ] {
+                let mut query = base.clone();
+                query
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let result = app.operate(query).await.unwrap();
+                let row = &result["history"]["rows"][0];
+                assert_eq!(row["body"]["expired"], true);
+                assert!(row["body"]["payload"]["text"].is_null());
+                assert_eq!(row["unread"], false);
+                assert!(!result.to_string().contains("Expired synthetic secret"));
+            }
+            let mut query = base;
+            query["query"] = json!("Expired synthetic secret");
+            let result = app.operate(query).await.unwrap();
+            assert!(result["history"]["rows"].as_array().unwrap().is_empty());
+            assert!(app.operate(json!({"op":"remind","space":pin.space,"stream":pin.stream,"record":id,"due_at":now().unwrap().as_millis()+60_000})).await.is_err());
+        }
+        app.close().await.unwrap();
     }
     #[tokio::test]
     async fn paged_history_keeps_cursors_scoped_and_old_records_actionable() {

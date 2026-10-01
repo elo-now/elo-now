@@ -552,6 +552,12 @@ h2 {
 .attachment-name {
   overflow-wrap: anywhere;
 }
+.attachment-expiry {
+  display: block;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+}
 .attachment-active {
   padding: calc(12px * var(--elo-control-density)) 16px;
 }
@@ -641,6 +647,44 @@ h2 {
 }
 .composer button {
   flex-shrink: 0;
+}
+.composer-expiry {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-right: auto;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+}
+.composer-expiry > span {
+  white-space: nowrap;
+}
+.composer-expiry-options {
+  display: flex;
+  gap: 8px;
+}
+.composer:not([data-composer-expanded]):not([data-message-expiry]) .composer-expiry {
+  display: none;
+}
+.composer .composer-expiry button {
+  padding: 4px 12px;
+  min-width: 44px;
+  min-height: 32px;
+  line-height: 1.25;
+  border: 1px solid var(--elo-line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+}
+.composer .composer-expiry button[aria-pressed="true"] {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+  border-color: var(--elo-button);
 }
 .composer .composer-attach {
   border: 0;

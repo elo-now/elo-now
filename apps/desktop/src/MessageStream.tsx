@@ -42,7 +42,7 @@ type Gesture = {
 function EntryBody({ entry }: { entry: StreamEntry }) {
   const { row } = entry;
   return row.body.kind === "deleted" ? (
-    <p className="deleted-message">{t("messageActions.deleted")}</p>
+    <p className="deleted-message">{t(row.body.expired ? "messageActions.expired" : "messageActions.deleted")}</p>
   ) : row.body.kind === "unavailable" ? (
     <p>
       <span className="stream-text">{t("messageUnavailable.title")}</span>

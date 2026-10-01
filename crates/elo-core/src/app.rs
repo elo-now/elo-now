@@ -980,6 +980,15 @@ impl ClientApp {
                 self.persist_workspace()?;
             }
             "send" => {
+                let expires_in_hours = match v.get("expires_in_hours") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .filter(|hours| matches!(hours, 1 | 12 | 24))
+                            .ok_or("message_expiry_invalid")?,
+                    ),
+                };
                 let i = self.authority_index(&v)?;
                 let a = &self.authorities.0[i];
                 if !self.authorities.space_ready(a) {
@@ -1053,6 +1062,8 @@ impl ClientApp {
                         parents: vec![],
                         payload: TextPayload {
                             text: field(&v, "text")?.into(),
+                            expires_at_ms: expires_in_hours
+                                .map(|hours| time.as_millis() as u64 + hours * 3_600_000),
                             sender_name: self.profile_details.as_ref().map(|p| p.name.clone()),
                             thread_root,
                             action: None,
@@ -1121,6 +1132,7 @@ impl ClientApp {
                         parents: vec![],
                         payload: TextPayload {
                             text: String::new(),
+                            expires_at_ms: chat.payload.expires_at_ms,
                             sender_name: None,
                             thread_root: chat.payload.thread_root,
                             action: None,
@@ -1180,7 +1192,9 @@ impl ClientApp {
                         time,
                     )?)
                     .await?;
-                sent = Some(json!({"id":r.id(),"logical_time":r.body()["logical_time"]}));
+                sent = Some(
+                    json!({"id":r.id(),"logical_time":r.body()["logical_time"],"expires_at_ms":r.body()["payload"]["expires_at_ms"]}),
+                );
             }
             "add_peer" => {
                 let p: PeerDescriptor =
@@ -1425,12 +1439,12 @@ impl ClientApp {
                     }
                 }
                 let requested: history::HistoryRequest = request.decode()?;
-                let mut available = self
-                    .originals(a)
-                    .await?
+                let originals = self.originals(a).await?;
+                let projection = message_actions::Projection::new(&originals);
+                let mut available = originals
                     .into_iter()
                     .map(|(r, _)| r)
-                    .filter(|r| r.body()["kind"] == "chat.message")
+                    .filter(|r| r.body()["kind"] == "chat.message" && !projection.is_deleted(r))
                     .collect::<Vec<_>>();
                 let selection = if field(&v, "op")? == "history_preview" {
                     let start = available

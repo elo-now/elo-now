@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { OutgoingMessages, withOutgoingMessages } from "./outgoingMessages";
 import type { MessageRow } from "./messageThreads";
+import { useExpiringRows } from "./useMessageExpiry";
 
 export function useOutgoingMessages(
   profile: string,
@@ -22,7 +23,7 @@ export function useOutgoingMessages(
   );
   return {
     send: store.send.bind(store),
-    rows: withOutgoingMessages(rows, echoes, scope),
-    replies: withOutgoingMessages(replies, echoes, scope),
+    rows: useExpiringRows(withOutgoingMessages(rows, echoes, scope)),
+    replies: useExpiringRows(withOutgoingMessages(replies, echoes, scope)),
   };
 }

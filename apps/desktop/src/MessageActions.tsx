@@ -26,6 +26,8 @@ import "./messageActions.css";
 import { ActionDialog } from "./ActionDialog";
 import { BlockingProvider, BlockUserAction } from "./BlockedUsers";
 import { MessageDebug } from "./MessageDebug";
+import { useExpiringRows } from "./useMessageExpiry";
+import type { MessageExpiryHours } from "./messageExpiry";
 
 import reactionChoices from "../../../protocol/reactions.json";
 export type MessageCollection =
@@ -155,17 +157,25 @@ export function MessageActionsProvider({
 }) {
   const latestView = useRef(view);
   latestView.current = view;
+  const expiredReminders = (view.all_streams ?? view.streams)
+    .flatMap((chat) =>
+      chat.rows.filter((row) => row.body.expired).map((row) => row.id),
+    )
+    .join(":");
   const [selection, setSelection] = useState<Selection | null>(null);
   const [debug, setDebug] = useState<{ chat: Stream; record: string } | null>(
     null,
   );
-  const [panel, setPanel] = useState<"menu" | "reaction" | "remind" | "delete">(
-    "menu",
-  );
+  const [panel, setPanel] = useState<
+    "menu" | "reaction" | "remind" | "delete" | "expiry"
+  >("menu");
   const [busy, setBusy] = useState(false);
   const pending = useRef(false);
   const [customTime, setCustomTime] = useState("");
   const [presetMinutes, setPresetMinutes] = useState<number | null>(null);
+  const [expiryHours, setExpiryHours] = useState<MessageExpiryHours | null>(
+    null,
+  );
   const [systemNotification, setSystemNotification] = useState(false);
   const { reportError, notify } = useToast();
   const close = () => {
@@ -247,14 +257,18 @@ export function MessageActionsProvider({
     };
     document.addEventListener("visibilitychange", resume);
     return () => document.removeEventListener("visibilitychange", resume);
-  }, [view.identity, view.revision, mobile]);
+  }, [view.identity, view.revision, expiredReminders, mobile]);
   const currentChat =
     (view.all_streams ?? view.streams).find(
       (chat) => chat.stream === selection?.chat.stream,
     ) ?? selection?.chat;
-  const currentRow =
+  const selectedRow =
     currentChat?.rows.find((row) => row.id === selection?.row.id) ??
     selection?.row;
+  const [currentRow] = useExpiringRows(selectedRow ? [selectedRow] : []);
+  useEffect(() => {
+    if (currentRow?.body.kind === "deleted") setSelection(null);
+  }, [currentRow?.body.kind]);
   const menuItem = (key: MessageKey, action: () => void, disabled = false) => (
     <button
       type="button"
@@ -355,216 +369,295 @@ export function MessageActionsProvider({
             busy={busy}
           />
         )}
-        {selection && currentChat && currentRow && (
-          <ActionDialog
-            key={panel}
-            title={t(
-              panel === "reaction"
-                ? "messageActions.reaction"
-                : panel === "remind"
-                  ? "messageActions.remind"
-                  : panel === "delete"
-                    ? "messageActions.deleteTitle"
-                    : "messageActions.more",
-            )}
-            anchor={
-              panel === "menu" || panel === "reaction"
-                ? selection.anchor
-                : undefined
-            }
-            menu={panel === "menu"}
-            compact={panel === "reaction"}
-            className={panel === "reaction" ? "reaction-popover" : ""}
-            onClose={close}
-          >
-            {panel === "menu" ? (
-              <>
-                {!selection.onlyUnpin && (
-                  <>
-                    {menuItem(
-                      "messageActions.unread",
-                      () => void run(() => onUnread(currentChat, currentRow)),
-                    )}
-                  </>
-                )}
-                {menuItem(
-                  selection.onlyUnpin || currentRow.pinned
-                    ? "messageActions.unpin"
-                    : "messageActions.pin",
-                  () =>
-                    void run(() =>
-                      pin(
-                        currentChat,
-                        currentRow,
-                        selection.onlyUnpin ? false : !currentRow.pinned,
+        {selection &&
+          currentChat &&
+          currentRow &&
+          currentRow.body.kind !== "deleted" && (
+            <ActionDialog
+              key={panel}
+              title={t(
+                panel === "reaction"
+                  ? "messageActions.reaction"
+                  : panel === "remind"
+                    ? "messageActions.remind"
+                    : panel === "delete"
+                      ? "messageActions.deleteTitle"
+                      : panel === "expiry"
+                        ? "messageActions.deleteAfter"
+                        : "messageActions.more",
+              )}
+              anchor={
+                panel === "menu" || panel === "reaction"
+                  ? selection.anchor
+                  : undefined
+              }
+              menu={panel === "menu"}
+              compact={panel === "reaction"}
+              className={panel === "reaction" ? "reaction-popover" : ""}
+              onClose={close}
+            >
+              {panel === "menu" ? (
+                <>
+                  {!selection.onlyUnpin && (
+                    <>
+                      {menuItem(
+                        "messageActions.unread",
+                        () => void run(() => onUnread(currentChat, currentRow)),
+                      )}
+                    </>
+                  )}
+                  {menuItem(
+                    selection.onlyUnpin || currentRow.pinned
+                      ? "messageActions.unpin"
+                      : "messageActions.pin",
+                    () =>
+                      void run(() =>
+                        pin(
+                          currentChat,
+                          currentRow,
+                          selection.onlyUnpin ? false : !currentRow.pinned,
+                        ),
                       ),
-                    ),
-                  !currentChat.can_post || currentChat.forked,
-                )}
-                {!selection.onlyUnpin && (
-                  <>
-                    {menuItem("messageActions.remind", () =>
-                      setPanel("remind"),
-                    )}
-                    {currentRow.body.payload?.text &&
-                      menuItem(
-                        "messageActions.copy",
-                        () =>
-                          void run(async () => {
-                            await navigator.clipboard.writeText(
-                              currentRow.body.payload?.text ?? "",
+                    !currentChat.can_post || currentChat.forked,
+                  )}
+                  {!selection.onlyUnpin && (
+                    <>
+                      {menuItem("messageActions.remind", () =>
+                        setPanel("remind"),
+                      )}
+                      {currentRow.body.issuer_identity === view.identity &&
+                        currentRow.body.kind === "chat.message" &&
+                        menuItem(
+                          "messageActions.deleteAfter",
+                          () => {
+                            setExpiryHours(
+                              currentRow.body.payload?.expiry_hours ?? null,
                             );
-                            notify(t("messageActions.copied"));
-                          }),
-                      )}
-                    {currentRow.body.issuer_identity !== view.identity && (
-                      <BlockUserAction
-                        identity={currentRow.body.issuer_identity}
-                        name={
-                          currentChat.member_names?.[
-                            currentRow.body.issuer_identity
-                          ] ??
-                          currentRow.body.payload?.sender_name ??
-                          currentRow.body.issuer_identity.slice(0, 8)
-                        }
-                        menu
-                        onSelect={() => setSelection(null)}
-                      />
-                    )}
-                    {expert &&
-                      menuItem("messageDebug.title", () => {
-                        setDebug({ chat: currentChat, record: currentRow.id });
-                        setSelection(null);
-                      })}
-                    {currentRow.body.issuer_identity === view.identity &&
-                      ["chat.message", "file.shared"].includes(
-                        currentRow.body.kind,
-                      ) && (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          className="message-delete"
-                          disabled={
-                            busy || !currentChat.can_post || currentChat.forked
+                            setPanel("expiry");
+                          },
+                          !currentChat.can_post || currentChat.forked,
+                        )}
+                      {currentRow.body.payload?.text &&
+                        menuItem(
+                          "messageActions.copy",
+                          () =>
+                            void run(async () => {
+                              await navigator.clipboard.writeText(
+                                currentRow.body.payload?.text ?? "",
+                              );
+                              notify(t("messageActions.copied"));
+                            }),
+                        )}
+                      {currentRow.body.issuer_identity !== view.identity && (
+                        <BlockUserAction
+                          identity={currentRow.body.issuer_identity}
+                          name={
+                            currentChat.member_names?.[
+                              currentRow.body.issuer_identity
+                            ] ??
+                            currentRow.body.payload?.sender_name ??
+                            currentRow.body.issuer_identity.slice(0, 8)
                           }
-                          onClick={() => setPanel("delete")}
-                        >
-                          {t("messageActions.delete")}
-                        </button>
+                          menu
+                          onSelect={() => setSelection(null)}
+                        />
                       )}
-                  </>
-                )}
-              </>
-            ) : panel === "delete" ? (
-              <>
-                <p>{t("messageActions.deleteDescription")}</p>
-                <div className="dialog-buttons">
-                  <button className="secondary" disabled={busy} onClick={close}>
-                    {t("accountDeletion.cancel")}
-                  </button>
+                      {expert &&
+                        menuItem("messageDebug.title", () => {
+                          setDebug({
+                            chat: currentChat,
+                            record: currentRow.id,
+                          });
+                          setSelection(null);
+                        })}
+                      {currentRow.body.issuer_identity === view.identity &&
+                        ["chat.message", "file.shared"].includes(
+                          currentRow.body.kind,
+                        ) && (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="message-delete"
+                            disabled={
+                              busy ||
+                              !currentChat.can_post ||
+                              currentChat.forked
+                            }
+                            onClick={() => setPanel("delete")}
+                          >
+                            {t("messageActions.delete")}
+                          </button>
+                        )}
+                    </>
+                  )}
+                </>
+              ) : panel === "expiry" ? (
+                <div className="message-expiry-picker">
+                  <p>{t("messageActions.expiryDescription")}</p>
+                  <div
+                    className="message-expiry-options"
+                    role="group"
+                    aria-label={t("messageActions.deleteAfter")}
+                  >
+                    {([1, 12, 24, null] as const).map((hours) => (
+                      <button
+                        key={hours ?? "none"}
+                        type="button"
+                        className="secondary"
+                        disabled={busy}
+                        aria-pressed={expiryHours === hours}
+                        onClick={() =>
+                          setExpiryHours(expiryHours === hours ? null : hours)
+                        }
+                      >
+                        {hours == null
+                          ? t("messageActions.noExpiry")
+                          : t("composer.expiryHours", { hours })}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="dialog-buttons">
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={busy}
+                      onClick={close}
+                    >
+                      {t("dialog.cancel")}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        busy || !currentChat.can_post || currentChat.forked
+                      }
+                      onClick={() =>
+                        void run(() =>
+                          signedAction(currentChat, currentRow, {
+                            type: "expiry",
+                            hours: expiryHours,
+                          }),
+                        )
+                      }
+                    >
+                      {t("messageActions.saveExpiry")}
+                    </button>
+                  </div>
+                </div>
+              ) : panel === "delete" ? (
+                <>
+                  <p>{t("messageActions.deleteDescription")}</p>
+                  <div className="dialog-buttons">
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={close}
+                    >
+                      {t("accountDeletion.cancel")}
+                    </button>
+                    <button
+                      className="danger-action"
+                      disabled={busy}
+                      onClick={() =>
+                        void run(() =>
+                          signedAction(currentChat, currentRow, {
+                            type: "delete",
+                          }),
+                        )
+                      }
+                    >
+                      {t("messageActions.delete")}
+                    </button>
+                  </div>
+                </>
+              ) : panel === "reaction" ? (
+                <div className="reaction-picker">
+                  {reactionChoices.map((emoji) => (
+                    <button
+                      key={emoji}
+                      disabled={busy}
+                      aria-label={t("messageActions.reactWith", { emoji })}
+                      aria-pressed={
+                        !!currentRow.reactions?.find((r) => r.emoji === emoji)
+                          ?.mine
+                      }
+                      onClick={() => react(currentChat, currentRow, emoji)}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="reminder-picker">
+                  {(
+                    [
+                      [20, "reminders.twentyMinutes"],
+                      [60, "reminders.oneHour"],
+                      [180, "reminders.threeHours"],
+                      [1440, "reminders.tomorrow"],
+                      [10080, "reminders.nextWeek"],
+                    ] as const
+                  ).map(([minutes, label]) => (
+                    <button
+                      key={minutes}
+                      className="secondary"
+                      aria-pressed={presetMinutes === minutes}
+                      disabled={busy}
+                      onClick={() => {
+                        setPresetMinutes(minutes);
+                        setCustomTime("");
+                      }}
+                    >
+                      {t(label)}
+                    </button>
+                  ))}
+                  <label>
+                    {t("reminders.chooseTime")}
+                    <input
+                      type="datetime-local"
+                      value={customTime}
+                      onChange={(event) => {
+                        setCustomTime(event.target.value);
+                        setPresetMinutes(null);
+                      }}
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="check reminder-notification">
+                    <input
+                      type="checkbox"
+                      checked={systemNotification}
+                      disabled={busy}
+                      onChange={(event) =>
+                        setSystemNotification(event.target.checked)
+                      }
+                    />
+                    {t("reminders.systemNotification")}
+                  </label>
                   <button
-                    className="danger-action"
-                    disabled={busy}
+                    disabled={
+                      busy ||
+                      (presetMinutes === null &&
+                        (!customTime ||
+                          !Number.isFinite(Date.parse(customTime))))
+                    }
                     onClick={() =>
                       void run(() =>
-                        signedAction(currentChat, currentRow, {
-                          type: "delete",
-                        }),
+                        remind(
+                          currentChat,
+                          currentRow,
+                          presetMinutes === null
+                            ? Date.parse(customTime)
+                            : Date.now() + presetMinutes * 60_000,
+                        ),
                       )
                     }
                   >
-                    {t("messageActions.delete")}
+                    {t("reminders.save")}
                   </button>
                 </div>
-              </>
-            ) : panel === "reaction" ? (
-              <div className="reaction-picker">
-                {reactionChoices.map((emoji) => (
-                  <button
-                    key={emoji}
-                    disabled={busy}
-                    aria-label={t("messageActions.reactWith", { emoji })}
-                    aria-pressed={
-                      !!currentRow.reactions?.find((r) => r.emoji === emoji)
-                        ?.mine
-                    }
-                    onClick={() => react(currentChat, currentRow, emoji)}
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="reminder-picker">
-                {(
-                  [
-                    [20, "reminders.twentyMinutes"],
-                    [60, "reminders.oneHour"],
-                    [180, "reminders.threeHours"],
-                    [1440, "reminders.tomorrow"],
-                    [10080, "reminders.nextWeek"],
-                  ] as const
-                ).map(([minutes, label]) => (
-                  <button
-                    key={minutes}
-                    className="secondary"
-                    aria-pressed={presetMinutes === minutes}
-                    disabled={busy}
-                    onClick={() => {
-                      setPresetMinutes(minutes);
-                      setCustomTime("");
-                    }}
-                  >
-                    {t(label)}
-                  </button>
-                ))}
-                <label>
-                  {t("reminders.chooseTime")}
-                  <input
-                    type="datetime-local"
-                    value={customTime}
-                    onChange={(event) => {
-                      setCustomTime(event.target.value);
-                      setPresetMinutes(null);
-                    }}
-                    disabled={busy}
-                  />
-                </label>
-                <label className="check reminder-notification">
-                  <input
-                    type="checkbox"
-                    checked={systemNotification}
-                    disabled={busy}
-                    onChange={(event) =>
-                      setSystemNotification(event.target.checked)
-                    }
-                  />
-                  {t("reminders.systemNotification")}
-                </label>
-                <button
-                  disabled={
-                    busy ||
-                    (presetMinutes === null &&
-                      (!customTime || !Number.isFinite(Date.parse(customTime))))
-                  }
-                  onClick={() =>
-                    void run(() =>
-                      remind(
-                        currentChat,
-                        currentRow,
-                        presetMinutes === null
-                          ? Date.parse(customTime)
-                          : Date.now() + presetMinutes * 60_000,
-                      ),
-                    )
-                  }
-                >
-                  {t("reminders.save")}
-                </button>
-              </div>
-            )}
-          </ActionDialog>
-        )}
+              )}
+            </ActionDialog>
+          )}
       </ActionsContext.Provider>
     </BlockingProvider>
   );

@@ -390,4 +390,19 @@ fn message_actions_are_strict_typed_signed_events_without_changing_legacy_bytes(
     let offset = changed.windows(5).position(|p| p == b"false").unwrap();
     changed[offset..offset + 5].copy_from_slice(b"true ");
     assert!(!valid(&changed));
+    for hours in [json!(1), json!(12), json!(24), Value::Null] {
+        body["payload"]["action"] = json!({"type":"expiry","target":legacy.id(),"hours":hours});
+        assert!(valid(&raw(&serde_json::to_vec(&body).unwrap())));
+    }
+    for hours in [
+        json!(0),
+        json!(2),
+        json!(25),
+        json!(-1),
+        json!(1.5),
+        json!("1"),
+    ] {
+        body["payload"]["action"] = json!({"type":"expiry","target":legacy.id(),"hours":hours});
+        assert!(!valid(&raw(&serde_json::to_vec(&body).unwrap())));
+    }
 }

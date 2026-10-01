@@ -92,6 +92,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hourly_deadlines_cleanup_only_due_objects_and_retry_until_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save_named(
+                dir.path().join("profile"),
+                "synthetic expiry test password".into(),
+                "General",
+                "Owner",
+            )
+            .await
+            .unwrap();
+        let current = time().unwrap();
+        let mut state = app.service_state().unwrap();
+        for hours in [1u8, 12, 24] {
+            state.attachments.insert(
+                AttachmentId::from_bytes([hours; 16]),
+                HostedAttachment {
+                    object_id: AttachmentObjectId::from_bytes([hours; 16]),
+                    issuer: app.identity_id(),
+                    plaintext_size: 1,
+                    encrypted_size: 100,
+                    ciphertext_sha256: "11".repeat(32),
+                    created_at_ms: current,
+                    expires_at_ms: Some(current + u64::from(hours) * 3_600_000),
+                    reservation_expires_at_ms: current,
+                    state: HostedAttachmentState::Available,
+                    message_id: Some(RecordId::from_bytes([hours; 32])),
+                    terminal_at_ms: 0,
+                },
+            );
+        }
+        app.save_service_state(&state).unwrap();
+        let credential = app.session.credential().clone();
+        for hours in [12, 24, 1] {
+            let command = Command {
+                v: 1,
+                kind: "space.command".into(),
+                space: app.authorities.0[0].space(),
+                nonce: "11".repeat(16),
+                issued: current,
+                action: "attachment_retention".into(),
+                body: json!({"hours":hours}),
+            };
+            app.attachment_space_command(&mut state, &credential, true, &command, current)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.attachments[&AttachmentId::from_bytes([1; 16])].expires_at_ms,
+                Some(current + 3_600_000)
+            );
+        }
+        let download_token = "synthetic download token";
+        state.attachment_access.insert(
+            token_hash(download_token),
+            AttachmentAccess {
+                attachment: AttachmentId::from_bytes([1; 16]),
+                credential: None,
+                kind: "download".into(),
+                expires_at_ms: current + 7_200_000,
+            },
+        );
+        app.save_service_state(&state).unwrap();
+        app.attachment_download_grant(download_token, current + 3_599_999)
+            .unwrap();
+        assert!(
+            app.attachment_download_grant(download_token, current + 3_600_000)
+                .is_err()
+        );
+        assert!(
+            app.attachment_cleanup_targets(current + 3_599_999, 32)
+                .unwrap()
+                .is_empty()
+        );
+        for hours in [1u8, 12, 24] {
+            let deadline = current + u64::from(hours) * 3_600_000;
+            for _ in 0..2 {
+                let due = app.attachment_cleanup_targets(deadline, 32).unwrap();
+                assert_eq!(due.len(), 1);
+                assert_eq!(due[0].attachment_id, AttachmentId::from_bytes([hours; 16]));
+            }
+            app.attachment_cleanup_complete(AttachmentId::from_bytes([hours; 16]))
+                .unwrap();
+        }
+        assert_eq!(app.attachment_storage_usage().unwrap().used_bytes, 0);
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cleanup_bounds_terminal_metadata_and_keeps_expired_uploads_tracked() {
         let dir = tempfile::tempdir().unwrap();
         let app = ProfileDraft::new()
@@ -180,12 +269,18 @@ pub(super) struct HostedAttachment {
 }
 
 impl HostedAttachment {
-    fn availability(&self) -> Option<AttachmentAvailability> {
+    fn availability(&self, current: u64) -> Option<AttachmentAvailability> {
         Some(match self.state {
-            HostedAttachmentState::Available | HostedAttachmentState::DeletingExpired => {
-                AttachmentAvailability::Available
+            HostedAttachmentState::Available => {
+                if self.expires_at_ms.is_some_and(|expires| expires <= current) {
+                    AttachmentAvailability::Expired
+                } else {
+                    AttachmentAvailability::Available
+                }
             }
-            HostedAttachmentState::Expired => AttachmentAvailability::Expired,
+            HostedAttachmentState::Expired | HostedAttachmentState::DeletingExpired => {
+                AttachmentAvailability::Expired
+            }
             HostedAttachmentState::Deleted | HostedAttachmentState::DeletingDeleted => {
                 AttachmentAvailability::Deleted
             }
@@ -503,7 +598,7 @@ impl ClientApp {
                 let Some(stored) = state.attachments.get(&attachment) else {
                     return Some(Ok(json!({"status":"missing"})));
                 };
-                let Some(availability) = stored.availability() else {
+                let Some(availability) = stored.availability(current) else {
                     return Some(Ok(json!({"status":"missing"})));
                 };
                 if availability != AttachmentAvailability::Available {
@@ -519,7 +614,10 @@ impl ClientApp {
                         attachment,
                         credential: Some(credential.id()),
                         kind: "download".into(),
-                        expires_at_ms: current + ACCESS_TTL_MS,
+                        expires_at_ms: stored
+                            .expires_at_ms
+                            .unwrap_or(current + ACCESS_TTL_MS)
+                            .min(current + ACCESS_TTL_MS),
                     },
                 );
                 if let Err(error) = self.save_service_state(state) {
@@ -545,7 +643,7 @@ impl ClientApp {
                     let availability = state
                         .attachments
                         .get(&id)
-                        .and_then(HostedAttachment::availability)
+                        .and_then(|attachment| attachment.availability(current))
                         .unwrap_or(AttachmentAvailability::Missing);
                     result.insert(
                         text.into(),
@@ -555,20 +653,12 @@ impl ClientApp {
                 Ok(Value::Object(result))
             }
             "attachment_retention" if owner => {
-                let retention = match command.body["days"].as_u64() {
-                    None if command.body["days"].is_null() => AttachmentRetention::Never,
-                    Some(value @ (1 | 7 | 30 | 90 | 365)) => {
-                        AttachmentRetention::Days(value as u32)
-                    }
-                    _ => return Some(Err("Choose Never, 1, 7, 30, 90 or 365 days.".into())),
+                let retention = match command.body["hours"].as_u64() {
+                    Some(value @ (1 | 12 | 24)) => AttachmentRetention::Hours(value as u32),
+                    _ => return Some(Err("attachment_retention_invalid".into())),
                 };
                 state.attachment_policy.retention = retention;
-                for attachment in state.attachments.values_mut() {
-                    if matches!(attachment.state, HostedAttachmentState::Available) {
-                        attachment.expires_at_ms =
-                            state.attachment_policy.expires_at(attachment.created_at_ms);
-                    }
-                }
+                // Every sent message keeps the deadline signed at upload time.
                 if let Err(error) = self.save_service_state(state) {
                     return Some(Err(error));
                 }
@@ -688,7 +778,7 @@ impl ClientApp {
             .attachments
             .get(&access.attachment)
             .ok_or("Attachment was not found.")?;
-        if !matches!(attachment.state, HostedAttachmentState::Available) {
+        if attachment.availability(current) != Some(AttachmentAvailability::Available) {
             return Err("Attachment is no longer available.".into());
         }
         Ok(AttachmentTransferGrant {

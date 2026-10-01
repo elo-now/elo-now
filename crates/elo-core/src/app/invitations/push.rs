@@ -767,19 +767,28 @@ impl ClientApp {
             return;
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut message_projections = BTreeMap::new();
         for (id, object, stored_at) in pending {
             let result:Result<bool>=async {
                 let bytes=self.store.get_object(object).await?.ok_or("Missing message")?;
                 let record=crypto::open_object(&bytes,self.session.age_identity())?;
                 if record.id()!=id {return Err("Invalid message".into());}
                 let chat=record.chat()?;
+                let current = time.as_millis() as u64;
                 let a=self.authorities.for_record(&record)?;
                 a.verify_historical(&record)?;
+                let scope = (chat.space_id, chat.stream_id);
+                if let std::collections::btree_map::Entry::Vacant(slot) = message_projections.entry(scope) {
+                    slot.insert(super::super::message_actions::Projection::new(&self.originals(a).await?));
+                }
+                let projection = &message_projections[&scope];
+                if projection.is_deleted(&record) { return Ok(true); }
+                let expires = projection.body(&record)["payload"]["expires_at_ms"].as_u64();
                 let mut found=false;
                 let mut complete=true;
                 for (route,credential,_) in routes.iter().filter(|(r,c,_)| c.identity()!=self.session.identity_id() && chat.audience.contains(&c.identity()) && r.since<=stored_at as u64) {
                     if !a.head()?.members.iter().any(|m|m.identity_id==credential.identity() && m.credential_ids.contains(&credential.id()) && m.capabilities.contains(&Capability::Read)) {continue;}
-                    let target=Target{chat:None,v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,expires:time.as_millis() as u64+86_400_000};
+                    let target=Target{chat:None,v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,expires:expires.unwrap_or(current + 86_400_000).min(current + 86_400_000)};
                     let mut request=wake_request(route,Some((chat.space_id,chat.stream_id)),&id.to_string(),&target,&credential.recipient())?;
                     super::super::push_sender::sign(&self.session, &route.id, &mut request)?;
                     found=true;
