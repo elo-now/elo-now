@@ -532,6 +532,11 @@ fn decrypt(ciphertext: &[u8], passphrase: SecretString) -> Result<Zeroizing<Vec<
     Ok(plaintext)
 }
 pub fn read_private(path: &Path) -> Result<Vec<u8>> {
+    read_private_bounded(path, MAX_VAULT + 4096)
+}
+/// Read a private file using the caller's format limit without weakening its
+/// file-type or Unix permission checks. Vault readers retain their own limit.
+pub(crate) fn read_private_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path).map_err(|_| VaultError::File)?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(VaultError::File);
@@ -546,10 +551,10 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .map_err(|_| VaultError::File)?
-        .take((MAX_VAULT + 4097) as u64)
+        .take((limit as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| VaultError::File)?;
-    if bytes.len() > MAX_VAULT + 4096 {
+    if bytes.len() > limit {
         return Err(VaultError::File);
     }
     Ok(bytes)

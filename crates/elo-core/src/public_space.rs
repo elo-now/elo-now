@@ -1387,7 +1387,7 @@ impl PublicSpaceService {
         if credential.key() != &signing_key.verifying_key() {
             return Err("Invalid transport signing key.".into());
         }
-        let bytes = vault::read_private(&directory.join("state.json"))?;
+        let bytes = vault::read_private_bounded(&directory.join("state.json"), STATE_LIMIT)?;
         if bytes.len() > STATE_LIMIT {
             return Err("Space state is too large.".into());
         }
@@ -1442,7 +1442,7 @@ impl PublicSpaceService {
         })
     }
     fn service_state(&self) -> Result<ServiceState> {
-        let bytes = vault::read_private(&self.directory.join("state.json"))?;
+        let bytes = vault::read_private_bounded(&self.directory.join("state.json"), STATE_LIMIT)?;
         if bytes.len() > STATE_LIMIT {
             return Err("Space state is too large.".into());
         }
@@ -1904,6 +1904,66 @@ mod tests {
         drop(service);
         let reopened = PublicSpaceService::open(directory.path(), true).unwrap();
         assert_eq!(reopened.authorities.0[0].head_id(), authority.head_id());
+    }
+    #[test]
+    fn public_state_larger_than_a_profile_vault_remains_readable_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = Device::new();
+        let authority = initial(&owner);
+        let service = PublicSpaceService::create(
+            directory.path(),
+            authority.call_proof().unwrap(),
+            &[owner.credential.identity()],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let mut state = service.service_state().unwrap();
+        state.replies.insert(
+            "cached-response".into(),
+            (
+                1,
+                "status".into(),
+                json!({"padding": "x".repeat(300 * 1024)}),
+            ),
+        );
+        service.save_service_state(&state).unwrap();
+        let path = directory.path().join("state.json");
+        assert!(
+            vault::read_private(&path).is_err(),
+            "vault limit stays unchanged"
+        );
+        assert_eq!(
+            service.space_access_devices().unwrap(),
+            vec![owner.credential.id()]
+        );
+        drop(service);
+        let reopened = PublicSpaceService::open(directory.path(), true).unwrap();
+        assert_eq!(reopened.authorities.0[0].head_id(), authority.head_id());
+        assert_eq!(reopened.service_state().unwrap().replies.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                reopened.service_state().is_err(),
+                "private permissions remain required"
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(STATE_LIMIT as u64 + 1)
+            .unwrap();
+        assert!(vault::read_private_bounded(&path, STATE_LIMIT).is_err());
+        assert!(
+            reopened.service_state().is_err(),
+            "public state remains bounded"
+        );
+        assert!(PublicSpaceService::open(directory.path(), true).is_err());
     }
     #[test]
     fn authority_publication_uses_durable_compare_and_swap_and_rejects_a_valid_fork() {
