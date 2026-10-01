@@ -626,7 +626,9 @@ impl ReplicaStore {
    let body=serde_json::to_vec(&body).map_err(|_|ReplicaError::Storage)?;let receipt=SignedRecord::sign(&body,&db.key).map_err(|_|ReplicaError::Storage)?;
    Ok((inserted,receipt.bytes().to_vec()))
   }).await?;
-        if result.0 { self.realtime.changed(mailbox); }
+        if result.0 {
+            self.realtime.changed(mailbox);
+        }
         Ok(result)
     }
     pub async fn get(&self, mailbox: MailboxId, token: String, id: ObjectId) -> Result<Vec<u8>> {

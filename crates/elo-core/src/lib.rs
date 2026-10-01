@@ -11,8 +11,8 @@ pub mod retention_access;
 
 pub mod client_policy;
 pub mod http;
-pub mod replica;
 pub mod realtime;
+pub mod replica;
 
 pub mod sync;
 
@@ -31,5 +31,5 @@ pub mod files;
 pub mod app;
 pub mod vault;
 
-pub mod public_space;
 pub mod owner_admission;
+pub mod public_space;
