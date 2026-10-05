@@ -418,6 +418,16 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
             if app.has_spaces_catalog() {
                 app.quarantine_restored_spaces()?;
                 app.enable_spaces().await?;
+                // Attempt current membership verification before completing
+                // the import or activating live-pairing owner controls. Offline
+                // Spaces stay quarantined; ordinary unlock still opens locally.
+                if app
+                    .spaces
+                    .as_ref()
+                    .is_some_and(|spaces| spaces.awaiting_verification())
+                {
+                    app.operate(json!({"op":"space_refresh"})).await?;
+                }
             }
             app.view().await?;
             progress.report(RestoreStage::Ready, 1, 1)?;
