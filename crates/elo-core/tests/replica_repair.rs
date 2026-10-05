@@ -622,6 +622,6 @@ async fn migration_from_v3_preserves_queued_bytes_receipts_and_authority_snapsho
     assert_eq!(
         raw.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        8
+        9
     );
 }
