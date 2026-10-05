@@ -1,0 +1,12 @@
+{
+  "legal_name": "Example Publisher Ltd.",
+  "address": "123 Example Street, Example City",
+  "registration": "",
+  "support_email": "support@example.invalid",
+  "privacy_email": "privacy@example.invalid",
+  "deployment_email": "teams@example.invalid",
+  "app_store_url": "https://apps.apple.com/app/id6814766127",
+  "google_play_url": "https://play.google.com/store/apps/details?id=now.elo",
+  "desktop_release_url": "https://github.com/elo-now/elo-now/releases",
+  "legal_review_complete": false
+}

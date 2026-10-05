@@ -1,4 +1,5 @@
 //! Signed local-file invitations with explicit fingerprint approval. No URL grants READ.
+pub mod contact_code;
 pub mod shared;
 use crate::{
     authority::{Authority, Capability, ConfigAction, ConfigAdmission, Member},

@@ -632,6 +632,26 @@ function App() {
     [action, setAction] = useState<Action | null>(null),
     [values, setValues] = useState<Record<string, string | boolean>>({});
   const view = useExpiringView(storedView);
+  const previousUnlockIdentity = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const identity = view?.identity;
+    const firstOpen =
+      previousUnlockIdentity.current === undefined && !!identity;
+    previousUnlockIdentity.current = identity;
+    // Diagnostic-only marker after the unlocked shell has had a paint opportunity.
+    // Normal builds do not expose this bridge or schedule these animation frames.
+    if (!firstOpen || !window.eloAppearance?.recordUnlockFrame) return;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        try {
+          window.eloAppearance?.recordUnlockFrame?.();
+        } catch {
+          // Timing collection must never affect access to the unlocked profile.
+        }
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [view?.identity]);
   useEffect(() => {
     if (view && spaceInvitation) openSettings("spaces");
   }, [view?.identity, spaceInvitation]);

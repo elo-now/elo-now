@@ -548,7 +548,7 @@ export function MessageActionsProvider({
                     role="group"
                     aria-label={t("messageActions.deleteAfter")}
                   >
-                    {([1, 12, 24, null] as const).map((hours) => (
+                    {([null, 1, 24] as const).map((hours) => (
                       <button
                         key={hours ?? "none"}
                         type="button"
@@ -559,7 +559,7 @@ export function MessageActionsProvider({
                           setExpiryHours(expiryHours === hours ? null : hours)
                         }
                       >
-                        {hours == null
+                        {hours === null
                           ? t("messageActions.noExpiry")
                           : t("composer.expiryHours", { hours })}
                       </button>
@@ -577,7 +577,10 @@ export function MessageActionsProvider({
                     <button
                       type="button"
                       disabled={
-                        busy || !currentChat.can_post || currentChat.forked
+                        busy ||
+                        expiryHours === 12 ||
+                        !currentChat.can_post ||
+                        currentChat.forked
                       }
                       onClick={() =>
                         void run(() =>

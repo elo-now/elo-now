@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   QrParts,
   EXCHANGE_PREFIX,
+  CONTACT_PREFIX,
   SPACE_PREFIX,
   SHORT_SPACE_PREFIX,
   normalizeInvitationLink,
@@ -44,6 +45,38 @@ describe("invitation input classification", () => {
       const parts = new QrParts();
       expect(parts.add(`eloqr:1:0123456789abcdef:1:2:aB7_-xyz9`)).toBeNull();
       expect(parts.add(`eloqr:1:0123456789abcdef:0:2:${prefix}`)).toBe(link);
+    }
+  });
+
+  it("routes compact contact codes through exchange handling for paste and QR", () => {
+    const payload = "AQIDBA";
+    const link = `${CONTACT_PREFIX}${payload}`;
+    expect(normalizeInvitationLink(` \n${link}\t`)).toEqual({
+      kind: "exchange",
+      link,
+    });
+    expect(new QrParts().add(` ${link}\n`)).toBe(link);
+
+    const parts = new QrParts();
+    expect(parts.add(`eloqr:1:0123456789abcdef:1:2:${payload}`)).toBeNull();
+    expect(parts.add(`eloqr:1:0123456789abcdef:0:2:${CONTACT_PREFIX}`)).toBe(
+      link,
+    );
+  });
+
+  it("rejects empty, non-ASCII, oversized and unknown-version contact codes", () => {
+    for (const invalid of [
+      CONTACT_PREFIX,
+      `${CONTACT_PREFIX}é`,
+      `${CONTACT_PREFIX}a\u0000b`,
+      `${CONTACT_PREFIX}a\nb`,
+      `${CONTACT_PREFIX}${"a".repeat(2 * 1024 * 1024)}`,
+      "elo://contact/v0#AQIDBA",
+      "elo://contact/v2#AQIDBA",
+      "elo://contact/v10#AQIDBA",
+    ]) {
+      expect(normalizeInvitationLink(invalid)).toBeNull();
+      expect(() => new QrParts().add(invalid)).toThrow("invitationInvalidCode");
     }
   });
 
@@ -93,6 +126,26 @@ describe("invitation input classification", () => {
 });
 
 describe("QR exchange transport", () => {
+  it("applies version and assembled-size limits to animated contact codes", () => {
+    const unknownVersion = new QrParts();
+    expect(
+      unknownVersion.add("eloqr:1:0123456789abcdef:0:2:elo://contact/v2#"),
+    ).toBeNull();
+    expect(() =>
+      unknownVersion.add("eloqr:1:0123456789abcdef:1:2:AQIDBA"),
+    ).toThrow("invitationInvalidCode");
+
+    const link = `${CONTACT_PREFIX}${"a".repeat(64 * 1024)}`;
+    const chunks = link.match(/.{1,900}/g)!;
+    const parts = new QrParts();
+    for (const [index, chunk] of chunks.entries()) {
+      const frame = `eloqr:1:0123456789abcdef:${index}:${chunks.length}:${chunk}`;
+      if (index === chunks.length - 1)
+        expect(() => parts.add(frame)).toThrow("invitationInvalidCode");
+      else expect(parts.add(frame)).toBeNull();
+    }
+  });
+
   it("reassembles only a complete consistent transfer", () => {
     const p = new QrParts();
     expect(p.add("eloqr:1:0123456789abcdef:1:2:payload")).toBeNull();

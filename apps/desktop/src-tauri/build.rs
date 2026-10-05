@@ -17,6 +17,7 @@ fn main() {
         "ELO_WITNESS_KEY_GENERATION",
         "TAURI_ELO_WITNESS_KEY_GENERATION",
         "ELO_DISTRIBUTION_CHANNEL",
+        "TAURI_ELO_UNLOCK_TIMING",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }

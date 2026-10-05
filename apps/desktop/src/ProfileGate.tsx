@@ -195,6 +195,9 @@ export function ProfileGate({
         );
       }
     } catch (error) {
+      await invoke("profile_task", {
+        request: { op: "biometric_prompt_reset" },
+      }).catch(() => {});
       if (!biometricCancelled(error)) reportError(error);
     } finally {
       setBusy(false);

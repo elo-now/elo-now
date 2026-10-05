@@ -1,179 +1,231 @@
 # elo.now
 
-**Built by [9bits](https://9bits.com).**
+**Private team communication. On your terms.**
 
-[English](#english) · [Polski](#polski)
+elo.now brings conversations, files and live audio/video sessions together in
+Spaces. It is an open-source communication platform for teams that want to
+understand how their data is handled and have the option to operate their own
+infrastructure. Built by [9bits](https://9bits.com).
 
-## English
+[iOS](https://apps.apple.com/app/id6814766127) ·
+[Android](https://play.google.com/store/apps/details?id=now.elo) ·
+[macOS, Windows and Linux](https://github.com/elo-now/elo-now/releases) ·
+[Build from source](docs/BUILDING.md) · [Self-host](docs/SELF_HOSTING.md)
 
-This development source includes a separately provisioned authorization witness,
-an independent attachment storage broker, and Notes. These source changes are not
-retroactively included in published build 1114. The witness and storage rollout
-still requires the deployment and acceptance steps described in
-[Building from source](docs/BUILDING.md#optional-services-and-mobile-push).
+See the release notes for supported platforms, architectures and package signing.
 
-### 1 man, 1 week, 1 GPT Astra
+## Your team's workspace, managed by 9bits
 
-elo.now started with an idea: team conversations should be easy to organize, and the people having them should control their data.
+Get a private elo workspace ready for your organization, with help from the team
+behind the application. **9bits can install and configure elo on your own
+infrastructure, or host and manage it for you.**
 
-One person at 9bits, working with GPT Astra, took elo.now from an idea to a working MVP in one week. Product decisions, interface design, the Rust core, mobile clients and real-device testing grew together in one fast development cycle. This was not just a set of mockups: people could create profiles, join Spaces, exchange encrypted messages and receive notifications on a phone.
+- **A setup that fits your team:** Spaces, access and attachment storage configured
+  around the way you work.
+- **Your choice of infrastructure:** a deployment on your servers or hosting
+  provided by 9bits.
+- **Ongoing care:** updates, monitoring, backups and support.
 
-We are sharing the application source so others can see how it works, inspect the trade-offs and help improve it. One week brought us to a working MVP, not the end of development or a completed independent security audit.
+[Talk to 9bits](mailto:contact@9bits.com) about your organization and we will help
+you choose a setup and prepare an offer.
 
-### The application
+## Work together
 
-elo.now is a messaging app for small groups and teams. A **Space** keeps one group's people and conversations together. Inside it you can chat in channels or directly, share encrypted photos and files, and make voice or video calls. The same app runs on iPhone, Android and desktop.
+| Area                             | What you can do                                                                                                                                                                                |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Spaces**                       | Keep organizations and projects separate, invite people by link or QR, and choose whether an invitation requires owner approval.                                                               |
+| **Conversations**                | Use General, named chats, one-to-one and group DMs; reply in threads, mention teammates, edit your text, react, pin and search available messages.                                             |
+| **Buzz**                         | Catch up through **All**, **Mentions** and **Threads**. Follow a thread or mute a conversation to control your attention.                                                                      |
+| **Notes and drafts**             | Send notes and files to yourself in a private conversation shared with your admitted devices. Unsent drafts stay encrypted on the device where you write them.                                 |
+| **Attachments**                  | Share encrypted photos and files, paste image bytes or drop a file into a desktop chat, and view downloaded images in the conversation.                                                        |
+| **Audio and video**              | Start or join a session from a chat, use full-screen video, choose the audio output on mobile and share your screen on desktop. Sessions are voluntary: they do not ring like telephone calls. |
+| **Devices and recovery**         | Link and approve devices, manage registered access, unlock with a password or supported biometrics, and export encrypted backups of supported profile and chat data.                           |
+| **Notifications and appearance** | Use optional system notifications, unread indicators and desktop notification sounds; choose Dark, Auto or Light, interface size and background motifs.                                        |
+| **Retention**                    | Choose the Space's server message lifetime, set **Keep** on individual text messages and set a separate attachment expiry policy.                                                              |
 
-### Start in five steps
+Live synchronization uses authenticated WebSocket connections. Typing indicators,
+online status and upload previews provide context while connected; ordinary
+synchronization catches up after reconnecting. A storage acknowledgment is not a
+receipt proving that another person received or read a message.
 
-1. Install elo.now, choose **New with elo?**, enter your name and set a password. Save the recovery code somewhere safe; it is how you recover your identity if you lose the device.
-2. Choose **Create a Space**, give it a name and enter a contact email. Keep **Require owner approval** enabled to approve people using the first invitation, or turn it off to let anyone with that QR/link join directly. You become its primary owner. The **General** conversation is ready automatically.
-3. In **Spaces**, tap the Share icon beside your Space. Send its QR code or invitation link to someone you trust.
-4. That person chooses **Join a Space** and scans the code or opens the link. If the invitation requires approval, approve their request in **Approvals**.
-5. Open **General** to send your first message. Add other channels or start a direct conversation as needed. You can enable notifications in Settings.
+The shared application supports iPhone, Android and desktop. English is the
+currently supported interface language. Native capabilities and distribution
+signing vary by platform; see [building and platform requirements](docs/BUILDING.md).
 
-Joining someone else's group? Start at step 1, then choose **Join a Space** instead of creating one. A recovery code restores your identity; use a separate encrypted backup if you also need to restore supported chat history.
+## How Spaces organize conversations
 
-## Download
+A profile is your identity across its admitted devices. A **Space** brings a
+particular organization's or project's members and conversations together.
+Joining a Space admits you to its General conversation; other chats have their
+own participants and permissions. Space membership does not automatically let
+you read every private conversation or earlier history.
 
-- [iPhone on the App Store](https://apps.apple.com/app/id6814766127)
-- [Android on Google Play](https://play.google.com/store/apps/details?id=now.elo)
-- [Desktop releases for macOS, Windows and Linux](https://github.com/elo-now/elo-now/releases)
+```mermaid
+flowchart TD
+    P["Your profile and admitted devices"] --> A["Space: Product team"]
+    P --> B["Space: Another project"]
+    A --> G["General<br/>Space members"]
+    A --> C["Named chats<br/>Selected participants"]
+    A --> D["Direct messages<br/>One person or a group"]
+    A --> N["Notes<br/>Only your admitted devices"]
+    C --> T["Messages and threads<br/>Files and live sessions"]
+```
 
-Store links become available after the respective store approves and releases the app. Check the desktop release notes for supported architectures and signing status.
+Each profile has its own Notes conversation in a Space. Personal chat groups
+organize your list; moving a chat into a group does not change its membership.
+Details and device-admission limits are in [chat groups and Notes](docs/CHAT_GROUPS.md).
 
-## In the app
+### Get started
 
-- **Spaces:** switch between organizations, join by invitation or QR, and keep each Space's conversations separate. Owners can approve join requests.
-- **Conversations:** channels, group and direct messages, replies, reactions, pins, encrypted file and photo attachments, and search. Each Space has a General channel.
-- **Live activity:** faster message synchronization, typing indicators, online status and attachment upload previews while connected. Durable synchronization catches up after reconnecting.
-- **Calls:** joinable audio/video sessions in chats, full-screen video, and screen sharing on desktop.
-- **Buzz:** catch up on unread messages. Mute a conversation to exclude it from Buzz and message notifications.
-- **Notifications:** optional mobile system notifications, quiet follow-up alerts while messages remain unread, and links to the relevant conversation.
-- **Your profile:** password or supported biometric unlocking, device linking, recovery codes and password-protected recovery QR images.
-- **Appearance:** color schemes, background motifs (including a motif you draw), opacity and interface size.
-- **Backups:** encrypted exports of supported profile and conversation data. Attachment bytes are excluded. The 64 MiB budget is measured before compression and encryption; older message groups may be omitted to fit.
+1. Install the app, choose **New with elo?**, enter your name and set a password.
+   Save your recovery code somewhere safe.
+2. **Create a Space**, set its name and server message lifetime, and choose whether
+   the initial invitation requires owner approval. General is created for you.
+   In a deployment with the attachment broker, attachments start disabled; the
+   owner can enable and configure them during creation or later in Space settings.
+3. Share the Space's invitation QR or link with people you trust. They choose
+   **Join a Space**; approval-required requests appear in the owner's **Approvals**.
+4. Open General, create other conversations and configure notifications as needed.
 
-English is the currently supported interface language. Publisher-operated hosting allows two Spaces per creator identity, with 150 MB of encrypted message storage and a separate 50 MB attachment quota in each Space. The application is under active development. Publishing these sources does not mean that public app-store releases or an independent security audit have been completed.
+A recovery code restores identity, not all chat history. A separate encrypted
+backup restores supported profile and conversation data, without attachment
+bytes. Its 64 MiB budget is measured before compression and encryption; older
+message groups may be omitted to fit. Keep backups independently of your device.
 
 ## How data moves
 
-A **Space** is an organizational context: a company or team with its own access and conversations. A **Replica** is a storage and delivery server. They are different concepts; changing a server does not by itself define who belongs to a conversation.
+A **Replica** is a temporary delivery store, not a Space or an archive. Devices
+sign messages and encrypt them for authorized device keys before upload.
+Recipients decrypt locally and verify the signature and authorization before
+accepting a message. Hosted sending also requires fresh authorization evidence;
+unavailable services can pause new sends even though saved local history remains
+readable.
 
-1. Before encrypting new content in a hosted Space, the app checks a short-lived confirmation of chat permissions from its pinned host. Normal synchronization refreshes these confirmations in batches; each message does not require a separate request. Known permission changes invalidate the cached result immediately. If no valid confirmation is available, sending waits for the host. The Rust core signs and encrypts the message for the authorized device keys.
-2. The device uploads the encrypted object to a configured Replica. The Replica stores ciphertext and delivery metadata rather than the message text.
-3. Recipients synchronize the encrypted object, decrypt it on their own devices and verify its signature and authorization before accepting it.
-4. With system notifications enabled, a separate wake service sends a generic alert through Firebase Cloud Messaging and APNs. The current push payload does not include the message text or conversation name; its routing target is encrypted. Opening the alert takes the app to the relevant conversation.
+The following diagram shows message and attachment paths in a deployment with
+the separately provisioned witness and storage broker. Dashed arrows represent
+authorization checks, not message content.
 
 ```mermaid
 flowchart LR
-    A["Sender's device<br/>Sign and encrypt"] -->|Ciphertext| R["Replica<br/>Store and deliver"]
-    R -->|Ciphertext| B["Recipient's device<br/>Decrypt and verify"]
-    W["Optional wake service"] -->|Generic alert| P["FCM / APNs"]
-    P --> B
+    A["Sender device<br/>Sign and encrypt"] -->|Encrypted message| R["API / Replica<br/>Temporary delivery storage"]
+    R -->|Encrypted message| B["Recipient device<br/>Verify and decrypt"]
+    A -.->|General authority| W["Witness<br/>Signed authorization state"]
+    B -.->|General authority| W
+    A -->|Encrypted file| S["Storage broker<br/>Access and transfers"]
+    S <-->|Encrypted file| F["Owner's MEGA folder<br/>or S3 storage"]
+    S -->|Encrypted file| B
+    S -.->|Current General authority| W
 ```
 
-Profiles and conversation history are kept on participating devices. A Space enrollment service handles joining and General membership. Joining General gives access to new messages; it does not automatically reveal earlier history. Recovery codes restore identity, while separately exported encrypted backups restore supported conversation data.
+Other traffic has separate paths:
 
-**Security limits:** recovery alone does not revoke a lost device. Hosted sends require current server-confirmed permissions; unavailable hosts pause sending. Revocation cannot erase existing copies, and there is no forward secrecy for retained message objects. Standalone mode and older deployed versions have different guarantees. Read the [threat model](THREAT_MODEL.md) before relying on these protections.
+- **Notifications:** the wake service sends generic alerts through Firebase Cloud
+  Messaging and APNs. Current push payloads omit message text and conversation
+  names; their navigation target is encrypted. Providers still process tokens
+  and delivery metadata. Desktop notifications require the app to remain running
+  and unlocked; they do not wake a closed desktop application.
+- **Audio, video and screen sharing:** direct sessions prefer authenticated
+  WebRTC between devices, with TURN relay fallback. Group sessions use a LiveKit
+  media server with additional end-to-end media encryption. Media does not pass
+  through the message Replica and is not stored there. Call infrastructure still
+  sees connection and session metadata. See [calls and media boundaries](docs/CALLS.md).
 
-### Where attachments and calls go
+### What the witness does
 
-Files are encrypted on the sender's device before upload. The hosting operator chooses where to keep the encrypted file bytes: local storage, MEGA through WebDAV, or S3-compatible object storage. Publisher-operated hosting currently uses MEGA. Attachment storage does not need the file decryption keys. Individual files are limited to 5 MB on publisher-operated hosting.
+The witness is a separate authorization service for witnessed **General**
+membership changes. It verifies owner-signed policies and proposals, serializes
+accepted changes and provides signed freshness evidence. An open invitation can
+admit its holder while the owner is offline, within the owner's registered
+policy; approval-required invitations still need owner approval.
 
-Calls use a separate authorization and control service. Direct calls try an authenticated WebRTC connection between devices and can use a TURN relay when a direct route is unavailable. Group calls use a LiveKit media server (SFU). The messaging Replica does not store call audio or video. The app discovers the call service through its configured Space endpoint; server placement is the hosting operator's choice.
+This adds a verification boundary outside the API host. It is not a universal
+validator for every private-chat action, and it does not hold message decryption
+keys. Clients must receive the witness's trust pin independently of the API.
+Hosting the two services under one provider account leaves a shared compromise
+and recovery risk. Witness-host compromise, lost signing keys and rollback
+recovery require their own protections; see [witness deployment and recovery](deploy/witness/README.md).
 
-### Message and attachment expiry
+### Connect your own attachment storage
 
-Text messages can expire after **1, 12 or 24 hours**. Choose a duration in the
-composer, or use your sent message's **Delete after** menu to change it or select
-**No expiry** before it expires. A changed duration starts when saved. The chat
-shows the deadline; updated clients replace expired text with **Message expired**.
-This does not erase external copies or rewrite encrypted records and backups.
+The Space owner enables attachments and selects
+**MEGA** or **S3-compatible storage** during creation or in Space settings. MEGA
+uses a dedicated writable folder link and write authorization, not the account
+password. S3 uses credentials restricted to the intended bucket and prefix.
+An owner's MEGA account still uses MEGA's infrastructure; it is not a server
+physically owned by the user.
 
-New attachments expire on the server after **1 hour** by default. Space owners
-can choose **12 or 24 hours** for future uploads. Attachment tiles show the
-deadline and then **Expired**; physical storage cleanup is retried in the
-background. Files already saved on a device remain available there.
+The client sends provider configuration directly to the separate storage broker.
+The Space API does not receive those credentials. The broker retains encrypted
+provider configuration and uses it to transfer encrypted files; it does not need
+the file decryption keys. An attacker controlling the broker host could still
+obtain provider credentials or delete ciphertext within their scope. Use a
+dedicated folder or bucket with limited permissions.
 
-### Security, with clear boundaries
+Changing providers affects new uploads. Existing objects retain their original
+provider and expiry; disabling attachments stops new uploads while existing
+objects remain downloadable until expiry. The broker enforces a 5 MiB file limit
+and a 50,000,000-byte Space quota.
+See the [storage broker contract](crates/elo-storage/README.md).
 
-The design uses Ed25519 signatures, the age encryption format and HTTPS transport. A storage Replica does not need participants' decryption keys to deliver their messages. Passwords, recovery secrets and server administrator credentials do not belong in a source repository or notification payload.
+## Three different expiry settings
 
-These protections have limits. Servers and notification providers can observe some metadata, including timing, object sizes or delivery information. Authorized recipients can copy content, and a compromised unlocked device can expose it. The current design uses long-term recipient keys, without a messaging ratchet or a guarantee of forward secrecy. Legacy version-1 Spaces gave the General enrollment service a key that could decrypt General messages. That service role did not grant access to independent private conversations.
+| Setting                     | Choices                                           | What it controls                                                                                                                                         |
+| --------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Server message lifetime** | **6 h / 12 h / 24 h**, default **24 h**           | How long the Replica retains an encrypted message body, measured from server receipt. It does not erase history already on devices.                      |
+| **Keep** on a text message  | **No expiry / 1 h / 24 h**, default **No expiry** | When updated clients hide that message's content and show **Message expired**. The composer represents No expiry as **∞**.                               |
+| **Attachment expiry**       | **1 h / 12 h / 24 h**, default **1 h**            | When the attachment stops being downloadable and its encrypted object becomes due for deletion from storage. New policy choices apply to future uploads. |
 
-Version 1.0.5 uses owner-managed version-2 General for newly created Spaces. Its host has no General content key; approved owner devices sign membership changes. This requires matching clients and a fresh hosting deployment; existing Spaces are not converted. Open invitation links still allow any token holder, including the host, to join. See the [General trust boundary](THREAT_MODEL.md#hosted-general-trust-boundary).
+A one-to-one DM body can leave the Replica earlier: after one device of the other
+identity verifies and durably accepts it. This is not a human read receipt, and
+another device of that identity may still need to retrieve a copy.
 
-Newly linked and recovered devices receive independent keys. To link a device, show the QR from **Devices → +**, scan it on the new device, then choose **Accept** on the original device. The new device opens the transferred profile with the same password. Keep this QR private. An unlocked, admitted device can revoke another device through **Delete** and confirmation. Server confirmation is required, private-chat controllers must update recipient keys, and copies already on a device cannot be erased. These protocol changes require matching app and server versions; see the [threat model](THREAT_MODEL.md) for rollout boundaries and remaining risks.
+Server expiry does **not** mean all Space data disappears. Encrypted locators,
+authorization and membership state, operational metadata, logs and backups have
+separate lifecycles. After a long offline period, **Retrieve** may require a
+current member's app to be online, unlocked and still holding the message. If no
+copy remains, the content cannot be recovered.
 
-This is an actively developed MVP. Open source makes the implementation available for inspection; it is not proof that every component has been audited or that the application is immune to vulnerabilities.
+Use a sent message's **Keep** menu to change or remove its deadline before expiry.
+A new duration starts when saved. Replies have independent deadlines. Expiry is
+an application visibility rule, not verified erasure from every device, signed
+record, backup or external copy. Downloaded attachment copies can remain on a
+device; failed provider deletion is retried in the background.
+See [message retention and retrieval](docs/REPLICA_RETENTION.md) for the full contract.
 
-### Server and app updates
+## Privacy with explicit boundaries
 
-App releases and server API versions are separate. The security baseline requires matching clients and server services. Compatible releases preserve their supported contracts. The app checks for updates in the background without delaying access to local profiles or saved chats. Required updates are disabled by default on the server and have separate minimum versions for each platform. When required, a single-line orange banner stays below the header and new online actions pause; local features remain available. Users install updates from their store or the desktop releases page. Existing store builds do not acquire this mechanism automatically. See [API compatibility and updates](docs/API_COMPATIBILITY.md) for configuration and rollout, and [self-hosting](docs/SELF_HOSTING.md) for the installation guide.
+elo uses Ed25519 signatures, age encryption for message objects and HTTPS
+transport. In the current owner-managed General design, the API and Replica do
+not hold General content decryption keys. This does not retroactively remove
+keys from legacy version-1 Spaces. The app does not include a service that sends
+conversation content to an AI assistant or model for processing; a participant
+can still copy or export content to another tool.
 
-## Polski
+Encryption does not eliminate metadata processing. Depending on the service and
+deployment, operators process IP addresses and abuse-prevention hashes,
+identifiers, sizes and delivery times, notification registrations and routing,
+Space membership and chosen names, and public device keys and permissions.
+Call and storage providers also observe their respective connection or transfer
+metadata. Retention differs across databases, logs and backups. Read the
+[privacy policy](https://elo.now/privacy/) for the publisher-operated service and
+the [current in-app legal text](apps/desktop/src/locales/legal.en.json); a
+self-hosting operator must document its own infrastructure and data practices.
 
-### 1 człowiek, 1 tydzień, 1 GPT Astra
+Important limits remain:
 
-elo.now zaczęło się od pomysłu: rozmowy zespołu powinny być łatwe do uporządkowania, a osoby, które je prowadzą, powinny mieć kontrolę nad swoimi danymi.
+- Authorized recipients can copy content, and a compromised unlocked device can
+  expose it. Revoking access cannot erase copies already obtained.
+- Message encryption currently uses long-term recipient keys, without a messaging
+  ratchet, forward secrecy for retained message objects or post-compromise security.
+- Recovery alone does not revoke a lost device. Device admission, Notes controller
+  access and revocation have the limits described in the linked technical docs.
+- An independent security audit has not been completed. Passing tests and public
+  code are not a guarantee of availability or immunity to vulnerabilities.
 
-Jedna osoba w [9bits](https://9bits.com), pracując z GPT Astra, przeszła od pomysłu do działającego MVP elo.now w tydzień. Decyzje produktowe, projekt interfejsu, rdzeń w Ruście, aplikacje mobilne i testy na prawdziwym telefonie powstawały w jednym krótkim cyklu. Powstały nie tylko makiety: można było założyć profil, dołączyć do Space, wymieniać zaszyfrowane wiadomości i odbierać powiadomienia na telefonie.
+Read the [threat model](THREAT_MODEL.md) and the component contracts before relying
+on a particular guarantee. They distinguish legacy, baseline and witnessed paths.
 
-Udostępniamy kod aplikacji, żeby można było sprawdzić, jak działa, poznać przyjęte kompromisy i pomóc w jej rozwoju. Tydzień wystarczył na działające MVP. Nie oznacza to zakończenia rozwoju ani przeprowadzenia niezależnego audytu bezpieczeństwa.
-
-### Co to za aplikacja?
-
-elo.now to otwarty komunikator zespołowy na iOS, Androida i desktop. **Spaces** rozdzielają konteksty różnych firm i zespołów. W każdym można korzystać z kanałów, General i rozmów bezpośrednich, odpowiadać na wiadomości, dodawać reakcje, przypinać treści, wysyłać zaszyfrowane pliki i zdjęcia oraz prowadzić rozmowy głosowe i wideo. Na desktopie można udostępniać ekran.
-
-**Buzz** zbiera nieprzeczytane wiadomości. Wyciszona rozmowa nie dodaje wiadomości do Buzz i nie wysyła powiadomień o nich. Aplikacja oferuje również przypomnienia, wyszukiwanie, łączenie urządzeń, odzyskiwanie profilu oraz wybór kolorów i motywów, także własnoręcznie narysowanego. Hosting wydawcy pozwala utworzyć dwa Spaces na tożsamość: każdy ma 150 MB na zaszyfrowane wiadomości i osobny limit 50 MB na załączniki. Obecnie obsługiwanym językiem interfejsu jest angielski.
-
-### Jak przepływają dane?
-
-**Space** to przestrzeń organizacji z dostępem do jej rozmów. **Replika** to serwer przechowujący i dostarczający dane. To nie jest to samo: sam adres serwera nie określa, kto może czytać daną rozmowę.
-
-1. Urządzenie nadawcy podpisuje wiadomość i szyfruje ją dla uprawnionych odbiorców.
-2. Replika otrzymuje zaszyfrowany obiekt. Przechowuje szyfrogram i informacje potrzebne do dostarczenia go, zamiast treści wiadomości.
-3. Urządzenie odbiorcy pobiera obiekt, odszyfrowuje go oraz sprawdza podpis i uprawnienia.
-4. Opcjonalna usługa powiadomień wysyła ogólny alert przez Firebase Cloud Messaging i APNs. Obecny push nie zawiera tekstu wiadomości ani nazwy rozmowy, a dane wskazujące rozmowę są zaszyfrowane.
-
-Profile i historia są przechowywane na urządzeniach uczestników. Osobna usługa Space obsługuje dołączanie i członkostwo w General. Nowa osoba otrzymuje dostęp do nowych wiadomości; wcześniejsza historia nie jest udostępniana automatycznie.
-
-Kod recovery odzyskuje tożsamość, nie całą historię. Do przeniesienia obsługiwanych danych rozmów służy osobny, zaszyfrowany backup. Backup nie zawiera zawartości załączników. Jego limit wynosi 64 MiB danych przed kompresją i szyfrowaniem; najstarsze grupy wiadomości mogą zostać pominięte, aby zmieścić eksport w limicie.
-
-### Co chronimy, a czego nie obiecujemy?
-
-Wykorzystujemy podpisy Ed25519, format szyfrowania age i transport HTTPS. Replika przechowująca dane nie potrzebuje kluczy uczestników do odszyfrowania wiadomości. Hasła, kody recovery i dane administratora nie są częścią publikowanych źródeł ani powiadomień.
-
-Szyfrowanie nie ukrywa wszystkich metadanych. Serwery i dostawcy powiadomień mogą widzieć m.in. czas transmisji, rozmiary obiektów czy informacje o dostarczeniu. Odbiorca może skopiować otrzymaną treść, a przejęte, odblokowane urządzenie może ujawnić dane. Obecny mechanizm korzysta z długoterminowych kluczy odbiorców: nie ma ratchetu komunikatora ani gwarancji forward secrecy.
-
-In legacy version-1 Spaces, the General enrollment service held a content key.
-Owner-managed version-2 General removed that service key for newly created
-Spaces; existing Spaces are not converted automatically. See the
-[General trust boundary](THREAT_MODEL.md#hosted-general-trust-boundary).
-
-Nie obiecujemy „stuprocentowego bezpieczeństwa”. Kod jest otwarty i dostępny do sprawdzenia, ale sam fakt publikacji nie zastępuje niezależnego audytu. Aplikacja pozostaje aktywnie rozwijanym MVP.
-
-**Projekt tworzy [9bits](https://9bits.com).** Kod aplikacji udostępniamy na licencji **AGPL-3.0-only**; zależności zachowują własne licencje.
-
-## Build and test
-
-See [Building from source](docs/BUILDING.md) for prerequisites, local startup, native project setup and optional notification configuration.
-
-### Run your own Space host
-
-For the baseline installation without a witness, start with **one VPS and one HTTPS origin**. Build the `elo-team` hosted-Space service on the VPS, keep its data and private configuration on that server, and set `TAURI_ELO_API_URL=https://chat.example.org` when building the app. The app uses that origin for Space creation; it does not need your VPS login. The default source build points to `https://api.elo.now`, so set the override for a self-hosted build.
-
-The [complete single-VPS installation guide](docs/SELF_HOSTING.md) covers service configuration, attachment storage, TLS routes, calls, notifications and operational checks. Encrypted attachments can stay on the VPS or use a private MEGA WebDAV or S3-compatible provider. Their credentials never belong in the app.
-
-The staged witnessed-Space path requires a separately controlled host and an
-explicit client trust pin; it is not enabled by the single API-origin setting.
-See [witness deployment](deploy/witness/README.md) and the
-[independent attachment broker](crates/elo-storage/README.md). In that path,
-owners configure their own attachment provider through the client, which sends
-the configuration directly to the broker. Attachments start disabled. Provider
-credentials must never be embedded in a distributed app binary or sent to the
-Space API.
+## Build and operate
 
 ```sh
 cd apps/desktop
@@ -181,30 +233,56 @@ npm ci
 npm run tauri -- dev
 ```
 
-The default source build contains the public service origin described above, but no demo access credentials, private server configuration, Firebase project configuration or signing identities. Use a local profile/demo or connect to a Space prepared by its operator.
+[Building from source](docs/BUILDING.md) covers toolchains, native setup and
+platform requirements. Set `TAURI_ELO_API_URL` for your own deployment; the default
+source build uses `https://api.elo.now` without private credentials or demo access.
+Compiled clients must match the services they use.
+
+The [single-VPS guide](docs/SELF_HOSTING.md) describes the baseline installation
+without an independent witness. Witnessed General and the attachment broker
+require a separate host, explicit client/service trust pins and their documented
+activation and acceptance checks. Setting an API URL alone does not enable them.
+Use the [witness guide](deploy/witness/README.md) and
+[broker guide](crates/elo-storage/README.md) for that path.
+
+Deploy compatible client and server versions together. Review
+[API compatibility and release policy](docs/API_COMPATIBILITY.md) before changing
+a deployment, and keep minimum-version requirements aligned with distributed
+applications. Private service credentials and signing identities never belong
+in distributed app binaries or this repository.
 
 ## Repository layout
 
-| Path | Contents |
-| --- | --- |
-| `apps/desktop` | Shared React interface and Tauri desktop/mobile application |
-| `crates/elo-core` | Identity, cryptography, messaging, storage, synchronization and Replica implementation |
-| `crates/elo-cli` | Command-line tools and Replica entry point |
-| `crates/elo-team` | Space enrollment and General membership service |
-| `crates/elo-call-service` | Call signaling and authorization service |
-| `crates/elo-wake` | Optional notification delivery service |
-| `crates/elo-witness` | Staged independent General authorization witness |
-| `crates/elo-storage` | Staged independent encrypted-attachment storage broker |
-| `crates/tauri-plugin-elo-push` | Native iOS and Android push integration |
-| `migrations`, `protocol` | Database migrations and deterministic protocol test fixtures |
-| `vendor/tauri-plugin-notification` | Bundled notification plugin with local fixes and upstream licenses |
+| Path                           | Contents                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------- |
+| `apps/desktop`                 | Shared React interface and Tauri desktop/mobile application               |
+| `crates/elo-core`              | Identity, cryptography, authority, messaging, synchronization and Replica |
+| `crates/elo-cli`               | Command-line tools and Replica entry point                                |
+| `crates/elo-team`              | Hosted Spaces, enrollment and General coordination                        |
+| `crates/elo-witness`           | Independent witnessed-General authorization service                       |
+| `crates/elo-storage`           | Independent encrypted-attachment storage broker                           |
+| `crates/elo-call-service`      | Session signaling and authorization                                       |
+| `crates/elo-wake`              | Optional notification delivery                                            |
+| `crates/tauri-plugin-elo-push` | Native mobile notification integration                                    |
+| `migrations`, `protocol`       | Database migrations and deterministic protocol fixtures                   |
+| `landingpage`                  | Static website, public legal pages and website assets                     |
+| `tools`                        | Build, validation, packaging and website-generation scripts               |
 
-This repository contains application source and build resources. The marketing website, brandbook, internal decisions, development conversations, private notes, operational configurations, user profiles, signing credentials and compiled packages are not part of it. Deterministic test fixtures and test-only passwords are public test data; never use them for real accounts.
+The published repository contains application source, build resources and the
+static website with its generator and example publishing configuration. Internal
+notes, live publishing and operational configurations, user profiles, signing
+credentials and compiled packages are excluded from source packaging.
+Deterministic test fixtures and test-only passwords are public test data; never
+use them for real accounts.
 
-## License
+## License and security reports
 
-Project code is licensed under **AGPL-3.0-only**. See the full [LICENSE](LICENSE). Third-party components retain their own licenses, including the notices under `apps/desktop/public/licenses`, `apps/desktop/public/brand` and `vendor/tauri-plugin-notification`.
+Project code is **AGPL-3.0-only**; see [LICENSE](LICENSE). Third-party components
+retain their own licenses, including the notices in `apps/desktop/public/licenses`,
+`apps/desktop/public/brand` and `vendor`.
 
-## Reporting security problems
-
-Do not put recovery material, passwords, keys, private messages, server capabilities or memory dumps in issues. Use synthetic data for public bug reports. A monitored private security reporting contact and response policy have not yet been designated; no response-time commitment is made here.
+Do not put recovery material, passwords, keys, private messages, server
+capabilities or memory dumps in public issues. Use synthetic data for bug reports.
+Report suspected vulnerabilities privately using the contact and instructions in
+[SECURITY.md](SECURITY.md). No response-time commitment or independent security
+certification is made there.

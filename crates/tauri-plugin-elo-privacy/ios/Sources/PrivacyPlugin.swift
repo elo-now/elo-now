@@ -16,6 +16,18 @@ private final class AppearanceHandler: NSObject, WKScriptMessageHandler {
     }
 }
 
+// Local diagnostics accept one fixed lifecycle marker, never renderer data.
+private final class UnlockFrameHandler: NSObject, WKScriptMessageHandler {
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame,
+              message.body as? String == "frame",
+              Bundle.main.object(forInfoDictionaryKey: "EloUnlockTimingEnabled") as? Bool == true else { return }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("elo.privacy.unlockFrame"), object: nil)
+        }
+    }
+}
+
 final class EloPrivacyPlugin: Plugin {
     private weak var appearanceWebView: WKWebView?
 
@@ -27,7 +39,12 @@ final class EloPrivacyPlugin: Plugin {
             let controller = webview.configuration.userContentController
             controller.removeScriptMessageHandler(forName: "eloAppearance")
             controller.add(AppearanceHandler(self), name: "eloAppearance")
-            let script = """
+            controller.removeScriptMessageHandler(forName: "eloUnlockFrame")
+            let timingEnabled = Bundle.main.object(forInfoDictionaryKey: "EloUnlockTimingEnabled") as? Bool == true
+            if timingEnabled {
+                controller.add(UnlockFrameHandler(), name: "eloUnlockFrame")
+            }
+            var script = """
             (() => {
             if (location.href === "about:blank") return;
             window.eloAppearance = {
@@ -45,6 +62,20 @@ final class EloPrivacyPlugin: Plugin {
             } catch { window.eloAppearance.setPreference("dark"); }
             })();
             """
+            if timingEnabled {
+                script += """
+
+                (() => {
+                if (location.href === "about:blank") return;
+                window.eloAppearance = {
+                  ...window.eloAppearance,
+                  recordUnlockFrame() {
+                    window.webkit.messageHandlers.eloUnlockFrame.postMessage("frame");
+                  }
+                };
+                })();
+                """
+            }
             controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
             // Plugin loading may finish after the initial document has started.
             webview.evaluateJavaScript(script, completionHandler: nil)
@@ -60,6 +91,36 @@ final class EloPrivacyPlugin: Plugin {
         let background = UIColor(named: "LaunchBackground") ?? .systemBackground
         webview.backgroundColor = background
         webview.scrollView.backgroundColor = background
+    }
+
+    // Rust authorizes this only for a biometric unlock of the locked profile.
+    // Acknowledge on the main queue after the cover observer has handled it.
+    @objc func beginUnlockPrompt(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("elo.privacy.unlockPrompt.begin"), object: nil)
+            invoke.resolve()
+        }
+    }
+
+    @objc func endUnlockPrompt(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("elo.privacy.unlockPrompt.end"), object: nil)
+            invoke.resolve()
+        }
+    }
+
+    @objc func completeBiometricUnlock(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("elo.privacy.unlockPrompt.complete"), object: nil)
+            invoke.resolve()
+        }
+    }
+
+    @objc func resetUnlockPrompt(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("elo.privacy.unlockPrompt.reset"), object: nil)
+            invoke.resolve()
+        }
     }
 
     @objc func copyRecoveryCode(_ invoke: Invoke) throws {

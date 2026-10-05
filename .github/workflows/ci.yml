@@ -85,6 +85,11 @@ jobs:
         run: |
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/PushInbox.swift crates/tauri-plugin-elo-push/ios/Tests/PushInboxTests.swift -o "$RUNNER_TEMP/elo-push-inbox-tests"
           "$RUNNER_TEMP/elo-push-inbox-tests"
+      - name: iOS unlock privacy cover state
+        if: runner.os == 'macOS'
+        run: |
+          xcrun clang++ -std=c++17 tools/tests/ios_unlock_cover_test.cpp -o "$RUNNER_TEMP/elo-unlock-cover-tests"
+          "$RUNNER_TEMP/elo-unlock-cover-tests"
 
   rust:
     if: github.event_name != 'schedule'

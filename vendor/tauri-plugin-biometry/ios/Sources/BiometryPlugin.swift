@@ -41,6 +41,7 @@ struct GetDataOptions: Decodable {
   let domain: String
   let name: String
   let reason: String
+  var cancelTitle: String?
 }
 
 class BiometryPlugin: Plugin {
@@ -237,6 +238,13 @@ class BiometryPlugin: Plugin {
   
   @objc func getData(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(GetDataOptions.self)
+
+    // Own exactly one context per protected read. Never reuse an earlier
+    // device unlock or keep the authentication session alive after the read.
+    let context = LAContext()
+    context.localizedReason = args.reason
+    context.localizedCancelTitle = args.cancelTitle
+    context.touchIDAuthenticationAllowableReuseDuration = 0
     
     let query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
@@ -244,12 +252,15 @@ class BiometryPlugin: Plugin {
       kSecReturnData as String: kCFBooleanTrue!,
       kSecAttrAccount as String: args.name,
       kSecAttrService as String: args.domain,
-      kSecUseOperationPrompt as String: args.reason
+      kSecUseAuthenticationContext as String: context
     ]
     
     DispatchQueue.global(qos: .userInitiated).async {
       var dataTypeRef: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
+      // Invalidate the completed authentication context on success and failure;
+      // no later operation may reuse it. UIKit controls when its UI disappears.
+      context.invalidate()
       
       DispatchQueue.main.async {
         if status == errSecSuccess, let data = dataTypeRef as? Data {

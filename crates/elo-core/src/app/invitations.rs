@@ -1,7 +1,7 @@
 //! Local invitation exchange. Links carry bounded signed proofs, never vault secrets.
 //! Sharing/scanning and encrypted mailbox delivery move the same verified packets.
 use super::*;
-use crate::invite::shared;
+use crate::invite::{contact_code, shared};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 
@@ -209,6 +209,13 @@ fn encode(packet: &Packet) -> Result<String> {
     Ok(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(zip.finish()?)))
 }
 fn decode(link: &str) -> Result<Packet> {
+    if link.trim().starts_with(contact_code::PREFIX) {
+        let (card, credential) = contact_code::decode(link)?;
+        return Ok(Packet::Contact {
+            card: STANDARD.encode(card.bytes()),
+            credential: STANDARD.encode(credential.bytes()),
+        });
+    }
     let encoded = link
         .trim()
         .strip_prefix(PREFIX)
@@ -679,7 +686,7 @@ impl ClientApp {
                             && card.name == name
                             && card.wake == state.own_wake
                         {
-                            return Ok(json!({"link":encode(packet)?}));
+                            return Ok(json!({"link":contact_code::encode(&signed, c.record())?}));
                         }
                     }
                 }
@@ -691,7 +698,7 @@ impl ClientApp {
                 };
                 state.outgoing.insert(card.id().to_string(), packet.clone());
                 self.save_invitations(&state)?;
-                return Ok(json!({"link":encode(&packet)?}));
+                return Ok(json!({"link":contact_code::encode(&card, c.record())?}));
             }
             "invitation_preview" => {
                 let packet = decode(field(&v, "link")?)?;

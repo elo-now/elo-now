@@ -205,6 +205,118 @@ describe("macOS biometric bridge", () => {
 });
 
 describe("profile-bound biometric unlock", () => {
+  it("awaits the guarded presentation acknowledgement and ends it before returning a key", async () => {
+    await enableBiometricUnlock("first password", undefined, first);
+    const originalInvoke = vi.mocked(invoke).getMockImplementation()!;
+    const events: string[] = [];
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      const op = (args as { request?: { op?: string } } | undefined)?.request
+        ?.op;
+      if (op === "biometric_prompt_begin") {
+        events.push("begin");
+        await acknowledgement;
+      } else if (op === "biometric_prompt_end") {
+        events.push("end");
+      }
+      return originalInvoke(command, args);
+    });
+    const originalGetData = vi.mocked(getData).getMockImplementation()!;
+    vi.mocked(getData).mockImplementation(async (options) => {
+      events.push("get_data");
+      return originalGetData(options);
+    });
+
+    const pending = readBiometricCredential("Unlock", first);
+    await vi.waitFor(() => expect(events).toEqual(["begin"]));
+    expect(getData).not.toHaveBeenCalled();
+    acknowledge();
+    expect(await pending).toEqual({ key: "AGE-SECRET-KEY-1profile" });
+    expect(events).toEqual(["begin", "get_data", "end"]);
+    expect(getData).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_begin", ...first },
+    });
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_end" },
+    });
+    expect(invoke).not.toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    });
+  });
+
+  it.each(["userCancel", "authenticationFailed"])(
+    "resets the presentation exception after Keychain error %s",
+    async (failure) => {
+      vi.mocked(getData).mockRejectedValueOnce(new Error(failure));
+      await expect(readBiometricCredential("Unlock", first)).rejects.toThrow(
+        failure,
+      );
+      expect(getData).toHaveBeenCalledTimes(1);
+      expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+        request: { op: "biometric_prompt_reset" },
+      });
+      expect(invoke).not.toHaveBeenCalledWith("profile_task", {
+        request: { op: "biometric_prompt_end" },
+      });
+    },
+  );
+
+  it("keeps authentication and key validation when presentation calls fail", async () => {
+    await enableBiometricUnlock("first password", undefined, first);
+    const originalInvoke = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      const op = (args as { request?: { op?: string } } | undefined)?.request
+        ?.op;
+      if (
+        op === "biometric_prompt_begin" ||
+        op === "biometric_prompt_end" ||
+        op === "biometric_prompt_reset"
+      )
+        throw new Error("Native privacy operation failed.");
+      return originalInvoke(command, args);
+    });
+    expect(await readBiometricCredential("Unlock", first)).toEqual({
+      key: "AGE-SECRET-KEY-1profile",
+    });
+    expect(getData).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    });
+    const name = vi.mocked(setData).mock.lastCall![0].name;
+    keychain.set(name, "unbound credential");
+    await expect(readBiometricCredential("Unlock", first)).rejects.toThrow(
+      "dataNeedsReenrollment",
+    );
+    expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    });
+  });
+
+  it("resets the exception when the post-authentication profile check fails", async () => {
+    await enableBiometricUnlock("first password", undefined, first);
+    const originalInvoke = vi.mocked(invoke).getMockImplementation()!;
+    let profileChecks = 0;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "profile_environment" && ++profileChecks === 2)
+        throw new Error("Local profile check failed");
+      return originalInvoke(command, args);
+    });
+    await expect(readBiometricCredential("Unlock", first)).rejects.toThrow(
+      "Local profile check failed",
+    );
+    expect(getData).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_end" },
+    });
+    expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    });
+  });
+
   it("keeps biometric storage access confined to the app profile domain", async () => {
     const entry = { domain: "other.application", name: "vault-password-v1" };
     await expect(hasData(entry)).rejects.toThrow("scopeDenied");
@@ -288,6 +400,12 @@ describe("profile-bound biometric unlock", () => {
     await expect(readBiometricCredential("Unlock", first)).rejects.toThrow(
       "dataNeedsReenrollment",
     );
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: { op: "biometric_prompt_end" },
+    });
+    expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    });
   });
 
   it("rejects unbound or mismatched data even when the native key lookup succeeds", async () => {
@@ -298,8 +416,11 @@ describe("profile-bound biometric unlock", () => {
       "elo-biometry:v1:{}",
       "elo-biometry:v2:null",
       "elo-biometry:v3:null",
+      "elo-biometry:v3:{",
       "elo-biometry:v3:" +
         JSON.stringify({ version: 3, ...second, key: "AGE-SECRET-KEY-1wrong" }),
+      "elo-biometry:v3:" +
+        JSON.stringify({ version: 3, ...first, key: "wrong key format" }),
       "elo-biometry:v2:" +
         JSON.stringify({ version: 2, ...second, password: "other password" }),
     ]) {
@@ -307,6 +428,9 @@ describe("profile-bound biometric unlock", () => {
       await expect(readBiometricCredential("Unlock", first)).rejects.toThrow(
         "dataNeedsReenrollment",
       );
+      expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+        request: { op: "biometric_prompt_reset" },
+      });
     }
   });
 });

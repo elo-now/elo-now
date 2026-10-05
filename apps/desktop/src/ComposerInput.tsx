@@ -10,6 +10,7 @@ import {
 import { createPortal } from "react-dom";
 import { useRealtimePresentation } from "./useRealtime";
 import { pastedImage } from "./composerClipboard";
+import { createComposerSizer } from "./composerSizing";
 import { t } from "./i18n";
 import {
   insertMention,
@@ -49,6 +50,8 @@ export function ComposerInput({
     if (!props.value || props.disabled) realtime.typing(false);
   }, [props.value, props.disabled]);
   const input = inputRef ?? localRef;
+  const sizer = useRef<ReturnType<typeof createComposerSizer>>(undefined);
+  if (!sizer.current) sizer.current = createComposerSizer();
   const listId = useId();
   const [caret, setCaret] = useState<number>();
   const [activeOption, setActiveOption] = useState(0);
@@ -137,23 +140,7 @@ export function ComposerInput({
   };
   const resize = () => {
     const node = input.current;
-    if (!node || !node.getClientRects().length) return;
-    const style = getComputedStyle(node);
-    const minimum = Number.parseFloat(style.minHeight);
-    const maximum = Math.max(
-      minimum,
-      (window.visualViewport?.height ?? window.innerHeight) / 3,
-    );
-    const borders =
-      Number.parseFloat(style.borderTopWidth) +
-      Number.parseFloat(style.borderBottomWidth);
-    // Reset before measuring so deletion and successful sending also shrink it.
-    node.style.height = "0px";
-    const height = Math.max(minimum, node.scrollHeight + borders);
-    node.style.height = `${Math.min(height, maximum)}px`;
-    // CSS can impose a smaller desktop cap than the viewport limit.
-    node.style.overflowY =
-      node.scrollHeight > node.clientHeight ? "auto" : "hidden";
+    if (node) sizer.current!.resize(node);
   };
   // Includes preference changes and restored drafts, not just keystrokes.
   useLayoutEffect(resize);
@@ -174,13 +161,18 @@ export function ComposerInput({
     const viewport = window.visualViewport;
     viewport?.addEventListener("resize", resize);
     window.addEventListener("resize", resize);
-    document.fonts.addEventListener("loadingdone", resize);
+    const fontsLoaded = () => {
+      sizer.current!.invalidate();
+      resize();
+    };
+    document.fonts.addEventListener("loadingdone", fontsLoaded);
     return () => {
       observer.disconnect();
       cancelAnimationFrame(resizeFrame);
       viewport?.removeEventListener("resize", resize);
       window.removeEventListener("resize", resize);
-      document.fonts.removeEventListener("loadingdone", resize);
+      document.fonts.removeEventListener("loadingdone", fontsLoaded);
+      sizer.current!.dispose();
     };
   }, [input]);
   return (

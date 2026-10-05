@@ -44,22 +44,28 @@ export function UnavailableMessage({
       className="unavailable-message"
       data-requesting={requesting || undefined}
     >
-      {requesting ? (
-        <span role="status" aria-live="polite">
-          {t("messageUnavailable.requesting")}
-        </span>
-      ) : (
-        <>
-          <span>{t("messageUnavailable.title")}</span>
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={() => void request()}
-          >
-            {t("messageUnavailable.request")}
-          </button>
-        </>
-      )}
+      <div
+        className="unavailable-message-action"
+        aria-hidden={requesting || undefined}
+      >
+        <span>{t("messageUnavailable.title")}</span>
+        <button
+          type="button"
+          aria-label={t("messageUnavailable.requestLabel")}
+          disabled={disabled || requesting}
+          onClick={() => void request()}
+        >
+          {t("messageUnavailable.request")}
+        </button>
+      </div>
+      <span
+        className="unavailable-message-status"
+        role="status"
+        aria-live="polite"
+        aria-hidden={!requesting || undefined}
+      >
+        {t("messageUnavailable.requesting")}
+      </span>
     </div>
   );
 }

@@ -1,5 +1,6 @@
 // QR framing is transport only. Rust validates every complete signed exchange.
 export const EXCHANGE_PREFIX = "elo://exchange/v1#";
+export const CONTACT_PREFIX = "elo://contact/v1#";
 export const SPACE_PREFIX = "elo://space/v1#";
 export const SHORT_SPACE_PREFIX = "https://elo.now/join#";
 export type InvitationLink = { kind: "space" | "exchange"; link: string };
@@ -32,7 +33,11 @@ export function normalizeInvitationLink(value: string): InvitationLink | null {
     return null;
   if (link.startsWith(SPACE_PREFIX) && link.length > SPACE_PREFIX.length)
     return { kind: "space", link };
-  if (link.startsWith(EXCHANGE_PREFIX) && link.length > EXCHANGE_PREFIX.length)
+  if (
+    (link.startsWith(EXCHANGE_PREFIX) &&
+      link.length > EXCHANGE_PREFIX.length) ||
+    (link.startsWith(CONTACT_PREFIX) && link.length > CONTACT_PREFIX.length)
+  )
     return { kind: "exchange", link };
   return null;
 }

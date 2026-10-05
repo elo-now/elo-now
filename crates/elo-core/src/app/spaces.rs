@@ -336,6 +336,8 @@ impl ClientApp {
     }
     /// Called after build configuration. An existing catalog always wins: a
     /// deliberately disconnected Demo must never be added back on unlock.
+    /// Opening is local; restored Spaces stay quarantined until normal polling
+    /// verifies their membership, without delaying access to the local profile.
     pub async fn enable_spaces(&mut self) -> Result<()> {
         if self.spaces.is_some() {
             return Ok(());
@@ -487,14 +489,6 @@ impl ClientApp {
             spaces.children.insert(entry.id.clone(), child);
         }
         spaces.save(self)?;
-        if spaces
-            .catalog
-            .entries
-            .iter()
-            .any(|e| e.status == "checking")
-        {
-            spaces.poll(self).await?;
-        }
         self.spaces = Some(Box::new(spaces));
         Ok(())
     }
@@ -2924,6 +2918,100 @@ mod tests {
         let id = spaces.add_joined(client, address, value).await.unwrap();
         client.spaces = Some(spaces);
         id
+    }
+    #[tokio::test]
+    async fn opening_quarantined_spaces_is_local_and_failed_poll_cannot_enable_posting() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut user = profile(temp.path(), "offline restore").await;
+        user.enable_spaces().await.unwrap();
+        let local = user.view().await.unwrap();
+        let chat = local["streams"][0].clone();
+        assert_eq!(chat["can_post"], true);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = SpaceAddress {
+            service_credential: None,
+            url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
+            scope: user.team_scope().unwrap(),
+            message_lifetime_seconds: 86_400,
+        };
+        let id = address.scope.space.to_string();
+        let router = axum::Router::new().route(
+            "/team/v1/spaces",
+            axum::routing::post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut spaces = user.spaces.take().unwrap();
+        let entry = &mut spaces.catalog.entries[0];
+        entry.id = id.clone();
+        entry.address = Some(address);
+        spaces.catalog.active = Some(id.clone());
+        spaces.save(&user).unwrap();
+        user.spaces = Some(spaces);
+        // Use the same quarantine transition as profile recovery; the cached
+        // root still has posting authority but must not expose or use it.
+        user.quarantine_restored_spaces().unwrap();
+        user.close().await.unwrap();
+
+        let mut reopened =
+            ClientApp::open(temp.path().join("offline restore"), PASSWORD.into(), true)
+                .await
+                .unwrap();
+        reopened.enable_spaces().await.unwrap();
+        reopened.enable_paged_views();
+        let view = reopened.view().await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "unlock and its local view must not contact the service"
+        );
+        assert_eq!(view["spaces"][0]["status"], "checking");
+        assert_eq!(view["active_space"], Value::Null);
+        assert_eq!(view["streams"], json!([]));
+        assert_eq!(view["all_streams"], json!([]));
+        assert!(reopened.spaces.as_ref().unwrap().children.is_empty());
+        assert!(reopened.export_profile(PASSWORD.into()).await.is_err());
+        assert!(
+            reopened
+                .operate(json!({"op":"space_select","id":id}))
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .operate(json!({
+                    "op":"send", "space":chat["space"], "stream":chat["stream"],
+                    "text":"Must remain quarantined", "created_at":"2026-10-05T12:00:00Z"
+                }))
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        // Ordinary synchronization still runs the existing status poll. An
+        // unreachable service cannot promote the entry or restore can_post.
+        let synced = reopened.operate(json!({"op":"sync"})).await.unwrap();
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+        assert_eq!(synced["view"]["spaces"][0]["status"], "checking");
+        assert_eq!(synced["view"]["active_space"], Value::Null);
+        assert_eq!(synced["view"]["streams"], json!([]));
+        assert_eq!(synced["view"]["all_streams"], json!([]));
+        assert!(reopened.spaces.as_ref().unwrap().awaiting_verification());
+        reopened.close().await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
     #[tokio::test]
     async fn witnessed_pending_poll_reconciles_lost_admission_before_relay_after_reopen() {

@@ -94,6 +94,13 @@ subsequent releases that already contain that mechanism.
 
 ## Later compatible releases
 
+The compact My code transport uses the separate `elo://contact/v1#` prefix.
+Updated apps can still import legacy Contact exchanges, but an old app cannot
+interpret the new prefix. Publish the decoder on each client platform before
+expecting cross-platform use of compact cards. This only changes user-facing
+contact sharing: enrollment and automatic exchanges keep `elo://exchange/v1#`;
+no server change or server-side contact-card storage is required.
+
 1. Deploy an additive discovery endpoint with all minimums disabled.
 2. Publish and verify clients containing the update gate. Keep the previous
    server behavior available during this adoption period.

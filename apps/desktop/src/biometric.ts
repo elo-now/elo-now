@@ -193,32 +193,48 @@ export async function readBiometricCredential(
   profile: BiometricProfile,
 ): Promise<BiometricCredential> {
   await requireActiveProfile(profile);
-  const data = (
-    await getData({
-      ...secret(profile),
-      reason,
-      cancelTitle: t("dialog.cancel"),
-    })
-  ).data;
-  await requireActiveProfile(profile);
+  // Presentation is best-effort; it never replaces protected Keychain access.
+  await invoke("profile_task", {
+    request: { op: "biometric_prompt_begin", ...profile },
+  }).catch(() => {});
   try {
-    if (data.startsWith(credentialPrefix)) {
-      const decoded = JSON.parse(data.slice(credentialPrefix.length));
-      if (
-        decoded?.version === 3 &&
-        decoded.id === profile.id &&
-        decoded.identity === profile.identity &&
-        typeof decoded.key === "string" &&
-        decoded.key.startsWith("AGE-SECRET-KEY-1") &&
-        (decoded.demoProfile === undefined ||
-          typeof decoded.demoProfile === "string")
-      )
-        return { key: decoded.key, demoProfile: decoded.demoProfile };
+    const data = (
+      await getData({
+        ...secret(profile),
+        reason,
+        cancelTitle: t("dialog.cancel"),
+      })
+    ).data;
+    await invoke("profile_task", {
+      request: { op: "biometric_prompt_end" },
+    }).catch(() => {});
+    await requireActiveProfile(profile);
+    try {
+      if (data.startsWith(credentialPrefix)) {
+        const decoded = JSON.parse(data.slice(credentialPrefix.length));
+        if (
+          decoded?.version === 3 &&
+          decoded.id === profile.id &&
+          decoded.identity === profile.identity &&
+          typeof decoded.key === "string" &&
+          decoded.key.startsWith("AGE-SECRET-KEY-1") &&
+          (decoded.demoProfile === undefined ||
+            typeof decoded.demoProfile === "string")
+        )
+          return { key: decoded.key, demoProfile: decoded.demoProfile };
+      }
+    } catch {
+      /* Invalid or unbound entries require explicit reenrollment. */
     }
-  } catch {
-    /* Invalid or unbound entries require explicit reenrollment. */
+    throw new Error("dataNeedsReenrollment");
+  } catch (error) {
+    // Failed authentication or binding checks cannot leave the presentation
+    // exception active for a later profile operation.
+    await invoke("profile_task", {
+      request: { op: "biometric_prompt_reset" },
+    }).catch(() => {});
+    throw error;
   }
-  throw new Error("dataNeedsReenrollment");
 }
 
 export function shouldOfferBiometricUnlock(profile: BiometricProfile): boolean {

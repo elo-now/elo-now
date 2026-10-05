@@ -306,10 +306,11 @@ export const en = {
   "history.latest": "Latest messages",
   "history.newBelow": "New messages. Scroll to latest",
   "messageUnavailable.title": "Message unavailable",
-  "messageUnavailable.request": "Request messages",
-  "messageUnavailable.requesting": "Requesting messages...",
+  "messageUnavailable.request": "Retrieve",
+  "messageUnavailable.requestLabel": "Retrieve this message",
+  "messageUnavailable.requesting": "Retrieving…",
   "messageUnavailable.body":
-    "Couldn’t retrieve this message right now. Try again later.",
+    "Couldn’t retrieve this message right now. If it’s no longer on the server, another device with a copy needs to be online with elo open and the profile unlocked.",
 
   "spaces.storage.copyCleared":
     "This message is no longer on the server. Devices that already downloaded it keep their copy.",
@@ -710,7 +711,8 @@ export const en = {
   "messageActions.saveEdit": "Save changes",
   "messageActions.edited": "Edited",
   "error.messageEditAuthor": "Only the author can edit this message.",
-  "error.messageEditUnavailable": "This message is no longer available to edit.",
+  "error.messageEditUnavailable":
+    "This message is no longer available to edit.",
   "messageActions.unread": "Mark unread",
   "messageActions.pin": "Pin",
   "messageActions.pinned": "Pinned",
@@ -1404,23 +1406,21 @@ export const en = {
   "file.expired": "Expired",
   "file.removed": "Removed",
   "file.unavailable": "Unavailable",
-  "composer.deleteAfter": "Delete after:",
+  "composer.deleteAfter": "Keep:",
   "composer.expiryHours": "{hours}h",
-  "composer.expiryNone": "—",
   "composer.noExpiry": "No expiry",
   "messageActions.expired": "Message expired",
   "messageActions.expiresAt": "Expires: {date}",
-  "messageActions.deleteAfter": "Delete after",
+  "messageActions.deleteAfter": "Keep",
   "messageActions.noExpiry": "No expiry",
-  "messageActions.expiryDescription":
-    "The new time starts when you save. Choose No expiry to keep this message.",
+  "messageActions.expiryDescription": "The new time starts when you save.",
   "messageActions.saveExpiry": "Save",
   "error.messageExpiryAuthor":
     "Only the author can change this message’s expiry.",
   "error.messageExpiryUnavailable":
     "This message has already expired or been deleted.",
   "error.messageExpiry":
-    "Choose 1, 12 or 24 hours, or turn off automatic deletion.",
+    "Choose 1 or 24 hours, or turn off automatic deletion.",
   "file.serverCopyUnavailable":
     "The encrypted server copy is no longer available",
   "onboarding.prepare": "Preparing your keys…",

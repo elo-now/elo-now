@@ -37,6 +37,7 @@ mod sensitive_request;
 #[path = "../service_endpoints.rs"]
 mod service_endpoints;
 mod team_replica;
+mod unlock_timing;
 #[derive(Default)]
 struct Runtime {
     client: Option<ClientApp>,
@@ -55,6 +56,29 @@ struct Runtime {
 type State = Mutex<Runtime>;
 
 impl Runtime {
+    fn attach_profile(
+        &mut self,
+        app: &tauri::AppHandle,
+        client: ClientApp,
+        biometric_unlock: bool,
+    ) -> Result<(), String> {
+        // Only a verified biometric unlock may reveal its foreground view before
+        // UIKit becomes active. Other entry paths cancel that presentation state.
+        #[cfg(target_os = "ios")]
+        app.state::<tauri_plugin_elo_privacy::Privacy>().call(
+            if biometric_unlock {
+                "completeBiometricUnlock"
+            } else {
+                "resetUnlockPrompt"
+            },
+            serde_json::json!({}),
+        )?;
+        #[cfg(not(target_os = "ios"))]
+        let _ = (app, biometric_unlock);
+        self.client = Some(client);
+        Ok(())
+    }
+
     fn detach_profile(&mut self) -> Option<ClientApp> {
         let old = std::mem::take(self);
         self.view_revision = old.view_revision.wrapping_add(1);
@@ -139,7 +163,7 @@ async fn open_demo(
         view["demo_names"] = names.clone();
         state.draft = None;
         state.demo_names = Some(names);
-        state.client = Some(client);
+        state.attach_profile(&app, client, false)?;
         app.state::<background_history::BackgroundHistory>()
             .resume();
         realtime::activate(&app, state.client.as_ref().unwrap());
@@ -245,7 +269,7 @@ async fn create_profile(
         return Err(error.to_string());
     }
     state.draft = None;
-    state.client = Some(client);
+    state.attach_profile(&app, client, false)?;
     app.state::<background_history::BackgroundHistory>()
         .resume();
     realtime::activate(&app, state.client.as_ref().unwrap());
@@ -269,10 +293,14 @@ async fn unlock(
     biometric_profile: Option<String>,
     biometric_identity: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    use unlock_timing::Stage;
+    let mut unlock_trace = unlock_timing::UnlockTiming::new(&app);
     #[cfg(debug_assertions)]
     let timing = std::time::Instant::now();
     let mut secret: age::secrecy::SecretString = password.into();
     let mut state = state.lock().await;
+    unlock_trace.mark(Stage::Mutex);
+    let biometric_unlock = biometric_key.is_some();
     if let Some(key) = biometric_key {
         secret = profiles::biometric_password(
             &app,
@@ -286,6 +314,7 @@ async fn unlock(
         )
         .map_err(|e| e.to_string())?;
     }
+    unlock_trace.mark(Stage::BiometricEnvelope);
     #[cfg(debug_assertions)]
     let queued = timing.elapsed();
     if state.client.is_some() {
@@ -298,6 +327,7 @@ async fn unlock(
     )
     .await
     .map_err(|e| e.to_string())?;
+    unlock_trace.mark(Stage::ProfileOpen);
     #[cfg(debug_assertions)]
     history_timing(
         &app,
@@ -310,11 +340,14 @@ async fn unlock(
     team_replica::configure(&mut client)?;
     push::configure_client(&mut client)?;
     witness::configure_client(&mut client)?;
+    unlock_trace.mark(Stage::Configure);
     client.enable_spaces().await.map_err(|e| e.to_string())?;
+    unlock_trace.mark(Stage::SpacesOpen);
     client
         .configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))
         .map_err(|error| error.to_string())?;
     client.enable_paged_views();
+    unlock_trace.mark(Stage::Configure);
     #[cfg(debug_assertions)]
     history_timing(
         &app,
@@ -325,6 +358,7 @@ async fn unlock(
     #[cfg(debug_assertions)]
     let timing = std::time::Instant::now();
     let view = client.view().await.map_err(|e| e.to_string())?;
+    unlock_trace.mark(Stage::View);
     #[cfg(debug_assertions)]
     history_timing(
         &app,
@@ -333,13 +367,15 @@ async fn unlock(
         timing.elapsed(),
     );
     state.draft = None;
-    state.client = Some(client);
+    state.attach_profile(&app, client, biometric_unlock)?;
     app.state::<background_history::BackgroundHistory>()
         .resume();
     realtime::activate(&app, state.client.as_ref().unwrap());
     push::update(&app, &view);
     #[cfg(desktop)]
     desktop_activity::update(&app, &view);
+    unlock_trace.mark(Stage::Activate);
+    unlock_trace.mark(Stage::Complete);
     Ok(view)
 }
 #[tauri::command]

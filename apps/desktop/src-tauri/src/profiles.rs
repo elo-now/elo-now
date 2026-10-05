@@ -442,11 +442,26 @@ async fn run(
     if op == "pause_recovery" {
         return Ok(json!({"paused":crate::recovery_progress::pause(app, text(&v,"request_id")?)}));
     }
+    if matches!(op, "biometric_prompt_end" | "biometric_prompt_reset") {
+        // Presentation cleanup must work after a profile change and must not
+        // wait behind another operation holding the profile mutex.
+        #[cfg(target_os = "ios")]
+        let _ = app.state::<tauri_plugin_elo_privacy::Privacy>().call(
+            if op == "biometric_prompt_end" {
+                "endUnlockPrompt"
+            } else {
+                "resetUnlockPrompt"
+            },
+            json!({}),
+        );
+        return Ok(json!({}));
+    }
     let mut state = state.lock().await;
     if !matches!(
         op,
         "biometric_enroll"
             | "biometric_forget"
+            | "biometric_prompt_begin"
             | "account_deletion_status"
             | "cancel"
             | "select"
@@ -465,6 +480,19 @@ async fn run(
         crate::release_policy::require_online(app)?;
     }
     match op {
+        "biometric_prompt_begin" => {
+            biometric_profile(app, text(&v, "id")?, text(&v, "identity")?)?;
+            if state.client.is_some() {
+                return Err("The profile is already unlocked.".into());
+            }
+            // Only the locked, selected profile may request this temporary
+            // presentation change. Keychain authentication is independent.
+            #[cfg(target_os = "ios")]
+            let _ = app
+                .state::<tauri_plugin_elo_privacy::Privacy>()
+                .call("beginUnlockPrompt", json!({}));
+            return Ok(json!({}));
+        }
         "biometric_enroll" => {
             use age::secrecy::ExposeSecret;
             let id = text(&v, "id")?;
@@ -704,7 +732,7 @@ async fn run(
             state.backup = None;
             state.recovery_qr = None;
             state.control_recovery = None;
-            state.client = Some(client);
+            state.attach_profile(app, client, false)?;
             crate::realtime::activate(app, state.client.as_ref().unwrap());
             app.state::<crate::background_history::BackgroundHistory>()
                 .resume();
@@ -834,7 +862,7 @@ async fn run(
                 return Err(e);
             }
             state.pair_target = None;
-            state.client = Some(client);
+            state.attach_profile(app, client, false)?;
             crate::realtime::activate(app, state.client.as_ref().unwrap());
             app.state::<crate::background_history::BackgroundHistory>()
                 .resume();

@@ -1,6 +1,6 @@
 # Initial migrations
 
-`001_client.sql` and `001_replica.sql` are alternatives for **two separate databases**, not consecutive migrations of one database. Apply each once to an empty database of the appropriate role. `user_version=1` identifies the schema version, not the process type. Later client migrations are described in [STORAGE](../docs/STORAGE.md).
+`001_client.sql` and `001_replica.sql` are alternatives for **two separate databases**, not consecutive migrations of one database. Apply each once to an empty database of the appropriate role. `user_version=1` identifies the schema version, not the process type. Later migrations are selected and verified by the [client store](../crates/elo-core/src/store/mod.rs).
 
 Before migration and after opening each connection, the application sets `foreign_keys=ON`, `journal_mode=WAL`, `synchronous=FULL`, and `busy_timeout=5000`, then reads them back. Do not change journal_mode inside a transaction. SQLite must support STRICT tables. `rusqlite` uses the bundled version recorded in Cargo.lock.
 
@@ -12,6 +12,6 @@ A Replica checks per-mailbox quota in the same transaction as the write; an exis
 
 `receipt_record` holds a signed node declaration without message plaintext. Signature validation and mailbox/object/peer binding belong to the domain layer, not the database. The client database does not contain plaintext client tokens; the protected vault is separate.
 
-Executed checks: [VALIDATION](../docs/VALIDATION.md). The initial schema alone does not constitute a complete protocol or backup system; subsequent work adds state such as durably consumed invitation IDs.
+Reproducible SQL checks are in [test_rust_sql_contracts.py](../tests/test_rust_sql_contracts.py). The initial schema alone does not constitute a complete protocol or backup system; subsequent work adds state such as durably consumed invitation IDs.
 
-`002_replica_mailbox_delegation.sql` upgrades the recognized Replica v1 schema to v2, adding bounded parent/child mailboxes. The Replica verifies the existing schema before migrating and preserves its receipt key, generation, objects and deliveries. Back up a stopped instance before upgrading; an old v1 binary cannot open the upgraded database. Delegated bytes count against all ancestor quotas; expiry does not delete stored data. See [transport](../docs/TRANSPORT.md#delegated-mailboxes-for-invitation-delivery).
+`002_replica_mailbox_delegation.sql` upgrades the recognized Replica v1 schema to v2, adding bounded parent/child mailboxes. The Replica verifies the existing schema before migrating and preserves its receipt key, generation, objects and deliveries. Back up a stopped instance before upgrading; an old v1 binary cannot open the upgraded database. Delegated bytes count against all ancestor quotas; expiry does not delete stored data. See the [Replica implementation](../crates/elo-core/src/replica.rs).

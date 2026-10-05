@@ -10,6 +10,14 @@ elo stores only a random age wrapping key through this adapter. The profile
 password is wrapped in a separate local file, excluded from portable exports.
 Old password entries require explicit reenrollment. Preserve upstream licenses.
 
+iOS reads use a fresh `LAContext` with `localizedReason` and
+`kSecUseAuthenticationContext` instead of the deprecated operation-prompt key.
+Authentication reuse is disabled. The context is invalidated immediately after
+the synchronous Keychain read completes, on success and failure, before returning
+the result. No separate policy preauthentication or cached authorization is used;
+the protected item's access control still gates the read. System UI dismissal
+timing remains controlled by iOS and requires measurement on a device.
+
 The macOS bridge is enabled for elo and uses the data-protection Keychain on
 every item operation. Its device-local entries use `BiometryCurrentSet`, matching
 iOS; a Mac account password cannot replace the biometric check. Each read uses

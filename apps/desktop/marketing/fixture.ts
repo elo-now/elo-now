@@ -104,58 +104,75 @@ const launch = chat(
         message("maya", "A whole family, one very happy Grandpa. 💛", 49),
       ]
     : [
-        message("maya", "The new homepage is ready for a final look.", 20),
+        message(
+          "maya",
+          "Release 2.4 is ready for review. @Alex, can you check the rollout plan?",
+          20,
+        ),
         message(
           "jules",
-          "Love the direction. The mobile layout feels great.",
+          "Staging checks passed. The mobile layout is ready too.",
           22,
         ),
-        message("alex", "Let’s keep launch updates in this channel.", 24),
-        message("sam", "Copy is approved. We’re ready for Monday!", 26),
-        message("maya", "One team. One good launch. ✨", 28),
+        message(
+          "alex",
+          "I’ll review it now. Let’s keep the release decisions in this thread.",
+          24,
+        ),
         message(
           "sam",
-          "The welcome email is ready too. I’ve added a quick getting-started guide.",
+          "Customer notes are updated. Support is ready for Monday.",
+          26,
+        ),
+        message(
+          "maya",
+          "I’ll start an audio session here at 14:00 for the final check.",
+          28,
+        ),
+        message(
+          "sam",
+          "The deployment checklist covers the backup, health checks and rollback.",
           30,
         ),
         message(
           "jules",
-          "Nice! Can we include the three things people should try first?",
+          "Can we include the smoke-test owner for each platform?",
           32,
         ),
         message(
           "maya",
-          "Join General, say hello to a teammate, and save a reminder.",
+          "Added. Jules owns desktop, Sam owns mobile, and I’ll check the API.",
           34,
         ),
         message(
           "alex",
-          "Exactly. Small steps, and a useful conversation from day one.",
+          "Thanks. I’ll post the release decision after those checks.",
           36,
         ),
         message(
           "sam",
-          "Updated. The invite and guide are together in the launch checklist.",
+          "The release notes and customer guide are ready for a final read.",
           40,
         ),
         message(
           "jules",
-          "I’ll be around after lunch to help the first teams settle in.",
+          "I’ll watch the error rate after deployment and report back here.",
           45,
         ),
         message(
           "maya",
-          "Final walkthrough at 14:00? We can check the whole flow together.",
+          "The final walkthrough is at 14:00. Bring any unresolved issues.",
           47,
         ),
         message(
           "alex",
-          "See you there. Thanks for bringing this together, everyone! 🙌",
+          "Rollout plan reviewed. We can go ahead after the final checks.",
           49,
         ),
       ],
 );
 launch.rows[0].reply_count = 3;
+if (!family) launch.rows[0].body.payload!.mentions = ["alex"];
 launch.rows[2].pinned = true;
 launch.rows[3].reactions = [
   { emoji: "🙌", count: 3, mine: true, people: ["alex", "maya", "jules"] },
@@ -179,10 +196,15 @@ const general = chat(
         ),
       ]
     : [
-        message("sam", "Welcome to Studio North. Say hello!", 12, true),
+        message(
+          "sam",
+          "Welcome to Studio North. Team updates live here.",
+          12,
+          true,
+        ),
         message(
           "maya",
-          "A warm welcome to everyone joining us this week. What are you working on?",
+          "The release walkthrough is at 14:00 in Launch day.",
           46,
           true,
         ),
@@ -201,19 +223,19 @@ const design = chat(
     : [
         message(
           "maya",
-          "Two new directions for the packaging. Which one feels right?",
+          "The revised onboarding screens are ready for review.",
           32,
           true,
         ),
         message(
           "sam",
-          "The second direction gives the illustrations more room to breathe.",
+          "The new hierarchy makes the primary action much clearer.",
           41,
           true,
         ),
         message(
           "maya",
-          "Agreed. I’ll bring the softer palette into the next round.",
+          "I’ll apply that spacing to the remaining screens.",
           44,
           true,
         ),
@@ -236,13 +258,13 @@ const plans = chat(
     : [
         message(
           "jules",
-          "Tomorrow’s priorities are ready. Add yours before we meet.",
+          "This week: ship 2.4, review feedback, then plan the next cycle.",
           30,
           true,
         ),
         message(
           "sam",
-          "My focus is the welcome guide and a first round of customer conversations.",
+          "I’ll handle the customer guide and the first feedback sessions.",
           42,
           true,
         ),
@@ -258,9 +280,13 @@ const direct = chat(
         message("maya", "Lovely. See you on Saturday! 💛", 39),
       ]
     : [
-        message("maya", "Have a minute to look at the new concept?", 14),
-        message("alex", "Absolutely. The softer palette is my favourite.", 16),
-        message("maya", "Same here! I’ll share it with the team.", 39),
+        message("maya", "Have a minute to review the rollout checklist?", 14),
+        message(
+          "alex",
+          "Yes. I’ll add my comments before the walkthrough.",
+          16,
+        ),
+        message("maya", "Thanks. I’ve shared it in Launch day.", 39),
       ],
   true,
 );
@@ -471,6 +497,12 @@ mockIPC(
         demo_space_id: "demo",
       };
     if (command === "unlock") return view;
+    if (command === "draft_load")
+      return {
+        session: "fictional-draft-session",
+        draft: { text: "", expiry: null, mentions: [], attachment: null },
+      };
+    if (command === "draft_save" || command === "realtime_context") return null;
     if (command === "push_task")
       return { available: false, enabled: false, pending: false };
     if (command === "plugin:deep-link|get_current") return null;

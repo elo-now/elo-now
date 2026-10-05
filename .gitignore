@@ -59,3 +59,9 @@ __pycache__/
 /crates/tauri-plugin-elo-privacy/**/build/
 /crates/tauri-plugin-elo-privacy/**/.gradle/
 /crates/tauri-plugin-elo-privacy/**/.build/
+
+# Local publishing configuration, working evidence and release packages.
+/landingpage/publisher.json
+/release/
+/docs/STORE_RELEASE.md
+/docs/VALIDATION.md

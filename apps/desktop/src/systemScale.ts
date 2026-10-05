@@ -5,6 +5,8 @@ declare global {
       setPreference?(preference: "dark" | "light" | "auto"): void;
       getTextScale?(): number;
       revealApp?(): void;
+      /** Present only in an explicitly enabled local iOS diagnostic build. */
+      recordUnlockFrame?(): void;
     };
   }
 }

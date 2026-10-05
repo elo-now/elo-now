@@ -222,7 +222,12 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 4px;
     padding: 4px 12px
-      max(4px, var(--app-content-bottom-inset, env(safe-area-inset-bottom)));
+      max(
+        4px,
+        calc(
+          var(--app-content-bottom-inset, env(safe-area-inset-bottom)) - 16px
+        )
+      );
     border-top: 1px solid var(--elo-line);
     background: var(--elo-background);
   }
@@ -248,8 +253,22 @@
     height: 21px;
   }
   .mobile-tabbar button[aria-current="page"] {
-    background: var(--elo-button);
+    isolation: isolate;
+    background: transparent;
     color: var(--elo-onButton);
+  }
+  .mobile-tabbar button[aria-current="page"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--elo-button);
+    pointer-events: none;
+  }
+  .mobile-tabbar
+    button[aria-current="page"]:is(:first-child, :last-child)::before {
+    inset-inline: 6px;
   }
   .conversation {
     background: var(--elo-background);
@@ -766,10 +785,10 @@
     display: none;
   }
   .screen-header {
-    min-height: 52px;
+    min-height: 45px;
     grid-template-rows: minmax(44px, auto);
     margin: 0 0 8px;
-    padding: 3px 0;
+    padding: 0;
   }
   .conversation > .screen-header {
     margin-inline: var(--elo-page-inset);

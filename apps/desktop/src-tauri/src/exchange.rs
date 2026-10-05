@@ -337,6 +337,7 @@ fn validate_invitation_qr_link(link: &str) -> Result<(), String> {
             });
     }
     if !(link.starts_with("elo://exchange/v1#")
+        || link.starts_with(elo_core::invite::contact_code::PREFIX)
         || link.starts_with(elo_core::app::space_service::PREFIX))
         || !link.is_ascii()
         || link.len() > 64 * 1024
@@ -411,7 +412,11 @@ fn uniform_qr_codes(contents: &[String]) -> Result<Vec<qrcode::QrCode>, String> 
 mod tests {
     #[test]
     fn invitation_image_contains_the_full_link_not_an_animation_frame() {
-        for prefix in ["elo://space/v1#", "elo://exchange/v1#"] {
+        for prefix in [
+            "elo://space/v1#",
+            "elo://exchange/v1#",
+            elo_core::invite::contact_code::PREFIX,
+        ] {
             let link = format!("{prefix}{}", "aB7_-xyz9".repeat(290));
             assert!(link.len() > 1800);
             let png = super::invitation_png(&link).unwrap();
