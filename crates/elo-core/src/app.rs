@@ -820,7 +820,7 @@ impl ClientApp {
     }
     pub async fn operate(&mut self, v: Value) -> Result<Value> {
         if matches!(v["op"].as_str(), Some("sync" | "sync_live")) {
-            self.retry_device_revocations(false).await?;
+            Box::pin(self.retry_device_revocations(false)).await?;
         }
         if v["op"] == "set_user_blocked" {
             self.update_block(&v)?;

@@ -1974,6 +1974,27 @@ impl Spaces {
             result["history"]["space_context"] = json!(id);
             return Ok(result);
         }
+        // Chat operations must not poll the large hosting/synchronization
+        // dispatcher: its debug stack frame remains live during signature work.
+        if matches!(op, "sync" | "sync_live" | "invitation_sync") {
+            Box::pin(self.operate_sync(root, v)).await
+        } else if op.starts_with("space_")
+            || matches!(
+                op,
+                "attachment_upload"
+                    | "attachment_download"
+                    | "set_profile_name"
+                    | "set_profile_details"
+                    | "view"
+            )
+        {
+            Box::pin(self.operate_space(root, v)).await
+        } else {
+            Box::pin(self.operate_selected(root, v)).await
+        }
+    }
+    async fn operate_space(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+        let op = field(&v, "op")?;
         let mut result = json!({});
         match op {
             "space_list" => {}
@@ -2409,276 +2430,277 @@ impl Spaces {
                     }
                 };
             }
-            "sync" | "sync_live" | "invitation_sync" => {
-                let mut reports = Vec::new();
-                let mut storage_full_spaces = Vec::new();
-                let live = v["op"] == "sync_live";
-                // A notification can prioritize discovery in a locally joined
-                // Space. It cannot join a Space or supply a transport address.
-                let target_discovery = if op == "invitation_sync"
-                    && let Some(id) = v["target_space"].as_str()
-                {
-                    Some(
-                        self.catalog
-                            .entries
-                            .iter()
-                            .find(|entry| entry.id == id && entry.status == "joined")
-                            .cloned()
-                            .ok_or("Space unavailable.")?,
-                    )
-                } else {
-                    None
-                };
-                let receive_discovery = op == "invitation_sync" && v["receive_only"] == true;
-                if receive_discovery && target_discovery.is_none() {
-                    return Err("Space unavailable.".into());
-                }
-                let foreground_discovery = op == "invitation_sync"
-                    && (v["foreground"] == true || target_discovery.is_some());
-                let mut poll_retry = false;
-                let scoped_discovery = target_discovery.is_some();
-                let discovery_entry = if let Some(entry) = target_discovery {
-                    // A tapped invitation receives signed envelopes first. Host
-                    // status and outbound work stay on the regular sync worker;
-                    // this pass grants no fresh lease for sending messages.
-                    if !receive_discovery {
-                        poll_retry = self
-                            .poll_entry(root, entry.clone(), PollMode::Notification)
-                            .await?;
-                        self.save(root)?;
-                    }
-                    Some((entry.id, false))
-                } else if foreground_discovery && !self.catalog.entries.is_empty() {
-                    let index = self.invitation_round % self.catalog.entries.len();
-                    self.invitation_round = self.invitation_round.wrapping_add(1);
-                    self.invitation_force |= v["force"] == true;
-                    let entry = self.catalog.entries[index].clone();
-                    let rest = index + 1 < self.catalog.entries.len();
-                    poll_retry = self
-                        .poll_entry(root, entry.clone(), PollMode::Foreground)
-                        .await?;
-                    self.save(root)?;
-                    Some((entry.id, rest))
-                } else {
-                    None
-                };
-                let mut v = v.clone();
-                if foreground_discovery {
-                    v["foreground"] = json!(true);
-                    if !scoped_discovery {
-                        v["force"] = json!(self.invitation_force);
-                        if discovery_entry.as_ref().is_none_or(|(_, rest)| !rest) {
-                            self.invitation_force = false;
-                        }
-                    }
-                }
-                let ids = self
-                    .catalog
-                    .entries
-                    .iter()
-                    .filter(|e| e.status == "joined")
-                    .map(|e| e.id.clone())
-                    .collect::<Vec<_>>();
-                let selected = if live && v["receive_only"] == true && v["target_space"].is_string()
-                {
-                    let id = field(&v, "target_space")?;
-                    if !ids.iter().any(|joined| joined == id) {
-                        return Err("Space unavailable.".into());
-                    }
-                    Some((id.to_owned(), false))
-                } else if live && !ids.is_empty() {
-                    let index = self.sync_round % ids.len();
-                    self.sync_round = self.sync_round.wrapping_add(1);
-                    Some((ids[index].clone(), index + 1 < ids.len()))
-                } else {
-                    None
-                };
-                for id in &ids {
-                    if discovery_entry
-                        .as_ref()
-                        .is_some_and(|(selected, _)| selected != id)
-                    {
-                        continue;
-                    }
-                    if selected
-                        .as_ref()
-                        .is_some_and(|(selected, _)| selected != id)
-                    {
-                        continue;
-                    }
-                    let entry = self.catalog.entries.iter().find(|e| &e.id == id).unwrap();
-                    let report = if entry.root {
-                        root.operate_local(v.clone()).await
-                    } else {
-                        Box::pin(
-                            self.children
-                                .get_mut(id)
-                                .ok_or("Space unavailable.")?
-                                .operate_local(v.clone()),
-                        )
-                        .await
-                    };
-                    if live {
-                        if report.as_ref().is_ok_and(|r| r["result"]["more"] == true) {
-                            self.sync_backlog.insert(id.clone());
-                        } else {
-                            self.sync_backlog.remove(id);
-                        }
-                    }
-                    if report
-                        .as_ref()
-                        .is_ok_and(|r| r["result"]["quota_exceeded"].as_u64().unwrap_or(0) > 0)
-                    {
-                        storage_full_spaces.push(json!({"id":id,"name":entry.name}));
-                    }
-                    reports.push(report);
-                }
-                self.sync_backlog.retain(|id| ids.contains(id));
-                let mut summary = serde_json::Map::new();
-                let mut received = Vec::new();
-                let mut delivery_retry = u64::from(poll_retry);
-                let mut delivery_more = false;
-                let mut delivery_received = 0u64;
-                let mut delivery_progressed = false;
-                let mut report_more = false;
-                for report in reports {
-                    match report {
-                        Ok(report) => {
-                            report_more |= report["result"]["more"] == true;
-                            delivery_retry += report["delivery"]["retry"].as_u64().unwrap_or(0);
-                            delivery_more |= report["delivery"]["more"] == true;
-                            delivery_received +=
-                                report["delivery"]["received"].as_u64().unwrap_or(0);
-                            delivery_progressed |= report["delivery"]["progressed"] == true;
-                            if let Some(values) = report["result"].as_object() {
-                                for (key, value) in values {
-                                    if let Some(n) = value.as_u64() {
-                                        let old =
-                                            summary.get(key).and_then(Value::as_u64).unwrap_or(0);
-                                        summary.insert(key.clone(), json!(old + n));
-                                    }
-                                }
-                            }
-                            received.extend(
-                                report["result"]["received_messages"]
-                                    .as_array()
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        Err(_) => {
-                            delivery_retry += 1;
-                            let old = summary.get("retry").and_then(Value::as_u64).unwrap_or(0);
-                            summary.insert("retry".into(), json!(old + 1));
-                        }
-                    }
-                }
-                let changed = [
-                    "downloaded",
-                    "accepted",
-                    "rejected",
-                    "stored",
-                    "held",
-                    "waiting_for_proof",
-                    "quarantined",
-                    "generation_changes",
-                    "repaired",
-                    "repair_downloaded",
-                    "repair_expired",
-                    "repair_pending",
-                    "private_settings_changed",
-                ]
-                .iter()
-                .any(|key| summary.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
-                summary.insert("catching_up".into(), json!(!self.sync_backlog.is_empty()));
-                let remaining_spaces = live && selected.as_ref().is_some_and(|(_, rest)| *rest);
-                // A failed compartment must not delay receipt from the rest of
-                // the round. Keep this distinct from backlog in the same Space.
-                summary.insert("remaining_spaces".into(), json!(remaining_spaces));
-                summary.insert(
-                    "more".into(),
-                    json!(
-                        report_more
-                            || (live && (!self.sync_backlog.is_empty() || remaining_spaces))
-                    ),
-                );
-                summary.insert("storage_full_spaces".into(), json!(storage_full_spaces));
-                summary.insert("received_messages".into(), json!(received));
-                result["result"] = Value::Object(summary);
-                let remaining_spaces = discovery_entry.as_ref().is_some_and(|(_, rest)| *rest);
-                result["delivery"] = json!({"retry":delivery_retry,"more":delivery_more || remaining_spaces,"remaining_spaces":remaining_spaces,"received":delivery_received,"progressed":delivery_progressed});
-                if !live && !foreground_discovery {
-                    self.poll(root).await?;
-                }
-                if live && !changed {
-                    result["view"] = Value::Null;
-                    return Ok(result);
-                }
-            }
             "set_profile_name" | "set_profile_details" => {
-                result = root.operate_local(v.clone()).await?;
+                result = Box::pin(root.operate_local(v.clone())).await?;
                 for child in self.children.values_mut() {
                     child.profile_details = root.profile_details.clone();
                 }
             }
             "view" => return self.view(root).await,
-            _ => {
-                let call_operation = matches!(
-                    op,
-                    "call_authorization"
-                        | "call_notify_ready"
-                        | "call_encrypt_signal"
-                        | "call_open_signal"
-                        | "call_endpoint"
-                );
-                let target = if call_operation
-                    || matches!(
-                        op,
-                        "remind" | "reminder_remove" | "message_action" | "thread_follow"
-                    ) {
-                    v["target_space"].as_str()
-                } else {
-                    None
-                };
-                let id = target
-                    .or(self.catalog.active.as_deref())
-                    .ok_or("Join a Space first.")?;
-                let entry = self
-                    .catalog
+            _ => return Box::pin(self.operate_selected(root, v)).await,
+        }
+        self.operation_result(root, result).await
+    }
+    async fn operate_sync(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+        let op = field(&v, "op")?;
+        let mut result = json!({});
+        let mut reports = Vec::new();
+        let mut storage_full_spaces = Vec::new();
+        let live = v["op"] == "sync_live";
+        // A notification can prioritize discovery in a locally joined
+        // Space. It cannot join a Space or supply a transport address.
+        let target_discovery = if op == "invitation_sync"
+            && let Some(id) = v["target_space"].as_str()
+        {
+            Some(
+                self.catalog
                     .entries
                     .iter()
-                    .find(|e| e.id == id && e.status == "joined")
-                    .ok_or("Space not found.")?;
-                if call_operation
-                    && (entry.address.is_none() || v["hosting_space_id"].as_str() != Some(id))
-                {
-                    return Err("Call Space authorization mismatch.".into());
-                }
-                if op == "call_endpoint" {
-                    let mut endpoint = reqwest::Url::parse(
-                        &entry.address.as_ref().ok_or("Join a Space first.")?.url,
-                    )?;
-                    endpoint.set_path("/calls/v1");
-                    endpoint.set_query(None);
-                    endpoint.set_fragment(None);
-                    return Ok(json!({"url": endpoint.as_str()}));
-                }
-                result = if entry.root {
-                    root.operate_local(v).await?
-                } else {
-                    Box::pin(
-                        self.children
-                            .get_mut(id)
-                            .ok_or("Space unavailable.")?
-                            .operate_local(v),
-                    )
-                    .await?
-                };
-                if call_operation {
-                    return Ok(result);
+                    .find(|entry| entry.id == id && entry.status == "joined")
+                    .cloned()
+                    .ok_or("Space unavailable.")?,
+            )
+        } else {
+            None
+        };
+        let receive_discovery = op == "invitation_sync" && v["receive_only"] == true;
+        if receive_discovery && target_discovery.is_none() {
+            return Err("Space unavailable.".into());
+        }
+        let foreground_discovery =
+            op == "invitation_sync" && (v["foreground"] == true || target_discovery.is_some());
+        let mut poll_retry = false;
+        let scoped_discovery = target_discovery.is_some();
+        let discovery_entry = if let Some(entry) = target_discovery {
+            // A tapped invitation receives signed envelopes first. Host
+            // status and outbound work stay on the regular sync worker;
+            // this pass grants no fresh lease for sending messages.
+            if !receive_discovery {
+                poll_retry = self
+                    .poll_entry(root, entry.clone(), PollMode::Notification)
+                    .await?;
+                self.save(root)?;
+            }
+            Some((entry.id, false))
+        } else if foreground_discovery && !self.catalog.entries.is_empty() {
+            let index = self.invitation_round % self.catalog.entries.len();
+            self.invitation_round = self.invitation_round.wrapping_add(1);
+            self.invitation_force |= v["force"] == true;
+            let entry = self.catalog.entries[index].clone();
+            let rest = index + 1 < self.catalog.entries.len();
+            poll_retry = self
+                .poll_entry(root, entry.clone(), PollMode::Foreground)
+                .await?;
+            self.save(root)?;
+            Some((entry.id, rest))
+        } else {
+            None
+        };
+        let mut v = v.clone();
+        if foreground_discovery {
+            v["foreground"] = json!(true);
+            if !scoped_discovery {
+                v["force"] = json!(self.invitation_force);
+                if discovery_entry.as_ref().is_none_or(|(_, rest)| !rest) {
+                    self.invitation_force = false;
                 }
             }
         }
+        let ids = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.status == "joined")
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>();
+        let selected = if live && v["receive_only"] == true && v["target_space"].is_string() {
+            let id = field(&v, "target_space")?;
+            if !ids.iter().any(|joined| joined == id) {
+                return Err("Space unavailable.".into());
+            }
+            Some((id.to_owned(), false))
+        } else if live && !ids.is_empty() {
+            let index = self.sync_round % ids.len();
+            self.sync_round = self.sync_round.wrapping_add(1);
+            Some((ids[index].clone(), index + 1 < ids.len()))
+        } else {
+            None
+        };
+        for id in &ids {
+            if discovery_entry
+                .as_ref()
+                .is_some_and(|(selected, _)| selected != id)
+            {
+                continue;
+            }
+            if selected
+                .as_ref()
+                .is_some_and(|(selected, _)| selected != id)
+            {
+                continue;
+            }
+            let entry = self.catalog.entries.iter().find(|e| &e.id == id).unwrap();
+            let report = if entry.root {
+                Box::pin(root.operate_local(v.clone())).await
+            } else {
+                Box::pin(
+                    self.children
+                        .get_mut(id)
+                        .ok_or("Space unavailable.")?
+                        .operate_local(v.clone()),
+                )
+                .await
+            };
+            if live {
+                if report.as_ref().is_ok_and(|r| r["result"]["more"] == true) {
+                    self.sync_backlog.insert(id.clone());
+                } else {
+                    self.sync_backlog.remove(id);
+                }
+            }
+            if report
+                .as_ref()
+                .is_ok_and(|r| r["result"]["quota_exceeded"].as_u64().unwrap_or(0) > 0)
+            {
+                storage_full_spaces.push(json!({"id":id,"name":entry.name}));
+            }
+            reports.push(report);
+        }
+        self.sync_backlog.retain(|id| ids.contains(id));
+        let mut summary = serde_json::Map::new();
+        let mut received = Vec::new();
+        let mut delivery_retry = u64::from(poll_retry);
+        let mut delivery_more = false;
+        let mut delivery_received = 0u64;
+        let mut delivery_progressed = false;
+        let mut report_more = false;
+        for report in reports {
+            match report {
+                Ok(report) => {
+                    report_more |= report["result"]["more"] == true;
+                    delivery_retry += report["delivery"]["retry"].as_u64().unwrap_or(0);
+                    delivery_more |= report["delivery"]["more"] == true;
+                    delivery_received += report["delivery"]["received"].as_u64().unwrap_or(0);
+                    delivery_progressed |= report["delivery"]["progressed"] == true;
+                    if let Some(values) = report["result"].as_object() {
+                        for (key, value) in values {
+                            if let Some(n) = value.as_u64() {
+                                let old = summary.get(key).and_then(Value::as_u64).unwrap_or(0);
+                                summary.insert(key.clone(), json!(old + n));
+                            }
+                        }
+                    }
+                    received.extend(
+                        report["result"]["received_messages"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                }
+                Err(_) => {
+                    delivery_retry += 1;
+                    let old = summary.get("retry").and_then(Value::as_u64).unwrap_or(0);
+                    summary.insert("retry".into(), json!(old + 1));
+                }
+            }
+        }
+        let changed = [
+            "downloaded",
+            "accepted",
+            "rejected",
+            "stored",
+            "held",
+            "waiting_for_proof",
+            "quarantined",
+            "generation_changes",
+            "repaired",
+            "repair_downloaded",
+            "repair_expired",
+            "repair_pending",
+            "private_settings_changed",
+        ]
+        .iter()
+        .any(|key| summary.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
+        summary.insert("catching_up".into(), json!(!self.sync_backlog.is_empty()));
+        let remaining_spaces = live && selected.as_ref().is_some_and(|(_, rest)| *rest);
+        // A failed compartment must not delay receipt from the rest of
+        // the round. Keep this distinct from backlog in the same Space.
+        summary.insert("remaining_spaces".into(), json!(remaining_spaces));
+        summary.insert(
+            "more".into(),
+            json!(report_more || (live && (!self.sync_backlog.is_empty() || remaining_spaces))),
+        );
+        summary.insert("storage_full_spaces".into(), json!(storage_full_spaces));
+        summary.insert("received_messages".into(), json!(received));
+        result["result"] = Value::Object(summary);
+        let remaining_spaces = discovery_entry.as_ref().is_some_and(|(_, rest)| *rest);
+        result["delivery"] = json!({"retry":delivery_retry,"more":delivery_more || remaining_spaces,"remaining_spaces":remaining_spaces,"received":delivery_received,"progressed":delivery_progressed});
+        if !live && !foreground_discovery {
+            self.poll(root).await?;
+        }
+        if live && !changed {
+            result["view"] = Value::Null;
+            return Ok(result);
+        }
+        self.operation_result(root, result).await
+    }
+    async fn operate_selected(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+        let op = field(&v, "op")?;
+        let call_operation = matches!(
+            op,
+            "call_authorization"
+                | "call_notify_ready"
+                | "call_encrypt_signal"
+                | "call_open_signal"
+                | "call_endpoint"
+        );
+        let target = if call_operation
+            || matches!(
+                op,
+                "remind" | "reminder_remove" | "message_action" | "thread_follow"
+            ) {
+            v["target_space"].as_str()
+        } else {
+            None
+        };
+        let id = target
+            .or(self.catalog.active.as_deref())
+            .ok_or("Join a Space first.")?;
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|e| e.id == id && e.status == "joined")
+            .ok_or("Space not found.")?;
+        if call_operation && (entry.address.is_none() || v["hosting_space_id"].as_str() != Some(id))
+        {
+            return Err("Call Space authorization mismatch.".into());
+        }
+        if op == "call_endpoint" {
+            let mut endpoint =
+                reqwest::Url::parse(&entry.address.as_ref().ok_or("Join a Space first.")?.url)?;
+            endpoint.set_path("/calls/v1");
+            endpoint.set_query(None);
+            endpoint.set_fragment(None);
+            return Ok(json!({"url": endpoint.as_str()}));
+        }
+        let result = if entry.root {
+            Box::pin(root.operate_local(v)).await?
+        } else {
+            Box::pin(
+                self.children
+                    .get_mut(id)
+                    .ok_or("Space unavailable.")?
+                    .operate_local(v),
+            )
+            .await?
+        };
+        if call_operation {
+            return Ok(result);
+        }
+        self.operation_result(root, result).await
+    }
+    async fn operation_result(&self, root: &ClientApp, mut result: Value) -> Result<Value> {
         if result.get("history").is_some() {
             result["history"]["space_context"] = json!(self.catalog.active);
             return Ok(result);
