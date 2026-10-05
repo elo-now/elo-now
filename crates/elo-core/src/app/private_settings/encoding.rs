@@ -419,8 +419,10 @@ mod tests {
                 StreamId::from_bytes([2; 16]),
                 RecordId::from_bytes([3; 32]),
                 true,
-                RecordId::from_bytes([4; 32]),
-                100,
+                Stamp {
+                    clock: 100,
+                    device: RecordId::from_bytes([4; 32]),
+                },
             )
             .unwrap();
         let original = state.encode_compact().unwrap();

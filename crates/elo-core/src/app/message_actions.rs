@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 type Version = (u64, RecordId);
 type Expiry = (Option<u64>, Option<u8>);
+type EditHistory = BTreeMap<Version, (String, Vec<IdentityId>)>;
 #[derive(Clone)]
 struct ExpirySource {
     id: RecordId,
@@ -46,7 +47,7 @@ pub(super) struct Projection {
     reactions: BTreeMap<(RecordId, String, IdentityId), (Version, bool)>,
     pins: BTreeMap<RecordId, (Version, bool)>,
     deletions: BTreeSet<(RecordId, IdentityId)>,
-    edits: BTreeMap<(RecordId, IdentityId), BTreeMap<Version, (String, Vec<IdentityId>)>>,
+    edits: BTreeMap<(RecordId, IdentityId), EditHistory>,
     expiry: BTreeMap<(RecordId, IdentityId), BTreeMap<Version, Option<u8>>>,
 }
 impl Projection {

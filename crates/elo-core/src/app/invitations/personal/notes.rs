@@ -249,15 +249,14 @@ impl ClientApp {
             return Err("Open Notes on its original device to approve this device.".into());
         }
         let previous = index.map(|index| &self.authorities.0[index]);
-        if let Some(previous) = previous {
-            if previous.space() != authority.space()
+        if let Some(previous) = previous
+            && (previous.space() != authority.space()
                 || !authority.proves_config_at(
                     previous.head_id().ok_or("Missing Notes head.")?,
                     previous.head()?.sequence,
-                )
-            {
-                return Err("Notes authority changed unexpectedly.".into());
-            }
+                ))
+        {
+            return Err("Notes authority changed unexpectedly.".into());
         }
         let authority = authority
             .merge_into_store(previous, &self.store, self.session.age_identity(), now()?)

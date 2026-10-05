@@ -39,8 +39,10 @@ fn concurrent_offline_read_markers_converge_under_duplicates_and_reordering() {
         values[0].stream,
         values[0].record,
         true,
-        values[0].stamp.device,
-        101,
+        Stamp {
+            clock: 101,
+            device: values[0].stamp.device,
+        },
     )
     .unwrap();
     assert!(left.values[&key].stamp.clock > 101);
@@ -61,8 +63,10 @@ fn repeated_mark_read_does_not_generate_an_event_or_overwrite_manual_unread() {
                 value.stream,
                 value.record,
                 false,
-                value.stamp.device,
-                100
+                Stamp {
+                    clock: 100,
+                    device: value.stamp.device,
+                },
             )
             .unwrap()
             .is_some()
@@ -76,8 +80,10 @@ fn repeated_mark_read_does_not_generate_an_event_or_overwrite_manual_unread() {
                 value.stream,
                 value.record,
                 false,
-                value.stamp.device,
-                500
+                Stamp {
+                    clock: 500,
+                    device: value.stamp.device,
+                },
             )
             .unwrap()
             .is_none()
@@ -144,8 +150,10 @@ fn fresh_changes_precede_a_large_checkpoint_and_coalesce_duplicates() {
             StreamId::from_bytes([12; 16]),
             fresh,
             true,
-            RecordId::from_bytes([1; 32]),
-            200,
+            Stamp {
+                clock: 200,
+                device: RecordId::from_bytes([1; 32]),
+            },
         )
         .unwrap();
     let keys = state.batch_keys();

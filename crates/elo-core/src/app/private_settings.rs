@@ -132,15 +132,14 @@ impl State {
         stream: StreamId,
         record: RecordId,
         active: bool,
-        device: RecordId,
-        time: u64,
+        stamp: Stamp,
     ) -> Result<Option<Entry>> {
         let mut entry = Entry {
             field,
             space,
             stream,
             record,
-            stamp: Stamp { clock: 0, device },
+            stamp,
             active,
         };
         let key = entry.key();
@@ -151,7 +150,7 @@ impl State {
         {
             return Ok(None);
         }
-        self.clock = record::next_message_time(self.clock, time);
+        self.clock = record::next_message_time(self.clock, entry.stamp.clock);
         entry.stamp.clock = self.clock;
         self.values.insert(key.clone(), entry.clone());
         self.pending.insert(key);
@@ -272,8 +271,10 @@ impl ClientApp {
                     stream,
                     record,
                     unread,
-                    self.session.credential().id(),
-                    time,
+                    Stamp {
+                        clock: time,
+                        device: self.session.credential().id(),
+                    },
                 )?;
             if let Some(entry) = changed {
                 apply_read(&mut read, &entry);
@@ -326,8 +327,10 @@ impl ClientApp {
                 stream,
                 root,
                 active,
-                self.session.credential().id(),
-                now()?.as_millis() as u64,
+                Stamp {
+                    clock: now()?.as_millis() as u64,
+                    device: self.session.credential().id(),
+                },
             )?;
         if changed.is_some() || initialized {
             self.write_read_state(&read)?;
