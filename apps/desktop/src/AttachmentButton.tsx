@@ -1,4 +1,5 @@
 import { formatAttachmentExpiry, formatFileSize, t } from "./i18n";
+import { isExpiryTimestamp, timestampIso } from "./timestamps";
 import type { MessageRow } from "./messageThreads";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
@@ -82,7 +83,8 @@ export function AttachmentButton({
     cached?.decoded === true ||
     (decoded !== null && decoded.key === key && decoded.url === previewUrl);
   const active = !!download;
-  const expiresAt = row.body.attachment?.expires_at_ms;
+  const deadline = row.body.attachment?.expires_at_ms;
+  const expiresAt = isExpiryTimestamp(deadline) ? deadline : undefined;
   const [now, setNow] = useState(Date.now);
   useLayoutEffect(() => {
     // Preserve the actual download tile during the next local preview lookup.
@@ -222,9 +224,9 @@ export function AttachmentButton({
     >
       {t(`file.${unavailable}`)}
     </small>
-  ) : expiresAt != null && Number.isFinite(new Date(expiresAt).getTime()) ? (
+  ) : expiresAt != null ? (
     <small className="attachment-expiry">
-      <time dateTime={new Date(expiresAt).toISOString()}>
+      <time dateTime={timestampIso(expiresAt)}>
         {t("file.expiresAt", { date: formatAttachmentExpiry(expiresAt) })}
       </time>
     </small>

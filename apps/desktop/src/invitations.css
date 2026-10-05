@@ -228,30 +228,52 @@
 html.elo-scanning,
 .elo-scanning body,
 .elo-scanning #root,
-.elo-scanning .shell,
-.elo-scanning .invitation-scanner {
+.elo-scanning .shell {
   background: transparent !important;
 }
-/* The scanner can be nested inside opaque Settings or onboarding panels. Hide
-   their paint while keeping the scanner and its controls visible above camera. */
-.elo-scanning #root {
+/* The camera sits below the webview. Only its own top-layer controls may paint. */
+.elo-scanning #root,
+.elo-scanning dialog:not(.qr-scanner) {
   visibility: hidden;
 }
-.elo-scanning .invitation-scanner {
-  visibility: visible;
+.elo-scanning dialog::backdrop {
+  background: transparent;
 }
-.invitation-scanner .screen-header,
+.qr-scanner {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  max-width: none;
+  height: var(--app-viewport-height, 100dvh);
+  max-height: 100%;
+  margin: 0;
+  padding: max(0px, env(safe-area-inset-top)) var(--elo-page-inset)
+    max(12px, var(--app-content-bottom-inset, env(safe-area-inset-bottom)));
+  border: 0;
+  border-radius: 0;
+  color: var(--elo-text);
+  background: transparent;
+  visibility: visible;
+  overflow: hidden;
+  outline: none;
+}
+.qr-scanner[open] {
+  display: flex;
+  flex-direction: column;
+}
+.qr-scanner .screen-header,
 .scan-controls {
+  flex-shrink: 0;
   background: var(--elo-background);
 }
 .scan-window {
   flex: 1;
   display: grid;
   place-items: center;
-  min-height: 180px;
+  min-height: 0;
 }
 .scan-window > span {
-  width: min(80vw, 280px);
+  width: min(70vw, 35dvh, 280px);
   aspect-ratio: 1;
   border: 2px solid white;
   border-radius: 16px;

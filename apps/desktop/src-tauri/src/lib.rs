@@ -1,3 +1,4 @@
+mod witness;
 use elo_core::app::{ClientApp, ProfileDraft};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
@@ -13,9 +14,12 @@ mod control_recovery;
 mod demo;
 #[cfg(desktop)]
 mod desktop_activity;
+#[cfg(desktop)]
+mod desktop_notifications;
 mod device_list_load;
 mod device_name;
 mod download_protection;
+mod drafts;
 mod exchange;
 mod mail;
 mod native_media;
@@ -45,6 +49,8 @@ struct Runtime {
     recovery_qr: Option<String>,
     control_recovery: Option<serde_json::Value>,
     view_revision: u64,
+    draft_session: Option<String>,
+    draft_attachments: std::collections::BTreeMap<String, elo_core::app::drafts::StoredAttachment>,
 }
 type State = Mutex<Runtime>;
 
@@ -123,7 +129,11 @@ async fn open_demo(
             .map_err(|e| e.to_string())?;
         team_replica::configure(&mut client)?;
         push::configure_client(&mut client)?;
+        witness::configure_client(&mut client)?;
         client.enable_spaces().await.map_err(|e| e.to_string())?;
+        client
+            .configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))
+            .map_err(|error| error.to_string())?;
         client.enable_paged_views();
         let mut view = client.view().await.map_err(|e| e.to_string())?;
         view["demo_names"] = names.clone();
@@ -151,7 +161,7 @@ fn profile_environment(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let directory = profiles::active(&app).map_err(|e| e.to_string())?;
     Ok(
-        serde_json::json!({"mobile": cfg!(mobile), "platform":std::env::consts::OS, "directory":directory,
+        serde_json::json!({"mobile": cfg!(mobile), "biometric_supported":cfg!(any(mobile, target_os = "macos")), "platform":std::env::consts::OS, "directory":directory,
         "has_profile":directory.exists(), "demo_helpers":cfg!(debug_assertions),
         "demo_space_available":cfg!(feature = "team-test-replica"),
         "demo_space_id":team_replica::demo_space_id(),
@@ -220,10 +230,14 @@ async fn create_profile(
         .await
         .map_err(|e| e.to_string())?;
     push::configure_client(&mut client)?;
+    witness::configure_client(&mut client)?;
     client
         .begin_space_setup()
         .await
         .map_err(|e| e.to_string())?;
+    client
+        .configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))
+        .map_err(|error| error.to_string())?;
     client.enable_paged_views();
     let view = client.view().await.map_err(|e| e.to_string())?;
     if let Err(error) = profiles::select(&app, &path) {
@@ -295,7 +309,11 @@ async fn unlock(
     let timing = std::time::Instant::now();
     team_replica::configure(&mut client)?;
     push::configure_client(&mut client)?;
+    witness::configure_client(&mut client)?;
     client.enable_spaces().await.map_err(|e| e.to_string())?;
+    client
+        .configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))
+        .map_err(|error| error.to_string())?;
     client.enable_paged_views();
     #[cfg(debug_assertions)]
     history_timing(
@@ -511,6 +529,7 @@ fn application_operation(op: &str) -> bool {
             | "reminder_remove"
             | "mark_read"
             | "mark_unread"
+            | "thread_follow"
             | "call_endpoint"
             | "call_authorization"
             | "call_encrypt_signal"
@@ -539,6 +558,9 @@ fn application_operation(op: &str) -> bool {
             | "space_attachment_retention"
             | "space_attachment_cleanup_preview"
             | "space_attachment_cleanup"
+            | "space_external_storage_status"
+            | "space_external_storage_configure"
+            | "space_external_storage_disable"
             | "contact_add_members"
             | "contact_create_chat"
             | "contact_preview"
@@ -778,10 +800,13 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.manage(desktop_activity::Activity::default());
     #[cfg(desktop)]
+    let builder = builder.manage(desktop_notifications::Notifications::default());
+    #[cfg(desktop)]
     let builder = builder.manage(recovery_clipboard::ClipboardState::default());
+    #[cfg(any(mobile, target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_biometry::init());
     #[cfg(mobile)]
     let builder = builder
-        .plugin(tauri_plugin_biometry::init())
         .plugin(tauri_plugin_barcode_scanner::init())
         .plugin(tauri_plugin_sharekit::init());
     #[cfg(all(mobile, feature = "mobile-push"))]
@@ -812,6 +837,8 @@ pub fn run() {
             exchange::clear(app.handle()).map_err(std::io::Error::other)?;
             #[cfg(desktop)]
             desktop_activity::setup(app.handle());
+            #[cfg(desktop)]
+            desktop_notifications::setup(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -826,10 +853,15 @@ pub fn run() {
             attachment_transfer,
             cancel_attachment_transfer,
             operate,
+            drafts::draft_load,
+            drafts::draft_save,
             realtime::realtime_context,
             push::push_task,
+            #[cfg(desktop)]
+            desktop_notifications::desktop_notification_task,
             native_media::native_call_media,
             native_media::native_call_state,
+            native_media::native_call_audio,
             profiles::profile_task,
             exchange::choose_attachment,
             exchange::stage_attachment,
@@ -840,6 +872,7 @@ pub fn run() {
             exchange::share_cached_attachment,
             mail::open_mail_draft,
             exchange::invitation_qr,
+            exchange::save_invitation_qr,
             recovery_clipboard::copy_recovery_code,
             control_recovery::control_task,
             release_policy::release_policy,
@@ -849,6 +882,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("application runtime failed")
         .run(|_app, _event| {
+            if matches!(&_event, tauri::RunEvent::Resumed) {
+                witness::resumed(_app);
+            }
             #[cfg(desktop)]
             match _event {
                 tauri::RunEvent::WindowEvent { label, event, .. } if label == "main" => match event

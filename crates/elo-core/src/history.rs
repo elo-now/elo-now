@@ -3,12 +3,13 @@ use crate::{
     authority::{Authority, Capability},
     crypto,
     ids::{IdentityId, ObjectId, RecordId, SpaceId, StreamId},
-    record::{self, ChatMessage, RecordError, Result, SignedRecord},
+    record::{self, ChatMessage, MessageAction, RecordError, Result, SignedRecord},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 pub const MAX_BUNDLE: usize = 8 * 1024 * 1024;
+const MAX_RELATED_ACTIONS: usize = 1000;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryRequest {
@@ -51,9 +52,22 @@ pub struct HistoryGrant {
     pub request_id: RecordId,
     pub recipient_identity: IdentityId,
     pub selection: Vec<Selection>,
+    /// Signed author actions needed to present the selected messages accurately.
+    /// They do not increase the requested number of disclosed messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_actions: Vec<Selection>,
     pub proofs: Vec<String>,
     pub count: u64,
     pub selection_basis: SelectionBasis,
+}
+impl HistoryGrant {
+    /// Store source indexes address originals first, followed by their actions.
+    pub(crate) fn source(&self, index: usize) -> Option<&Selection> {
+        self.selection
+            .iter()
+            .chain(&self.related_actions)
+            .nth(index)
+    }
 }
 pub fn create_request(
     a: &Authority,
@@ -192,18 +206,34 @@ pub fn approve(
     selection: &[SignedRecord],
     key: &SigningKey,
 ) -> Result<SignedRecord> {
+    approve_with_actions(a, request, exporter, selection, &[], key)
+}
+
+/// Share original signed records plus their verified author edit/expiry state.
+pub fn approve_with_actions(
+    a: &Authority,
+    request: &SignedRecord,
+    exporter: RecordId,
+    selection: &[SignedRecord],
+    actions: &[SignedRecord],
+    key: &SigningKey,
+) -> Result<SignedRecord> {
     let requested = verify_request(a, request)?;
     let identity = validate_exporter(a, exporter)?;
     if a.credential(exporter)?.key() != &key.verifying_key()
         || selection.is_empty()
         || selection.len() > 100
         || selection.len() > requested.count as usize
+        || actions.len() > MAX_RELATED_ACTIONS
     {
         return Err(RecordError::Authority);
     }
     let mut ordered = Vec::new();
     for r in selection {
         let chat = a.verify_historical(r)?;
+        if !matches!(chat.kind.as_str(), "chat.message" | "chat.action") {
+            return Err(RecordError::Authority);
+        }
         ordered.push((order(&chat, r.id()), r.clone()));
     }
     ordered.sort_by_key(|(key, _)| *key);
@@ -221,6 +251,14 @@ pub fn approve(
         }
     }
     let originals: Vec<_> = ordered.into_iter().map(|(_, r)| r).collect();
+    let mut actions = actions.to_vec();
+    actions.sort_by_key(|record| record.chat().map(|chat| order(&chat, record.id())).ok());
+    validate_related_actions(a, &originals, &actions)?;
+    let evidence = originals
+        .iter()
+        .chain(&actions)
+        .cloned()
+        .collect::<Vec<_>>();
     let (audience, recipient_credentials) = recipients(a, requested.issuer_identity, identity)?;
     let grant = HistoryGrant {
         v: 1,
@@ -243,7 +281,14 @@ pub fn approve(
                 signed_record_base64: STANDARD.encode(r.bytes()),
             })
             .collect(),
-        proofs: proofs(a, &originals)?,
+        related_actions: actions
+            .iter()
+            .map(|r| Selection {
+                record_id: r.id(),
+                signed_record_base64: STANDARD.encode(r.bytes()),
+            })
+            .collect(),
+        proofs: proofs(a, &evidence)?,
         selection_basis: SelectionBasis {
             anchor_record_id: requested.anchor_record_id,
             order: "logical_time,issuer_credential,record_id".into(),
@@ -254,6 +299,56 @@ pub fn approve(
         key,
         MAX_BUNDLE,
     )
+}
+
+fn selected_record(selected: &Selection) -> Result<SignedRecord> {
+    if selected.signed_record_base64.len() > record::MAX_RECORD.div_ceil(3) * 4 {
+        return Err(RecordError::Framing);
+    }
+    let bytes = STANDARD
+        .decode(&selected.signed_record_base64)
+        .map_err(|_| RecordError::Json)?;
+    let record = SignedRecord::parse(&bytes)?;
+    if record.id() != selected.record_id {
+        return Err(RecordError::Authority);
+    }
+    Ok(record)
+}
+
+fn validate_related_actions(
+    a: &Authority,
+    originals: &[SignedRecord],
+    actions: &[SignedRecord],
+) -> Result<()> {
+    if actions.len() > MAX_RELATED_ACTIONS {
+        return Err(RecordError::Authority);
+    }
+    let authors = originals
+        .iter()
+        .filter(|r| r.body()["kind"] == "chat.message")
+        .map(|r| Ok((r.id(), r.chat()?.issuer_identity)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let mut last = None;
+    for record in actions {
+        let chat = a.verify_historical(record)?;
+        let key = order(&chat, record.id());
+        let target = match &chat.payload.action {
+            Some(
+                action @ (MessageAction::Edit { .. }
+                | MessageAction::Delete { .. }
+                | MessageAction::Expiry { .. }),
+            ) => action.target(),
+            _ => return Err(RecordError::Authority),
+        };
+        if chat.kind != "chat.action"
+            || authors.get(&target) != Some(&chat.issuer_identity)
+            || last.is_some_and(|previous| previous >= key)
+        {
+            return Err(RecordError::Authority);
+        }
+        last = Some(key);
+    }
+    Ok(())
 }
 pub fn seal(a: &Authority, grant: &SignedRecord) -> Result<Vec<u8>> {
     let g: HistoryGrant = grant.decode()?;
@@ -306,6 +401,7 @@ impl VerifiedBundle {
             || grant.selection.len() > 100
             || grant.count != grant.selection.len() as u64
             || grant.count > requested.count
+            || grant.related_actions.len() > MAX_RELATED_ACTIONS
             || grant.selection_basis.order != "logical_time,issuer_credential,record_id"
             || grant.selection_basis.anchor_record_id != requested.anchor_record_id
         {
@@ -314,17 +410,11 @@ impl VerifiedBundle {
         let mut originals = Vec::new();
         let mut last = None;
         for selected in &grant.selection {
-            if selected.signed_record_base64.len() > record::MAX_RECORD.div_ceil(3) * 4 {
-                return Err(RecordError::Framing);
-            }
-            let bytes = STANDARD
-                .decode(&selected.signed_record_base64)
-                .map_err(|_| RecordError::Json)?;
-            let r = SignedRecord::parse(&bytes)?;
-            if r.id() != selected.record_id {
+            let r = selected_record(selected)?;
+            let chat = a.verify_historical(&r)?;
+            if !matches!(chat.kind.as_str(), "chat.message" | "chat.action") {
                 return Err(RecordError::Authority);
             }
-            let chat = a.verify_historical(&r)?;
             let key = order(&chat, r.id());
             if last.is_some_and(|p| p >= key) {
                 return Err(RecordError::Authority);
@@ -337,6 +427,13 @@ impl VerifiedBundle {
         {
             return Err(RecordError::Authority);
         }
+        let actions = grant
+            .related_actions
+            .iter()
+            .map(selected_record)
+            .collect::<Result<Vec<_>>>()?;
+        validate_related_actions(a, &originals, &actions)?;
+        originals.extend(actions);
         if grant.proofs != proofs(a, &originals)? {
             return Err(RecordError::Authority);
         }
@@ -382,6 +479,7 @@ pub(crate) fn verify_outgoing(a: &Authority, r: &SignedRecord, own: RecordId) ->
         || g.count == 0
         || g.count > 100
         || g.selection.len() as u64 != g.count
+        || g.related_actions.len() > MAX_RELATED_ACTIONS
     {
         return Err(RecordError::Authority);
     }

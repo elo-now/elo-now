@@ -1,4 +1,5 @@
 import { en } from "./locales/en";
+import { isExpiryTimestamp } from "./timestamps";
 
 export const locale = "en";
 export type MessageKey = keyof typeof en;
@@ -42,7 +43,11 @@ export function formatFileSize(bytes: number): string {
 }
 
 /** Attachment deadlines use the reader's time zone without a year or seconds. */
-export function formatAttachmentExpiry(value: number, timeZone?: string): string {
+export function formatAttachmentExpiry(
+  value: number,
+  timeZone?: string,
+): string {
+  if (!isExpiryTimestamp(value)) return "";
   return new Intl.DateTimeFormat(locale, {
     day: "numeric",
     month: "short",

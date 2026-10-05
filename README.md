@@ -6,6 +6,12 @@
 
 ## English
 
+This development source includes a separately provisioned authorization witness,
+an independent attachment storage broker, and Notes. These source changes are not
+retroactively included in published build 1114. The witness and storage rollout
+still requires the deployment and acceptance steps described in
+[Building from source](docs/BUILDING.md#optional-services-and-mobile-push).
+
 ### 1 man, 1 week, 1 GPT Astra
 
 elo.now started with an idea: team conversations should be easy to organize, and the people having them should control their data.
@@ -139,7 +145,12 @@ Kod recovery odzyskuje tożsamość, nie całą historię. Do przeniesienia obs�
 
 Wykorzystujemy podpisy Ed25519, format szyfrowania age i transport HTTPS. Replika przechowująca dane nie potrzebuje kluczy uczestników do odszyfrowania wiadomości. Hasła, kody recovery i dane administratora nie są częścią publikowanych źródeł ani powiadomień.
 
-Szyfrowanie nie ukrywa wszystkich metadanych. Serwery i dostawcy powiadomień mogą widzieć m.in. czas transmisji, rozmiary obiektów czy informacje o dostarczeniu. Odbiorca może skopiować otrzymaną treść, a przejęte, odblokowane urządzenie może ujawnić dane. Obecny mechanizm korzysta z długoterminowych kluczy odbiorców: nie ma ratchetu komunikatora ani gwarancji forward secrecy. Usługa dołączania do General posiada klucz uprawnionego uczestnika tego kanału, dlatego administrator organizacji jest częścią modelu zaufania.
+Szyfrowanie nie ukrywa wszystkich metadanych. Serwery i dostawcy powiadomień mogą widzieć m.in. czas transmisji, rozmiary obiektów czy informacje o dostarczeniu. Odbiorca może skopiować otrzymaną treść, a przejęte, odblokowane urządzenie może ujawnić dane. Obecny mechanizm korzysta z długoterminowych kluczy odbiorców: nie ma ratchetu komunikatora ani gwarancji forward secrecy.
+
+In legacy version-1 Spaces, the General enrollment service held a content key.
+Owner-managed version-2 General removed that service key for newly created
+Spaces; existing Spaces are not converted automatically. See the
+[General trust boundary](THREAT_MODEL.md#hosted-general-trust-boundary).
 
 Nie obiecujemy „stuprocentowego bezpieczeństwa”. Kod jest otwarty i dostępny do sprawdzenia, ale sam fakt publikacji nie zastępuje niezależnego audytu. Aplikacja pozostaje aktywnie rozwijanym MVP.
 
@@ -151,9 +162,18 @@ See [Building from source](docs/BUILDING.md) for prerequisites, local startup, n
 
 ### Run your own Space host
 
-For a private installation, start with **one VPS and one HTTPS origin**. Build the `elo-team` hosted-Space service on the VPS, keep its data and private configuration on that server, and set `TAURI_ELO_API_URL=https://chat.example.org` when building the app. The app uses that origin for Space creation; it does not need your VPS login or storage-provider password. The default source build points to `https://api.elo.now`, so set the override for a self-hosted build.
+For the baseline installation without a witness, start with **one VPS and one HTTPS origin**. Build the `elo-team` hosted-Space service on the VPS, keep its data and private configuration on that server, and set `TAURI_ELO_API_URL=https://chat.example.org` when building the app. The app uses that origin for Space creation; it does not need your VPS login. The default source build points to `https://api.elo.now`, so set the override for a self-hosted build.
 
 The [complete single-VPS installation guide](docs/SELF_HOSTING.md) covers service configuration, attachment storage, TLS routes, calls, notifications and operational checks. Encrypted attachments can stay on the VPS or use a private MEGA WebDAV or S3-compatible provider. Their credentials never belong in the app.
+
+The staged witnessed-Space path requires a separately controlled host and an
+explicit client trust pin; it is not enabled by the single API-origin setting.
+See [witness deployment](deploy/witness/README.md) and the
+[independent attachment broker](crates/elo-storage/README.md). In that path,
+owners configure their own attachment provider through the client, which sends
+the configuration directly to the broker. Attachments start disabled. Provider
+credentials must never be embedded in a distributed app binary or sent to the
+Space API.
 
 ```sh
 cd apps/desktop
@@ -173,6 +193,8 @@ The default source build contains the public service origin described above, but
 | `crates/elo-team` | Space enrollment and General membership service |
 | `crates/elo-call-service` | Call signaling and authorization service |
 | `crates/elo-wake` | Optional notification delivery service |
+| `crates/elo-witness` | Staged independent General authorization witness |
+| `crates/elo-storage` | Staged independent encrypted-attachment storage broker |
 | `crates/tauri-plugin-elo-push` | Native iOS and Android push integration |
 | `migrations`, `protocol` | Database migrations and deterministic protocol test fixtures |
 | `vendor/tauri-plugin-notification` | Bundled notification plugin with local fixes and upstream licenses |

@@ -3,12 +3,109 @@
   gap: 12px;
   margin-top: 20px;
 }
+.active-sessions {
+  display: grid;
+  gap: 8px;
+}
+.active-sessions > h2 {
+  margin: 0;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+}
+.active-session-row,
+.active-session-join {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  color: var(--elo-text);
+  background: var(--elo-surface);
+  border: 1px solid var(--elo-line);
+  border-radius: 12px;
+  text-align: left;
+}
+.active-session-row {
+  width: 100%;
+}
+.active-session-row.desktop-nav-item {
+  gap: 8px;
+  padding: 8px;
+  border: 0;
+  background: transparent;
+}
+.active-session-row > svg,
+.active-session-join > svg {
+  flex-shrink: 0;
+  color: var(--elo-accent);
+}
+.active-session-details {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+.active-session-details strong {
+  font-size: var(--elo-type-label);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.active-session-details small {
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.active-session-participants {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.active-session-dot {
+  flex: 0 0 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d94343;
+}
+.active-session-join > button {
+  flex-shrink: 0;
+  min-height: 44px;
+}
 .call-choice button {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
   width: 100%;
+}
+.call-output-options {
+  display: grid;
+  gap: 8px;
+}
+.call-output-options button,
+.call-output-mute button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+}
+.call-output-options button span,
+.call-output-mute button span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.call-output-options button svg,
+.call-output-mute button svg {
+  flex-shrink: 0;
+}
+.call-output-mute {
+  border-top: 1px solid var(--elo-line);
+  margin-top: 16px;
+  padding-top: 16px;
 }
 .call-dock {
   position: fixed;

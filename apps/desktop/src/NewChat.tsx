@@ -5,7 +5,7 @@ import { Icon } from "./Icon";
 import { ScreenHeader } from "./ScreenHeader";
 import { ChatGroupField } from "./ChatOrganization";
 import { useToast } from "./Toast";
-import { directName, knownPeople } from "./directMessages";
+import { directName, knownPeople, toggleDirectPerson } from "./directMessages";
 import type { ChatGroup, View } from "./model";
 import "./newChat.css";
 import { PeoplePicker } from "./PeoplePicker";
@@ -43,15 +43,20 @@ export function NewChat({
   const [busy, setBusy] = useState(false);
   const pending = useRef(false);
   const attempt = useRef({ key: "", id: "" });
-  const people = useMemo(() => knownPeople(view), [view]);
+  const people = useMemo(
+    () => knownPeople(view, kind === "direct"),
+    [view, kind],
+  );
   const chosen = people.filter((person) => selected.includes(person.id));
   const toggle = (id: string) =>
     setSelected((current) =>
-      current.includes(id)
-        ? current.filter((value) => value !== id)
-        : current.length < 999
-          ? [...current, id]
-          : current,
+      kind === "direct"
+        ? toggleDirectPerson(current, id, view.identity)
+        : current.includes(id)
+          ? current.filter((value) => value !== id)
+          : current.length < 999
+            ? [...current, id]
+            : current,
     );
   const create = async () => {
     if (pending.current || editingGroup) return;
@@ -143,6 +148,10 @@ export function NewChat({
               disabled={busy}
               onClick={() => {
                 setKind(value);
+                if (value !== "direct")
+                  setSelected((current) =>
+                    current.filter((id) => id !== view.identity),
+                  );
                 setEditingGroup(false);
               }}
             >

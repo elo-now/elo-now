@@ -31,6 +31,14 @@ import { scopeKey, type MediaTile } from "./types";
 import "./calls.css";
 import { NativeVideo } from "./NativeVideo";
 import { listenNativeSessionEnd } from "./sessionActivity";
+import { useAudioOutput } from "./audioOutput";
+import type { SessionStarted } from "./sessionPresence";
+export { ActiveSessions, ActiveSessionJoin } from "./ActiveSessions";
+import {
+  AudioOutputIcon,
+  AudioOutputMenu,
+  audioOutputLabel,
+} from "./AudioOutputMenu";
 export function useCalls(view: View | null | undefined) {
   const [calls] = useState(() => new Calls());
   useEffect(() => {
@@ -55,6 +63,17 @@ export function useCalls(view: View | null | undefined) {
     };
   }, [calls]);
   return calls;
+}
+export function useSessionStarted(
+  calls: Calls,
+  listener: (event: SessionStarted) => void,
+) {
+  const latest = useRef(listener);
+  latest.current = listener;
+  useEffect(
+    () => calls.subscribeSessionStarted((event) => latest.current(event)),
+    [calls],
+  );
 }
 export function CallButton({ calls, chat }: { calls: Calls; chat: Stream }) {
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
@@ -218,6 +237,12 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
   const [pinned, setPinned] = useState<string>();
   const [mutedPeople, setMutedPeople] = useState<Set<string>>(() => new Set());
   const [speakerMuted, setSpeakerMuted] = useState(false);
+  const appliedPlayback = useRef({ speaker: false, people: new Set<string>() });
+  const [outputOpen, setOutputOpen] = useState(false);
+  const audio = useAudioOutput(calls.audioOutputContext());
+  const selectedOutput = audio.outputs.find(
+    (output) => output.id === audio.selected,
+  );
   const active = state.active;
   const name = (credential: string) => {
     const participant = Object.values(active?.participants ?? {}).find(
@@ -249,12 +274,30 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
         type="button"
         className="icon call-media-control call-speaker"
         aria-label={t(
-          speakerMuted ? "calls.unmuteSpeaker" : "calls.muteSpeaker",
+          audio.supported
+            ? "calls.chooseOutput"
+            : speakerMuted
+              ? "calls.unmuteSpeaker"
+              : "calls.muteSpeaker",
+          { output: audioOutputLabel(selectedOutput) },
         )}
-        aria-pressed={speakerMuted}
-        onClick={() => setSpeakerMuted((value) => !value)}
+        aria-pressed={audio.supported ? undefined : speakerMuted}
+        aria-haspopup={audio.supported ? "dialog" : undefined}
+        disabled={audio.supported && !audio.ready}
+        onClick={() => {
+          if (audio.supported) {
+            void audio.refresh();
+            setOutputOpen(true);
+          } else setSpeakerMuted((value) => !value);
+        }}
       >
-        {speakerMuted ? <VolumeOff /> : <Volume2 />}
+        {audio.supported ? (
+          <AudioOutputIcon output={selectedOutput} muted={speakerMuted} />
+        ) : speakerMuted ? (
+          <VolumeOff />
+        ) : (
+          <Volume2 />
+        )}
       </button>
       {full && (
         <button
@@ -370,6 +413,8 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
     setPinned(undefined);
     setMutedPeople(new Set());
     setSpeakerMuted(false);
+    appliedPlayback.current = { speaker: false, people: new Set() };
+    setOutputOpen(false);
   }, [active?.call_id]);
   useEffect(() => {
     if (!people.length) return;
@@ -394,10 +439,28 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
   const localPerson = people.find((person) => person.local);
   const remotePerson = people.find((person) => !person.local);
   useEffect(() => {
-    calls.setSpeakerMuted(
-      speakerMuted ||
-        (!!remotePerson && mutedPeople.has(remotePerson.credential)),
-    );
+    let disposed = false;
+    const previous = appliedPlayback.current;
+    void calls
+      .setSpeakerMuted(
+        speakerMuted ||
+          (!!remotePerson && mutedPeople.has(remotePerson.credential)),
+      )
+      .then((applied) => {
+        if (disposed) return;
+        if (applied)
+          appliedPlayback.current = {
+            speaker: speakerMuted,
+            people: mutedPeople,
+          };
+        else {
+          setSpeakerMuted(previous.speaker);
+          setMutedPeople(previous.people);
+        }
+      });
+    return () => {
+      disposed = true;
+    };
   }, [calls, speakerMuted, mutedPeople, remotePerson?.credential]);
   const connectionStatus = t(
     state.phase === "connected"
@@ -424,6 +487,14 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
   };
   return (
     <>
+      {active && outputOpen && (
+        <AudioOutputMenu
+          audio={audio}
+          muted={speakerMuted}
+          onMute={() => setSpeakerMuted((value) => !value)}
+          onClose={() => setOutputOpen(false)}
+        />
+      )}
       {!active && state.phase === "connecting" && (
         <section className="call-dock" aria-label={t("calls.active")}>
           <div className="call-dock-title" role="status" aria-live="polite">

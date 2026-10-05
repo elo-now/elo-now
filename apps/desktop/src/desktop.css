@@ -619,6 +619,74 @@ body:has(.shell[data-mobile="false"]) .toast {
   padding: calc(13px * var(--desktop-density))
     calc(14px * var(--desktop-density)) calc(6px * var(--desktop-density));
 }
+.shell[data-mobile="false"] .conversation[data-file-drag] {
+  position: relative;
+  outline: 2px solid var(--elo-accent);
+  outline-offset: -3px;
+}
+.attachment-drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--elo-surface) 90%, transparent);
+  color: var(--elo-text);
+  font-size: var(--elo-type-title);
+}
+.quick-switcher > header,
+.keyboard-help > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.quick-switcher h2,
+.keyboard-help h2 {
+  margin: 0;
+  font-size: var(--elo-type-body);
+}
+.quick-switcher > input {
+  width: 100%;
+}
+.quick-switcher-list {
+  max-height: 360px;
+  overflow: auto;
+  margin-top: 12px;
+}
+.quick-switcher-list > button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  background: transparent;
+  text-align: start;
+}
+.quick-switcher-list > button[aria-selected="true"] {
+  background: var(--elo-button);
+  color: var(--elo-onButton);
+}
+.quick-switcher-list small {
+  color: var(--elo-muted);
+}
+.keyboard-help dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  margin-block: 12px;
+}
+.keyboard-help dd {
+  margin: 0;
+  white-space: nowrap;
+}
+.keyboard-help kbd {
+  font: inherit;
+  color: var(--elo-muted);
+}
 .shell[data-mobile="false"] .composer > div:not(.composer-attachment),
 .shell[data-mobile="false"][data-mode="default"]
   .composer

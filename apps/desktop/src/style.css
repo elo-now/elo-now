@@ -617,20 +617,33 @@ h2 {
   accent-color: var(--elo-accent);
 }
 .unavailable-message {
+  --unavailable-action-height: 32px;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-  margin: 8px 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 calc(12px * var(--elo-content-density));
+  min-height: var(--unavailable-action-height);
+  margin: calc(4px * var(--elo-content-density)) 0;
   color: var(--elo-muted);
-}
-.unavailable-message strong {
-  font-size: var(--elo-type-message);
-  font-weight: 500;
+  font-size: var(--elo-type-caption);
+  font-weight: 400;
+  line-height: 1.5;
 }
 .unavailable-message button {
-  min-height: 40px;
-  padding: 7px 14px;
+  min-height: var(--unavailable-action-height);
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--elo-accent);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+@media (max-width: 760px), (pointer: coarse) {
+  .unavailable-message {
+    --unavailable-action-height: 44px;
+  }
 }
 .composer {
   margin: 0 24px 16px;
@@ -676,10 +689,6 @@ h2 {
 .composer-expiry-options {
   display: flex;
   gap: 8px;
-}
-.composer:not([data-composer-expanded]):not([data-message-expiry])
-  .composer-expiry {
-  display: none;
 }
 .composer .composer-expiry button {
   padding: 4px 12px;
@@ -3135,6 +3144,17 @@ button {
 .push-settings > p {
   font-size: var(--elo-type-label);
   margin-top: 0.5rem;
+}
+.notification-sound-settings {
+  margin-top: var(--elo-space-4, 1rem);
+}
+.notification-sound-settings label {
+  display: grid;
+  gap: 0.5rem;
+}
+.notification-sound-settings p {
+  margin-top: 0.5rem;
+  font-size: var(--elo-type-label);
 }
 
 .sync-progress,

@@ -16,6 +16,7 @@ import {
 } from "@tauri-apps/plugin-barcode-scanner";
 import { t } from "./i18n";
 import { ScreenHeader } from "./ScreenHeader";
+import { QrScanner } from "./QrScanner";
 import { ActionDialog } from "./ActionDialog";
 import { parseRecoveryCode, recoveryCode } from "./recoveryCode";
 import { Icon } from "./Icon";
@@ -204,35 +205,59 @@ export function CodeInput({
 }) {
   const { reportError } = useToast();
   const [scanning, setScanning] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
   const [captured, setCaptured] = useState(false);
+  const scanSession = useRef<symbol | null>(null);
   const live = useRef(true);
   const gallery = useRef<HTMLInputElement>(null);
   useEffect(() => {
     live.current = true;
     return () => {
       live.current = false;
-      if (mobile) void cancel().catch(() => {});
+      if (scanSession.current) {
+        scanSession.current = null;
+        void cancel().catch(() => {});
+      }
     };
   }, [mobile]);
   const read = async () => {
+    if (scanSession.current) return;
+    const session = Symbol();
+    scanSession.current = session;
     setScanning(true);
+    setCameraOpen(true);
+    const current = () => live.current && scanSession.current === session;
     try {
-      if (
-        (await checkPermissions()) !== "granted" &&
-        (await requestPermissions()) !== "granted"
-      )
-        throw t("invite.cameraDenied");
-      const result = await scan({ formats: [Format.QRCode], windowed: false });
-      if (live.current) {
+      let permission = await checkPermissions();
+      if (!current()) return;
+      if (permission !== "granted") {
+        permission = await requestPermissions();
+        if (!current()) return;
+      }
+      if (permission !== "granted") throw t("invite.cameraDenied");
+      const result = await scan({ formats: [Format.QRCode], windowed: true });
+      if (current()) {
         onChange(result.content);
         setCaptured(true);
         onCaptured?.(result.content);
       }
     } catch (e) {
-      if (live.current && !/cancel/i.test(String(e))) reportError(e);
+      if (current() && !/cancel/i.test(String(e))) reportError(e);
     } finally {
-      if (live.current) setScanning(false);
+      if (scanSession.current === session) {
+        scanSession.current = null;
+        if (live.current) {
+          setScanning(false);
+          setCameraOpen(false);
+        }
+      }
     }
+  };
+  const stopScan = () => {
+    scanSession.current = null;
+    setScanning(false);
+    setCameraOpen(false);
+    void cancel().catch(() => {});
   };
   const choose = async (input: HTMLInputElement) => {
     const file = input.files?.[0];
@@ -263,6 +288,7 @@ export function CodeInput({
   };
   return (
     <>
+      {cameraOpen && <QrScanner onCancel={stopScan} />}
       <input
         hidden
         type="file"

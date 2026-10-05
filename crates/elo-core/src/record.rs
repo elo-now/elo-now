@@ -14,6 +14,8 @@ pub const MAX_RECORD: usize = 1024 * 1024;
 pub const MAX_CHAT_MEMBERS: usize = 1000;
 pub const MAX_CHAT_CREDENTIALS: usize = 2000;
 pub const MAX_INTEGER: u64 = (1 << 53) - 1;
+/// Inclusive ECMAScript Date limit, shared by the clients displaying deadlines.
+pub const MAX_EXPIRY_TIMESTAMP_MS: u64 = 8_640_000_000_000_000;
 pub const MAX_MESSAGE_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Lamport ordering must not let a peer exhaust the wire integer range.
@@ -177,7 +179,15 @@ impl SignedRecord {
                             | "space.genesis"
                             | "stream.config"
                             | "space.create"
+                            | "witness.approval"
+                            | "witness.challenge"
+                            | "witness.admission"
                     )
+                ))
+            && !(matches!(body.get("v").and_then(Value::as_u64), Some(3 | 4))
+                && matches!(
+                    body.get("kind").and_then(Value::as_str),
+                    Some("space.genesis" | "stream.config")
                 ))
         {
             return Err(RecordError::Unsupported);
@@ -241,6 +251,8 @@ impl SignedRecord {
 #[serde(deny_unknown_fields)]
 pub struct TextPayload {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<IdentityId>,
     /// Sender-signed deadline, independent of transport retention on replicas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
@@ -269,6 +281,12 @@ pub enum MessageAction {
     Delete {
         target: RecordId,
     },
+    Edit {
+        target: RecordId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<IdentityId>,
+    },
     Expiry {
         target: RecordId,
         /// None cancels the deadline; otherwise count from this event's clock.
@@ -288,17 +306,25 @@ impl MessageAction {
             Self::Reaction { target, .. }
             | Self::Pin { target, .. }
             | Self::Delete { target }
-            | Self::Expiry { target, .. } => *target,
+            | Self::Expiry { target, .. }
+            | Self::Edit { target, .. } => *target,
         }
     }
     fn valid(&self) -> bool {
         match self {
             Self::Reaction { emoji, .. } => reaction_choices().contains(emoji),
             Self::Pin { .. } | Self::Delete { .. } => true,
+            Self::Edit { text, mentions, .. } => {
+                !text.trim().is_empty() && text.len() <= 16384 && valid_mentions(mentions)
+            }
             Self::Expiry { hours, .. } => hours.is_none_or(|h| matches!(h, 1 | 12 | 24)),
         }
     }
 }
+pub fn valid_mentions(mentions: &[IdentityId]) -> bool {
+    mentions.len() <= 32 && mentions.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 pub fn valid_display_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 120
@@ -355,18 +381,26 @@ impl ChatMessage {
         if self.v != 1
             || !matches!(
                 self.kind.as_str(),
-                "chat.message" | "chat.action" | "chat.locator"
+                "chat.message" | "chat.action" | "chat.locator" | "chat.private-settings"
             )
         {
             return Err(RecordError::Unsupported);
         }
         hex::<16>(&self.nonce)?;
         if self.payload.expires_at_ms.is_some_and(|expires| {
-            expires == 0 || expires > MAX_INTEGER || self.kind == "chat.action"
+            expires == 0 || expires > MAX_EXPIRY_TIMESTAMP_MS || self.kind == "chat.action"
         }) {
             return Err(RecordError::Json);
         }
-        if !sorted_unique(&self.audience, 1, MAX_CHAT_MEMBERS)
+        if !valid_mentions(&self.payload.mentions)
+            || self
+                .payload
+                .mentions
+                .iter()
+                .any(|id| !self.audience.contains(id))
+            || (self.kind != "chat.message" && !self.payload.mentions.is_empty())
+            || matches!(&self.payload.action, Some(MessageAction::Edit { mentions, .. }) if mentions.iter().any(|id| !self.audience.contains(id)))
+            || !sorted_unique(&self.audience, 1, MAX_CHAT_MEMBERS)
             || !sorted_unique(&self.recipient_credentials, 1, MAX_CHAT_CREDENTIALS)
             || self.parents.len() > 16
             || self
@@ -377,6 +411,14 @@ impl ChatMessage {
             || self.logical_time > MAX_INTEGER
             || match (&*self.kind, &self.payload.action, &self.locator) {
                 ("chat.message", None, None) => !(1..=16384).contains(&self.payload.text.len()),
+                ("chat.private-settings", None, None) => {
+                    !(1..=16384).contains(&self.payload.text.len())
+                        || self.audience != [self.issuer_identity]
+                        || self.payload.sender_name.is_some()
+                        || self.payload.thread_root.is_some()
+                        || self.payload.expires_at_ms.is_some()
+                        || !self.parents.is_empty()
+                }
                 ("chat.action", Some(action), None) => {
                     !self.payload.text.is_empty()
                         || self.payload.thread_root.is_some()

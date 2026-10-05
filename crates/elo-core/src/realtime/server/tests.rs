@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     identity::DeviceRevocation, ids::ObjectId, replica::MailboxDescriptor, vault::Session,
 };
+use futures_util::FutureExt;
 
 fn proof(
     session: &Session,
@@ -65,7 +66,7 @@ fn listener(
         mailbox,
         identity,
         sender,
-        cancel: CancellationToken::new(),
+        changed: Arc::new(Notify::new()),
         hint_pending: Arc::new(AtomicBool::new(false)),
         queued_bytes: Arc::new(AtomicUsize::new(0)),
     }
@@ -156,6 +157,7 @@ async fn a_committed_upload_emits_one_coalesced_hint_and_duplicate_uploads_emit_
     let (sender, mut receiver) = mpsc::channel(QUEUE);
     let entry = listener("slot", request.mailbox, session.identity_id(), sender);
     let pending = entry.hint_pending.clone();
+    let changed = entry.changed.clone();
     let _registration = store.realtime.subscribe(entry);
     let bytes = b"synthetic opaque ciphertext".to_vec();
     let object = ObjectId::of_ciphertext(&bytes);
@@ -169,10 +171,9 @@ async fn a_committed_upload_emits_one_coalesced_hint_and_duplicate_uploads_emit_
         )
         .await
         .unwrap();
-    assert!(matches!(
-        receiver.recv().await.unwrap().event,
-        Event::Changed
-    ));
+    assert!(changed.notified().now_or_never().is_some());
+    assert!(pending.load(Ordering::Acquire));
+    assert!(receiver.try_recv().is_err());
     assert_eq!(
         store
             .get(mailbox.mailbox_id, mailbox.read_token.clone(), object)
@@ -192,26 +193,37 @@ async fn a_committed_upload_emits_one_coalesced_hint_and_duplicate_uploads_emit_
         .await
         .unwrap();
     assert!(receiver.try_recv().is_err());
+    assert!(changed.notified().now_or_never().is_none());
     for _ in 0..1000 {
         store.realtime.changed(request.mailbox);
     }
-    assert!(matches!(receiver.try_recv().unwrap().event, Event::Changed));
+    assert!(pending.swap(false, Ordering::AcqRel));
+    assert!(changed.notified().now_or_never().is_some());
+    assert!(changed.notified().now_or_never().is_none());
     assert!(receiver.try_recv().is_err());
+    // A change during authorization/sending schedules another wakeup instead
+    // of being cleared by completion of the previous hint.
+    store.realtime.changed(request.mailbox);
+    assert!(pending.load(Ordering::Acquire));
+    assert!(changed.notified().now_or_never().is_some());
 }
 
 #[tokio::test]
-async fn ephemeral_fanout_filters_before_buffering_and_disconnects_only_slow_recipients() {
+async fn ephemeral_fanout_drops_over_budget_data_without_blocking_durable_hints() {
     let bus = Arc::new(Events::default());
     let (session, _) = Session::create().unwrap();
     let (other, _) = Session::create().unwrap();
     let mailbox = MailboxId::from_bytes([1; 32]);
     let (sender, mut receiver) = mpsc::channel(QUEUE);
     let noisy = listener("noisy", mailbox, session.identity_id(), sender);
-    let cancel = noisy.cancel.clone();
+    let noisy_pending = noisy.hint_pending.clone();
+    let noisy_changed = noisy.changed.clone();
+    let queued_bytes = noisy.queued_bytes.clone();
     let _noisy = bus.subscribe(noisy);
     let (sender, mut quiet_receiver) = mpsc::channel(QUEUE);
     let quiet = listener("quiet", mailbox, other.identity_id(), sender);
-    let quiet_cancel = quiet.cancel.clone();
+    let quiet_pending = quiet.hint_pending.clone();
+    let quiet_changed = quiet.changed.clone();
     let _quiet = bus.subscribe(quiet);
     let recipients = BTreeSet::from([session.identity_id()]);
     for _ in 0..5 {
@@ -223,21 +235,70 @@ async fn ephemeral_fanout_filters_before_buffering_and_disconnects_only_slow_rec
             &"x".repeat(MAX_ENVELOPE),
         );
     }
-    assert!(cancel.is_cancelled());
-    assert!(!quiet_cancel.is_cancelled());
+    assert_eq!(queued_bytes.load(Ordering::Acquire), MAX_QUEUED_BYTES);
     assert!(quiet_receiver.try_recv().is_err());
+    // Both recipients still get their durable sync wakeup, including the one
+    // whose transient-byte budget is completely occupied.
+    bus.changed(mailbox);
+    for (pending, changed) in [
+        (&noisy_pending, &noisy_changed),
+        (&quiet_pending, &quiet_changed),
+    ] {
+        assert!(pending.swap(false, Ordering::AcqRel));
+        assert!(changed.notified().now_or_never().is_some());
+    }
     for _ in 0..4 {
-        assert!(matches!(
-            receiver.try_recv().unwrap().event,
-            Event::Ephemeral { .. }
-        ));
+        let notice = receiver.try_recv().unwrap();
+        queued_bytes.fetch_sub(notice.envelope.len(), Ordering::AcqRel);
     }
     assert!(receiver.try_recv().is_err());
+    assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
+    bus.publish(
+        mailbox,
+        session.credential().into(),
+        false,
+        &recipients,
+        "recovered",
+    );
+    assert_eq!(&*receiver.try_recv().unwrap().envelope, "recovered");
+}
+
+#[tokio::test]
+async fn a_full_or_closed_ephemeral_queue_returns_its_byte_reservation() {
+    let bus = Arc::new(Events::default());
+    let (session, _) = Session::create().unwrap();
+    let mailbox = MailboxId::from_bytes([1; 32]);
+    let (sender, mut receiver) = mpsc::channel(1);
+    let entry = listener("slot", mailbox, session.identity_id(), sender);
+    let queued_bytes = entry.queued_bytes.clone();
+    let pending = entry.hint_pending.clone();
+    let changed = entry.changed.clone();
+    let _registration = bus.subscribe(entry);
+    let recipients = BTreeSet::from([session.identity_id()]);
+    for _ in 0..1000 {
+        bus.publish(
+            mailbox,
+            session.credential().into(),
+            false,
+            &recipients,
+            "queued",
+        );
+    }
+    assert_eq!(queued_bytes.load(Ordering::Acquire), "queued".len());
     bus.changed(mailbox);
-    assert!(matches!(
-        quiet_receiver.recv().await.unwrap().event,
-        Event::Changed
-    ));
+    assert!(pending.swap(false, Ordering::AcqRel));
+    assert!(changed.notified().now_or_never().is_some());
+    let notice = receiver.try_recv().unwrap();
+    queued_bytes.fetch_sub(notice.envelope.len(), Ordering::AcqRel);
+    drop(receiver);
+    bus.publish(
+        mailbox,
+        session.credential().into(),
+        false,
+        &recipients,
+        "closed",
+    );
+    assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -373,6 +434,24 @@ async fn websocket_multiplexes_slots_and_delivers_only_explicit_recipient_events
             matches!(wire_receive(&mut socket).await, ServerFrame::Changed { id } if id == request.id)
         );
     }
+    // A different slot name cannot multiply recipient work for the same
+    // authenticated device and mailbox, even when its proof is fresh.
+    let duplicate = SubscriptionRequest {
+        id: "alice-again".into(),
+        ..first.clone()
+    };
+    wire_send(
+        &mut socket,
+        ClientFrame::Subscribe {
+            request: duplicate.clone(),
+            proof: proof(&alice, &store, &duplicate, PATH),
+        },
+    )
+    .await;
+    assert!(
+        matches!(wire_receive(&mut socket).await, ServerFrame::Error { code } if code == "duplicate_subscription")
+    );
+    // The existing Alice/Bob slots continue to work after rejecting the duplicate.
     wire_send(
         &mut socket,
         ClientFrame::Publish {

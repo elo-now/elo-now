@@ -12,8 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 mod call_proof;
 mod checkpoint;
 mod recovery;
+mod witness;
 pub use call_proof::CallAuthorityProof;
 pub use recovery::ControllerRecovery;
+pub use witness::{
+    WitnessAdmissionEvidence, WitnessAdmissionEvidenceV2, WitnessAdmissionIntent,
+    WitnessAdmissionIntentV2, WitnessApproval, WitnessApprovalV2, WitnessChallenge,
+    WitnessChallengeV2, WitnessConfigEvidence, WitnessInvitationPolicy, WitnessJoinRequest,
+    WitnessJoinRequestEvidence, WitnessPin,
+};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Owner {
@@ -29,6 +36,8 @@ pub struct SpaceGenesis {
     pub issuer_identity: IdentityId,
     pub owners: Vec<Owner>,
     pub controller_credential_id: RecordId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<WitnessPin>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -84,6 +93,8 @@ pub struct StreamConfig {
     /// of a new controller generation. Old configs retain their exact bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_evidence: Option<WitnessConfigEvidence>,
 }
 impl StreamConfig {
     pub fn sign(&self, key: &SigningKey) -> Result<SignedRecord> {
@@ -136,7 +147,7 @@ impl Authority {
         let body: SpaceGenesis = genesis.decode()?;
         match body.v {
             1 => genesis.verify_signature(pinned_root)?,
-            2 => {
+            2..=4 => {
                 if controller.identity() != IdentityId::of_root_key(pinned_root.as_bytes())
                     || controller.record().body()["root_public_key"]
                         != record::encode_hex(pinned_root.as_bytes())
@@ -148,7 +159,15 @@ impl Authority {
             _ => return Err(RecordError::Authority),
         }
         record::hex::<16>(&body.nonce)?;
+        match (body.v, &body.witness) {
+            (4, Some(pin)) => pin.validate()?,
+            (1..=3, None) => {}
+            _ => return Err(RecordError::Authority),
+        }
         if body.kind != "space.genesis"
+            // A device may bootstrap its own private authority, but cannot
+            // appoint other identities as owners of that authority.
+            || (body.v == 3 && body.owners.len() != 1)
             || body.issuer_identity != IdentityId::of_root_key(pinned_root.as_bytes())
             || body.controller_credential_id != controller.id()
             || !record::sorted_unique(
@@ -223,10 +242,10 @@ impl Authority {
     pub fn is_forked(&self) -> bool {
         self.forked
     }
-    /// Version 2 pins the first device and delegates later updates only through
-    /// the exact owner credentials in the preceding signed configuration.
+    /// Versions 2 and 4 delegate owner updates through the exact owner devices
+    /// in the preceding configuration. Version 4 additionally pins a witness.
     pub fn is_owner_managed(&self) -> bool {
-        self.body.v == 2
+        matches!(self.body.v, 2 | 4)
     }
     /// This is authority permission, independent of a device's local vault mode.
     pub fn can_manage(&self, credential: RecordId) -> bool {
@@ -278,7 +297,11 @@ impl Authority {
             return Ok(ConfigAdmission::AlreadyPresent);
         }
         let config: StreamConfig = record.decode()?;
-        record.verify_signature(self.credential(config.controller_credential_id)?.key())?;
+        if self.witness_pin().is_some() && config.sequence > 1 {
+            record.verify_signature(&self.witness_pin().ok_or(RecordError::Authority)?.key()?)?;
+        } else {
+            record.verify_signature(self.credential(config.controller_credential_id)?.key())?;
+        }
         self.validate_config(&config)?;
         let prior_seq = match config.previous_config_id {
             None => 0,
@@ -320,6 +343,7 @@ impl Authority {
             || c.sequence == 0
             || c.sequence > record::MAX_INTEGER
             || (c.sequence == 1) != c.previous_config_id.is_none()
+            || (c.witness_evidence.is_some() != (self.witness_pin().is_some() && c.sequence > 1))
             || c.action.actor_identity != self.credential(c.controller_credential_id)?.identity()
             || ![
                 "create",

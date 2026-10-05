@@ -5,7 +5,7 @@ connections and a second file inventory reject a capture that overlaps writes,
 replacement or deletion. A busy source fails safely instead of stopping services
 or publishing a mixed snapshot. No remote attachment bytes are included.
 """
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import os
 from pathlib import Path
@@ -19,8 +19,31 @@ class SourceChanged(RuntimeError):
     pass
 
 
+@contextmanager
+def regular_source(path):
+    """Open every component without following a replaced directory or file link."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('Backup paths must be absolute and canonical')
+    directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:-1]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+    finally:
+        os.close(directory)
+    with os.fdopen(descriptor, 'rb') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError('Backup source is not a regular file')
+        yield source
+
+
 def digest(path):
-    with path.open('rb') as stream:
+    with regular_source(path) as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
@@ -35,10 +58,15 @@ def inventory(paths):
             elif path.is_dir():
                 entries[path] = ('directory', mode)
             elif path.is_file():
-                with path.open('rb') as stream:
+                with regular_source(path) as stream:
+                    opened = os.fstat(stream.fileno())
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise SourceChanged('Backup source was replaced')
                     database = stream.read(16) == b'SQLite format 3\0'
+                    stream.seek(0)
+                    checksum = None if database else hashlib.file_digest(stream, 'sha256').hexdigest()
                 entries[path] = (('sqlite', mode, info.st_dev, info.st_ino) if database
-                                 else ('file', mode, digest(path)))
+                                 else ('file', mode, checksum, info.st_dev, info.st_ino))
             else:
                 raise ValueError('Unsupported backup file type')
     # Never copy WAL files over a self-contained SQLite backup on restore.
@@ -83,7 +111,11 @@ def capture(paths, destination, timeout=120):
                     if output.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
                         raise RuntimeError('Snapshot database failed validation')
             else:
-                shutil.copyfile(path, target, follow_symlinks=False)
+                with regular_source(path) as source, target.open('xb') as output:
+                    info = os.fstat(source.fileno())
+                    if (info.st_dev, info.st_ino) != entry[3:]:
+                        raise SourceChanged('Backup source was replaced during capture')
+                    shutil.copyfileobj(source, output)
                 if digest(target) != entry[2]:
                     raise SourceChanged('File changed during capture')
             if entry[0] != 'link':

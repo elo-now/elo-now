@@ -32,6 +32,7 @@ fn member(session: &Session, post: bool) -> Member {
 fn authority(owner: &Session, card: &RecoveryCard, people: &[(&Session, bool)]) -> Authority {
     let root = card.recover_root(owner.identity_id()).unwrap();
     let genesis = SpaceGenesis {
+        witness: None,
         v: 1,
         kind: "space.genesis".into(),
         nonce: random_hex::<16>().unwrap(),
@@ -70,6 +71,7 @@ fn authority(owner: &Session, card: &RecoveryCard, people: &[(&Session, bool)]) 
         a.add_credential(person.credential().clone());
     }
     let config = StreamConfig {
+        witness_evidence: None,
         v: 1,
         kind: "stream.config".into(),
         nonce: random_hex::<16>().unwrap(),

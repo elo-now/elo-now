@@ -157,7 +157,7 @@ impl ClientApp {
             json!({"devices":devices.into_values().collect::<Vec<_>>(), "unavailable":unavailable,"pending":self.pending_devices()?.jobs.len(),"can_link":self.can_link_device()}),
         )
     }
-    pub async fn revoke_linked_device(&self, encoded: &str) -> Result<Value> {
+    pub async fn revoke_linked_device(&mut self, encoded: &str) -> Result<Value> {
         let record = decode_record(encoded)?;
         let root = root_key(field(
             self.session.credential().record().body(),
@@ -235,7 +235,7 @@ impl ClientApp {
         Ok(body)
     }
 
-    pub(super) async fn retry_device_revocations(&self, immediate: bool) -> Result<()> {
+    pub(super) async fn retry_device_revocations(&mut self, immediate: bool) -> Result<()> {
         let mut pending = self.pending_devices()?;
         let current = now()?.as_millis() as u64;
         if pending.jobs.is_empty() || !immediate && pending.retry_after > current {
@@ -259,15 +259,40 @@ impl ClientApp {
                 }
             }
             let target = crate::identity::DeviceRevocation::verify(&decode_record(&job.proof)?)?;
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(if immediate { 12 } else { 2 }),
-                async {
-                    let body = self.device_revocation_body(&job.address, &job.proof)?;
-                    self.call_space(&job.address, "device_revoke", body).await
-                },
-            )
-            .await;
-            if !matches!(result, Ok(Ok(ref result)) if result["revoked"] == json!(target.id())) {
+            let witnessed = |client: &ClientApp| {
+                client.authorities.0.iter().any(|authority| {
+                    authority.space() == job.address.scope.space
+                        && authority.stream() == job.address.scope.stream
+                        && authority.witness_pin().is_some()
+                })
+            };
+            let result = if witnessed(self) {
+                self.revoke_witnessed_owner_device(&job.address, &job.proof)
+                    .await
+            } else if let Some(child) = self.spaces.as_mut().and_then(|spaces| {
+                spaces
+                    .children_mut()
+                    .values_mut()
+                    .find(|child| witnessed(child))
+            }) {
+                child
+                    .revoke_witnessed_owner_device(&job.address, &job.proof)
+                    .await
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(if immediate { 12 } else { 2 }),
+                    async {
+                        let body = self.device_revocation_body(&job.address, &job.proof)?;
+                        self.call_space(&job.address, "device_revoke", body).await
+                    },
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("Space server timed out.".into()),
+                }
+            };
+            if !matches!(result, Ok(ref result) if result["revoked"] == json!(target.id())) {
                 pending.jobs.push(job);
             }
             self.save_pending_devices(&pending)?;
@@ -390,7 +415,7 @@ mod tests {
                 .contains(&draft.card().phrase)
         );
         app.close().await.unwrap();
-        let reopened = ClientApp::open(path, "synthetic revocation password".into(), false)
+        let mut reopened = ClientApp::open(path, "synthetic revocation password".into(), false)
             .await
             .unwrap();
         assert_eq!(reopened.pending_devices().unwrap().jobs.len(), 1);

@@ -42,12 +42,15 @@ export default function LicenseSettings({
   onBack,
   backLabel,
   embedded = false,
+  desktopRoot = false,
   initialDocument,
   serviceRequests,
 }: {
   onBack: () => void;
   backLabel?: string;
   embedded?: boolean;
+  /** Hide the root Back action only when persistent desktop navigation exists. */
+  desktopRoot?: boolean;
   initialDocument?: LegalDocument;
   serviceRequests?: ReactNode;
 }) {
@@ -95,7 +98,7 @@ export default function LicenseSettings({
       ) : (
         <ScreenHeader
           title={title}
-          desktopRoot={!nested}
+          desktopRoot={desktopRoot && !nested}
           onBack={back}
           backLabel={
             nested

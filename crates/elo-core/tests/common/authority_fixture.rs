@@ -21,6 +21,7 @@ pub fn setup() -> (Person, Person, Authority, Vec<SignedRecord>) {
     let owner = person(10);
     let reader = person(20);
     let g = SpaceGenesis {
+        witness: None,
         v: 1,
         kind: "space.genesis".into(),
         nonce: random_hex::<16>().unwrap(),
@@ -54,6 +55,7 @@ pub fn setup() -> (Person, Person, Authority, Vec<SignedRecord>) {
         external: false,
     };
     let mut c = StreamConfig {
+        witness_evidence: None,
         chat_kind: None,
         recovery: None,
         v: 1,

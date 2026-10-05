@@ -41,6 +41,7 @@ export type SpaceSummary = {
   id: string;
   name: string;
   status: "joined" | "pending" | "declined" | "checking";
+  pending_reason?: "approval" | "owner_sync" | null;
   owner: boolean;
   requests: number;
   activity?: number;
@@ -50,6 +51,24 @@ export type SpaceSummary = {
   roles_revision?: number;
   message_lifetime_seconds?: number;
 };
+export function spaceStatusText(
+  space: Pick<SpaceSummary, "status" | "pending_reason">,
+): string {
+  switch (space.status) {
+    case "checking":
+      return t("spaces.checking");
+    case "pending":
+      return t(
+        space.pending_reason === "owner_sync"
+          ? "spaces.waitingOwner"
+          : "spaces.pending",
+      );
+    case "declined":
+      return t("spaces.declined");
+    default:
+      return "";
+  }
+}
 export type Stream = {
   is_general?: boolean;
   owner_managed?: boolean;
@@ -68,6 +87,10 @@ export type Stream = {
   group?: string | null;
   /** Private profile preference; unread state and delivery are unaffected. */
   muted?: boolean;
+  /** Private per-profile thread subscription overrides. */
+  followed_threads?: string[];
+  unfollowed_threads?: string[];
+  participating_threads?: string[];
   created_at?: number;
   space: string;
   stream: string;
@@ -109,7 +132,15 @@ export type Stream = {
       expired?: boolean;
       issuer_identity: string;
       created_at?: string;
-      payload?: { text?: string; sender_name?: string; thread_root?: string; expires_at_ms?: number | null; expiry_hours?: 1 | 12 | 24 | null };
+      payload?: {
+        text?: string;
+        mentions?: string[];
+        edited_at_ms?: number;
+        sender_name?: string;
+        thread_root?: string;
+        expires_at_ms?: number | null;
+        expiry_hours?: 1 | 12 | 24 | null;
+      };
       locator?: {
         message_record_id: string;
         body_object_id: string;
@@ -137,6 +168,7 @@ export type View = {
   paged?: boolean;
   partial?: boolean;
   space_setup?: boolean;
+  attachment_storage_available?: boolean;
   space_creation?: {
     name: string;
     contact_email?: string;
@@ -144,6 +176,7 @@ export type View = {
     space?: string;
     invitation?: string;
     message_lifetime_seconds?: number;
+    attachment_storage_pending?: boolean;
   } | null;
   space_role_requests?: SpaceRoleRequest[];
   active_space?: string | null;

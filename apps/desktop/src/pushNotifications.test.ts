@@ -499,3 +499,137 @@ test("viewing Invitations never marks hidden notices or a future approval as see
   expect(invitationSeenRequest("invite", activity)).toBeUndefined();
   expect(invitationSeenRequest("activity", {})).toBeUndefined();
 });
+
+function sessionTargetFixture() {
+  const chat = {
+    ...view.streams[0],
+    space_context: "company-b",
+    forked: false,
+    members: [
+      {
+        identity_id: "me",
+        credential_ids: ["device"],
+        capabilities: ["READ", "POST"],
+        external: false,
+      },
+    ],
+  };
+  const current = {
+    ...view,
+    active_space: "company-a",
+    streams: [],
+    all_streams: [chat],
+    spaces: [
+      {
+        id: "company-a",
+        name: "Company A",
+        status: "joined",
+        owner: false,
+        requests: 0,
+        managed: true,
+      },
+      {
+        id: "company-b",
+        name: "Company B",
+        status: "joined",
+        owner: false,
+        requests: 0,
+        managed: true,
+      },
+    ],
+  } as View;
+  const target = {
+    identity: "me",
+    category: "session_start",
+    space_context: "company-b",
+    space: "space",
+    stream: "chat",
+    call_id: "a".repeat(32),
+    expires: Date.now() + 60_000,
+  };
+  return { chat, current, target };
+}
+
+test("a session notification selects only its known readable chat in the matching profile and Space", () => {
+  const { chat, current, target } = sessionTargetFixture();
+  const before = structuredClone(current);
+  expect(notificationChat(current, target)).toBe(chat);
+  expect(notificationSpace(current, target)).toBe("company-b");
+  expect(notificationPage(current, target)).toBeUndefined();
+  expect(notificationEntry(current, target)).toBeUndefined();
+  for (const change of [
+    { identity: "other" },
+    { space_context: "company-a" },
+    { space: "unknown" },
+    { stream: "unknown" },
+    { category: "message" },
+    { record: "message" },
+    { call_id: "" },
+    { call_id: "a".repeat(31) },
+    { call_id: "a".repeat(33) },
+    { call_id: "A".repeat(32) },
+    { call_id: "z".repeat(32) },
+  ])
+    expect(notificationChat(current, { ...target, ...change })).toBeUndefined();
+  for (const change of [
+    { forked: true },
+    { members: [] },
+    {
+      members: [
+        {
+          identity_id: "me",
+          capabilities: ["POST"],
+          credential_ids: ["device"],
+          external: false,
+        },
+      ],
+    },
+  ])
+    expect(
+      notificationChat(
+        { ...current, all_streams: [{ ...chat, ...change }] },
+        target,
+      ),
+    ).toBeUndefined();
+  expect(current).toEqual(before);
+});
+
+test("an expired session notification can still navigate to its verified chat but never confers session availability", () => {
+  const { chat, current, target } = sessionTargetFixture();
+  const expired = { ...target, expires: 1 };
+  expect(notificationChat(current, expired)).toBe(chat);
+  expect(notificationSpace(current, expired)).toBe("company-b");
+  // No call is returned or started: the caller receives only the local chat.
+  // Join is separately gated by the latest ready session in Calls.
+  expect(
+    notificationChat({ ...current, all_streams: [] }, expired),
+  ).toBeUndefined();
+  expect(
+    notificationChat(current, { ...expired, identity: "other" }),
+  ).toBeUndefined();
+  expect(notificationCatchUpRequest(current, target)).toEqual({
+    op: "sync_live",
+    foreground: true,
+    receive_only: true,
+    target_space: "company-b",
+    expected_identity: "me",
+    expected_space: "company-a",
+  });
+});
+
+test("session routing keeps exact hosting context when the same chat IDs occur in two Spaces", () => {
+  const { chat, current, target } = sessionTargetFixture();
+  const other = { ...chat, space_context: "company-a" };
+  current.all_streams = [other, chat];
+  expect(notificationChat(current, target)).toBe(chat);
+  expect(notificationCatchUpRequest(current, target)?.target_space).toBe(
+    "company-b",
+  );
+  expect(
+    notificationChat(current, { ...target, space_context: "missing" }),
+  ).toBeUndefined();
+  current.all_streams = [{ ...other, space_context: undefined }];
+  expect(
+    notificationChat(current, { ...target, space_context: "company-a" }),
+  ).toBe(current.all_streams[0]);
+});

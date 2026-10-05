@@ -18,6 +18,27 @@ impl PublicSpaceService {
         credential: &VerifiedCredential,
         body: &Value,
     ) -> Result<Value> {
+        let general = &self.authorities.0[0];
+        if body["stream"]
+            == json!(crate::notes::stream(
+                general.space(),
+                general.stream(),
+                credential.identity()
+            ))
+        {
+            return Err("Notes permissions require the Notes registry.".into());
+        }
+        let reply = self.record_space_call_head(state, credential, body)?;
+        self.save_service_state(state)?;
+        Ok(reply)
+    }
+
+    pub(super) fn record_space_call_head(
+        &self,
+        state: &mut ServiceState,
+        credential: &VerifiedCredential,
+        body: &Value,
+    ) -> Result<Value> {
         let general = self.authorities.0.first().ok_or("Space unavailable.")?;
         if crate::calls::require_member(general, credential.id()).ok()
             != Some(credential.identity())
@@ -74,7 +95,6 @@ impl PublicSpaceService {
                 credentials,
             },
         );
-        self.save_service_state(state)?;
         Ok(json!({"head":head}))
     }
 

@@ -20,11 +20,19 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn owner_creation() -> (Session, CreateCommand) {
+        owner_creation_with_witness(None)
+    }
+
+    fn owner_creation_with_witness(
+        witness: Option<crate::authority::WitnessPin>,
+    ) -> (Session, CreateCommand) {
         let (owner, _) = Session::create().unwrap();
         let request_id = "ab".repeat(16);
         let root = field(owner.credential().record().body(), "root_public_key").unwrap();
+        let version = if witness.is_some() { 4 } else { 2 };
         let genesis = SpaceGenesis {
-            v: 2,
+            witness,
+            v: version,
             kind: "space.genesis".into(),
             nonce: request_id.clone(),
             issuer_identity: owner.identity_id(),
@@ -46,7 +54,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let config = StreamConfig {
-            v: 2,
+            witness_evidence: None,
+            v: version,
             kind: "stream.config".into(),
             nonce: request_id.clone(),
             space_id: authority.space(),
@@ -92,6 +101,70 @@ pub(crate) mod tests {
             authority: Some(authority.call_proof().unwrap()),
         };
         (owner, command)
+    }
+
+    #[test]
+    fn witnessed_creation_requires_the_independent_pin_and_rejects_downgrade() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[67; 32]);
+        let pin = crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(key.verifying_key().as_bytes()),
+            key_generation: 1,
+        };
+        let (owner, command) = owner_creation_with_witness(Some(pin.clone()));
+        assert!(verify_creation_authority(&command, owner.credential()).is_err());
+        let authority =
+            verify_creation_authority_with_witness(&command, owner.credential(), Some(&pin))
+                .unwrap()
+                .unwrap();
+        assert_eq!(authority.witness_pin(), Some(&pin));
+        let mut changed_pin = pin.clone();
+        changed_pin.key_generation += 1;
+        assert!(
+            verify_creation_authority_with_witness(
+                &command,
+                owner.credential(),
+                Some(&changed_pin)
+            )
+            .is_err()
+        );
+        let (legacy_owner, legacy) = owner_creation();
+        assert!(
+            verify_creation_authority_with_witness(&legacy, legacy_owner.credential(), Some(&pin))
+                .is_err()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = crate::public_space::PublicSpaceService::create_with_witness(
+            directory.path().join("service"),
+            command.authority.clone().unwrap(),
+            &[owner.identity_id()],
+            None,
+            false,
+            None,
+            Some(pin.clone()),
+        )
+        .unwrap();
+        assert_eq!(service.team_scope().unwrap().space, authority.space());
+        drop(service);
+        assert!(
+            crate::public_space::PublicSpaceService::open(directory.path().join("service"), false)
+                .is_err()
+        );
+        assert!(
+            crate::public_space::PublicSpaceService::open_with_witness(
+                directory.path().join("service"),
+                false,
+                Some(changed_pin)
+            )
+            .is_err()
+        );
+        crate::public_space::PublicSpaceService::open_with_witness(
+            directory.path().join("service"),
+            false,
+            Some(pin),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -290,6 +363,17 @@ pub fn verify_create(
     expected_host: &str,
     current: u64,
 ) -> Result<(CreateCommand, VerifiedCredential)> {
+    verify_create_with_witness(request, expected_host, current, None)
+}
+
+/// The deployment supplies this pin independently of the request. A witnessed
+/// deployment rejects legacy creation rather than accepting a client downgrade.
+pub fn verify_create_with_witness(
+    request: &CreateRequest,
+    expected_host: &str,
+    current: u64,
+    witness: Option<&crate::authority::WitnessPin>,
+) -> Result<(CreateCommand, VerifiedCredential)> {
     request.verify_work()?;
     if request.record.len() + request.credential.len() > CREATE_LIMIT {
         return Err("Space request is too large.".into());
@@ -315,13 +399,24 @@ pub fn verify_create(
     }
     space_service::validate_contact_email(&command.contact_email)?;
     space_service::validate_message_lifetime(command.message_lifetime_seconds)?;
-    verify_creation_authority(&command, &credential)?;
+    verify_creation_authority_with_witness(&command, &credential, witness)?;
     Ok((command, credential))
 }
 pub(crate) fn verify_creation_authority(
     command: &CreateCommand,
     credential: &VerifiedCredential,
 ) -> Result<Option<Authority>> {
+    verify_creation_authority_with_witness(command, credential, None)
+}
+
+pub fn verify_creation_authority_with_witness(
+    command: &CreateCommand,
+    credential: &VerifiedCredential,
+    witness: Option<&crate::authority::WitnessPin>,
+) -> Result<Option<Authority>> {
+    if let Some(pin) = witness {
+        pin.validate()?;
+    }
     if !matches!(
         (command.v, command.authority.is_some()),
         (1, false) | (2, true)
@@ -329,11 +424,18 @@ pub(crate) fn verify_creation_authority(
         return Err("Invalid Space creation authority version.".into());
     }
     let Some(proof) = &command.authority else {
+        if witness.is_some() {
+            return Err("Witnessed Space creation requires an updated app.".into());
+        }
         return Ok(None);
     };
     let genesis = decode_record(&proof.genesis)?;
     let stream = StreamId::from_bytes(record::hex::<16>(&command.request_id)?);
-    let authority = proof.verify(genesis.id().to_string().parse()?, stream)?;
+    let space = genesis.id().to_string().parse()?;
+    let authority = match witness {
+        Some(pin) => proof.verify_witnessed(space, stream, pin)?,
+        None => proof.verify(space, stream)?,
+    };
     let body: SpaceGenesis = authority.genesis().decode()?;
     let head = authority.head()?;
     if !authority.is_owner_managed()
@@ -395,6 +497,27 @@ pub fn seal_creation(
         )?),
     })
 }
+/// The witnessed bootstrap contains transport metadata, never an admission token.
+pub fn seal_witnessed_creation(
+    credential: &VerifiedCredential,
+    command: &CreateCommand,
+    address: &space_service::SpaceAddress,
+) -> Result<CreateResponse> {
+    let value = json!({"v":2,"kind":"space.created.witnessed","request_id":command.request_id,"host":command.host,"name":command.name,"contact_email":command.contact_email,"message_lifetime_seconds":command.message_lifetime_seconds,"require_approval":command.require_approval,"address":address});
+    Ok(CreateResponse {
+        ciphertext: STANDARD.encode(crypto::seal_bytes(
+            &Zeroizing::new(serde_json::to_vec(&value)?),
+            &[credential.recipient()],
+            CREATE_LIMIT,
+        )?),
+    })
+}
+
+pub(super) enum HostedCreation {
+    Legacy(String),
+    Witnessed(space_service::SpaceAddress),
+}
+
 impl ClientApp {
     pub fn hosted_create_request(
         &self,
@@ -461,7 +584,7 @@ impl ClientApp {
         contact_email: &str,
         message_lifetime_seconds: u64,
         require_approval: bool,
-    ) -> Result<String> {
+    ) -> Result<HostedCreation> {
         let mut request = self.hosted_create_payload(
             host,
             request_id,
@@ -471,8 +594,27 @@ impl ClientApp {
             require_approval,
         )?;
         let command: CreateCommand = decode_record(&request.record)?.decode()?;
-        let authority = verify_creation_authority(&command, self.session.credential())?
-            .ok_or("Missing owner-managed Space authority.")?;
+        let authority = verify_creation_authority_with_witness(
+            &command,
+            self.session.credential(),
+            self.witness_pin.as_ref(),
+        )?
+        .ok_or("Missing owner-managed Space authority.")?;
+        if self.witness_pin.is_some() {
+            self.require_invitation_origin(host)?;
+            // Registration may have succeeded before a previous response was lost.
+            // A full independently fresh Read reconciles that outcome.
+            if self.witness_read_authority(&authority).await.is_err() {
+                let registration = self.witness_register_authority(&authority).await;
+                let observed = self.witness_read_authority(&authority).await;
+                match (registration, observed) {
+                    (_, Ok(current)) if current.head_id() == authority.head_id() => (),
+                    (Err(error), _) => return Err(error),
+                    (_, Err(error)) => return Err(error),
+                    _ => return Err("Space creation authority changed.".into()),
+                }
+            }
+        }
         let request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
             request.solve_work()?;
             Ok(request)
@@ -526,6 +668,20 @@ impl ClientApp {
         {
             return Err("Unexpected Space hosting response.".into());
         }
+        if self.witness_pin.is_some() {
+            if value["v"] != 2
+                || value["kind"] != "space.created.witnessed"
+                || value.get("invitation").is_some()
+            {
+                return Err("Invalid witnessed Space bootstrap.".into());
+            }
+            let address: space_service::SpaceAddress =
+                serde_json::from_value(value["address"].clone())?;
+            address.validate(self.allow_loopback)?;
+            self.require_invitation_origin(&address.url)?;
+            verify_created_address(&address, &authority)?;
+            return Ok(HostedCreation::Witnessed(address));
+        }
         let link = field(&value, "invitation")?;
         let invite = space_service::SpaceInvitation::parse(link, self.allow_loopback)?;
         if reqwest::Url::parse(&invite.address.url)?.origin() != reqwest::Url::parse(host)?.origin()
@@ -533,6 +689,6 @@ impl ClientApp {
             return Err("Space hosting response changed server.".into());
         }
         verify_created_address(&invite.address, &authority)?;
-        Ok(link.into())
+        Ok(HostedCreation::Legacy(link.into()))
     }
 }

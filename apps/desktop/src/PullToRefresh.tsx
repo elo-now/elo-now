@@ -152,14 +152,50 @@ export function PullToRefresh({
     const node = element.current;
     if (!active || !node) return;
     if (historyReady && node.clientHeight) followingEnd.current = atEnd(node);
+    let height = node.clientHeight;
+    let contentHeight = node.scrollHeight;
     const scroll = () => {
       if (!isActive.current || !node.clientHeight) return;
+      const layoutChanged =
+        height !== node.clientHeight || contentHeight !== node.scrollHeight;
+      height = node.clientHeight;
+      contentHeight = node.scrollHeight;
+      // WebKit can emit scroll for keyboard/composer layout before the resize
+      // observer runs. That is not the reader leaving the end of the chat.
+      if (
+        layoutChanged &&
+        followingEnd.current &&
+        latestPage.current &&
+        !anchor.current
+      )
+        node.scrollTop = Math.max(0, contentHeight - height);
       viewport.current = { key: resetKey, top: node.scrollTop };
       followingEnd.current = atEnd(node);
       if (followingEnd.current && latestPage.current) setBelow(undefined);
     };
+    const wheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) followingEnd.current = false;
+    };
+    let touchY: number | undefined;
+    const touchStart = (event: TouchEvent) => {
+      touchY = event.touches.length === 1 ? event.touches[0].clientY : undefined;
+    };
+    const touchMove = (event: TouchEvent) => {
+      if (touchY === undefined || event.touches.length !== 1) return;
+      const next = event.touches[0].clientY;
+      if (next > touchY) followingEnd.current = false;
+      touchY = next;
+    };
     node.addEventListener("scroll", scroll, { passive: true });
-    return () => node.removeEventListener("scroll", scroll);
+    node.addEventListener("wheel", wheel, { passive: true });
+    node.addEventListener("touchstart", touchStart, { passive: true });
+    node.addEventListener("touchmove", touchMove, { passive: true });
+    return () => {
+      node.removeEventListener("scroll", scroll);
+      node.removeEventListener("wheel", wheel);
+      node.removeEventListener("touchstart", touchStart);
+      node.removeEventListener("touchmove", touchMove);
+    };
   }, [resetKey, historyReady, active]);
   useLayoutEffect(() => {
     const node = element.current;

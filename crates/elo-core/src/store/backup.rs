@@ -8,6 +8,12 @@ use std::collections::BTreeMap;
 // For composite indexes, correlate the second membership check with EXISTS.
 // Two IN loops can enumerate every kept record/object pair before checking the
 // source index, making bounded exports quadratic in the retained history.
+// Applied private settings already live in the encrypted read-state snapshot.
+// Unprocessed events and unfinished deliveries must survive a profile backup.
+const REDUNDANT_PRIVATE_SETTINGS: &str = "kind='chat.private-settings'
+    AND record_id IN (SELECT record_id FROM private_settings_inbox WHERE sequence<=?1)
+    AND record_id NOT IN (SELECT record_id FROM outbox WHERE state!='STORED')";
+
 const TABLES: &[(&str, &str)] = &[
     (
         "objects",
@@ -24,6 +30,10 @@ const TABLES: &[(&str, &str)] = &[
     (
         "outbox",
         "WHERE object_id IN (SELECT object_id FROM elo_backup.objects) AND EXISTS (SELECT 1 FROM elo_backup.records AS kept WHERE kept.record_id = main.outbox.record_id)",
+    ),
+    (
+        "private_settings_inbox",
+        "WHERE record_id IN (SELECT record_id FROM elo_backup.records)",
     ),
     ("stream_heads", ""),
     ("peer_cursors", ""),
@@ -57,13 +67,14 @@ impl ClientStore {
     /// A committed-WAL snapshot for recovery, without sent/received file bodies.
     /// The writer serializes access; the source database is never modified.
     pub async fn message_backup_image(&self, maximum: usize) -> Result<Vec<u8>> {
-        self.selected_message_backup_image(maximum, None).await
+        self.selected_message_backup_image(maximum, None, 0).await
     }
 
     pub(crate) async fn selected_message_backup_image(
         &self,
         maximum: usize,
         records: Option<Vec<RecordId>>,
+        private_settings_cursor: i64,
     ) -> Result<Vec<u8>> {
         self.call(move |connection| {
             let schema = read_schema(connection)?;
@@ -93,6 +104,10 @@ impl ClientStore {
                     }
                     None => { connection.execute("INSERT INTO elo_selection.keep SELECT record_id FROM records WHERE kind != 'file.body'", [])?; }
                 }
+                connection.execute(
+                    &format!("DELETE FROM elo_selection.keep WHERE record_id IN (SELECT record_id FROM records WHERE {REDUNDANT_PRIVATE_SETTINGS})"),
+                    [private_settings_cursor],
+                )?;
                 connection.execute("ATTACH DATABASE ':memory:' AS elo_backup", [])?;
                 let result = copy_messages(connection, &schema, maximum);
                 let detached = connection.execute("DETACH DATABASE elo_backup", []);
@@ -122,7 +137,7 @@ fn copy_messages(
     ))?;
     let result = (|| {
         let transaction = connection.transaction()?;
-        for kind in ["table", "index", "trigger"] {
+        for kind in ["table", "index"] {
             let prefix = format!("CREATE {} ", kind.to_uppercase());
             for entry in schema.iter().filter(|entry| entry.0 == kind) {
                 let sql = entry.3.as_ref().ok_or(StoreError::UnrecognizedSchema)?;
@@ -139,6 +154,25 @@ fn copy_messages(
                 &format!("INSERT INTO elo_backup.{table} SELECT * FROM main.{table} {filter}"),
                 [],
             )?;
+        }
+        // The encrypted read-state cursor can exceed every retained inbox row.
+        // Keep SQLite's high-water mark even when all applied events are omitted,
+        // or newly received settings after restore would reuse consumed positions.
+        transaction.execute("DELETE FROM elo_backup.sqlite_sequence", [])?;
+        transaction.execute(
+            "INSERT INTO elo_backup.sqlite_sequence SELECT * FROM main.sqlite_sequence",
+            [],
+        )?;
+        // Install triggers after copying records: transport queue IDs in the
+        // image must preserve their original sequence, not be regenerated.
+        for entry in schema.iter().filter(|entry| entry.0 == "trigger") {
+            let definition = entry
+                .3
+                .as_ref()
+                .ok_or(StoreError::UnrecognizedSchema)?
+                .strip_prefix("CREATE TRIGGER ")
+                .ok_or(StoreError::UnrecognizedSchema)?;
+            transaction.execute_batch(&format!("CREATE TRIGGER elo_backup.{definition}"))?;
         }
         transaction.execute_batch(&format!("PRAGMA elo_backup.user_version={SCHEMA_VERSION}"))?;
         if transaction
@@ -185,14 +219,15 @@ impl ClientStore {
     pub(crate) async fn message_backup_plan(
         &self,
         action_targets: Vec<(RecordId, RecordId)>,
+        private_settings_cursor: i64,
     ) -> Result<MessageBackupPlan> {
         self.call(move |connection| {
             let mut records = Vec::new();
             let mut indices = BTreeMap::new();
             let mut statement = connection.prepare(
-                "SELECT record_id, kind, first_seen_local_ms FROM records WHERE kind != 'file.body' ORDER BY record_id",
+                &format!("SELECT record_id, kind, first_seen_local_ms FROM records WHERE kind != 'file.body' AND NOT ({REDUNDANT_PRIVATE_SETTINGS}) ORDER BY record_id"),
             )?;
-            let mut rows = statement.query([])?;
+            let mut rows = statement.query([private_settings_cursor])?;
             while let Some(row) = rows.next()? {
                 let id = row.get::<_, String>(0)?.parse::<RecordId>()?;
                 indices.insert(id, records.len());
@@ -324,7 +359,7 @@ mod tests {
             .unwrap();
         let original = store.backup_image(1024 * 1024).await.unwrap();
         let plan = store
-            .message_backup_plan(vec![(ids[4], ids[1])])
+            .message_backup_plan(vec![(ids[4], ids[1])], 0)
             .await
             .unwrap();
         assert_eq!(plan.required, vec![ids[0]]);
@@ -342,7 +377,7 @@ mod tests {
             keep.extend(&group.records);
         }
         let image = store
-            .selected_message_backup_image(1024 * 1024, Some(keep))
+            .selected_message_backup_image(1024 * 1024, Some(keep), 0)
             .await
             .unwrap();
         let path = temp.path().join("restored");
@@ -362,6 +397,136 @@ mod tests {
             );
         }
         assert_eq!(store.backup_image(1024 * 1024).await.unwrap(), original);
+        restored.close().await.unwrap();
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_backup_omits_applied_private_checkpoints_but_keeps_pending_and_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ClientStore::open(temp.path().join("source")).await.unwrap();
+        let target = DeliveryTarget {
+            peer_id: "11".repeat(32).parse().unwrap(),
+            mailbox_id: "22".repeat(32).parse().unwrap(),
+        };
+        let ids: Vec<RecordId> = (1..=4)
+            .map(|index| format!("{index:064x}").parse().unwrap())
+            .collect();
+        for (index, id) in ids.iter().enumerate() {
+            // Opaque synthetic bytes exercise export retention, not signatures.
+            let size = if index == 0 { 2 * 1024 * 1024 } else { 512 };
+            store
+                .commit_local_record_with_outbox(
+                    PreparedLocalRecord::new(
+                        *id,
+                        vec![index as u8; size],
+                        RecordMetadata::new("chat.private-settings", None, None, None).unwrap(),
+                        if index < 3 { vec![target] } else { vec![] },
+                        LocalTime::from_millis(index as u64).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = ids[0];
+        let held = ids[2];
+        store
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE outbox SET state='STORED',receipt_record=X'01' WHERE record_id=?1",
+                    [first.to_string()],
+                )?;
+                connection.execute(
+                    "UPDATE outbox SET state='HELD_STALE_CONFIG' WHERE record_id=?1",
+                    [held.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let original = store.backup_image(4 * 1024 * 1024).await.unwrap();
+        assert!(store.message_backup_image(1024 * 1024).await.is_err());
+        let plan = store.message_backup_plan(vec![], 3).await.unwrap();
+        assert_eq!(plan.required, ids[1..]);
+        assert!(plan.groups.is_empty());
+        let image = store
+            .selected_message_backup_image(1024 * 1024, None, 3)
+            .await
+            .unwrap();
+        let directory = temp.path().join("with-pending");
+        std::fs::create_dir(&directory).unwrap();
+        private_file(&directory.join("client.sqlite"))
+            .unwrap()
+            .write_all(&image)
+            .unwrap();
+        let restored = ClientStore::open(&directory).await.unwrap();
+        assert_eq!(restored.stats().await.unwrap().records, 3);
+        let incoming = restored.private_settings_sources(3).await.unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].1.record, ids[3]);
+        let retained: Vec<String> = restored
+            .call(|connection| {
+                Ok(connection
+                    .prepare("SELECT state FROM outbox ORDER BY record_id")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained, vec!["PENDING", "HELD_STALE_CONFIG"]);
+        restored.close().await.unwrap();
+        assert_eq!(store.backup_image(4 * 1024 * 1024).await.unwrap(), original);
+
+        store
+            .call(|connection| {
+                connection.execute("UPDATE outbox SET state='STORED',receipt_record=X'01'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .message_backup_plan(vec![], 4)
+                .await
+                .unwrap()
+                .required
+                .is_empty()
+        );
+        let image = store
+            .selected_message_backup_image(1024 * 1024, None, 4)
+            .await
+            .unwrap();
+        let directory = temp.path().join("all-applied");
+        std::fs::create_dir(&directory).unwrap();
+        private_file(&directory.join("client.sqlite"))
+            .unwrap()
+            .write_all(&image)
+            .unwrap();
+        let restored = ClientStore::open(&directory).await.unwrap();
+        assert_eq!(restored.stats().await.unwrap().records, 0);
+        let next: RecordId = format!("{:064x}", 5).parse().unwrap();
+        restored
+            .commit_local_record_with_outbox(
+                PreparedLocalRecord::new(
+                    next,
+                    vec![5; 512],
+                    RecordMetadata::new("chat.private-settings", None, None, None).unwrap(),
+                    vec![],
+                    LocalTime::from_millis(5).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let incoming = restored.private_settings_sources(4).await.unwrap();
+        assert_eq!(
+            incoming.len(),
+            1,
+            "new events must exceed the restored encrypted cursor"
+        );
+        assert_eq!(incoming[0].1.record, next);
+        assert_eq!(incoming[0].0, 5);
         restored.close().await.unwrap();
         store.close().await.unwrap();
     }
@@ -449,6 +614,31 @@ mod tests {
         restored.close().await.unwrap();
         store.close().await.unwrap();
     }
+    #[test]
+    fn private_checkpoint_backup_filter_does_not_rescan_every_delivery_for_each_record() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("            CREATE TABLE records(record_id TEXT PRIMARY KEY,kind TEXT);
+            CREATE TABLE private_settings_inbox(sequence INTEGER PRIMARY KEY,record_id TEXT UNIQUE);
+            CREATE TABLE outbox(record_id TEXT,state TEXT);
+            WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<1024)
+              INSERT INTO records SELECT printf('r%04d',v),'chat.private-settings' FROM n;
+            INSERT INTO private_settings_inbox SELECT CAST(substr(record_id,2) AS INTEGER),record_id FROM records;
+            INSERT INTO outbox SELECT record_id,CASE WHEN CAST(substr(record_id,2) AS INTEGER)%2=0 THEN 'STORED' ELSE 'PENDING' END FROM records;
+        ").unwrap();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT record_id FROM records WHERE {REDUNDANT_PRIVATE_SETTINGS}"
+            ))
+            .unwrap();
+        let ids: Vec<String> = statement
+            .query_map([512], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids.len(), 256);
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 100_000);
+    }
+
     #[test]
     fn backup_membership_filters_have_bounded_work_and_keep_only_matching_pairs() {
         let connection = Connection::open_in_memory().unwrap();

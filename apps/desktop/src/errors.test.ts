@@ -4,11 +4,21 @@ import { en } from "./locales/en";
 
 describe("native error presentation", () => {
   it("explains a native export failure instead of hiding it as cancellation", () => {
-    expect(presentError("file_export_failed")).toEqual({ message: en["error.fileExport"] });
+    expect(presentError("file_export_failed")).toEqual({
+      message: en["error.fileExport"],
+    });
+  });
+  it("offers the complete link when an invitation cannot fit in one image", () => {
+    expect(presentError("invitation_qr_image_too_large")).toEqual({
+      message: en["invite.qrImageTooLarge"],
+    });
   });
   it("explains cleanup errors without implying that logout failed", () => {
     for (const [reason, key] of [
-      ["profile_logout_notifications_pending", "profile.logoutNotificationsPending"],
+      [
+        "profile_logout_notifications_pending",
+        "profile.logoutNotificationsPending",
+      ],
       ["profile_logout_cleanup_pending", "profile.logoutCleanupPending"],
     ] as const) {
       expect(presentError(reason)).toEqual({ message: en[key] });
@@ -45,6 +55,10 @@ describe("native error presentation", () => {
         "recover.error.pairInterrupted",
       ],
       ["Chat permissions need to be refreshed.", "error.chatPermissionsStale"],
+      [
+        "This Space uses an unsupported access protocol.",
+        "error.spaceProtocolUnsupported",
+      ],
       [
         "Chat devices have changed. The chat owner needs to update access.",
         "error.chatDevicesChanged",

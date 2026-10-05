@@ -1,5 +1,6 @@
 //! Everyday chat creation uses an already authorized device, never a root key.
 use super::*;
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod tests;
@@ -20,6 +21,63 @@ pub(super) fn imported_kind(authority: &Authority, identity: IdentityId) -> Resu
 }
 
 impl ClientApp {
+    /// A linked owner has its own signing key. General's live owner grant may
+    /// authorize a new private namespace, never another device's old streams.
+    fn private_device_genesis(&self) -> Result<SignedRecord> {
+        let scope = &self
+            .team
+            .as_ref()
+            .ok_or("no active personal chat controller")?
+            .scope;
+        let general = self
+            .authorities
+            .0
+            .iter()
+            .find(|authority| {
+                authority.is_owner_managed()
+                    && authority.space() == scope.space
+                    && authority.stream() == scope.stream
+                    && authority.initial_controller().id() == scope.controller
+                    && self.pins.iter().any(|pin| {
+                        pin.space == scope.space
+                            && pin.stream == scope.stream
+                            && pin.root == scope.root
+                    })
+            })
+            .ok_or("no active personal chat controller")?;
+        self.require_controller(general)?;
+        let credential = self.session.credential();
+        // Reuse one namespace in this General and vault generation. Restoring
+        // a backup rotates transfer_nonce, so creating a new Space cannot
+        // reactivate an earlier private namespace with the same device key.
+        let hash = Sha256::digest(
+            [
+                b"elo.now/private-genesis/v3\0".as_slice(),
+                credential.id().as_bytes(),
+                self.session.transfer_nonce().as_bytes(),
+                scope.space.as_bytes(),
+                scope.stream.as_bytes(),
+            ]
+            .concat(),
+        );
+        let genesis = SpaceGenesis {
+            witness: None,
+            v: 3,
+            kind: "space.genesis".into(),
+            nonce: record::encode_hex(&hash[..16]),
+            issuer_identity: credential.identity(),
+            owners: vec![Owner {
+                identity_id: credential.identity(),
+                root_public_key: field(credential.record().body(), "root_public_key")?.into(),
+            }],
+            controller_credential_id: credential.id(),
+        };
+        Ok(SignedRecord::sign(
+            &serde_json::to_vec(&genesis)?,
+            self.session.signing_key(),
+        )?)
+    }
+
     /// Publish a legacy stream's stable category when its controller invites someone.
     /// The signed update preserves every participant, permission and recovery proof.
     pub(super) async fn ensure_chat_kind(&mut self, index: usize) -> Result<()> {
@@ -82,7 +140,7 @@ impl ClientApp {
             {
                 continue;
             }
-            // v1 initial Stream configs must be signed by the genesis device.
+            // Single-controller initial configs must be signed by the genesis device.
             // A recovered device cannot invent that signature or transplant
             // another Stream's config chain. Fail closed until the protocol
             // supports a recovery proof on an initial config.
@@ -90,15 +148,21 @@ impl ClientApp {
                 recovered = true;
                 continue;
             }
-            source = Some((a, genesis));
+            source = Some(a.genesis().clone());
             break;
         }
-        let (source, genesis) = source.ok_or(if recovered {
-            "new chat after controller recovery is not supported"
-        } else {
-            "no active personal chat controller"
-        })?;
-        let space = source.space();
+        let signed_genesis = match source {
+            Some(genesis) => genesis,
+            None => self.private_device_genesis().map_err(|_| {
+                if recovered {
+                    "new chat after controller recovery is not supported"
+                } else {
+                    "no active personal chat controller"
+                }
+            })?,
+        };
+        let genesis: SpaceGenesis = signed_genesis.decode()?;
+        let space: SpaceId = signed_genesis.id().to_string().parse()?;
         let stream = match requested_stream {
             Some(stream) => stream,
             None => record::random_hex::<16>()?.parse()?,
@@ -106,15 +170,16 @@ impl ClientApp {
         let c = self.session.credential();
         let root = &genesis.owners[0].root_public_key;
         let mut authority = Authority::new(
-            source.genesis().bytes(),
+            signed_genesis.bytes(),
             space,
             &root_key(root)?,
             c.clone(),
             stream,
         )?;
         let config = StreamConfig {
+            witness_evidence: None,
             chat_kind: Some(kind),
-            v: 1,
+            v: genesis.v,
             kind: "stream.config".into(),
             nonce: match requested_stream {
                 Some(stream) => stream.to_string(),
@@ -151,6 +216,20 @@ impl ClientApp {
         authority
             .commit_update(&self.store, record, self.session.age_identity(), now()?)
             .await?;
+        if !self.session.can_control(space) {
+            let previous_mode = self.session.controller_mode;
+            let previous_spaces = self.session.controller_spaces.clone();
+            let granted = self
+                .session
+                .activate_new_space_controller(space)
+                .map_err(Into::into)
+                .and_then(|()| self.persist_vault());
+            if let Err(error) = granted {
+                self.session.controller_mode = previous_mode;
+                self.session.controller_spaces = previous_spaces;
+                return Err(error);
+            }
+        }
         self.pins.push(Pin {
             personal_seed: Some(false),
             chat_kind: Some(kind),
@@ -162,8 +241,8 @@ impl ClientApp {
             created_at: now()?.as_millis(),
         });
         self.authorities.0.push(authority);
-        // No vault rewrite or controller activation: existing device grants
-        // remain unchanged. The new config and workspace are encrypted.
+        // Existing namespaces do not rewrite the vault. The new config and
+        // workspace remain encrypted, including device-created private chats.
         self.persist_workspace()?;
         Ok(())
     }

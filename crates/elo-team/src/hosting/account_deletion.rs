@@ -218,6 +218,7 @@ impl Host {
                 reservation.creator = None;
                 reservation.request_id.clear();
                 reservation.invitation = None;
+                reservation.reclaim_if_unclaimed = false;
                 reservation.contact_email = membership["contact_email"].as_str().map(str::to_owned);
                 save(&reservation_path, &reservation)?;
                 let mut config = space.config.clone();
@@ -294,12 +295,30 @@ pub(super) async fn request(
             .account_scopes(credential.identity())
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let evidence = elo_core::public_space::AdminEvidence {
+            record: request.record.clone(),
+            credential: request.credential.clone(),
+        };
+        // Refuse unprovable General removals before creating a durable job:
+        // a permanently pending erasure job would block unrelated members.
+        for id in &spaces {
+            let space = host
+                .spaces
+                .read()
+                .await
+                .get(id)
+                .cloned()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let client = space.client.lock().await;
+            client
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                .validate_account_deletion(&space.config, credential.identity(), Some(&evidence))
+                .map_err(|_| StatusCode::FORBIDDEN)?;
+        }
         let time = current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let job = Job {
-            proof: Some(elo_core::public_space::AdminEvidence {
-                record: request.record.clone(),
-                credential: request.credential.clone(),
-            }),
+            proof: Some(evidence),
             identity: credential.identity(),
             id: record::random_hex::<16>().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
             requested_at: time,
@@ -344,8 +363,10 @@ mod tests {
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };

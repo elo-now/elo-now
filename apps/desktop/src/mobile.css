@@ -327,7 +327,7 @@
     border-radius: 14px;
     flex-wrap: wrap;
   }
-  .composer[data-composer-expanded] {
+  .composer:focus-within {
     border-color: var(--elo-accent);
   }
   .composer textarea {
@@ -366,17 +366,13 @@
   .shell[data-mode="default"] .composer > .composer-attachment-uploading {
     padding-inline: calc(var(--elo-input-inset) - 3px);
   }
-  .composer > .composer-attachment + textarea {
-    flex-basis: calc(100% - 88px);
-  }
-  .composer[data-composer-expanded] > textarea,
-  .composer[data-message-expiry] > textarea {
+  .composer > textarea {
     flex-basis: 100%;
   }
-  .shell .composer[data-composer-expanded] > .composer-actions,
-  .shell .composer[data-message-expiry] > .composer-actions {
+  .shell[data-mode] .composer > .composer-actions {
     flex: 0 0 100%;
-    padding-left: calc(var(--elo-input-inset) - 3px);
+    padding: 4px calc(var(--elo-input-inset) - 3px) 8px;
+    gap: 4px;
   }
   .composer button:not(.attachment-cancel) {
     width: 44px;

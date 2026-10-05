@@ -29,7 +29,7 @@ internal object NotificationInbox {
         }
         saved.keys().asSequence().toList().sortedBy { saved.optLong(it) }.take((saved.length() - 1024).coerceAtLeast(0)).forEach { saved.remove(it) }
         val edit = prefs.edit().putString(READS, saved.toString())
-        for (key in listOf("notifications.nativeMessage", "notifications.nativeInvitation", "notifications.nativeActivity", "notifications.channelMessages", "notifications.channelInvitations")) {
+        for (key in listOf("notifications.nativeMessage", "notifications.nativeInvitation", "notifications.nativeActivity", "notifications.nativeSession", "notifications.channelMessages", "notifications.channelInvitations")) {
             args.labels[key]?.takeIf { it.length <= 160 }?.let { edit.putString(key, it) }
         }
         edit.commit()
@@ -38,7 +38,7 @@ internal object NotificationInbox {
             val data = active.notification.extras
             val scope = data.getString("elo_scope") ?: return@forEach
             val event = data.getString("elo_event") ?: ""
-            if (data.getString("elo_registration") != args.registration || scope !in args.scopes || saved.has("$scope:$event")) {
+            if (data.getString("elo_registration") != args.registration || scope !in args.scopes || saved.has("$scope:$event") || (data.containsKey("elo_expires") && data.getLong("elo_expires") <= System.currentTimeMillis())) {
                 manager.cancel(active.tag, active.id)
             }
         }
@@ -49,7 +49,8 @@ internal object NotificationInbox {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify("elo-wake:$scope", 71001, notification)
     }
-    fun metadata(registration: String?, scope: String, event: String) = Bundle().apply {
+    fun metadata(registration: String?, scope: String, event: String, expires: Long? = null) = Bundle().apply {
         putString("elo_registration", registration); putString("elo_scope", scope); putString("elo_event", event)
+        if (expires != null) putLong("elo_expires", expires)
     }
 }

@@ -25,6 +25,11 @@ import {
   usesNativePeer,
 } from "./nativePeer";
 import { nativeCallState } from "./sessionActivity";
+import {
+  activeSessions,
+  sessionAvailable,
+  type SessionStarted,
+} from "./sessionPresence";
 export class Calls {
   snapshot: Snapshot = {
     phase: "idle",
@@ -40,6 +45,11 @@ export class Calls {
   private subscriptionRetry?: ReturnType<typeof setTimeout>;
   private subscriptionBackoff = new Map<string, number>();
   private listeners = new Set<() => void>();
+  private sessionListeners = new Set<(event: SessionStarted) => void>();
+  private seenSessions = new Set<string>();
+  private endedSessions = new Set<string>();
+  private initializingSubscriptions = new Set<string>();
+  private revokedScopes = new Set<string>();
   private capture?: MediaStream;
   private nativeDirect = false;
   private nativeActivity?: {
@@ -49,10 +59,12 @@ export class Calls {
     context: Record<string, unknown>;
   };
   private activityQueue: Promise<void> = Promise.resolve();
+  private audioActivationReady?: string;
   private sessionWork = new Set<Promise<void>>();
   private refreshBeforeStart = false;
   private mediaStopping: Promise<void> = Promise.resolve();
   private speakerMuted = false;
+  private playbackRevision = 0;
   private screen?: MediaStream;
   private mediaChanging = false;
   private pendingMediaAdmission?: number;
@@ -103,6 +115,16 @@ export class Calls {
     };
   };
   getSnapshot = () => this.snapshot;
+  subscribeSessionStarted = (listener: (event: SessionStarted) => void) => {
+    this.sessionListeners.add(listener);
+    return () => {
+      this.sessionListeners.delete(listener);
+    };
+  };
+  private rememberSession(set: Set<string>, id: string) {
+    set.add(id);
+    if (set.size > 2048) set.delete(set.values().next().value!);
+  }
   dismissError = () => this.change({ error: undefined });
   private change(update: Partial<Snapshot>) {
     this.snapshot = { ...this.snapshot, ...update };
@@ -115,6 +137,10 @@ export class Calls {
       this.connections.clear();
       this.subscribed.clear();
       this.subscriptionBackoff.clear();
+      this.seenSessions.clear();
+      this.endedSessions.clear();
+      this.initializingSubscriptions.clear();
+      this.revokedScopes.clear();
       this.subscriptionCursor = 0;
       clearTimeout(this.subscriptionRetry);
       this.subscriptionRetry = undefined;
@@ -123,6 +149,16 @@ export class Calls {
     }
     this.view = view ?? undefined;
     if (!view) return;
+    const available = Object.fromEntries(
+      Object.entries(this.snapshot.available).filter(([, call]) =>
+        this.validate(call),
+      ),
+    );
+    if (
+      Object.keys(available).length !==
+      Object.keys(this.snapshot.available).length
+    )
+      this.change({ available });
     if (this.snapshot.active && !this.chatFor(this.snapshot.active))
       void this.leave("chat_unavailable");
     const active = this.snapshot.active;
@@ -239,6 +275,7 @@ export class Calls {
         )
           continue;
         attempts++;
+        this.initializingSubscriptions.add(key);
         try {
           const previous = this.snapshot.available[key];
           const result = await this.command(chat, { type: "subscribe" });
@@ -251,6 +288,7 @@ export class Calls {
           )
             continue;
           this.subscribed.set(key, chat.head);
+          this.revokedScopes.delete(key);
           this.subscriptionBackoff.delete(key);
           if (result.call) await this.presence(result.call);
           else if (previous && this.snapshot.available[key] === previous) {
@@ -265,6 +303,8 @@ export class Calls {
           // A rejected chat must not prevent other chats from receiving calls.
           // Transport failures still stop this pass to avoid repeated timeouts.
           if (reason !== "unauthorized" && reason !== "invalid") return;
+        } finally {
+          this.initializingSubscriptions.delete(key);
         }
       }
       // One signed command at a time; reserve the socket for interactive calls
@@ -315,8 +355,14 @@ export class Calls {
   }
   private async event(event: Result) {
     if (event.type === "presence" && event.call)
-      await this.presence(event.call);
+      await this.presence(
+        event.call,
+        this.subscribed.has(callKey(event.call)) &&
+          !this.initializingSubscriptions.has(callKey(event.call)),
+      );
     else if (event.type === "ended" || event.type === "access_revoked") {
+      if (event.type === "ended" && typeof event.call_id === "string")
+        this.rememberSession(this.endedSessions, event.call_id);
       const eventScope = event.scope as ActiveCall["scope"] | undefined;
       const matchesScope = (scope: ActiveCall["scope"]) =>
         scope.hosting_space_id === eventScope?.hosting_space_id &&
@@ -333,7 +379,10 @@ export class Calls {
             hosting_space_id: chat.space_context!,
             conversation: { space_id: chat.space, stream_id: chat.stream },
           };
-          if (matchesScope(scope)) this.subscribed.delete(scopeKey(chat));
+          if (matchesScope(scope)) {
+            this.subscribed.delete(scopeKey(chat));
+            this.revokedScopes.add(scopeKey(chat));
+          }
         }
       }
       const available = { ...this.snapshot.available };
@@ -362,19 +411,29 @@ export class Calls {
       if (generation !== this.generation) this.events = Promise.resolve();
     } else this.events = this.events.catch(() => {}).then(handle);
   }
-  private presence(call: ActiveCall): Promise<void> {
+  private presence(call: ActiveCall, announce = false): Promise<void> {
     const generation = this.generation;
     const task = this.presenceQueue
       .catch(() => {})
       .then(() => {
-        if (generation === this.generation) return this.applyPresence(call);
+        if (generation === this.generation)
+          return this.applyPresence(call, announce);
       });
     this.presenceQueue = task;
     return task;
   }
-  private async applyPresence(call: ActiveCall) {
+  private async applyPresence(call: ActiveCall, announce = false) {
     const chat = this.validate(call);
-    if (!chat || !this.view) return;
+    if (
+      !chat ||
+      !this.view ||
+      this.endedSessions.has(call.call_id) ||
+      this.revokedScopes.has(callKey(call))
+    )
+      return;
+    const known = this.snapshot.available[callKey(call)];
+    if (known?.call_id === call.call_id && known.key_epoch > call.key_epoch)
+      return;
     if (Object.keys(call.participants).length === 0) {
       const key = callKey(call);
       const known = this.snapshot.available[key];
@@ -387,12 +446,28 @@ export class Calls {
         await this.leave("call_empty");
       return;
     }
-    const known = this.snapshot.available[callKey(call)];
-    if (known?.call_id === call.call_id && known.key_epoch > call.key_epoch)
+    if (
+      known?.call_id === call.call_id &&
+      known.ready === true &&
+      call.ready !== true
+    )
       return;
-    this.change({
-      available: { ...this.snapshot.available, [callKey(call)]: call },
-    });
+    const available = { ...this.snapshot.available };
+    if (sessionAvailable(call)) available[callKey(call)] = call;
+    else if (known?.call_id === call.call_id) delete available[callKey(call)];
+    this.change({ available });
+    if (sessionAvailable(call) && !this.seenSessions.has(call.call_id)) {
+      this.rememberSession(this.seenSessions, call.call_id);
+      if (announce && call.started_by !== this.view.identity && !chat.muted) {
+        const session = activeSessions(this.view, { [callKey(call)]: call })[0];
+        if (session)
+          this.sessionListeners.forEach((listener) => {
+            try {
+              listener(session);
+            } catch {}
+          });
+      }
+    }
     if (!this.snapshot.active) return;
     if (call.call_id !== this.snapshot.active.call_id) return;
     if (
@@ -752,7 +827,12 @@ export class Calls {
         if (existing && !this.validate(existing))
           throw new Error("unauthorized");
         const available = { ...this.snapshot.available };
-        if (existing) available[scopeKey(chat)] = existing;
+        if (
+          existing &&
+          sessionAvailable(existing) &&
+          !this.endedSessions.has(existing.call_id)
+        )
+          available[scopeKey(chat)] = existing;
         else delete available[scopeKey(chat)];
         this.change({ available });
         this.refreshBeforeStart = false;
@@ -800,7 +880,11 @@ export class Calls {
           }).catch(() => {});
         return;
       }
-      if (!result.call || !this.validate(result.call))
+      if (
+        !result.call ||
+        !this.validate(result.call) ||
+        this.endedSessions.has(result.call.call_id)
+      )
         throw new Error("unauthorized");
       this.change({
         active: result.call,
@@ -834,6 +918,20 @@ export class Calls {
           ? current
           : admitted,
       );
+      // Ready means captured/admitted media: a direct session can wait for its
+      // first peer. Notification delivery must never interrupt that session.
+      if (
+        generation === this.generation &&
+        admitted.ready === true &&
+        admitted.started_by === identity &&
+        !existing
+      ) {
+        void operate({
+          ...requestContext(chat, identity),
+          op: "call_notify_ready",
+          call_id: admitted.call_id,
+        }).catch(() => {});
+      }
     } catch (error) {
       capture?.getTracks().forEach((t) => t.stop());
       if (generation !== this.generation) return;
@@ -1025,11 +1123,36 @@ export class Calls {
   isNativeDirect() {
     return this.nativeDirect;
   }
-  setSpeakerMuted(muted: boolean) {
+  audioOutputContext() {
+    const context = this.nativeActivity;
+    return context && this.audioActivationReady === context.activation
+      ? {
+          identity: context.identity,
+          sessionId: context.sessionId,
+          activation: context.activation,
+        }
+      : undefined;
+  }
+  async setSpeakerMuted(muted: boolean): Promise<boolean> {
+    const previous = this.speakerMuted;
+    const generation = this.generation;
+    const adapter = this.adapter;
+    const revision = ++this.playbackRevision;
     this.speakerMuted = muted;
-    void this.adapter?.setSpeakerMuted?.(muted).catch(() => {
-      if (this.snapshot.active) this.fail("unavailable");
-    });
+    try {
+      await adapter?.setSpeakerMuted?.(muted);
+      return true;
+    } catch {
+      if (
+        generation !== this.generation ||
+        adapter !== this.adapter ||
+        revision !== this.playbackRevision
+      )
+        return true;
+      this.speakerMuted = previous;
+      if (this.snapshot.active) this.change({ error: "audio_unavailable" });
+      return false;
+    }
   }
   localCapture() {
     return this.capture;
@@ -1060,10 +1183,19 @@ export class Calls {
   private setNativeActivity(active: boolean, camera = false) {
     const context = this.nativeActivity;
     if (!context) return Promise.resolve();
-    if (!active) this.nativeActivity = undefined;
+    if (!active) {
+      this.nativeActivity = undefined;
+      this.audioActivationReady = undefined;
+    }
     const work = this.activityQueue
       .catch(() => {})
-      .then(() => nativeCallState({ ...context, active, camera }));
+      .then(() => nativeCallState({ ...context, active, camera }))
+      .then(() => {
+        if (active && this.nativeActivity === context) {
+          this.audioActivationReady = context.activation;
+          this.change({});
+        }
+      });
     this.activityQueue = work;
     return work;
   }

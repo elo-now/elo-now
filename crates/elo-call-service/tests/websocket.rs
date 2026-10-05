@@ -56,6 +56,135 @@ async fn submit(socket: &mut Socket, request: elo_call_service::engine::Request)
 }
 
 #[tokio::test]
+async fn native_state_read_requires_signed_subscribe_and_current_admission_without_joining() {
+    let f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let start = f.request(
+        &f.owner,
+        Operation::Start {
+            kind: CallKind::Group,
+            initial_media: InitialMedia::Audio,
+        },
+        now(),
+        true,
+    );
+    let prepared = engine.prepare(start, None, now()).unwrap();
+    let call_id = engine
+        .execute(prepared, now())
+        .unwrap()
+        .call
+        .unwrap()
+        .call_id;
+    let media = f.request(
+        &f.owner,
+        Operation::Media {
+            call_id: call_id.clone(),
+            state: elo_core::calls::MediaState::default(),
+        },
+        now(),
+        false,
+    );
+    let prepared = engine.prepare(media, None, now()).unwrap();
+    engine.execute(prepared, now()).unwrap();
+    let gate = Arc::new(Gate(AtomicBool::new(true)));
+    let service = Service::new(engine, gate.clone(), 8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("http://{}", listener.local_addr().unwrap());
+    let ws = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
+    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let client = reqwest::Client::new();
+    let endpoint = format!("{host}/calls/v1/state");
+    let read = || f.request(&f.peer, Operation::Subscribe, now(), true);
+    let response: Value = client
+        .post(&endpoint)
+        .json(&read())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["call"]["call_id"], call_id);
+    assert_eq!(response["call"]["ready"], true);
+    assert_eq!(
+        response["call"]["participants"].as_object().unwrap().len(),
+        1,
+        "a state read never joins the recipient"
+    );
+    let join = f.request(
+        &f.peer,
+        Operation::Join {
+            call_id: call_id.clone(),
+        },
+        now(),
+        true,
+    );
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .json(&join)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let mut forged = read();
+    forged.command.push('A');
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .json(&forged)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    gate.0.store(false, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .json(&read())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    gate.0.store(true, Ordering::SeqCst);
+    let (mut owner, _) = connect_async(ws).await.unwrap();
+    submit(
+        &mut owner,
+        f.request(&f.owner, Operation::Leave { call_id }, now(), true),
+    )
+    .await;
+    receive(&mut owner, "result").await;
+    let response: Value = client
+        .post(endpoint)
+        .json(&read())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        response["call"].is_null(),
+        "ended calls cannot authorize a session-start hint"
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn simultaneous_starts_share_a_room_signals_are_targeted_and_host_revocation_stops_admission()
 {
     let f = Fixture::new(false);

@@ -15,13 +15,16 @@ class AttachmentSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
+        self.access_key = self.root / 'backup.key'
+        self.access_key.write_text('a' * 64)
+        self.access_key.chmod(0o600)
         self.data = b'synthetic ciphertext bytes'
         self.space, self.obj = 'a' * 64, 'b' * 32
         self.manifest = {'version': 1, 'spaces': {self.space: {
             'revision': 'c' * 64, 'objects': [{'object': self.obj, 'size': len(self.data),
                                               'sha256': hashlib.sha256(self.data).hexdigest()}]}}}
-        self.job = AttachmentSnapshot({'operator_url': 'http://127.0.0.1:18901'})
+        self.job = AttachmentSnapshot({'operator_url': 'http://127.0.0.1:18901', 'access_key_file': str(self.access_key)})
         def request(path):
             return io.BytesIO(json.dumps(self.manifest).encode() if path == '/backup/attachments' else self.data)
         self.patch = patch.object(self.job, 'request', side_effect=request)
@@ -43,7 +46,7 @@ class AttachmentSnapshotTests(unittest.TestCase):
                 with patch.object(self.job, 'request', side_effect=lambda p: io.BytesIO(
                         json.dumps(self.manifest).encode() if p == '/backup/attachments' else content)):
                     with self.assertRaises(ValueError):
-                        self.job.capture(Path(temporary))
+                        self.job.capture(Path(temporary).resolve())
 
     def test_concurrent_metadata_change_rejects_snapshot(self):
         before = self.job.capture(self.root)
@@ -68,3 +71,22 @@ class AttachmentSnapshotTests(unittest.TestCase):
         for url in ('https://example.test', 'http://127.0.0.1@evil.test', 'http://user:password@127.0.0.1', 'http://127.0.0.1/?secret'):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 AttachmentSnapshot({'operator_url': url})
+
+    def test_requests_authenticate_without_redirecting_or_exposing_key_in_url(self):
+        self.patch.stop()
+        with patch.object(self.job.http, 'open', return_value=io.BytesIO(b'{}')) as opened:
+            self.job.request('/backup/attachments')
+        request = opened.call_args.args[0]
+        self.assertEqual(request.full_url, 'http://127.0.0.1:18901/backup/attachments')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer ' + 'a' * 64)
+
+    def test_access_key_must_exist_be_private_and_not_be_a_symlink(self):
+        config = {'operator_url': 'http://127.0.0.1:18901', 'access_key_file': str(self.access_key)}
+        self.access_key.chmod(0o644)
+        with self.assertRaises(ValueError):
+            AttachmentSnapshot(config)
+        self.access_key.chmod(0o600)
+        link = self.root / 'key-link'
+        link.symlink_to(self.access_key)
+        with self.assertRaises(OSError):
+            AttachmentSnapshot({**config, 'access_key_file': str(link)})

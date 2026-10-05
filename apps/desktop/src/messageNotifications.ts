@@ -2,7 +2,12 @@ import type { Stream, View } from "./model";
 import type { StreamEntry } from "./streamFeed";
 import { replyRoot } from "./messageThreads";
 
-export type MessageLocation = { stream: string; thread?: string } | null;
+export type MessageLocation = {
+  stream: string;
+  space?: string;
+  space_context?: string;
+  thread?: string;
+} | null;
 
 /** The in-chat hint also applies to muted conversations. Arrival IDs come
  * from verified sync, never from an unread count or a history-page refresh. */
@@ -51,7 +56,13 @@ export function incomingMessages(
             !row.unread
           )
             return false;
-          if (location?.stream !== chat.stream) return true;
+          if (
+            location?.stream !== chat.stream ||
+            (location.space && location.space !== chat.space) ||
+            (location.space_context ?? view.active_space) !==
+              (chat.space_context ?? view.active_space)
+          )
+            return true;
           return (
             (row.body.payload?.thread_root ?? undefined) !== location?.thread
           );

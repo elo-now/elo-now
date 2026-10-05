@@ -704,6 +704,7 @@ mod cache_tests {
         use crate::authority::*;
         let root_key = encode_hex(root.verifying_key().as_bytes());
         let genesis = SpaceGenesis {
+            witness: None,
             v: version,
             kind: "space.genesis".into(),
             nonce: record::random_hex::<16>().unwrap(),
@@ -732,6 +733,7 @@ mod cache_tests {
         )
         .unwrap();
         let config = StreamConfig {
+            witness_evidence: None,
             v: version,
             kind: "stream.config".into(),
             nonce: record::random_hex::<16>().unwrap(),

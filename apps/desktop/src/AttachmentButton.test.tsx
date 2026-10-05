@@ -46,12 +46,26 @@ test("an active attachment download shows progress and a subtle cancel action", 
 });
 
 test("a deadline appears below the size and changes to Expired without renaming the file", () => {
-  const row = (expires: number) => ({ ...attachment, body: { ...attachment.body,
-    attachment: { name: "holiday-photo.jpg", plaintext_size: 1_153_434, expires_at_ms: expires },
-  } }) as MessageRow;
-  const render = (expires: number) => renderToStaticMarkup(
-    <AttachmentButton row={row(expires)} onDownload={() => {}} onCancel={() => {}} />,
-  );
+  const row = (expires: number) =>
+    ({
+      ...attachment,
+      body: {
+        ...attachment.body,
+        attachment: {
+          name: "holiday-photo.jpg",
+          plaintext_size: 1_153_434,
+          expires_at_ms: expires,
+        },
+      },
+    }) as MessageRow;
+  const render = (expires: number) =>
+    renderToStaticMarkup(
+      <AttachmentButton
+        row={row(expires)}
+        onDownload={() => {}}
+        onCancel={() => {}}
+      />,
+    );
   const html = render(Date.now() + 3_600_000);
   expect(html.indexOf("Expires:")).toBeGreaterThan(html.indexOf("1.1 MB"));
   expect(html).toContain("<time dateTime=");
@@ -64,8 +78,51 @@ test("a deadline appears below the size and changes to Expired without renaming 
 });
 
 test("manual removal is distinct from expiry and network failure", () => {
-  expect(attachmentFailure("This attachment has expired on the server.")).toBe("expired");
-  expect(attachmentFailure("This attachment was removed from the server.")).toBe("removed");
+  expect(attachmentFailure("This attachment has expired on the server.")).toBe(
+    "expired",
+  );
+  expect(
+    attachmentFailure("This attachment was removed from the server."),
+  ).toBe("removed");
   expect(attachmentFailure("Space server timed out.")).toBeUndefined();
-  expect(renderToStaticMarkup(<AttachmentButton row={attachment} serverState="removed" onDownload={() => {}} onCancel={() => {}} />)).toContain(">Removed</small>");
+  expect(
+    renderToStaticMarkup(
+      <AttachmentButton
+        row={attachment}
+        serverState="removed"
+        onDownload={() => {}}
+        onCancel={() => {}}
+      />,
+    ),
+  ).toContain(">Removed</small>");
+});
+
+test("invalid cached attachment deadlines do not crash or falsely mark a file expired", () => {
+  for (const expires of [
+    8_640_000_000_000_001,
+    Number.MAX_SAFE_INTEGER,
+    Infinity,
+    NaN,
+    -1,
+    0,
+    1.5,
+  ]) {
+    const row = {
+      ...attachment,
+      body: {
+        ...attachment.body,
+        attachment: {
+          name: "holiday-photo.jpg",
+          plaintext_size: 1_153_434,
+          expires_at_ms: expires,
+        },
+      },
+    } as MessageRow;
+    const html = renderToStaticMarkup(
+      <AttachmentButton row={row} onDownload={() => {}} onCancel={() => {}} />,
+    );
+    expect(html).toContain("holiday-photo.jpg");
+    expect(html).not.toContain('class="attachment-expiry"');
+    expect(html).not.toContain('disabled=""');
+  }
 });

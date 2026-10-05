@@ -1,5 +1,6 @@
 use super::*;
 use crate::calls::{self, Operation, SignalPayload};
+mod notifications;
 
 impl ClientApp {
     /// New content requires a recent, nonce-bound signed answer from the pinned

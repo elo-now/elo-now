@@ -2,6 +2,7 @@
   "notifications.nativeMessage": "New messages",
   "notifications.nativeInvitation": "New invitation",
   "notifications.nativeActivity": "New activity",
+  "notifications.nativeSession": "A chat session has started. Open elo.now to join.",
   "notifications.channelMessages": "Messages",
   "notifications.channelInvitations": "Invitations",
   "calls.nativeOngoing": "Chat session in progress",

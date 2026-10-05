@@ -38,6 +38,7 @@ pub(super) fn message(app: &ClientApp, index: usize, sequence: u64) -> SignedRec
             created_at: "2026-09-13T12:00:00Z".into(),
             parents: vec![],
             payload: TextPayload {
+                mentions: vec![],
                 expires_at_ms: None,
                 text: format!(
                     "Synthetic performance message {sequence}: {}",

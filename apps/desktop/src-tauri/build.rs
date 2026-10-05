@@ -8,6 +8,14 @@ fn main() {
         "ELO_SPACE_HOST_URL",
         "TAURI_ELO_SPACE_HOST_URL",
         "TAURI_ELO_WAKE_URL",
+        "ELO_STORAGE_URL",
+        "TAURI_ELO_STORAGE_URL",
+        "ELO_WITNESS_URL",
+        "TAURI_ELO_WITNESS_URL",
+        "ELO_WITNESS_PUBLIC_KEY",
+        "TAURI_ELO_WITNESS_PUBLIC_KEY",
+        "ELO_WITNESS_KEY_GENERATION",
+        "TAURI_ELO_WITNESS_KEY_GENERATION",
         "ELO_DISTRIBUTION_CHANNEL",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
@@ -22,6 +30,17 @@ fn main() {
         endpoints.host
     );
     println!("cargo:rustc-env=ELO_CONFIGURED_WAKE={}", endpoints.wake);
+    println!(
+        "cargo:rustc-env=ELO_CONFIGURED_STORAGE={}",
+        endpoints.storage.unwrap_or_default()
+    );
+    let witness = endpoints.witness.map(|(url, public_key, key_generation)| {
+        serde_json::json!({"url":url,"public_key":public_key,"key_generation":key_generation})
+    });
+    println!(
+        "cargo:rustc-env=ELO_CONFIGURED_WITNESS={}",
+        witness.map(|pin| pin.to_string()).unwrap_or_default()
+    );
     configure_team_replica();
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
@@ -38,10 +57,14 @@ fn main() {
             "attachment_transfer",
             "cancel_attachment_transfer",
             "operate",
+            "draft_load",
+            "draft_save",
             "realtime_context",
             "push_task",
+            "desktop_notification_task",
             "native_call_media",
             "native_call_state",
+            "native_call_audio",
             "choose_attachment",
             "stage_attachment",
             "discard_exchange",
@@ -51,6 +74,7 @@ fn main() {
             "share_cached_attachment",
             "open_mail_draft",
             "invitation_qr",
+            "save_invitation_qr",
             "copy_recovery_code",
             "release_policy",
             "check_release_policy",

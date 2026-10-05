@@ -17,6 +17,87 @@ fn start(kind: CallKind) -> Operation {
 }
 
 #[test]
+fn session_becomes_ready_only_after_the_initiators_first_media_and_stays_ready_when_muted() {
+    let f = Fixture::new(false);
+    let mut registry = Registry::new(Limits::default()).unwrap();
+    let command = f.command(&f.owner, start(CallKind::Group), NOW);
+    let scope = Scope::from(&command);
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let call = registry.presence(&scope).unwrap();
+    let id = call.call_id.clone();
+    assert!(!call.ready && call.ready_at.is_none());
+    assert!(
+        call.participants
+            .values()
+            .all(|p| !p.ready && p.media.audio_muted)
+    );
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.peer,
+                Operation::Join {
+                    call_id: id.clone(),
+                },
+                NOW,
+            ),
+            NOW,
+        )
+        .unwrap();
+    let media = Operation::Media {
+        call_id: id.clone(),
+        state: MediaState {
+            audio_muted: true,
+            ..MediaState::default()
+        },
+    };
+    registry
+        .apply(
+            &f.authority,
+            &f.command(&f.peer, media.clone(), NOW + 1),
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(!registry.presence(&scope).unwrap().ready);
+    registry
+        .apply(
+            &f.authority,
+            &f.command(&f.owner, media.clone(), NOW + 2),
+            NOW + 2,
+        )
+        .unwrap();
+    let call = registry.presence(&scope).unwrap();
+    assert!(call.ready && call.participants.values().all(|p| p.ready));
+    assert_eq!(call.ready_at, Some(NOW + 2));
+    registry
+        .apply(&f.authority, &f.command(&f.owner, media, NOW + 3), NOW + 3)
+        .unwrap();
+    assert_eq!(registry.presence(&scope).unwrap().ready_at, Some(NOW + 2));
+    registry
+        .apply(
+            &f.authority,
+            &f.command(
+                &f.owner,
+                Operation::Leave {
+                    call_id: id.clone(),
+                },
+                NOW + 4,
+            ),
+            NOW + 4,
+        )
+        .unwrap();
+    assert!(registry.presence(&scope).unwrap().ready);
+    registry
+        .apply(
+            &f.authority,
+            &f.command(&f.peer, Operation::Leave { call_id: id }, NOW + 4),
+            NOW + 4,
+        )
+        .unwrap();
+    assert!(registry.presence(&scope).is_none());
+}
+
+#[test]
 fn concurrent_start_intents_share_one_call_and_identity_uses_only_one_device() {
     for direct in [true, false] {
         let f = Fixture::new(direct);

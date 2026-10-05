@@ -108,3 +108,46 @@ test("muted conversations suppress new messages and replies without losing unrea
     incomingMessages(muted, ["new", "reply"], null).map((e) => e.row.id),
   ).toEqual(["new", "reply"]);
 });
+
+test("an open chat suppresses only its full scope while identical stream IDs in other Spaces still notify", () => {
+  const current = {
+    ...source.streams[0],
+    space_context: "work",
+    rows: [row("current")],
+  };
+  const otherHost = {
+    ...current,
+    space_context: "friends",
+    rows: [row("other-host")],
+  };
+  const otherSpace = {
+    ...current,
+    space: "another-space",
+    rows: [row("other-space")],
+  };
+  const view = {
+    ...source,
+    active_space: "work",
+    streams: [current],
+    all_streams: [current, otherHost, otherSpace],
+  };
+  const location = {
+    space: current.space,
+    stream: current.stream,
+    space_context: "work",
+  };
+  const ids = ["current", "other-host", "other-space"];
+  expect(
+    incomingMessages(view, ids, location).map((entry) => entry.row.id),
+  ).toEqual(["other-host", "other-space"]);
+  // The active Space is the normalized context when its summary omits it.
+  expect(
+    incomingMessages(view, ids, { ...location, space_context: undefined }).map(
+      (entry) => entry.row.id,
+    ),
+  ).toEqual(["other-host", "other-space"]);
+  current.space_context = undefined as never;
+  expect(
+    incomingMessages(view, ids, location).map((entry) => entry.row.id),
+  ).toEqual(["other-host", "other-space"]);
+});

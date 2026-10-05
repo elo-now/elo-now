@@ -1,5 +1,38 @@
 import { messageCreatedAt, type Stream, type View } from "./model";
 import type { HistoryPage } from "./messageHistory";
+import { messageIdentity, replyRoot } from "./messageThreads";
+
+export type BuzzFilter = "all" | "mentions" | "threads";
+
+/** Explicit opt-outs override automatic subscriptions from participation. */
+export function followedThread(
+  chat: Stream,
+  root: string,
+  identity: string,
+): boolean {
+  if (chat.unfollowed_threads?.includes(root)) return false;
+  if (chat.followed_threads?.includes(root)) return true;
+  if (chat.participating_threads?.includes(root)) return true;
+  return chat.rows.some(
+    (row) =>
+      row.body.issuer_identity === identity &&
+      (replyRoot(row) === root ||
+        (!replyRoot(row) && messageIdentity(row) === root)),
+  );
+}
+
+export function filterBuzzEntries(
+  entries: StreamEntry[],
+  filter: BuzzFilter,
+  identity: string,
+): StreamEntry[] {
+  if (filter === "all") return entries;
+  return entries.filter(({ chat, row }) =>
+    filter === "mentions"
+      ? row.body.payload?.mentions?.includes(identity)
+      : !!replyRoot(row) && followedThread(chat, replyRoot(row)!, identity),
+  );
+}
 
 export type StreamEntry = {
   key: string;

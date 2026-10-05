@@ -5,16 +5,18 @@ import {
   senderName,
   type View,
 } from "./model";
+import { t } from "./i18n";
 
 export type KnownPerson = {
   id: string;
   name: string;
   initials: string;
   chats: string[];
+  self?: boolean;
 };
 
 /** Explicitly saved cards and verified current memberships, never a global directory. */
-export function knownPeople(view: View): KnownPerson[] {
+export function knownPeople(view: View, includeSelf = false): KnownPerson[] {
   const people = new Map<string, KnownPerson>();
   const services = generalServiceIdentities(view);
   for (const contact of view.contacts ?? []) {
@@ -67,9 +69,32 @@ export function knownPeople(view: View): KnownPerson[] {
       }
     }
   }
-  return [...people.values()].sort(
+  const sorted = [...people.values()].sort(
     (a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id),
   );
+  if (includeSelf) {
+    const name = profileName(view) || view.identity.slice(0, 8);
+    sorted.unshift({
+      id: view.identity,
+      name: t("dm.selfName", { name }),
+      initials: senderInitials(view, view.identity),
+      chats: [t("dm.selfLabel")],
+      self: true,
+    });
+  }
+  return sorted;
+}
+
+/** Notes is a private destination, never an additional group recipient. */
+export function toggleDirectPerson(
+  selected: string[],
+  id: string,
+  own: string,
+): string[] {
+  if (selected.includes(id)) return selected.filter((value) => value !== id);
+  if (id === own) return [own];
+  const others = selected.filter((value) => value !== own);
+  return others.length < 999 ? [...others, id] : others;
 }
 
 export function findPeople(
@@ -89,6 +114,8 @@ export function findPeople(
 }
 
 export function directName(view: View, people: KnownPerson[]): string {
+  if (people.length === 1 && people[0].id === view.identity)
+    return t("dm.selfLabel");
   const names = [
     ...(people.length === 1
       ? []

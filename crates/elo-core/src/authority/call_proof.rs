@@ -135,10 +135,34 @@ impl CallAuthorityProof {
     /// The Space ID is content-addressed. This proves its chain, not admission
     /// to a deployment or freshness beyond the server's known configuration.
     pub fn verify(&self, space: SpaceId, stream: StreamId) -> Result<Authority> {
+        self.verify_with_witness(space, stream, None)
+    }
+
+    /// The caller supplies a trusted deployment pin, never one read from this proof.
+    /// Freshness and a persisted rollback floor are separate caller requirements.
+    pub fn verify_witnessed(
+        &self,
+        space: SpaceId,
+        stream: StreamId,
+        pin: &WitnessPin,
+    ) -> Result<Authority> {
+        pin.validate()?;
+        self.verify_with_witness(space, stream, Some(pin))
+    }
+
+    fn verify_with_witness(
+        &self,
+        space: SpaceId,
+        stream: StreamId,
+        pin: Option<&WitnessPin>,
+    ) -> Result<Authority> {
         self.check_size()?;
         let decode = |s: &str| STANDARD.decode(s).map_err(|_| RecordError::Json);
         let genesis = SignedRecord::parse(&decode(&self.genesis)?)?;
         let body: SpaceGenesis = genesis.decode()?;
+        if body.witness.as_ref() != pin || (body.v == 4) != pin.is_some() {
+            return Err(RecordError::Authority);
+        }
         let root = body
             .owners
             .iter()

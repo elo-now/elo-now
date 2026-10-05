@@ -2,6 +2,16 @@
 
 This guide is for a **new, empty installation** on Debian 13 or Oracle Linux 10. It uses one VPS and one public application origin. It covers hosted Spaces and encrypted messages, attachments, chat audio/video sessions, and optional mobile notifications. There is no migration from the publisher's installation and no requirement for `api.elo.now`.
 
+The configuration below is the baseline without an independent witness. Current
+development sources also include witnessed General and a separate attachment
+broker; those changes are not retroactively included in published build 1114.
+For that staged path, follow [witness deployment](../deploy/witness/README.md)
+and the [attachment broker instructions](../crates/elo-storage/README.md).
+They require a host separate from the API, independently provisioned matching
+pins in clients and services, and the documented activation and acceptance
+checks. A single API-origin override does not enable either integration. The
+single-VPS instructions below do not establish the witness trust boundary.
+
 The examples use `chat.example.org` for the app API and media WebSocket, and `turn.example.org` for TURN on the same VPS. Replace both names throughout. Keep all private files and credentials **outside the source checkout**. Never put an SSH password, MEGA password, Firebase service account, APNs key, LiveKit secret or TURN secret in the mobile/desktop app.
 
 Debian 13 is the deployment path exercised by this project. Oracle Linux 10 follows the same service layout, but still requires its own end-to-end acceptance run, especially package availability, SELinux policy and media ports. Do not present an untested OEL10 installation as verified.
@@ -89,6 +99,7 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
   "max_space_creations_per_day": 32,
   "mailbox_quota_bytes": 150000000,
   "call_admission_key": "/etc/elo/host/admission.key",
+  "backup_access_key": "/etc/elo/host/backup-access.key",
   "attachment_storage": {
     "provider": "local",
     "root": "/var/lib/elo/attachments"
@@ -151,7 +162,7 @@ Start the host on loopback:
 /opt/elo/bin/elo-team host --config /etc/elo/host/config.json --bind 127.0.0.1:18900
 ```
 
-The process also binds a private operator listener at `127.0.0.1:18901`. Calls use only its `/internal/calls/admission` route. **Never proxy or expose port 18901 publicly.**
+The process also binds a private operator listener at `127.0.0.1:18901`. Calls use only its `/internal/calls/admission` route. Backup inventory and ciphertext exports require a separate `backup_access_key`: exactly 64 lowercase hexadecimal characters (256 random bits), in a mode-0600 file readable by hosting and the root backup job. Without that configured key, backup routes return 404; missing or incorrect bearer authorization returns 401. Do not reuse the call-admission key. **Never proxy or expose port 18901 publicly.**
 
 ## 5. LiveKit, TURN and call control
 
@@ -368,11 +379,15 @@ Create a root-owned mode-0600 `/etc/elo-backup/config.json` with:
   "destination": "/var/backups/elo-operations",
   "offsite_url": "http://127.0.0.1:18930/REPLACE_WITH_PRIVATE_COLLECTION/operations-backups",
   "retention_days": 7,
-  "attachments": {"operator_url": "http://127.0.0.1:18901", "max_bytes": 1073741824}
+  "attachments": {
+    "operator_url": "http://127.0.0.1:18901",
+    "access_key_file": "/etc/elo/host/backup-access.key",
+    "max_bytes": 1073741824
+  }
 }
 ```
 
-Adapt paths to the deployment; every listed path must exist. Install `backup.py`, `online_snapshot.py` and `attachment_snapshot.py` together in `/opt/elo/hosting/`, create the destination directory with mode 0700, install the units, run `systemctl start elo-backup`, and verify its successful result before enabling `elo-backup.timer`.
+Adapt paths to the deployment; every listed path must exist and use canonical directory components without symlinks. Privileged runs accept only the fixed `/etc/elo-backup/config.json`, which must be a root-owned mode-0600 regular file; a caller cannot select a different config with `--config`. Install the scripts and their parent directories as root-owned and not writable by service users. Install `backup.py`, `online_snapshot.py` and `attachment_snapshot.py` together in `/opt/elo/hosting/`, create the destination directory with mode 0700, install the units, run `systemctl start elo-backup`, and verify its successful result before enabling `elo-backup.timer`.
 
 Snapshots use SQLite's online backup API, including committed WAL data. Persistent database observers and before/after file inventories reject a capture that overlaps a committed write, file replacement, deletion or configuration change. The job retries three times; sustained writes can make the backup fail rather than publish inconsistent state. It never stops application services. Plain staging files live only in a private temporary directory under the backup destination and are removed after encryption or failure; service-manager cleanup and the next locked job remove interrupted staging after a forced termination or machine shutdown. Allow free disk for staging plus encrypted output. Each capture has a two-minute budget. The timer runs daily; VPS and MEGA retention is seven days. Old local snapshots are pruned only after a new capture succeeds. Failed transfers remain local for retry. Inspect `systemctl status elo-backup` and the last successful off-site object; an enabled timer is not proof of a successful backup.
 
@@ -384,14 +399,29 @@ For an independently controlled copy, run `pull_backup.py --config /private/path
   "ssh_key": "/private/path/server-ssh-key",
   "age_key": "/private/path/offline-backup.agekey",
   "age": "/usr/local/bin/age",
-  "destination": "/private/path/independent-backups"
+  "destination": "/private/path/independent-backups",
+  "required_paths": ["/var/lib/elo/host", "/var/lib/elo/wake", "/var/lib/elo/call", "/etc/elo"],
+  "require_attachments": true
 }
 ```
 
-Keep this configuration and destination private. SSH host-key verification is mandatory and agent forwarding is disabled. The remote account needs permission to invoke the encrypted-only listing/export commands of `/opt/elo/hosting/backup.py`; use a narrowly scoped sudo policy for a dedicated backup reader. Schedule the pull on that separate computer (for example an hourly launchd agent on macOS), not from the VPS. The server receives no access to the local directory or decryption key. Remote deletion never propagates locally. Each downloaded archive is decrypted to a discard sink to check authentication before retention; at least two local copies survive retention, including during an extended outage. Review that separate retention policy against your own deletion obligations. The computer must be available regularly; this is not immutable cloud storage or an offline key copy. Each run fetches only the newest remote snapshot. The inventory is limited to 256 KiB; transfers are bounded to 2 GiB per archive and five minutes. The pull stops before its local directory exceeds 8 GiB or free disk falls below a 2 GiB reserve. It preserves existing copies when these limits prevent a download; review capacity and successful-pull status rather than deleting the last known-good copies.
+Keep this configuration and destination private. SSH host-key verification is mandatory and agent forwarding is disabled. Schedule the pull on that separate computer, not from the VPS. The server receives no access to the local directory or decryption key. Remote deletion never propagates locally.
+
+Age decryption verifies ciphertext integrity, **not who created a snapshot**: anyone with the server's public recipient can encrypt replacement data. The pull therefore never automatically deletes independent copies. Its bounded checks verify archive structure, the locally configured `required_paths`, and every attachment's length and SHA-256 against the manifest, without extracting archive paths. These checks detect missing or corrupt contents, but do not authenticate a compromised server's state. Keep older recovery points until an operator rehearses recovery and explicitly retires them; remote snapshots must not authorize pruning. This is not immutable cloud storage or an offline key copy.
+
+Each run fetches only the newest remote snapshot. The inventory is limited to 256 KiB; transfers are bounded to 2 GiB per archive and five minutes. Archive validation has a two-minute budget, 100,000-member limit and 8 GiB expanded-byte bound. The pull stops before its local directory exceeds 8 GiB or free disk falls below a 2 GiB reserve. It preserves all existing copies when these limits prevent a download. Plan independent capacity and monitor successful pulls. `required_paths` must match the server's configured snapshot roots; set `require_attachments` to false only for an intentionally state/configuration-only backup.
+
+A dedicated backup reader needs only the exact encrypted export commands. For sudo 1.9.10 or newer, a scoped policy can use argument regular expressions (adapt only the account name):
+
+```sudoers
+Cmnd_Alias ELO_BACKUP_READ = /usr/bin/python3 /opt/elo/hosting/backup.py --list-encrypted, /usr/bin/python3 ^/opt/elo/hosting/backup[.]py --read-encrypted elo-ops-[0-9]{8}T[0-9]{6}Z[.]tar[.]gz[.]age$
+elo-backup-reader ALL=(root) NOPASSWD: ELO_BACKUP_READ
+```
+
+Validate the policy with `visudo -cf` and test that `--config`, arbitrary Python, snapshot creation and extra arguments are rejected. Never delegate `/usr/bin/python3` or a wildcard `backup.py *`. Keep the script, imported helper modules and every parent directory root-owned and non-writable by the reader. The fixed-config restriction is defense in depth, not a replacement for the scoped sudo policy.
 
 
-With `attachments` configured, the archive also includes the **encrypted attachment bytes** under `elo-attachments/spaces/<space>/<object>` and a manifest. The loopback operator API lists committed uploads and available attachments, never plaintext filenames or decryption keys. The job streams them through the configured storage provider, verifies each length and SHA-256, captures the databases, and checks that the complete attachment metadata has not changed. An unavailable Space, missing/corrupt object, concurrent change or exhausted budget fails the snapshot instead of publishing an incomplete copy. Deleting, expired, already deleted and known-missing objects are not restorable attachments and are excluded; reserved uploads are not yet committed. New metadata invalidates the before/after check, including objects that were subsequently deleted during capture.
+With `attachments` configured, the archive also includes the **encrypted attachment bytes** under `elo-attachments/spaces/<space>/<object>` and a manifest. The loopback operator API lists committed uploads and available attachments, never plaintext filenames or decryption keys. The job streams them through the configured storage provider, verifies each length and SHA-256, captures the databases, and checks that the complete attachment metadata has not changed. A reservation is omitted from the attachment inventory only before any configuration or invitation was published. An unavailable configured Space, missing/corrupt object, concurrent change or exhausted budget fails the snapshot instead of publishing an incomplete copy. Deleting, expired, already deleted and known-missing objects are not restorable attachments and are excluded; reserved uploads are not yet committed. New metadata invalidates the before/after check, including objects that were subsequently deleted during capture.
 
 The default attachment budget is 1 GiB per attempt, with a ten-minute transfer budget, a 6 MiB per-object bound and a 2 GiB free-disk reserve. Configure sufficient space for staging, archive output and independent retention; the total allocation limit of the hosting service can exceed this backup budget. Sustained attachment mutations can exhaust the three attempts. Monitor actual successful backups. Omitting `attachments` intentionally makes a state/configuration-only backup. This is not a full operating-system image.
 
@@ -409,7 +439,7 @@ The host shares four SQLite worker slots across profiles. The notification relay
 
 ### Isolate the local attachment bridge
 
-A loopback bind is not authorization between local users. Restrict MEGA's WebDAV port to the hosting service UID, attachment daemon UID and root using an nftables output rule. Cover both `127.0.0.1` and `::1`, persist it with the existing firewall configuration, and verify that a request as `elo-wake` or `elo-call` is rejected while hosting still works. Do not expose or log the private WebDAV collection URL. Bound wake and MEGA service memory and task counts as well as the hosting service. Keep key-only SSH, disable root/password/X11 access after testing a separate key connection, and retain a guarded rollback until that check succeeds.
+A loopback bind is not authorization between local users. The backup bearer key authenticates the caller, not the local server process: another user able to bind an unavailable port can impersonate its listener. Protect port ownership with separate network namespaces or an authenticated local transport before treating that boundary as isolated. The online SQLite capture still parses service-owned databases in the backup process; the no-follow regular-file reads do not sandbox SQLite or eliminate its path-based open race. Moving database capture into a restricted service-UID worker remains necessary for a hostile-local-service threat model. Restrict MEGA's WebDAV port to the hosting service UID, attachment daemon UID and root using an nftables output rule. Cover both `127.0.0.1` and `::1`, persist it with the existing firewall configuration, and verify that a request as `elo-wake` or `elo-call` is rejected while hosting still works. Do not expose or log the private WebDAV collection URL. Bound wake and MEGA service memory and task counts as well as the hosting service. Keep key-only SSH, disable root/password/X11 access after testing a separate key connection, and retain a guarded rollback until that check succeeds.
 
 ## Coordinated device-security upgrade
 

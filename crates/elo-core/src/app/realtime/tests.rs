@@ -18,6 +18,7 @@ impl Fixture {
         let outsider = Session::create().unwrap().0;
         let root = recovery.recover_root(owner.identity_id()).unwrap();
         let genesis = SpaceGenesis {
+            witness: None,
             v: 1,
             kind: "space.genesis".into(),
             nonce: record::random_hex::<16>().unwrap(),
@@ -75,6 +76,7 @@ impl Fixture {
         authority
             .apply_config(
                 StreamConfig {
+                    witness_evidence: None,
                     v: 1,
                     kind: "stream.config".into(),
                     nonce: record::random_hex::<16>().unwrap(),
@@ -1180,6 +1182,7 @@ async fn native_targets_interoperate_with_loopback_relay_and_durable_catchup() {
                 created_at: "2026-10-01T12:00:00Z".into(),
                 parents: vec![],
                 payload: TextPayload {
+                    mentions: vec![],
                     text: "Durable message after a live hint".into(),
                     expires_at_ms: None,
                     sender_name: None,

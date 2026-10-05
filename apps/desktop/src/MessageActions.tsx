@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { MessageEditor } from "./MessageEditor";
 import { MessageContent } from "./MessageContent";
 import { ScreenHeader } from "./ScreenHeader";
 import { EmptyState } from "./EmptyState";
@@ -28,6 +29,7 @@ import { BlockingProvider, BlockUserAction } from "./BlockedUsers";
 import { MessageDebug } from "./MessageDebug";
 import { useExpiringRows } from "./useMessageExpiry";
 import type { MessageExpiryHours } from "./messageExpiry";
+import { timestampIso } from "./timestamps";
 
 import reactionChoices from "../../../protocol/reactions.json";
 export type MessageCollection =
@@ -48,8 +50,13 @@ const ActionsContext = createContext<{
   ) => void;
   react: (chat: Stream, row: Row, emoji: string) => void;
   chooseReaction: (chat: Stream, row: Row, trigger: HTMLButtonElement) => void;
+  edit: (chat: Stream, row: Row) => void;
   busy: boolean;
 } | null>(null);
+
+export function useEditMessage() {
+  return useContext(ActionsContext)?.edit;
+}
 
 /** Shared by the timeline and its one-level threads; status keeps its own control. */
 export function MessageMore({
@@ -167,7 +174,7 @@ export function MessageActionsProvider({
     null,
   );
   const [panel, setPanel] = useState<
-    "menu" | "reaction" | "remind" | "delete" | "expiry"
+    "menu" | "reaction" | "remind" | "delete" | "expiry" | "edit"
   >("menu");
   const [busy, setBusy] = useState(false);
   const pending = useRef(false);
@@ -260,7 +267,10 @@ export function MessageActionsProvider({
   }, [view.identity, view.revision, expiredReminders, mobile]);
   const currentChat =
     (view.all_streams ?? view.streams).find(
-      (chat) => chat.stream === selection?.chat.stream,
+      (chat) =>
+        chat.stream === selection?.chat.stream &&
+        chat.space === selection?.chat.space &&
+        chat.space_context === selection?.chat.space_context,
     ) ?? selection?.chat;
   const selectedRow =
     currentChat?.rows.find((row) => row.id === selection?.row.id) ??
@@ -283,6 +293,19 @@ export function MessageActionsProvider({
     <BlockingProvider view={view} onChange={onChange}>
       <ActionsContext.Provider
         value={{
+          edit: (chat, row) => {
+            if (
+              busy ||
+              !chat.can_post ||
+              chat.forked ||
+              row.local_echo ||
+              row.body.kind !== "chat.message" ||
+              row.body.issuer_identity !== view.identity
+            )
+              return;
+            setPanel("edit");
+            setSelection({ chat, row, anchor: new DOMRect() });
+          },
           busy,
           react,
           chooseReaction: (chat, row, trigger) => {
@@ -384,7 +407,9 @@ export function MessageActionsProvider({
                       ? "messageActions.deleteTitle"
                       : panel === "expiry"
                         ? "messageActions.deleteAfter"
-                        : "messageActions.more",
+                        : panel === "edit"
+                          ? "messageActions.edit"
+                          : "messageActions.more",
               )}
               anchor={
                 panel === "menu" || panel === "reaction"
@@ -425,6 +450,13 @@ export function MessageActionsProvider({
                       {menuItem("messageActions.remind", () =>
                         setPanel("remind"),
                       )}
+                      {currentRow.body.issuer_identity === view.identity &&
+                        currentRow.body.kind === "chat.message" &&
+                        menuItem(
+                          "messageActions.edit",
+                          () => setPanel("edit"),
+                          !currentChat.can_post || currentChat.forked,
+                        )}
                       {currentRow.body.issuer_identity === view.identity &&
                         currentRow.body.kind === "chat.message" &&
                         menuItem(
@@ -491,6 +523,23 @@ export function MessageActionsProvider({
                     </>
                   )}
                 </>
+              ) : panel === "edit" ? (
+                <MessageEditor
+                  view={view}
+                  chat={currentChat}
+                  row={currentRow}
+                  busy={busy}
+                  onCancel={close}
+                  onSave={(text, mentions) =>
+                    void run(() =>
+                      signedAction(currentChat, currentRow, {
+                        type: "edit",
+                        text,
+                        mentions,
+                      }),
+                    )
+                  }
+                />
               ) : panel === "expiry" ? (
                 <div className="message-expiry-picker">
                   <p>{t("messageActions.expiryDescription")}</p>
@@ -771,7 +820,7 @@ function MessageCollectionView({
             >
               {due !== undefined && (
                 <div className="reminder-time" data-due={due <= time}>
-                  {formatTimestamp(new Date(due).toISOString())}
+                  {formatTimestamp(timestampIso(due))}
                   {due <= time && (
                     <span className="reminder-overdue">
                       {t("reminders.overdue")}

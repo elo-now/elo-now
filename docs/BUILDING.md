@@ -21,7 +21,11 @@ From `apps/desktop`:
 npm run tauri -- dev
 ```
 
-The normal source build does not embed access to the publisher's Demo services. No production credentials are required to compile it. A configured remote Space requires its operator's invitation and infrastructure.
+The default source build uses the public `https://api.elo.now` service origin,
+without embedding demo access credentials or private service configuration. Set
+`TAURI_ELO_API_URL` for a self-hosted build. No production credentials are required
+to compile it; joining a remote Space requires its operator's invitation and
+infrastructure.
 
 For a local release binary:
 
@@ -34,10 +38,18 @@ The Desktop release workflow packages macOS (`.dmg` for Apple Silicon and Intel)
 platform credentials and must stay outside the repository.
 
 The download workflow applies an ad hoc signature to the complete macOS app
-bundle and verifies its resource seal before packaging. This is an integrity
+bundle and verifies its resource seal from the final, read-only mounted DMG. This is an integrity
 check, not Developer ID signing or notarization. A local equivalent is
 `npm run tauri -- build --bundles app,dmg --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'`.
 Use the appropriate distribution identity instead when preparing a signed release.
+
+Touch ID profile unlocking on macOS requires enrolled biometrics and a valid
+app signature with access to the data-protection Keychain. The app stores only a
+device-local wrapping key there, protected by the current biometric enrollment.
+Ad hoc builds without the required Keychain entitlement keep password unlocking
+available and do not offer Touch ID enrollment. Do not add a restricted
+application-identifier entitlement to an ad hoc bundle: use an authorized signing
+identity and the matching entitlements and provisioning profile where required.
 
 Future runs of the Desktop release workflow stage only final installers, generate
 SHA256SUMS, and attest their provenance in a separate job with no build scripts.
@@ -139,11 +151,21 @@ the matching archive/dSYM UUID for each delivered build.
 The workspace also builds the service executables:
 
 ```sh
-cargo build --locked -p elo-cli -p elo-team -p elo-wake -p elo-call-service
+cargo build --locked -p elo-cli -p elo-team -p elo-wake -p elo-call-service -p elo-witness -p elo-storage
 cargo run --locked -p elo-cli -- --help
 ```
 
 Provision your own Replica, Space enrollment service and optional wake service. Live service configuration, infrastructure addresses and private access capabilities are deliberately not supplied in this repository. Use HTTPS and keep private configuration outside the checkout.
+
+This development source also contains the witnessed General and independent
+attachment broker paths. They are not retroactively part of published build
+1114. Building their executables does not enable or validate a deployment. Follow
+[witness deployment](../deploy/witness/README.md) and the
+[attachment broker instructions](../crates/elo-storage/README.md), including the
+separate host, trust-pin provisioning, sealed startup and acceptance requirements.
+Both client integrations are disabled when their build settings are absent.
+Keep the broker on loopback and its client endpoint unset in distributed builds
+until the documented rollout checks are complete.
 
 Set `TAURI_ELO_API_URL` when building a private mobile application, for example `https://chat.example.test`. One HTTPS origin supplies hosted creation at `/spaces/v1/create` and the optional wake service. An explicit private origin has no fallback to the official service. Without an override this source tree builds the official client for `https://api.elo.now`; DNS and services must be provisioned before that client is distributed.
 
@@ -155,6 +177,8 @@ The optional Tauri `mobile-push` feature enables the native push plugin. Its bui
 | --- | --- |
 | `TAURI_ELO_API_URL` | Single HTTPS origin; forwarded by Tauri to Xcode/Gradle. Plain `ELO_API_URL` also works with direct Cargo builds. |
 | `TAURI_ELO_SPACE_HOST_URL`, `TAURI_ELO_WAKE_URL` | Explicit separate overrides; the host value must include `/spaces/v1/create`, while wake is an HTTPS origin. Cannot be combined with the API-origin setting. `ELO_SPACE_HOST_URL` is the direct Cargo alias. |
+| `TAURI_ELO_WITNESS_URL`, `TAURI_ELO_WITNESS_PUBLIC_KEY`, `TAURI_ELO_WITNESS_KEY_GENERATION` | Staged witness integration; configure all three together. The HTTPS URL must end in `/witness/v1`, with the independently verified 64-character lowercase Ed25519 public key and positive key generation. Matching plain `ELO_` aliases are available for direct Cargo builds. |
+| `TAURI_ELO_STORAGE_URL` | Staged independent broker endpoint ending in `/storage/v1`; plain `ELO_STORAGE_URL` is the direct Cargo alias. Never inferred from the API origin. Leave unset until rollout checks pass. |
 | `TAURI_ELO_FIREBASE_IOS` | Absolute path to your Firebase iOS client plist |
 | `TAURI_ELO_FIREBASE_ANDROID` | Path to your Firebase Android client JSON |
 | `TAURI_ELO_ANDROID_SIGNING` | Absolute path to a private Android signing configuration |
@@ -175,7 +199,7 @@ See [API compatibility and required updates](API_COMPATIBILITY.md) before changi
 server contracts or setting a minimum application version. Release discovery is
 additive; cryptographic protocol changes need a separately verified rollout.
 
-For a fresh installation on Debian 13 or Oracle Linux 10, follow the [complete self-hosting guide](SELF_HOSTING.md). It identifies each service, private configuration file, public endpoint, storage choice, TLS route and acceptance check. The publisher's credentials and infrastructure are not included.
+For a fresh baseline installation without a witness on Debian 13 or Oracle Linux 10, follow the [single-VPS self-hosting guide](SELF_HOSTING.md). It identifies each service, private configuration file, public endpoint, storage choice, TLS route and acceptance check. The witnessed path additionally requires the separate-host setup linked above. The publisher's credentials and infrastructure are not included.
 
 ## Checks
 

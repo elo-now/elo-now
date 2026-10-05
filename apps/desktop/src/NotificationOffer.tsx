@@ -22,9 +22,11 @@ export function shouldOfferNotifications(
 export function NotificationOffer({
   onAccept,
   onDecline,
+  help,
 }: {
   onAccept: () => void;
   onDecline: () => void;
+  help?: string;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -43,7 +45,7 @@ export function NotificationOffer({
       }}
     >
       <h2 id="notification-offer-title">{t("notifications.offerTitle")}</h2>
-      <p>{t("notifications.offerHelp")}</p>
+      <p>{help ?? t("notifications.offerHelp")}</p>
       <div className="dialog-buttons">
         <button type="button" className="secondary" onClick={onDecline}>
           {t("notifications.notNow")}

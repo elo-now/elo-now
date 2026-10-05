@@ -12,7 +12,7 @@ use axum::{
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use elo_core::ids::{IdentityId, RecordId, SpaceId};
 use serde_json::json;
@@ -223,8 +223,78 @@ impl Service {
 pub fn app(service: Arc<Service>) -> Router {
     Router::new()
         .route("/calls/v1/connect", get(upgrade))
+        .route("/calls/v1/state", post(current_state))
         .route("/calls/v1/health", get(|| async { StatusCode::NO_CONTENT }))
         .with_state(service)
+}
+/// Native notification senders read current presence using the same signed
+/// Subscribe operation and hosting admission as a WebSocket. This route cannot
+/// start, join, renew or publish media for a participant.
+async fn current_state(
+    State(service): State<Arc<Service>>,
+    request: axum::extract::Request,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let permit = service
+        .verification
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(request.into_body(), MAX_FRAME),
+    )
+    .await
+    .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
+    .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    let request: Request = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let job = service
+        .engine
+        .lock()
+        .await
+        .preparation(request, None)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let (job, (command, identity), permit) = tokio::task::spawn_blocking(move || {
+        let authenticated = job.authenticate(now());
+        authenticated.map(|value| (job, value, permit))
+    })
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    .map_err(|_| StatusCode::FORBIDDEN)?;
+    if !matches!(command.operation, elo_core::calls::Operation::Subscribe) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !matches!(
+        service
+            .admission
+            .device_allowed(
+                command.hosting_space_id,
+                identity,
+                command.credential_id,
+                command.scope,
+                command.config_id
+            )
+            .await,
+        Ok(true)
+    ) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (prepared, _permit) =
+        tokio::task::spawn_blocking(move || job.verify(now()).map(|prepared| (prepared, permit)))
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+    let mut engine = service.engine.lock().await;
+    let expired = engine.registry.tick(now());
+    let applied = engine.execute(prepared, now());
+    let mut events = engine.take_events();
+    events.extend(expired);
+    drop(engine);
+    service
+        .publish_media(events)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let applied = applied.map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(axum::Json(json!({"call":applied.call})))
 }
 async fn upgrade(State(service): State<Arc<Service>>, ws: WebSocketUpgrade) -> impl IntoResponse {
     let Ok(permit) = service.connections.clone().try_acquire_owned() else {

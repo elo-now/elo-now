@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SpaceContactInput } from "./SpaceContact";
+import {
+  AttachmentStorageForm,
+  attachmentStorageRequest,
+  emptyAttachmentStorage,
+} from "./AttachmentStorageForm";
 import { ScreenHeader } from "./ScreenHeader";
 import { InvitationCode } from "./InvitationFlow";
 import { useToast } from "./Toast";
@@ -27,6 +32,12 @@ export function SpaceCreate({
     view.space_creation?.require_approval ?? true,
   );
   const [busy, setBusy] = useState(false);
+  const [attachmentStorage, setAttachmentStorage] = useState(() =>
+    emptyAttachmentStorage(
+      view.space_creation?.attachment_storage_pending ?? false,
+    ),
+  );
+  const pending = useRef(false);
   const alive = useRef(true);
   useEffect(() => {
     alive.current = true;
@@ -34,19 +45,22 @@ export function SpaceCreate({
       alive.current = false;
     };
   }, []);
-  const { reportError } = useToast();
+  const { reportError, showError, onInvalid } = useToast();
   const creation = view.space_creation;
+  const ready = !!creation?.invitation && !creation.attachment_storage_pending;
   const call = async (request: Record<string, unknown>) => {
     const reply = await invoke<{ view: View }>("operate", {
       request: { ...request, expected_identity: view.identity },
     });
     if (alive.current) onView(reply.view);
+    return reply.view;
   };
   const finish = async () => {
     if (busy) return;
     setBusy(true);
     try {
-      if (creation?.space) await call({ op: "space_setup_done" });
+      if (creation?.space && !creation.attachment_storage_pending)
+        await call({ op: "space_setup_done" });
       onBack();
     } catch (error) {
       reportError(error);
@@ -57,11 +71,11 @@ export function SpaceCreate({
   return (
     <section className="spaces-page">
       <ScreenHeader
-        title={creation?.invitation ? t("spaces.created") : t("spaces.create")}
+        title={ready ? t("spaces.created") : t("spaces.create")}
         onBack={busy ? undefined : () => void finish()}
       />
       <div className="settings-page">
-        {creation?.invitation ? (
+        {ready && creation?.invitation ? (
           <>
             <p className="page-description">
               {t("spaces.createdHelp", { name: creation.name })}
@@ -85,9 +99,11 @@ export function SpaceCreate({
         ) : (
           <form
             className="space-create-form"
+            onInvalid={onInvalid}
             onSubmit={(event) => {
               event.preventDefault();
-              if (busy) return;
+              if (pending.current) return;
+              pending.current = true;
               setBusy(true);
               void call({
                 op: "space_create",
@@ -96,13 +112,32 @@ export function SpaceCreate({
                 message_lifetime_seconds:
                   creation?.message_lifetime_seconds ?? messageLifetime,
                 require_approval: creation?.require_approval ?? requireApproval,
+                ...(view.attachment_storage_available
+                  ? {
+                      attachment_storage:
+                        attachmentStorageRequest(attachmentStorage),
+                    }
+                  : {}),
               })
+                .then((next) => {
+                  if (
+                    alive.current &&
+                    !next.space_creation?.attachment_storage_pending
+                  )
+                    setAttachmentStorage(emptyAttachmentStorage());
+                })
                 .catch(async (error) => {
                   if (!alive.current) return;
-                  reportError(error);
+                  if (
+                    attachmentStorage.enabled ||
+                    creation?.attachment_storage_pending
+                  )
+                    showError(t("spaces.attachments.creationFailed"));
+                  else reportError(error);
                   await call({ op: "space_list" }).catch(() => {});
                 })
                 .finally(() => {
+                  pending.current = false;
                   if (alive.current) setBusy(false);
                 });
             }}
@@ -158,9 +193,25 @@ export function SpaceCreate({
               />
               <span>{t("spaces.requireApproval")}</span>
             </label>
+            {view.attachment_storage_available && (
+              <AttachmentStorageForm
+                value={attachmentStorage}
+                onChange={setAttachmentStorage}
+                disabled={busy}
+              />
+            )}
+            {creation?.attachment_storage_pending && (
+              <p className="caption muted" role="status">
+                {t("spaces.attachments.creationPending")}
+              </p>
+            )}
             {creation && <p className="muted">{t("spaces.resumeHelp")}</p>}
             <p id="space-hosting-limits" className="space-hosting-limits muted">
-              {t("spaces.hostingLimits")}
+              {t(
+                view.attachment_storage_available
+                  ? "spaces.hostingLimitsExternalAttachments"
+                  : "spaces.hostingLimits",
+              )}
             </p>
             <button
               type="submit"

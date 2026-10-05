@@ -10,7 +10,8 @@ import UIKit
 import UserNotifications
 
 private struct NativeMediaArgs: Decodable { let payload: String }
-private struct CallStateArgs: Decodable { let active: Bool; let sessionId: String; let camera: Bool }
+private struct CallStateArgs: Decodable { let active: Bool; let sessionId: String; let activation: String; let camera: Bool; let routeChannel: Channel? }
+private struct CallAudioArgs: Decodable { let sessionId: String; let activation: String; let outputId: String? }
 private struct PushRegisterArgs: Decodable { let registration: String; let background: Bool? }
 private struct PushAckArgs: Decodable { let opened: String?; let wake: String? }
 private struct PushStatusListenerArgs: Decodable { let channel: Channel }
@@ -29,6 +30,7 @@ private struct PushStatus: Encodable {
     let opened: String?
     let token: String?
     let challenge: String?
+    let delivered: [[String: String]]
 }
 
 final class EloPushPlugin: Plugin, MessagingDelegate {
@@ -85,9 +87,19 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         let args = try invoke.parseArgs(CallStateArgs.self)
         Task { @MainActor in
             do {
-                try ChatSessionAudio.shared.set(active: args.active, id: args.sessionId)
+                try ChatSessionAudio.shared.set(active: args.active, id: args.sessionId, activation: args.activation) {
+                    _ = try? args.routeChannel?.send(["sessionId": args.sessionId, "activation": args.activation])
+                }
                 invoke.resolve()
             } catch { invoke.reject("unavailable") }
+        }
+    }
+
+    @objc func callAudio(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(CallAudioArgs.self)
+        Task { @MainActor in
+            do { invoke.resolve(try ChatSessionAudio.shared.route(id: args.sessionId, activation: args.activation, outputId: args.outputId)) }
+            catch { invoke.reject("unavailable") }
         }
     }
 
@@ -127,6 +139,9 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             prefs.set(challenge, forKey: "elo.push.challenge")
         } else if data["elo_wake"] as? String == "1", let target = data["elo_target"] as? String,
                   target.count <= 2048, target.range(of: "^[A-Za-z0-9_-]{64,}$", options: .regularExpression) != nil {
+            if data["elo_category"] as? String == "session_start",
+               PushInbox.isExpired(DeliveredPush(identifier: "", deliveredAt: Date().timeIntervalSince1970, data: data),
+                   now: Date().timeIntervalSince1970) { return }
             prefs.set(target, forKey: "elo.push.wake")
             if opened { prefs.set(target, forKey: "elo.push.opened") }
         } else { return }
@@ -147,6 +162,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             guard let self = self, self.configure() else {
                 invoke.reject("Notifications are not configured."); return
             }
+            PushBadge.invalidate(prefs: self.prefs)
             self.prefs.set(args.registration, forKey: "elo.push.registration")
             self.prefs.removeObject(forKey: "elo.push.challenge")
             self.prefs.set(true, forKey: "elo.push.enabled")
@@ -204,50 +220,41 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         try? statusChannel?.send([:] as [String: Bool])
     }
     @objc func status(_ invoke: Invoke) {
-        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
-            guard let self = self else { invoke.reject("Notifications are unavailable."); return }
-            invoke.resolve(PushStatus(available: FirebaseApp.app() != nil,
-                enabled: self.prefs.bool(forKey: "elo.push.enabled"),
-                permission: settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
-                registration: self.prefs.string(forKey: "elo.push.registration"),
-                wake: self.prefs.string(forKey: "elo.push.wake"), opened: self.prefs.string(forKey: "elo.push.opened"),
-                token: self.prefs.string(forKey: "elo.push.installation-id"), challenge: self.prefs.string(forKey: "elo.push.challenge")))
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self] settings in
+            center.getDeliveredNotifications { notifications in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { invoke.reject("Notifications are unavailable."); return }
+                    let enabled = self.prefs.bool(forKey: "elo.push.enabled")
+                    let registration = self.prefs.string(forKey: "elo.push.registration")
+                    let now = Date().timeIntervalSince1970
+                    let reads = self.prefs.dictionary(forKey: "elo.push.reads") as? [String: Double] ?? [:]
+                    let delivered = enabled ? PushInbox.pendingMessages(
+                        Self.inbox(notifications), registration: registration ?? "",
+                        reads: Set(reads.filter { $0.value > now }.keys), now: now
+                    ) : []
+                    invoke.resolve(PushStatus(available: FirebaseApp.app() != nil,
+                        enabled: enabled,
+                        permission: settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
+                        registration: registration,
+                        wake: self.prefs.string(forKey: "elo.push.wake"), opened: self.prefs.string(forKey: "elo.push.opened"),
+                        token: self.prefs.string(forKey: "elo.push.installation-id"), challenge: self.prefs.string(forKey: "elo.push.challenge"),
+                        delivered: delivered))
+                }
+            }
         }
+    }
+    private static func inbox(_ notifications: [UNNotification]) -> [DeliveredPush] {
+        notifications.map { DeliveredPush(identifier: $0.request.identifier,
+            deliveredAt: $0.date.timeIntervalSince1970, data: $0.request.content.userInfo) }
     }
     @objc func reconcile(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PushReconcileArgs.self)
         DispatchQueue.main.async { [self] in
-            guard prefs.bool(forKey: "elo.push.enabled"),
-                  prefs.string(forKey: "elo.push.registration") == args.registration else { invoke.resolve(); return }
-            let time = Date().timeIntervalSince1970
-            var reads = (prefs.dictionary(forKey: "elo.push.reads") as? [String:Double] ?? [:]).filter { $0.value > time }
-            for receipt in args.receipts.prefix(1024) {
-                guard let scope = receipt["scope"], let event = receipt["event"],
-                      scope.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
-                      event.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { continue }
-                reads[scope + ":" + event] = time + 86400
-            }
-            for key in reads.keys.sorted(by: { reads[$0, default: 0] < reads[$1, default: 0] }).prefix(max(0, reads.count - 1024)) { reads.removeValue(forKey: key) }
-            prefs.set(reads, forKey: "elo.push.reads")
-            let acknowledged = reads
-            let center = UNUserNotificationCenter.current()
-            center.getDeliveredNotifications { [self] notifications in
-                DispatchQueue.main.async { [self] in
-                    guard prefs.bool(forKey: "elo.push.enabled"), prefs.string(forKey: "elo.push.registration") == args.registration else { invoke.resolve(); return }
-                    var remove: [String] = []
-                    var remaining = false
-                    for notification in notifications {
-                        let data = notification.request.content.userInfo
-                        guard data["elo_wake"] as? String == "1", let scope = data["elo_scope"] as? String else { continue }
-                        let event = data["elo_event"] as? String ?? ""
-                        if data["elo_registration"] as? String != args.registration || !args.scopes.contains(scope) || acknowledged[scope + ":" + event] != nil {
-                            remove.append(notification.request.identifier)
-                        } else { remaining = true }
-                    }
-                    center.removeDeliveredNotifications(withIdentifiers: remove)
-                    // iOS has no dot-only badge. One indicates unread activity; it is not a message total.
-                    center.setBadgeCount(args.unread || remaining ? 1 : 0) { _ in invoke.resolve() }
-                }
+            PushBadge.reconcile(registration: args.registration, unread: args.unread,
+                receipts: args.receipts, scopes: args.scopes, prefs: prefs) { error in
+                if error != nil { invoke.reject("Could not update notification badge.") }
+                else { invoke.resolve() }
             }
         }
     }
@@ -262,6 +269,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
     }
     @objc func disable(_ invoke: Invoke) {
         DispatchQueue.main.async { [self] in
+            PushBadge.invalidate(prefs: prefs)
             waiting?.reject("Notification setup was cancelled.")
             waiting = nil
             registrationAttempt = nil

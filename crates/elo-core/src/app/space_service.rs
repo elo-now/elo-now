@@ -1578,7 +1578,8 @@ mod transport_tests {
                     true,
                 )
                 .await
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .to_string();
             let creation_expected = match code {
                 429 => {

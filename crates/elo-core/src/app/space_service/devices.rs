@@ -45,6 +45,11 @@ impl ClientApp {
         if !admitted {
             return Err("Join this Space using an invitation first.".into());
         }
+        if !self.authorities.0[0].head()?.members.iter().any(|member| {
+            member.identity_id == target.identity() && member.credential_ids.contains(&target.id())
+        }) {
+            return Err("Choose a device currently admitted to this Space.".into());
+        }
         // Tombstone precedes config publication and remains effective if updating
         // General is interrupted. Every hosted endpoint consults this registry.
         replica.revocations().insert(&proof)?;

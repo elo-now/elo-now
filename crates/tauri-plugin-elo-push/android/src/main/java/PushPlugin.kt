@@ -41,7 +41,10 @@ class ReconcileArgs { var registration: String = ""; var unread: Boolean = false
 class StatusListenerArgs { lateinit var channel: Channel }
 
 @InvokeArg
-class CallStateArgs { var active: Boolean = false; var sessionId: String = ""; var camera: Boolean = false }
+class CallStateArgs { var active: Boolean = false; var sessionId: String = ""; var activation: String = ""; var camera: Boolean = false; var routeChannel: Channel? = null }
+
+@InvokeArg
+class CallAudioArgs { var sessionId: String = ""; var activation: String = ""; var outputId: String? = null }
 
 @TauriPlugin
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
@@ -162,12 +165,23 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(CallStateArgs::class.java)
         activity.runOnUiThread {
             try {
-                ChatSessions.update(activity, args.sessionId, args.active, args.camera) { error ->
-                    if (error == null) invoke.resolve() else invoke.reject(error)
+                ChatSessions.update(activity, args.sessionId, args.activation, args.active, args.camera) { error ->
+                    if (error == null) {
+                        ChatSessionAudio.listen(args.sessionId, args.activation, if (args.active) ({ args.routeChannel?.send(JSObject().put("sessionId", args.sessionId).put("activation", args.activation)); Unit }) else null)
+                        invoke.resolve()
+                    } else invoke.reject(error)
                 }
             } catch (_: RuntimeException) {
                 invoke.reject("Open the app and allow microphone or camera access to join a chat session.")
             }
+        }
+    }
+    @Command
+    fun callAudio(invoke: Invoke) {
+        val args = invoke.parseArgs(CallAudioArgs::class.java)
+        activity.runOnUiThread {
+            try { invoke.resolve(ChatSessionAudio.route(args.sessionId, args.activation, args.outputId)) }
+            catch (_: RuntimeException) { invoke.reject("unavailable") }
         }
     }
     @Command

@@ -2,39 +2,144 @@ import {
   useEffect,
   useLayoutEffect,
   useRef,
+  useId,
+  useState,
   type ComponentPropsWithoutRef,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import { useRealtimePresentation } from "./useRealtime";
+import { pastedImage } from "./composerClipboard";
+import { t } from "./i18n";
+import {
+  insertMention,
+  mentionQuery,
+  mentionIdentities,
+  reconcileMentions,
+  type ComposerMention,
+  type MentionCandidate,
+} from "./composerMentions";
+import "./composerMentions.css";
+import { useEditMessage } from "./MessageActions";
+import type { Stream } from "./model";
 
 /** Share draft sizing between the conversation and its thread. */
 export function ComposerInput({
   inputRef,
-  resetRevision,
+  onPasteImage,
+  mentionCandidates = [],
+  mentions = [],
+  onDraftChange,
+  onEditLatest,
+  editTarget,
   ...props
 }: ComponentPropsWithoutRef<"textarea"> & {
   inputRef?: RefObject<HTMLTextAreaElement | null>;
-  resetRevision?: number;
+  onPasteImage?: (file: File) => void;
+  mentionCandidates?: MentionCandidate[];
+  mentions?: ComposerMention[];
+  onDraftChange?: (text: string, mentions: ComposerMention[]) => void;
+  onEditLatest?: () => void;
+  editTarget?: { chat: Stream; row: Stream["rows"][number] };
 }) {
   const localRef = useRef<HTMLTextAreaElement>(null);
   const realtime = useRealtimePresentation();
+  const editMessage = useEditMessage();
   useEffect(() => {
     if (!props.value || props.disabled) realtime.typing(false);
   }, [props.value, props.disabled]);
   const input = inputRef ?? localRef;
-  const setExpanded = (expanded: boolean) => {
-    const form = input.current?.form;
-    if (!form) return;
-    if (expanded) form.dataset.composerExpanded = "true";
-    else delete form.dataset.composerExpanded;
+  const listId = useId();
+  const [caret, setCaret] = useState<number>();
+  const [activeOption, setActiveOption] = useState(0);
+  const [dismissed, setDismissed] = useState<string>();
+  const [position, setPosition] = useState({
+    left: 0,
+    bottom: 0,
+    width: 0,
+    maxHeight: 240,
+  });
+  const text = typeof props.value === "string" ? props.value : "";
+  const query =
+    caret !== undefined && onDraftChange && !props.disabled && !props.readOnly
+      ? mentionQuery(text, caret)
+      : undefined;
+  const queryKey = query ? `${query.start}:${query.end}:${query.query}` : "";
+  const selectedIdentities = mentionIdentities(text, mentions);
+  const options =
+    query && dismissed !== queryKey
+      ? mentionCandidates
+          .filter(
+            (candidate) =>
+              (selectedIdentities.length < 32 ||
+                selectedIdentities.includes(candidate.identity_id)) &&
+              candidate.label
+                .toLocaleLowerCase()
+                .includes(query.query.toLocaleLowerCase()),
+          )
+          .slice(0, 8)
+      : [];
+  const open = options.length > 0;
+  useEffect(() => setActiveOption(0), [queryKey]);
+  useEffect(() => {
+    if (open)
+      document
+        .getElementById(
+          `${listId}-${Math.min(activeOption, options.length - 1)}`,
+        )
+        ?.scrollIntoView({ block: "nearest" });
+  }, [activeOption, open]);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const rect = input.current?.getBoundingClientRect();
+      if (rect)
+        setPosition({
+          left: Math.max(
+            8,
+            Math.min(
+              rect.left,
+              window.innerWidth - Math.min(rect.width, 360) - 8,
+            ),
+          ),
+          bottom: window.innerHeight - rect.top + 6,
+          width: Math.min(rect.width, 360, window.innerWidth - 16),
+          maxHeight: Math.min(
+            240,
+            Math.max(
+              44,
+              rect.top - (window.visualViewport?.offsetTop ?? 0) - 8,
+            ),
+          ),
+        });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+    };
+  }, [open, queryKey, input]);
+  const selectMention = (candidate: MentionCandidate) => {
+    if (!query || !onDraftChange) return;
+    const next = insertMention(text, mentions, query, candidate);
+    if (props.maxLength && next.text.length > props.maxLength) return;
+    onDraftChange(next.text, next.mentions);
+    setCaret(undefined);
+    input.current?.focus({ preventScroll: true });
+    requestAnimationFrame(() =>
+      input.current?.setSelectionRange(next.caret, next.caret),
+    );
+    realtime.typing(true);
   };
   const resize = () => {
     const node = input.current;
     if (!node || !node.getClientRects().length) return;
     const style = getComputedStyle(node);
-    const minimum =
-      Number.parseFloat(style.minHeight) *
-      (node.form?.dataset.composerExpanded === "true" ? 3 : 1);
+    const minimum = Number.parseFloat(style.minHeight);
     const maximum = Math.max(
       minimum,
       (window.visualViewport?.height ?? window.innerHeight) / 3,
@@ -46,11 +151,10 @@ export function ComposerInput({
     node.style.height = "0px";
     const height = Math.max(minimum, node.scrollHeight + borders);
     node.style.height = `${Math.min(height, maximum)}px`;
-    node.style.overflowY = height > maximum ? "auto" : "hidden";
+    // CSS can impose a smaller desktop cap than the viewport limit.
+    node.style.overflowY =
+      node.scrollHeight > node.clientHeight ? "auto" : "hidden";
   };
-  useLayoutEffect(() => {
-    setExpanded(false);
-  }, [resetRevision]);
   // Includes preference changes and restored drafts, not just keystrokes.
   useLayoutEffect(resize);
   useLayoutEffect(() => {
@@ -71,103 +175,163 @@ export function ComposerInput({
     viewport?.addEventListener("resize", resize);
     window.addEventListener("resize", resize);
     document.fonts.addEventListener("loadingdone", resize);
-    const form = node.form;
-    let outsidePointer = false;
-    let finishFrame = 0;
-    const finishEditing = () => {
-      cancelAnimationFrame(finishFrame);
-      finishFrame = requestAnimationFrame(() => {
-        setExpanded(false);
-        resize();
-      });
-    };
-    // WebKit can blur the textarea without focusing the tapped button. Keep
-    // the editing layout until the user actually leaves this composer, so a
-    // chip cannot move or disappear between touch-down and click.
-    const focusChanged = (event: FocusEvent) => {
-      const inside = event.target instanceof Node && !!form?.contains(event.target);
-      if (inside) {
-        cancelAnimationFrame(finishFrame);
-        setExpanded(true);
-        resize();
-      } else if (!outsidePointer) finishEditing();
-    };
-    const pointerDown = (event: PointerEvent) => {
-      cancelAnimationFrame(finishFrame);
-      outsidePointer = event.target instanceof Node && !form?.contains(event.target);
-    };
-    const pointerFinished = () => {
-      if (outsidePointer) {
-        outsidePointer = false;
-        // Wait until the click target is fixed before moving the message list.
-        finishEditing();
-      }
-    };
-    document.addEventListener("focusin", focusChanged);
-    document.addEventListener("pointerdown", pointerDown, true);
-    document.addEventListener("click", pointerFinished, true);
-    document.addEventListener("pointercancel", pointerFinished, true);
     return () => {
       observer.disconnect();
-      cancelAnimationFrame(finishFrame);
       cancelAnimationFrame(resizeFrame);
       viewport?.removeEventListener("resize", resize);
       window.removeEventListener("resize", resize);
       document.fonts.removeEventListener("loadingdone", resize);
-      document.removeEventListener("focusin", focusChanged);
-      document.removeEventListener("pointerdown", pointerDown, true);
-      document.removeEventListener("click", pointerFinished, true);
-      document.removeEventListener("pointercancel", pointerFinished, true);
-      if (form) delete form.dataset.composerExpanded;
     };
   }, [input]);
   return (
-    <textarea
-      {...props}
-      ref={input}
-      rows={1}
-      onChange={(event) => {
-        setExpanded(true);
-        props.onChange?.(event);
-        realtime.typing(!!event.target.value.trim());
-      }}
-      onPointerDown={(event) => {
-        props.onPointerDown?.(event);
-        if (!event.defaultPrevented && !props.disabled) {
-          setExpanded(true);
-          resize();
+    <>
+      <textarea
+        {...props}
+        ref={input}
+        rows={1}
+        aria-controls={open ? listId : undefined}
+        aria-autocomplete={
+          onDraftChange && mentionCandidates.length ? "list" : undefined
         }
-      }}
-      onFocus={(event) => {
-        props.onFocus?.(event);
-        setExpanded(true);
-        resize();
-      }}
-      onBlur={(event) => {
-        realtime.typing(false);
-        props.onBlur?.(event);
-        requestAnimationFrame(resize);
-      }}
-      onKeyDown={(event) => {
-        props.onKeyDown?.(event);
-        if (
-          !event.defaultPrevented &&
-          event.key === "Enter" &&
-          !event.shiftKey &&
-          !event.ctrlKey &&
-          !event.metaKey &&
-          !event.altKey &&
-          !event.nativeEvent.isComposing &&
-          window.matchMedia("(min-width: 768px)").matches
-        ) {
-          event.preventDefault();
-          const form = event.currentTarget.form;
-          const submit = form?.querySelector<HTMLButtonElement>(
-            'button:not([type]), button[type="submit"]',
+        aria-activedescendant={
+          open
+            ? `${listId}-${Math.min(activeOption, options.length - 1)}`
+            : undefined
+        }
+        onSelect={(event) => {
+          props.onSelect?.(event);
+          const node = event.currentTarget;
+          setCaret(
+            node.selectionStart === node.selectionEnd
+              ? node.selectionStart
+              : undefined,
           );
-          if (submit && !submit.disabled) form?.requestSubmit(submit);
-        }
-      }}
-    />
+        }}
+        onPaste={(event) => {
+          props.onPaste?.(event);
+          if (
+            event.defaultPrevented ||
+            props.disabled ||
+            props.readOnly ||
+            !onPasteImage
+          )
+            return;
+          const image = pastedImage(event.clipboardData);
+          if (!image) return;
+          event.preventDefault();
+          onPasteImage(image);
+        }}
+        onChange={(event) => {
+          onDraftChange?.(
+            event.target.value,
+            reconcileMentions(text, event.target.value, mentions),
+          );
+          props.onChange?.(event);
+          setCaret(event.target.selectionStart);
+          setDismissed(undefined);
+          realtime.typing(!!event.target.value.trim());
+        }}
+        onBlur={(event) => {
+          setCaret(undefined);
+          realtime.typing(false);
+          props.onBlur?.(event);
+        }}
+        onKeyDown={(event) => {
+          if (
+            !event.nativeEvent.isComposing &&
+            !event.ctrlKey &&
+            !event.metaKey &&
+            !event.altKey &&
+            !event.shiftKey &&
+            open &&
+            ["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(
+              event.key,
+            )
+          ) {
+            event.preventDefault();
+            if (event.key === "Escape") setDismissed(queryKey);
+            else if (event.key === "ArrowDown")
+              setActiveOption((value) => (value + 1) % options.length);
+            else if (event.key === "ArrowUp")
+              setActiveOption(
+                (value) => (value + options.length - 1) % options.length,
+              );
+            else
+              selectMention(
+                options[Math.min(activeOption, options.length - 1)],
+              );
+            return;
+          }
+          if (
+            (onEditLatest || (editTarget && editMessage)) &&
+            !text &&
+            event.key === "ArrowUp" &&
+            !event.shiftKey &&
+            !event.ctrlKey &&
+            !event.metaKey &&
+            !event.altKey &&
+            !event.nativeEvent.isComposing &&
+            window.matchMedia("(min-width: 768px)").matches
+          ) {
+            event.preventDefault();
+            if (onEditLatest) onEditLatest();
+            else if (editTarget) editMessage?.(editTarget.chat, editTarget.row);
+            return;
+          }
+          props.onKeyDown?.(event);
+          if (
+            !event.defaultPrevented &&
+            event.key === "Enter" &&
+            !event.shiftKey &&
+            !event.ctrlKey &&
+            !event.metaKey &&
+            !event.altKey &&
+            !event.nativeEvent.isComposing &&
+            window.matchMedia("(min-width: 768px)").matches
+          ) {
+            event.preventDefault();
+            const form = event.currentTarget.form;
+            const submit = form?.querySelector<HTMLButtonElement>(
+              'button:not([type]), button[type="submit"]',
+            );
+            if (submit && !submit.disabled) form?.requestSubmit(submit);
+          }
+        }}
+      />
+      {open &&
+        createPortal(
+          <div
+            id={listId}
+            role="listbox"
+            aria-label={t("mentions.choose")}
+            className="composer-mention-menu"
+            style={{ position: "fixed", ...position }}
+          >
+            {options.map((candidate, index) => (
+              <button
+                key={candidate.identity_id}
+                id={`${listId}-${index}`}
+                type="button"
+                role="option"
+                tabIndex={-1}
+                aria-selected={
+                  index === Math.min(activeOption, options.length - 1)
+                }
+                onPointerDown={(event) => event.preventDefault()}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => selectMention(candidate)}
+              >
+                <span>{candidate.label}</span>
+                {mentionCandidates.some(
+                  (other) =>
+                    other.identity_id !== candidate.identity_id &&
+                    other.label === candidate.label,
+                ) && <small>{candidate.identity_id.slice(0, 12)}</small>}
+              </button>
+            ))}
+          </div>,
+          input.current?.closest("dialog") ?? document.body,
+        )}
+    </>
   );
 }

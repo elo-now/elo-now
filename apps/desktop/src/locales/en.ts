@@ -129,6 +129,8 @@ export const en = {
     "This stops future access after the servers confirm removal. History already saved on the device stays there.",
   "error.chatPermissionsStale":
     "Chat access has changed. Refresh before sending.",
+  "error.spaceProtocolUnsupported":
+    "This Space uses an older access protocol and cannot be used in this version of elo. Join or create a new Space.",
   "error.chatDevicesChanged":
     "Chat devices have changed. The chat owner needs to update access.",
   "error.chatControllerRecovery": "Recover chat control before sending.",
@@ -146,6 +148,14 @@ export const en = {
   ...desktop,
   "calls.start": "Start session",
   "calls.join": "Join session",
+  "calls.activeSessions": "Active sessions",
+  "calls.inSpace": "in {name} space",
+  "calls.sessionParticipants": "{names}",
+  "calls.joinSession": "Join",
+  "calls.openSession": "Open {chat} in {space}",
+  "calls.sessionStarted": "{name} started a session in {chat}",
+  "calls.sessionStartedInSpace": "{name} started a session in {chat} · {space}",
+  "calls.sessionPeople": "{count} people in session",
   "calls.you": "You",
   "calls.participant": "Participant",
   "calls.active": "Session active",
@@ -159,6 +169,18 @@ export const en = {
   "calls.unmute": "Unmute microphone",
   "calls.muteSpeaker": "Mute session audio",
   "calls.unmuteSpeaker": "Unmute session audio",
+  "calls.audioOutput": "Audio output",
+  "calls.audioFailed": "Could not change audio",
+  "calls.audioRetry":
+    "Could not mute or unmute session audio. Try again. Your session is still active.",
+  "calls.chooseOutput": "Audio output: {output}",
+  "calls.output.receiver": "Phone earpiece",
+  "calls.output.speaker": "Speaker",
+  "calls.output.headphones": "Headphones",
+  "calls.output.bluetooth": "Bluetooth",
+  "calls.output.system": "System default",
+  "calls.outputFailed":
+    "Could not change the audio output. Try again. Your session is still active.",
   "calls.cameraOn": "Turn camera on",
   "calls.cameraOff": "Turn camera off",
   "calls.shareScreen": "Share screen",
@@ -240,9 +262,9 @@ export const en = {
   "legal.loading": "Loading…",
   "legal.read": "Privacy & terms",
   "legal.actionNotice":
-    "By tapping {action}, you agree to the {terms} and {community}. See our {privacy}.",
+    "By tapping {action}, you agree to the {terms} and {community}.\nSee our {privacy}.",
   "legal.unlockNotice":
-    "By unlocking your profile, you agree to the {terms} and {community}. See our {privacy}.",
+    "By unlocking your profile, you agree to the {terms} and {community}.\nSee our {privacy}.",
   "requests.mailUnavailable":
     "Couldn’t open your mail app. Set a default mail app on this computer and try again.",
   "requests.report": "Report a concern",
@@ -328,10 +350,57 @@ export const en = {
   "spaces.storage.cleared":
     "Freed {size} on the server. Local history is unchanged.",
   "spaces.attachments.title": "Attachments",
+  "spaces.attachments.enable": "Enable attachments",
+  "spaces.attachments.provider": "Storage provider",
+  "spaces.attachments.mega": "MEGA",
+  "spaces.attachments.s3": "S3-compatible storage",
+  "spaces.attachments.folderLink": "MEGA folder link",
+  "spaces.attachments.writeKey": "Folder write access key",
+  "spaces.attachments.endpoint": "Endpoint URL",
+  "spaces.attachments.region": "Region",
+  "spaces.attachments.bucket": "Bucket",
+  "spaces.attachments.accessKey": "Access key",
+  "spaces.attachments.secretKey": "Secret key",
+  "spaces.attachments.megaHelp":
+    "Use a MEGA folder link and the write access key for that folder. An ordinary folder link alone is not enough. Do not enter your MEGA account password.",
+  "spaces.attachments.s3Help":
+    "Use an HTTPS endpoint and credentials that can upload, download and delete files in this bucket.",
+  "spaces.attachments.credentialsHelp":
+    "Files are encrypted before upload. Storage credentials are not shared with Space members.",
+  "spaces.attachments.creationFailed":
+    "Couldn’t finish setting up your Space with attachments. Check the storage details and try again.",
+  "spaces.attachments.creationPending":
+    "Your Space is saved, but attachment setup is unfinished. Enter the storage details to retry, or turn off attachments to continue. This continues the same Space.",
+  "spaces.attachments.loading": "Checking attachment storage…",
+  "spaces.attachments.loadFailed":
+    "Couldn’t check attachment storage. Try again.",
+  "spaces.attachments.saveFailed":
+    "Couldn’t confirm attachment storage. Check the details and try again.",
+  "spaces.attachments.unavailable":
+    "Attachment storage is unavailable in this build.",
+  "spaces.attachments.changed":
+    "Attachment storage settings changed. Refresh and try again.",
+  "spaces.attachments.retry": "Try again",
+  "spaces.attachments.connected": "Attachments are enabled with {provider}.",
+  "spaces.attachments.change": "Change attachment storage",
+  "spaces.attachments.save": "Test and save storage",
+  "spaces.attachments.saving": "Saving attachment storage…",
+  "spaces.attachments.saved": "Attachment storage is ready.",
+  "spaces.attachments.disable": "Disable attachments",
+  "spaces.attachments.disabled": "New attachment uploads are disabled.",
+  "spaces.attachments.replaceTitle": "Replace attachment storage?",
+  "spaces.attachments.replaceHelp":
+    "New files will use the new storage after its connection is tested. No new files will go to the previous storage. Existing files stay in the previous storage until their expiry time.",
+  "spaces.attachments.disableTitle": "Disable attachments?",
+  "spaces.attachments.disableHelp":
+    "Members will no longer be able to upload new files. Existing files remain available until their expiry time.",
   "spaces.attachments.usage": "{used} of {quota} used",
   "spaces.attachments.limits":
     "Files can be up to 5 MB. This Space can keep up to 50 MB of encrypted attachments.",
+  "spaces.attachments.storageLimits":
+    "Files can be up to {fileSize}. This Space can keep up to {spaceSize} of encrypted attachments.",
   "spaces.attachments.retention": "Keep server copies",
+  "spaces.attachments.chooseRetention": "Choose retention",
   "spaces.attachments.oneHour": "1 hour",
   "spaces.attachments.hours": "{hours} hours",
   "spaces.attachments.retentionSaved": "Attachment retention updated.",
@@ -378,6 +447,8 @@ export const en = {
     "Give your Space a name. You will be its primary owner and can invite people when it is ready.",
   "spaces.hostingLimits":
     "You can create up to 2 Spaces on elo hosting. Each Space includes 150 MB of encrypted message storage and a separate 50 MB for attachments.",
+  "spaces.hostingLimitsExternalAttachments":
+    "You can create up to 2 Spaces on elo hosting. Each Space includes 150 MB of encrypted message storage. Attachments are off unless you connect your own storage, with a separate 50 MB limit per Space.",
   "spaces.messageLifetime.label": "Server message lifetime",
   "spaces.messageLifetime.21600": "6 hours",
   "spaces.messageLifetime.43200": "12 hours",
@@ -454,6 +525,7 @@ export const en = {
   "spaces.joining": "Joining…",
   "spaces.checkingInvitation": "Checking invitation…",
   "spaces.pending": "Waiting for approval",
+  "spaces.waitingOwner": "Waiting for the owner’s app to connect",
   "spaces.declined": "Request declined",
   "spaces.shareNamed": "Share {name}",
   "spaces.disconnectNamed": "Disconnect {name}",
@@ -468,7 +540,7 @@ export const en = {
     "This is not a Space invitation. Ask the Space owner for a new code.",
   "spaces.scanHint": "Point the camera at a Space invitation.",
   "spaces.joinApproval": "An owner will need to approve your request.",
-  "spaces.joinAutomatic": "No owner approval needed.",
+  "spaces.joinAutomatic": "No approval needed. An owner must have elo open.",
   "spaces.request": "{name} wants to join this Space.",
   "spaces.approve": "Approve",
   "spaces.decline": "Decline",
@@ -524,9 +596,41 @@ export const en = {
   "notifications.mutePending":
     "Saved on this device. System notifications will update when the connection returns.",
   "notifications.read": "Read",
+  "notifications.messageInSpace": "{name} · {chat} · {space}: {message}",
+  "notifications.sound.systemDefault":
+    "In the background, Windows uses its system notification sound. None also silences background notifications.",
+  "notifications.sound.serverDependent":
+    "Your desktop notification service decides whether to use the selected sound in the background.",
   "notifications.message": "{name} · {chat}: {message}",
   "notifications.directMessage": "{name}: {message}",
   "notifications.messages": "{count} new messages",
+  "notifications.messagesInChat": "{count} new messages · {chat}",
+  "notifications.messagesInChats":
+    "{count} new messages in {chats} conversations",
+  "notifications.messagesInSpace": "{count} new messages · {chat} · {space}",
+  "notifications.open": "Open",
+  "notifications.sound.label": "Notification sound",
+  "notifications.sound.default": "Default",
+  "notifications.sound.soft": "Soft",
+  "notifications.sound.eloMale": "Elo — male",
+  "notifications.sound.eloFemale": "Elo — female",
+  "notifications.sound.none": "None",
+  "notifications.sound.help":
+    "For this device. Selecting a sound plays a preview. Muted conversations stay quiet.",
+  "notifications.sound.previewFailed":
+    "The sound could not play. Select it again to retry.",
+  "notifications.desktopHelp":
+    "Show notifications while elo is running in the background. Your system controls their visibility and sound.",
+  "notifications.desktopDisabled": "Desktop notifications are off.",
+  "notifications.desktopDenied":
+    "Notifications are blocked in your system settings.",
+  "notifications.desktopPermission":
+    "Allow notifications for elo.now when your system asks.",
+  "notifications.desktopError":
+    "Could not update desktop notifications. Try again.",
+  "notifications.sound.system": "System notification settings",
+  "notifications.sound.systemHelp":
+    "Your device controls notification sounds, badges and Do Not Disturb.",
   "messageActions.delete": "Delete",
   "messageActions.deleteTitle": "Delete this message?",
   "messageActions.deleteDescription":
@@ -601,6 +705,12 @@ export const en = {
   "messageActions.reactions": "Reactions",
   "messageActions.reactWith": "React with {emoji}",
   "messageActions.reactionCount": "{emoji}: {count} reactions",
+  "messageActions.edit": "Edit message",
+  "messageActions.editText": "Message text",
+  "messageActions.saveEdit": "Save changes",
+  "messageActions.edited": "Edited",
+  "error.messageEditAuthor": "Only the author can edit this message.",
+  "error.messageEditUnavailable": "This message is no longer available to edit.",
   "messageActions.unread": "Mark unread",
   "messageActions.pin": "Pin",
   "messageActions.pinned": "Pinned",
@@ -632,6 +742,9 @@ export const en = {
   "reminders.notification": "You have a reminder. Open You → Reminders.",
 
   "thread.title": "Thread",
+  "thread.follow": "Follow thread",
+  "thread.unfollow": "Unfollow thread",
+  "mentions.choose": "Mention a person",
   "thread.reply": "Reply",
   "thread.oneReply": "1 reply",
   "thread.replies": "{count} replies",
@@ -652,6 +765,12 @@ export const en = {
   "nav.streamNew": "Buzz, {count} unread messages",
   "nav.backToStream": "Back to Buzz",
   "stream.empty": "All caught up",
+  "stream.filters": "Show unread activity",
+  "stream.filter.all": "All",
+  "stream.filter.mentions": "Mentions",
+  "stream.filter.threads": "Threads",
+  "stream.emptyMentions": "No unread mentions",
+  "stream.emptyThreads": "No unread replies in your threads",
   "stream.read": "Read",
   "stream.markRead": "Mark as read",
   "stream.open": "Read",
@@ -994,6 +1113,8 @@ export const en = {
   "invite.code": "Invitation QR code",
   "invite.qrUnavailable":
     "This response cannot be shown as a QR code. Use Share or copy the link.",
+  "invite.qrImageTooLarge":
+    "This invitation is too large for one image. Copy the link instead.",
   "invite.preparing": "Preparing code…",
   "invite.animatedHint": "Keep scanning until all parts are collected.",
   "invite.previousPart": "Previous QR part",
@@ -1254,6 +1375,9 @@ export const en = {
   "onboarding.initialChannel": "General",
 
   "file.attach": "Attach a file",
+  "file.dropToAttach": "Drop a file to attach",
+  "error.attachmentOneAtATime": "Attach one file at a time.",
+  "error.attachmentFolder": "Choose a file instead of a folder.",
   "file.attachOptions": "Add attachment",
   "file.photoVideo": "Photo or video",
   "file.camera": "Camera",
@@ -1282,6 +1406,8 @@ export const en = {
   "file.unavailable": "Unavailable",
   "composer.deleteAfter": "Delete after:",
   "composer.expiryHours": "{hours}h",
+  "composer.expiryNone": "—",
+  "composer.noExpiry": "No expiry",
   "messageActions.expired": "Message expired",
   "messageActions.expiresAt": "Expires: {date}",
   "messageActions.deleteAfter": "Delete after",
@@ -1324,6 +1450,7 @@ export const en = {
   "theme.mode": "Mode",
   "theme.light": "Light",
   "theme.dark": "Dark",
+  "theme.auto": "Auto",
   "theme.lightMode": "Light mode",
   "theme.darkMode": "Dark mode",
   "theme.switchToDark": "Switch to dark mode",
@@ -1418,6 +1545,8 @@ export const en = {
     "{name} unlocks the encrypted profile using a password protected by this device. Your biometric data never enters elo.",
   "biometric.demoHelp":
     "{name} can open this demo profile directly on this device. Your biometric data never enters elo.",
+  "biometric.buildUnavailable":
+    "{name} is unavailable in this app build. Use your profile password.",
   "biometric.setupHelp":
     "Set up a device passcode and biometrics in system settings to use biometric unlock.",
   "biometric.enable": "Enable {name}",
@@ -1440,6 +1569,8 @@ export const en = {
   "search.clear": "Clear search",
   "chat.newDirect": "New DM",
   "dm.findPeople": "Find people",
+  "dm.selfLabel": "Notes",
+  "dm.selfName": "{name} (you)",
   "dm.people": "People",
   "dm.selected": "Selected people",
   "dm.removePerson": "Remove {name}",
@@ -1555,6 +1686,20 @@ export const en = {
   "channel.controller": "Controller device",
   "channel.recovery": "Recovery proof",
   "dialog.close": "Close",
+  "shortcuts.switch": "Switch conversation",
+  "shortcuts.findConversation": "Find a conversation or Space",
+  "shortcuts.noConversations": "No matching conversations.",
+  "shortcuts.search": "Search this conversation",
+  "shortcuts.compose": "New direct message",
+  "shortcuts.attach": "Attach a file",
+  "shortcuts.preferences": "Appearance settings",
+  "shortcuts.nextPrevious": "Previous / next conversation",
+  "shortcuts.nextUnread": "Previous / next unread conversation",
+  "shortcuts.send": "Send message",
+  "shortcuts.newline": "New line",
+  "shortcuts.editLatest": "Edit your last message (empty composer)",
+  "shortcuts.close": "Close the current dialog or menu",
+  "shortcuts.help": "Keyboard shortcuts",
   "dialog.ok": "OK",
   "dialog.cancel": "Cancel",
   "dialog.eyebrow": "EXPLICIT ACTION",

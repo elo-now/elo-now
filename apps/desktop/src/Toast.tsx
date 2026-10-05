@@ -19,7 +19,7 @@ const ToastContext = createContext({
   showError: (_message: string, _detail?: string) => {},
   setHost: (_host: HTMLElement | null) => {},
   showNotice: (_message: string) => {},
-  showMessage: (_message: string, _open: () => void) => {},
+  showMessage: (_message: string, _open: () => void, _action?: string) => {},
   clearMessages: () => {},
 });
 
@@ -77,6 +77,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     id: number;
     tone: "error" | "notice" | "message";
     open?: () => void;
+    action?: string;
   } | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -158,7 +159,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               {toast.message}
             </span>
             <span className="toast-details-label">
-              {t("notifications.read")}
+              {toast.action ?? t("notifications.read")}
             </span>
           </button>
         ) : (
@@ -195,13 +196,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         showError,
         setHost,
         showNotice: (message) => showError(message, undefined, "notice"),
-        showMessage: (message, open) => {
+        showMessage: (message, open, action) => {
           setLeaving(false);
           const id = ++serial.current;
           setToast((current) =>
             current?.tone === "error"
               ? current
-              : { message, open, id, tone: "message" },
+              : { message, open, action, id, tone: "message" },
           );
         },
         clearMessages: () =>

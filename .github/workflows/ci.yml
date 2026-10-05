@@ -80,6 +80,11 @@ jobs:
       # Compile the client and both in-repository plugins on each desktop OS.
       # Native Kotlin/Swift mobile code remains part of mobile release builds.
       - run: cargo check --locked -p elo-desktop -p tauri-plugin-elo-push -p tauri-plugin-elo-privacy --all-targets --features elo-desktop/mobile-push,elo-desktop/custom-protocol
+      - name: iOS notification inbox logic
+        if: runner.os == 'macOS'
+        run: |
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/PushInbox.swift crates/tauri-plugin-elo-push/ios/Tests/PushInboxTests.swift -o "$RUNNER_TEMP/elo-push-inbox-tests"
+          "$RUNNER_TEMP/elo-push-inbox-tests"
 
   rust:
     if: github.event_name != 'schedule'
@@ -101,7 +106,8 @@ jobs:
           toolchain: '1.98.1'
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service --all-targets -- -D warnings
-      - run: cargo test --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service
+      - run: cargo clippy --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service -p elo-storage -p elo-witness --all-targets -- -D warnings
+      - run: cargo test --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service -p elo-storage -p elo-witness
       - run: sudo apt-get update && sudo apt-get install -y age
       - run: python3 -m unittest discover -s deploy/hosting -v
+      - run: python3 -m unittest discover -s deploy/storage -v

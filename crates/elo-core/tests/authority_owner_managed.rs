@@ -48,6 +48,7 @@ fn fixture(version: u64, admit_second: bool) -> Fixture {
     let unadmitted = device(&root, 13);
     let foreign = device(&SigningKey::from_bytes(&[20; 32]), 21);
     let genesis = SpaceGenesis {
+        witness: None,
         v: version,
         kind: "space.genesis".into(),
         nonce: random_hex::<16>().unwrap(),
@@ -80,6 +81,7 @@ fn fixture(version: u64, admit_second: bool) -> Fixture {
     }
     ids.sort();
     let config = StreamConfig {
+        witness_evidence: None,
         v: version,
         kind: "stream.config".into(),
         nonce: random_hex::<16>().unwrap(),

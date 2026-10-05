@@ -5,12 +5,48 @@ use crate::record::MessageAction;
 use std::collections::BTreeSet;
 
 type Version = (u64, RecordId);
+type Expiry = (Option<u64>, Option<u8>);
+#[derive(Clone)]
+struct ExpirySource {
+    id: RecordId,
+    author: IdentityId,
+    clock: u64,
+    deadline: Option<u64>,
+}
+impl ExpirySource {
+    fn initial_expiry(&self) -> Expiry {
+        let hours = self.deadline.and_then(|deadline| {
+            let duration = deadline.saturating_sub(self.clock);
+            [1u8, 12, 24]
+                .into_iter()
+                .find(|hours| duration.abs_diff(u64::from(*hours) * 3_600_000) < 1000)
+        });
+        (self.deadline, hours)
+    }
+    fn from_record(record: &SignedRecord) -> Option<Self> {
+        let body = record.body();
+        Some(Self {
+            id: if body["kind"] == "chat.locator" {
+                body["locator"]["message_record_id"]
+                    .as_str()?
+                    .parse()
+                    .ok()?
+            } else {
+                record.id()
+            },
+            author: body["issuer_identity"].as_str()?.parse().ok()?,
+            clock: body["logical_time"].as_u64().unwrap_or(0),
+            deadline: body["payload"]["expires_at_ms"].as_u64(),
+        })
+    }
+}
 #[derive(Default)]
 pub(super) struct Projection {
     now_ms: u64,
     reactions: BTreeMap<(RecordId, String, IdentityId), (Version, bool)>,
     pins: BTreeMap<RecordId, (Version, bool)>,
     deletions: BTreeSet<(RecordId, IdentityId)>,
+    edits: BTreeMap<(RecordId, IdentityId), BTreeMap<Version, (String, Vec<IdentityId>)>>,
     expiry: BTreeMap<(RecordId, IdentityId), BTreeMap<Version, Option<u8>>>,
 }
 impl Projection {
@@ -65,6 +101,17 @@ impl Projection {
                         .or_default()
                         .insert(version, hours);
                 }
+                Some(MessageAction::Edit {
+                    target,
+                    text,
+                    mentions,
+                }) => {
+                    state
+                        .edits
+                        .entry((target, chat.issuer_identity))
+                        .or_default()
+                        .insert(version, (text, mentions));
+                }
                 None => {}
             }
         }
@@ -116,34 +163,55 @@ impl Projection {
                 projected["payload"]["expires_at_ms"] = json!(deadline);
                 projected["payload"]["expiry_hours"] = json!(hours);
             }
+            if body["kind"] == "chat.message" {
+                let author = record.chat().map(|chat| chat.issuer_identity).ok();
+                if let Some(events) =
+                    author.and_then(|author| self.edits.get(&(record.id(), author)))
+                {
+                    let original_time = body["logical_time"].as_u64().unwrap_or(0);
+                    for ((changed_at, _), (text, mentions)) in events {
+                        if *changed_at <= original_time {
+                            continue;
+                        }
+                        let source = ExpirySource::from_record(record).expect("validated message");
+                        // An edit cannot resurrect content that had expired when signed.
+                        let mut past = source.initial_expiry().0;
+                        if let Some(expiry) = self.expiry.get(&(source.id, source.author)) {
+                            for ((at, _), hours) in expiry {
+                                if *at <= source.clock {
+                                    continue;
+                                }
+                                if *at > *changed_at || past.is_some_and(|deadline| *at >= deadline)
+                                {
+                                    break;
+                                }
+                                past = hours.map(|h| at.saturating_add(u64::from(h) * 3_600_000));
+                            }
+                        }
+                        if past.is_some_and(|deadline| *changed_at >= deadline) {
+                            continue;
+                        }
+                        projected["payload"]["text"] = json!(text);
+                        projected["payload"]["mentions"] = json!(mentions);
+                        projected["payload"]["edited_at_ms"] = json!(changed_at);
+                    }
+                }
+            }
             projected
         }
     }
     /// Only the author can change a deadline. Replay in signed order, including
     /// events delivered before the message, and never accept edits after expiry.
-    fn expiry(&self, record: &SignedRecord) -> (Option<u64>, Option<u8>) {
-        let body = record.body();
-        let mut deadline = body["payload"]["expires_at_ms"].as_u64();
-        let clock = body["logical_time"].as_u64().unwrap_or(0);
-        let mut hours = deadline.and_then(|d| {
-            let duration = d.saturating_sub(clock);
-            [1u8, 12, 24]
-                .into_iter()
-                .find(|h| duration.abs_diff(u64::from(*h) * 3_600_000) < 1000)
-        });
-        let target = if body["kind"] == "chat.locator" {
-            body["locator"]["message_record_id"]
-                .as_str()
-                .and_then(|id| id.parse().ok())
-        } else {
-            Some(record.id())
-        };
-        let author = body["issuer_identity"]
-            .as_str()
-            .and_then(|id| id.parse().ok());
-        if let Some(events) = target.zip(author).and_then(|key| self.expiry.get(&key)) {
+    pub(super) fn expiry(&self, record: &SignedRecord) -> (Option<u64>, Option<u8>) {
+        ExpirySource::from_record(record)
+            .map(|source| self.own_expiry(&source))
+            .unwrap_or_default()
+    }
+    fn own_expiry(&self, source: &ExpirySource) -> Expiry {
+        let (mut deadline, mut hours) = source.initial_expiry();
+        if let Some(events) = self.expiry.get(&(source.id, source.author)) {
             for ((changed_at, _), choice) in events {
-                if *changed_at <= clock {
+                if *changed_at <= source.clock {
                     continue;
                 }
                 if deadline.is_some_and(|expires| *changed_at >= expires) {
@@ -200,7 +268,16 @@ impl ClientApp {
         let action: MessageAction = serde_json::from_value(v["action"].clone())?;
         let originals = self.originals(authority).await?;
         let target = self.message_record(authority, action.target()).await?;
-        if matches!(action, MessageAction::Expiry { .. }) {
+        if matches!(action, MessageAction::Edit { .. }) {
+            if target.body()["issuer_identity"] != json!(self.session.identity_id())
+                || target.body()["kind"] != "chat.message"
+            {
+                return Err("Only the author can edit this message.".into());
+            }
+            if Projection::new(&originals).is_deleted(&target) {
+                return Err("This message is no longer available to edit.".into());
+            }
+        } else if matches!(action, MessageAction::Expiry { .. }) {
             if target.body()["issuer_identity"] != json!(self.session.identity_id())
                 || target.body()["kind"] != "chat.message"
             {
@@ -213,7 +290,8 @@ impl ClientApp {
             {
                 return Err("message_expiry_invalid".into());
             }
-            if Projection::new(&originals).is_deleted(&target) {
+            let projection = Projection::new(&originals);
+            if projection.is_deleted(&target) {
                 return Err("message_expiry_unavailable".into());
             }
         } else if matches!(action, MessageAction::Delete { .. }) {
@@ -236,8 +314,10 @@ impl ClientApp {
             .unwrap_or(0)
             .max(target.body()["logical_time"].as_u64().unwrap_or(0));
         let logical_time = record::next_message_time(highest, u64::try_from(time.as_millis())?);
-        if matches!(action, MessageAction::Expiry { .. })
-            && Projection::at(&originals, logical_time).is_deleted(&target)
+        if matches!(
+            action,
+            MessageAction::Expiry { .. } | MessageAction::Edit { .. }
+        ) && Projection::at(&originals, logical_time).is_deleted(&target)
         {
             return Err("message_expiry_unavailable".into());
         }
@@ -257,6 +337,7 @@ impl ClientApp {
                 created_at: field(v, "created_at")?.into(),
                 parents: vec![],
                 payload: TextPayload {
+                    mentions: vec![],
                     text: String::new(),
                     expires_at_ms: None,
                     sender_name: None,
@@ -344,6 +425,88 @@ impl ClientApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn expiry_message(clock: u64, deadline: Option<u64>, root: Option<RecordId>) -> SignedRecord {
+        let mut chat = SignedRecord::parse(include_bytes!(
+            "../../../../protocol/fixtures/chat-message-v1.record.bin"
+        ))
+        .unwrap()
+        .chat()
+        .unwrap();
+        chat.logical_time = clock;
+        chat.nonce = format!("{clock:032x}");
+        chat.payload.expires_at_ms = deadline;
+        chat.payload.thread_root = root;
+        chat.sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+            .unwrap()
+    }
+    fn expiry_edit(target: &SignedRecord, clock: u64, hours: Option<u8>) -> (SignedRecord, String) {
+        let mut chat = target.chat().unwrap();
+        chat.kind = "chat.action".into();
+        chat.logical_time = clock;
+        chat.nonce = format!("{clock:032x}");
+        chat.payload.text.clear();
+        chat.payload.expires_at_ms = None;
+        chat.payload.thread_root = None;
+        chat.payload.action = Some(MessageAction::Expiry {
+            target: target.id(),
+            hours,
+        });
+        (
+            chat.sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+                .unwrap(),
+            "ACCEPTED".into(),
+        )
+    }
+    #[test]
+    fn replies_keep_their_own_deadlines_after_parent_expiry_and_changes() {
+        let root = expiry_message(1, Some(10_000), None);
+        let reply = expiry_message(100, Some(20_000), Some(root.id()));
+        let permanent = expiry_message(101, None, Some(root.id()));
+        let original_bytes = reply.bytes().to_vec();
+        for records in [
+            vec![],
+            vec![(root.clone(), "ACCEPTED".into())],
+            vec![
+                (root.clone(), "ACCEPTED".into()),
+                expiry_edit(&root, 500, Some(24)),
+            ],
+            vec![
+                (root.clone(), "ACCEPTED".into()),
+                expiry_edit(&root, 500, None),
+            ],
+        ] {
+            let projection = Projection::at(&records, 10_000);
+            assert_eq!(projection.expiry(&reply).0, Some(20_000));
+            assert!(!projection.is_deleted(&reply));
+            assert!(!projection.is_deleted(&permanent));
+            assert_eq!(projection.body(&reply)["kind"], "chat.message");
+            assert!(Projection::at(&records, 20_000).is_expired(&reply));
+            assert!(!Projection::at(&records, 20_000).is_expired(&permanent));
+        }
+        assert_eq!(reply.bytes(), original_bytes);
+        assert!(Projection::at(&[], 10_000).is_expired(&root));
+    }
+    #[test]
+    fn reply_author_can_edit_its_deadline_independently_of_parent_policy() {
+        let root = expiry_message(1, Some(10_000), None);
+        let reply = expiry_message(100, Some(20_000), Some(root.id()));
+        let change = expiry_edit(&reply, 500, Some(12));
+        let cancel_parent = expiry_edit(&root, 600, None);
+        let records = vec![(root.clone(), "ACCEPTED".into()), change, cancel_parent];
+        for records in [records.clone(), records.into_iter().rev().collect()] {
+            let projection = Projection::at(&records, 30_000);
+            assert_eq!(projection.expiry(&reply).0, Some(43_200_500));
+            assert!(!projection.is_expired(&reply));
+        }
+        let mut foreign = expiry_edit(&reply, 501, None).0.chat().unwrap();
+        foreign.issuer_identity = IdentityId::from_bytes([99; 32]);
+        let foreign = foreign
+            .sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+            .unwrap();
+        assert!(Projection::at(&[(foreign, "ACCEPTED".into())], 20_000).is_expired(&reply));
+        let late_cancel = expiry_edit(&reply, 20_000, None);
+        assert!(Projection::at(&[late_cancel], 20_001).is_expired(&reply));
+    }
     fn event(
         identity: u8,
         clock: u64,
@@ -392,6 +555,183 @@ mod tests {
             "ACCEPTED".into(),
         )
     }
+    fn text_edit(
+        record: &SignedRecord,
+        author: IdentityId,
+        clock: u64,
+        text: &str,
+        nonce: u8,
+    ) -> (SignedRecord, String) {
+        let mut edit = event(1, clock, true, true, nonce).0.chat().unwrap();
+        edit.issuer_identity = author;
+        edit.payload.action = Some(MessageAction::Edit {
+            target: record.id(),
+            text: text.into(),
+            mentions: vec![],
+        });
+        (
+            edit.sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+                .unwrap(),
+            "ACCEPTED".into(),
+        )
+    }
+    #[test]
+    fn text_edits_are_author_only_ordered_and_do_not_restore_expired_or_deleted_text() {
+        let mut chat = SignedRecord::parse(include_bytes!(
+            "../../../../protocol/fixtures/chat-message-v1.record.bin"
+        ))
+        .unwrap()
+        .chat()
+        .unwrap();
+        chat.logical_time = 100;
+        chat.payload.expires_at_ms = Some(1000);
+        let author = chat.issuer_identity;
+        let original = chat
+            .sign(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+            .unwrap();
+        let early = text_edit(&original, author, 200, "First correction", 1);
+        let later = text_edit(&original, author, 300, "Final correction", 2);
+        let foreign = text_edit(
+            &original,
+            IdentityId::from_bytes([88; 32]),
+            400,
+            "Forged correction",
+            3,
+        );
+        let expired = text_edit(&original, author, 1000, "Too late", 4);
+        let before = text_edit(&original, author, 99, "Predates original", 5);
+        for events in [
+            vec![
+                early.clone(),
+                later.clone(),
+                foreign.clone(),
+                expired.clone(),
+                before.clone(),
+            ],
+            vec![expired, later.clone(), foreign, early, before, later],
+        ] {
+            let body = Projection::at(&events, 999).body(&original);
+            assert_eq!(body["payload"]["text"], "Final correction");
+            assert_eq!(body["payload"]["edited_at_ms"], 300);
+            let expired = Projection::at(&events, 1000).body(&original);
+            assert_eq!(expired["kind"], "deleted");
+            assert!(expired["payload"]["text"].is_null());
+            let mut deleted = events;
+            deleted.push(deletion(&original, author));
+            assert!(Projection::at(&deleted, 999).body(&original)["payload"]["text"].is_null());
+        }
+        assert_ne!(original.body()["payload"]["text"], "Final correction");
+    }
+    #[tokio::test]
+    async fn text_edit_survives_restart_and_updates_search_without_rewriting_signed_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("profile");
+        let mut app = super::super::performance::profile(path.clone()).await;
+        let chat = app.view().await.unwrap()["streams"][0].clone();
+        let sent=app.operate(json!({"op":"send","space":chat["space"],"stream":chat["stream"],"text":"Initial text fixture","created_at":"2026-10-05T12:00:00Z"})).await.unwrap();
+        let id = sent["sent"]["id"].clone();
+        let mut edit = json!({"op":"message_action","space":chat["space"],"stream":chat["stream"],"created_at":"2026-10-05T12:01:00Z","action":{"type":"edit","target":id,"text":"Updated text fixture"}});
+        app.operate(edit.clone()).await.unwrap();
+        for invalid in ["".to_owned(), "   ".to_owned(), "a".repeat(16385)] {
+            edit["action"]["text"] = json!(invalid);
+            assert!(app.operate(edit.clone()).await.is_err());
+        }
+        let originals = app.originals(&app.authorities.0[0]).await.unwrap();
+        assert_eq!(
+            originals
+                .iter()
+                .find(|(r, _)| json!(r.id()) == id)
+                .unwrap()
+                .0
+                .body()["payload"]["text"],
+            "Initial text fixture"
+        );
+        app.close().await.unwrap();
+        let mut app = ClientApp::open(path, "synthetic performance password".into(), false)
+            .await
+            .unwrap();
+        let mut search = json!({"op":"history_page","space":chat["space"],"stream":chat["stream"],"query":"Updated text fixture"});
+        let found = app.operate(search.clone()).await.unwrap();
+        assert_eq!(found["history"]["rows"][0]["id"], id);
+        assert!(found["history"]["rows"][0]["body"]["payload"]["edited_at_ms"].is_number());
+        search["query"] = json!("Initial text fixture");
+        assert!(
+            app.operate(search).await.unwrap()["history"]["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_history_disclosure_previews_and_imports_the_current_edited_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = super::super::performance::profile(tmp.path().join("profile")).await;
+        let chat = app.view().await.unwrap()["streams"][0].clone();
+        let sent = app.operate(json!({"op":"send", "space":chat["space"], "stream":chat["stream"], "text":"Superseded history text", "created_at":"2026-10-05T12:00:00Z"})).await.unwrap();
+        let id = sent["sent"]["id"].clone();
+        app.operate(json!({"op":"message_action", "space":chat["space"], "stream":chat["stream"], "created_at":"2026-10-05T12:01:00Z", "action":{"type":"edit","target":id,"text":"Current history text"}})).await.unwrap();
+        let authority = &app.authorities.0[0];
+        let request = history::create_request(
+            authority,
+            app.session.credential().id(),
+            1,
+            None,
+            app.session.signing_key(),
+        )
+        .unwrap();
+        let path = tmp.path().join("history-request.elo");
+        write_export(&path, request.bytes()).unwrap();
+        let preview = app.operate(json!({"op":"history_preview","space":chat["space"],"stream":chat["stream"],"path":path})).await.unwrap();
+        assert_eq!(preview["selection"][0]["text"], "Current history text");
+        let output = tmp.path().join("history-grant.elo");
+        app.operate(json!({"op":"history_approve", "space":chat["space"],"stream":chat["stream"],"path":path,"expected_request":request.id(),"selection":[id],"output":output})).await.unwrap();
+        let cipher = read_exchange(&output, history::MAX_BUNDLE).unwrap();
+        let bundle = history::VerifiedBundle::open(
+            &cipher,
+            app.session.age_identity(),
+            app.session.credential().id(),
+            &app.authorities.0[0],
+            &request,
+        )
+        .unwrap();
+        assert_eq!(bundle.grant().related_actions.len(), 1);
+        let records = bundle
+            .originals()
+            .iter()
+            .map(|r| (r.clone(), "ACCEPTED".into()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records[0].0.body()["payload"]["text"],
+            "Superseded history text"
+        );
+        assert_eq!(
+            Projection::new(&records).body(&records[0].0)["payload"]["text"],
+            "Current history text"
+        );
+        // Exercise the actual encrypted source-index reader after importing into
+        // a fresh store, without the original individual action objects.
+        let clean_store = ClientStore::open(tmp.path().join("recipient.sqlite"))
+            .await
+            .unwrap();
+        clean_store
+            .import_history(bundle, now().unwrap())
+            .await
+            .unwrap();
+        let old_store = std::mem::replace(&mut app.store, clean_store);
+        let page = app
+            .operate(json!({"op":"history_page", "space":chat["space"],"stream":chat["stream"]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["history"]["rows"][0]["body"]["payload"]["text"],
+            "Current history text"
+        );
+        old_store.close().await.unwrap();
+        app.close().await.unwrap();
+    }
+
     #[test]
     fn expiry_edits_are_author_only_ordered_and_cannot_reopen_an_expired_message() {
         let mut chat = SignedRecord::parse(include_bytes!(
@@ -518,6 +858,145 @@ mod tests {
             "Keep after cancelling expiry"
         );
         assert!(row["body"]["payload"]["expires_at_ms"].is_null());
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replies_sign_independent_deadlines_and_survive_parent_changes_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("profile");
+        let mut app = super::super::performance::profile(path.clone()).await;
+        let chat = app.view().await.unwrap()["streams"][0].clone();
+        let request = json!({"op":"send", "space":chat["space"], "stream":chat["stream"],
+            "text":"Thread root", "created_at":"2026-10-02T12:00:00Z", "expires_in_hours":1});
+        let root = app.operate(request.clone()).await.unwrap()["sent"].clone();
+        let mut reply_request = request.clone();
+        reply_request["reply_to"] = root["id"].clone();
+        reply_request["text"] = json!("Independent reply");
+        reply_request["expires_in_hours"] = json!(24);
+        let reply = app.operate(reply_request.clone()).await.unwrap()["sent"].clone();
+        assert!(reply["expires_at_ms"].as_u64().unwrap() > root["expires_at_ms"].as_u64().unwrap());
+        let signed_reply = app
+            .message_record(
+                &app.authorities.0[0],
+                reply["id"].as_str().unwrap().parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signed_reply.body()["payload"]["expires_at_ms"],
+            reply["expires_at_ms"]
+        );
+        let reply_bytes = signed_reply.bytes().to_vec();
+        reply_request
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_in_hours");
+        let permanent = app.operate(reply_request.clone()).await.unwrap()["sent"].clone();
+        assert!(permanent["expires_at_ms"].is_null());
+        let mut edit = json!({"op":"message_action", "space":chat["space"], "stream":chat["stream"],
+            "created_at":"2026-10-02T12:00:00Z", "action":{"type":"expiry", "target":root["id"], "hours":12}});
+        for hours in [json!(12), Value::Null] {
+            edit["action"]["hours"] = hours;
+            let changed = app.operate(edit.clone()).await.unwrap();
+            let rows = changed["view"]["streams"][0]["rows"].as_array().unwrap();
+            let reply_row = rows.iter().find(|r| r["id"] == reply["id"]).unwrap();
+            assert_eq!(
+                reply_row["body"]["payload"]["expires_at_ms"],
+                reply["expires_at_ms"]
+            );
+            assert!(rows.iter().find(|r| r["id"] == permanent["id"]).unwrap()["body"]["payload"]["expires_at_ms"].is_null());
+        }
+        edit["action"]["target"] = reply["id"].clone();
+        edit["action"]["hours"] = json!(12);
+        let changed = app.operate(edit).await.unwrap();
+        let reply_deadline = changed["view"]["streams"][0]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == reply["id"])
+            .unwrap()["body"]["payload"]["expires_at_ms"]
+            .clone();
+        assert!(reply_deadline.as_u64().unwrap() < reply["expires_at_ms"].as_u64().unwrap());
+        reply_request["reply_to"] = reply["id"].clone();
+        let nested = app.operate(reply_request).await.unwrap()["sent"].clone();
+        let nested_record = app
+            .message_record(
+                &app.authorities.0[0],
+                nested["id"].as_str().unwrap().parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested_record.body()["payload"]["thread_root"], root["id"]);
+        app.close().await.unwrap();
+        let mut app = ClientApp::open(path, "synthetic performance password".into(), false)
+            .await
+            .unwrap();
+        let page = app.operate(json!({"op":"history_page", "space":chat["space"], "stream":chat["stream"], "thread":root["id"]})).await.unwrap();
+        let rows = page["history"]["rows"].as_array().unwrap();
+        let reply_row = rows.iter().find(|r| r["id"] == reply["id"]).unwrap();
+        assert_eq!(reply_row["body"]["payload"]["text"], "Independent reply");
+        assert_eq!(
+            reply_row["body"]["payload"]["expires_at_ms"],
+            reply_deadline
+        );
+        assert!(rows.iter().find(|r| r["id"] == permanent["id"]).unwrap()["body"]["payload"]["expires_at_ms"].is_null());
+        assert_eq!(
+            app.message_record(
+                &app.authorities.0[0],
+                reply["id"].as_str().unwrap().parse().unwrap()
+            )
+            .await
+            .unwrap()
+            .bytes(),
+            reply_bytes
+        );
+        // Store an already expired, correctly signed parent without waiting.
+        let mut expired = super::super::performance::message(&app, 0, 1)
+            .chat()
+            .unwrap();
+        expired.payload.expires_at_ms = Some(1);
+        let signed = app.authorities.0[0]
+            .prepare_chat(expired, app.session.signing_key())
+            .unwrap();
+        app.store
+            .commit_local_record_with_outbox(
+                PreparedLocalRecord::new(
+                    signed.id(),
+                    crypto::seal_chat(&signed, &[app.session.credential().clone()]).unwrap(),
+                    RecordMetadata::new(
+                        "chat.message",
+                        Some(app.authorities.0[0].space()),
+                        Some(app.authorities.0[0].stream()),
+                        app.authorities.0[0].head_id(),
+                    )
+                    .unwrap(),
+                    vec![],
+                    now().unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut after_expiry = request;
+        after_expiry["reply_to"] = json!(signed.id());
+        after_expiry["text"] = json!("Reply outlives its parent");
+        after_expiry
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_in_hours");
+        let sent = app.operate(after_expiry).await.unwrap()["sent"].clone();
+        assert!(sent["expires_at_ms"].is_null());
+        let page = app.operate(json!({"op":"history_page", "space":chat["space"], "stream":chat["stream"], "thread":signed.id()})).await.unwrap();
+        let rows = page["history"]["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == json!(signed.id())).unwrap()["body"]["kind"],
+            "deleted"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == sent["id"]).unwrap()["body"]["payload"]["text"],
+            "Reply outlives its parent"
+        );
         app.close().await.unwrap();
     }
 

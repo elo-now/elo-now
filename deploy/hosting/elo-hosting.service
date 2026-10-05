@@ -1,0 +1,28 @@
+[Unit]
+Description=elo.now hosted Spaces
+After=network-online.target elo-megacmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elo-hosting
+Group=elo-hosting
+StateDirectory=elo-hosting
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/elo/bin/elo-hosting host --config /etc/elo-hosting/config.json --bind 127.0.0.1:18900
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/elo-hosting
+MemoryMax=2G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

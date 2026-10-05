@@ -52,6 +52,7 @@ pub struct Participant {
     pub identity_id: IdentityId,
     pub credential_id: RecordId,
     pub media: MediaState,
+    pub ready: bool,
     #[serde(skip)]
     last_seen: u64,
 }
@@ -64,6 +65,8 @@ pub struct ActiveCall {
     pub initial_media: InitialMedia,
     pub started_at: u64,
     pub started_by: IdentityId,
+    pub ready: bool,
+    pub ready_at: Option<u64>,
     pub config_id: RecordId,
     pub participants: BTreeMap<IdentityId, Participant>,
     pub key_epoch: u64,
@@ -191,6 +194,7 @@ impl Registry {
                 let participant = Participant {
                     identity_id: identity,
                     credential_id: command.credential_id,
+                    ready: false,
                     media: MediaState {
                         audio_muted: true,
                         ..MediaState::default()
@@ -206,6 +210,8 @@ impl Registry {
                         initial_media: *initial_media,
                         started_at: now,
                         started_by: identity,
+                        ready: false,
+                        ready_at: None,
                         config_id: command.config_id,
                         participants: BTreeMap::from([(identity, participant)]),
                         key_epoch: 1,
@@ -240,6 +246,7 @@ impl Registry {
                                 Participant {
                                     identity_id: identity,
                                     credential_id: command.credential_id,
+                                    ready: false,
                                     media: MediaState {
                                         audio_muted: true,
                                         ..MediaState::default()
@@ -289,7 +296,12 @@ impl Registry {
                             .get_mut(&identity)
                             .ok_or(CallError::Unauthorized)?;
                         participant.media = *state;
+                        participant.ready = true;
                         participant.last_seen = now;
+                        if identity == call.started_by && !call.ready {
+                            call.ready = true;
+                            call.ready_at = Some(now);
+                        }
                     }
                     Operation::Signal {
                         epoch,

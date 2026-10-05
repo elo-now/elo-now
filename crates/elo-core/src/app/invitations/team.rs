@@ -115,6 +115,9 @@ impl ClientApp {
         if reply.v == 2 {
             return self.accept_owner_general(&reply.packet).await;
         }
+        if self.witness_pin.is_some() {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
         if reply.v != 1 {
             return Err("Unsupported Space enrollment.".into());
         }
@@ -456,6 +459,11 @@ impl ClientApp {
         Ok(())
     }
     pub(super) async fn import_team(&mut self, packet: &Packet) -> Result<bool> {
+        // This legacy path is also reachable through mailbox discovery. A
+        // configured witness requires the pinned General proof entry point.
+        if self.witness_pin.is_some() {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
         let Packet::Team {
             scope,
             ciphertext,
@@ -615,6 +623,52 @@ mod tests {
             }
         }
         panic!("Sent message was not stored")
+    }
+    #[tokio::test]
+    async fn native_witness_pin_rejects_legacy_enrollment_and_discovery_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile(dir.path(), "Owner").await;
+        let scope = app.team_scope().unwrap();
+        app.configure_team(TeamDescriptor {
+            v: 1,
+            url: "https://host.example.test/team/v1/enroll".into(),
+            token: "76".repeat(32),
+            scope: scope.clone(),
+            message_lifetime_seconds: 86_400,
+            service_credential: None,
+        })
+        .unwrap();
+        let packet = app
+            .team_packet(&scope, &app.session.age_identity().to_public())
+            .unwrap();
+        let reply = EnrollmentReply {
+            v: 1,
+            packet: encode(&packet).unwrap(),
+        };
+        app.accept_space_enrollment(reply.clone()).await.unwrap();
+        let head = app.authorities.0[0].head_id();
+        app.configure_witness_pin(Some(crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(
+                ed25519_dalek::SigningKey::from_bytes(&[77; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            key_generation: 1,
+        }))
+        .unwrap();
+        assert!(app.accept_space_enrollment(reply).await.is_err());
+        assert!(
+            app.import_team(&packet).await.is_err(),
+            "mailbox discovery uses this entry point"
+        );
+        assert_eq!(app.authorities.0[0].head_id(), head);
+        app.configure_witness_pin(None).unwrap();
+        assert!(
+            app.import_team(&packet).await.is_ok(),
+            "the old build retains its legacy path"
+        );
+        app.close().await.unwrap();
     }
     #[tokio::test]
     async fn same_page_general_membership_enables_the_new_members_wake_route() {

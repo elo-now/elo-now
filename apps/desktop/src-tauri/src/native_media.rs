@@ -9,6 +9,8 @@ pub(crate) struct MediaGate {
     current: std::sync::Mutex<Option<MediaSession>>,
     #[cfg(all(mobile, feature = "mobile-push"))]
     activity: tokio::sync::Mutex<Option<CallActivity>>,
+    #[cfg(all(mobile, feature = "mobile-push"))]
+    route_channel: std::sync::OnceLock<tauri::ipc::Channel<Value>>,
 }
 #[cfg(all(target_os = "ios", feature = "mobile-push"))]
 struct MediaSession {
@@ -86,7 +88,14 @@ impl crate::call_lease::Driver for LeaseDriver {
         {
             current.take();
             let _ = stop_capture(&self.app).await;
-            let _ = session_activity(self.app.clone(), &self.call_id, false, false).await;
+            let _ = session_activity(
+                self.app.clone(),
+                &self.call_id,
+                &self.activation,
+                false,
+                false,
+            )
+            .await;
             let _ = self.app.emit(
                 "call-session-ended",
                 serde_json::json!({"sessionId":self.call_id,"activation":self.activation}),
@@ -126,7 +135,7 @@ pub(crate) async fn shutdown(app: &tauri::AppHandle) -> Result<(), String> {
         }
         let capture = stop_capture(app).await;
         let activity = if let Some(session) = session {
-            session_activity(app.clone(), &session.id, false, false).await
+            session_activity(app.clone(), &session.id, &session.activation, false, false).await
         } else {
             Ok(())
         };
@@ -140,10 +149,40 @@ pub(crate) async fn shutdown(app: &tauri::AppHandle) -> Result<(), String> {
 async fn session_activity(
     app: tauri::AppHandle,
     session_id: &str,
+    activation: &str,
     active: bool,
     camera: bool,
 ) -> Result<(), String> {
-    let args = serde_json::json!({"sessionId":session_id,"active":active,"camera":camera});
+    let gate = app.state::<MediaGate>();
+    // Tauri retains native channels for the process lifetime. Reuse one channel
+    // instead of registering another closure for every session/camera update.
+    let channel = gate.route_channel.get_or_init(|| {
+        let target = app.clone();
+        tauri::ipc::Channel::<Value>::new(move |body| {
+            if let Ok(value) = body.deserialize::<Value>() {
+                let valid_id = value["sessionId"].as_str().is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                let valid_activation = value["activation"].as_str().is_some_and(|id| {
+                    id.len() == 36
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+                });
+                if valid_id && valid_activation {
+                    let _ = target.emit(
+                        "call-audio-route-changed",
+                        serde_json::json!({
+                            "sessionId":value["sessionId"], "activation":value["activation"]
+                        }),
+                    );
+                }
+            }
+            Ok(())
+        })
+    });
+    let args = serde_json::json!({"sessionId":session_id,"active":active,"camera":camera,"routeChannel":channel,"activation":activation});
+    drop(gate);
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
             .call("setCallState", args)
@@ -151,6 +190,69 @@ async fn session_activity(
     })
     .await
     .map_err(|_| "unavailable".to_owned())?
+}
+
+/// Output routing is local to the unlocked, explicitly joined session. It never
+/// changes the remote media flags or terminates a call when a route is unavailable.
+#[tauri::command]
+pub(crate) async fn native_call_audio(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::State>,
+    identity: String,
+    session_id: String,
+    activation: String,
+    output_id: Option<String>,
+) -> Result<Value, String> {
+    if output_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > 512)
+    {
+        return Err("invalid".into());
+    }
+    #[cfg(all(mobile, feature = "mobile-push"))]
+    {
+        let runtime = state.lock().await;
+        if runtime
+            .client
+            .as_ref()
+            .ok_or("unauthorized")?
+            .identity_id()
+            .to_string()
+            != identity
+        {
+            return Err("unauthorized".into());
+        }
+        let gate = app.state::<MediaGate>();
+        let current = gate.activity.lock().await;
+        if !current.as_ref().is_some_and(|session| {
+            session.identity == identity
+                && session.id == session_id
+                && session.activation == activation
+        }) {
+            return Err("ended".into());
+        }
+        // The activity guard prevents a delayed route change from affecting the
+        // next session. Native code checks the same ID and activation on its main queue.
+        drop(runtime);
+        let target = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            target
+                .state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+                .call(
+                    "callAudio",
+                    serde_json::json!({"sessionId":session_id,"activation":activation,"outputId":output_id}),
+                )
+        })
+        .await
+        .map_err(|_| "unavailable".to_owned())?;
+        drop(current);
+        result
+    }
+    #[cfg(not(all(mobile, feature = "mobile-push")))]
+    {
+        let _ = (app, state, identity, session_id, activation, output_id);
+        Err("unavailable".into())
+    }
 }
 
 /// Background execution is independent of push opt-in and never starts from a push.
@@ -202,7 +304,8 @@ pub(crate) async fn native_call_state(
             if let Some(previous) = current.take() {
                 previous.lease.abort();
                 let capture = stop_capture(&app).await;
-                let activity = session_activity(app.clone(), &session_id, false, false).await;
+                let activity =
+                    session_activity(app.clone(), &session_id, &activation, false, false).await;
                 capture.and(activity)?;
             }
             return Ok(());
@@ -215,7 +318,7 @@ pub(crate) async fn native_call_state(
                 }
             }
             drop(runtime);
-            return session_activity(app.clone(), &session_id, true, camera).await;
+            return session_activity(app.clone(), &session_id, &activation, true, camera).await;
         }
         crate::release_policy::require_online(&app)?;
         let mut verified = serde_json::json!({"expected_identity":identity,"op":"call_endpoint"});
@@ -257,7 +360,7 @@ pub(crate) async fn native_call_state(
             .to_owned();
         url.set_scheme("wss").map_err(|_| "invalid")?;
         url.set_path(&format!("{}/connect", url.path().trim_end_matches('/')));
-        session_activity(app.clone(), &session_id, true, camera).await?;
+        session_activity(app.clone(), &session_id, &activation, true, camera).await?;
         let token = std::sync::Arc::new(());
         let target = crate::call_lease::Target {
             url: url.to_string(),
@@ -527,7 +630,14 @@ impl SessionDriver {
         }
         activity.take();
         let _ = stop_capture(&self.app).await;
-        let _ = session_activity(self.app.clone(), &self.call_id, false, false).await;
+        let _ = session_activity(
+            self.app.clone(),
+            &self.call_id,
+            &self.activation,
+            false,
+            false,
+        )
+        .await;
         let _ = self.app.emit(
             "call-session-ended",
             serde_json::json!({"sessionId":self.call_id,"activation":self.activation}),

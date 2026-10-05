@@ -385,10 +385,12 @@ impl ClientApp {
                 }
                 .into(),
                 space: self.call_host.as_ref().map(|host| host.scope.space),
+                space_context: None,
                 stream: None,
                 chat: chat.clone(),
                 record: None,
                 thread: None,
+                call_id: None,
                 expires: time + 86_400_000,
             };
             let mut body = wake_request(&route, None, event, &target, &c.recipient())?;
@@ -499,6 +501,8 @@ impl ClientApp {
                 .map(|id| super::super::push_sender::credential_tag(&route.id, *id))
                 .collect();
             scopes.push(json!({"scope":scope(route,Some((pin.space,pin.stream)))?,"enabled":member && !self.read.muted_streams.contains(&pin.stream),"senders":senders}));
+            scopes.push(json!({"scope":session_scope(route,pin.space,pin.stream)?,
+                "enabled":member && !self.read.muted_streams.contains(&pin.stream),"senders":senders,"alert_once":false}));
         }
         let introductions: BTreeSet<_> = self
             .known_people()?
@@ -511,7 +515,7 @@ impl ClientApp {
         scopes.push(json!({"scope":scope(route,None)?,"enabled":true,"alert_once":true,"allow_unknown":true,"senders":introductions}));
         Ok(json!({"introductions":true,"scopes":scopes}))
     }
-    pub fn open_notification(&self, encoded: &str) -> Result<Value> {
+    fn notification_target(&self, encoded: &str) -> Result<Target> {
         if encoded.len() > 2048 {
             return Err("Invalid notification.".into());
         }
@@ -521,15 +525,166 @@ impl ClientApp {
         if target.v != 1
             || !matches!(
                 target.category.as_str(),
-                "message" | "invitation" | "membership"
+                "message" | "invitation" | "membership" | "session_start"
             )
             || target.expires > now()?.as_millis() as u64 + 86_520_000
             || target.identity != self.session.identity_id()
-            || target.expires < now()?.as_millis() as u64
         {
             return Err("This notification is no longer available.".into());
         }
+        if target.category == "session_start"
+            && (target.space.is_none()
+                || target.space_context.is_none()
+                || target.stream.is_none()
+                || target
+                    .call_id
+                    .as_deref()
+                    .is_none_or(|id| record::hex::<16>(id).is_err())
+                || target.expires > now()?.as_millis() as u64 + 60_000)
+        {
+            return Err("This notification is no longer available.".into());
+        }
+        Ok(target)
+    }
+    pub fn open_notification(&self, encoded: &str) -> Result<Value> {
+        let target = self.notification_target(encoded)?;
+        if target.expires < now()?.as_millis() as u64 {
+            return Err("This notification is no longer available.".into());
+        }
+        if target.category == "session_start" {
+            let clients = self
+                .spaces
+                .as_ref()
+                .map(|spaces| spaces.clients(self))
+                .unwrap_or_else(|| vec![self]);
+            let current = clients.into_iter().any(|client| {
+                if client.call_host.as_ref().map(|host| host.scope.space) != target.space_context {
+                    return false;
+                }
+                client.authorities.0.iter().any(|authority| {
+                    Some(authority.space()) == target.space
+                        && Some(authority.stream()) == target.stream
+                        && client.authorities.space_ready(authority)
+                        && !client.read.muted_streams.contains(&authority.stream())
+                        && crate::calls::require_member(authority, client.session.credential().id())
+                            .is_ok()
+                })
+            });
+            if !current {
+                return Err("This notification is no longer available.".into());
+            }
+        }
         Ok(serde_json::to_value(target)?)
+    }
+    /// Reconcile late delivered alerts with verified local state, without
+    /// treating a message that has not arrived as read or exposing its target.
+    pub async fn notification_delivered_read_receipts(
+        &self,
+        route: &Route,
+        delivered: &[Value],
+    ) -> Result<Vec<Value>> {
+        if delivered.len() > 64 {
+            return Err("Too many delivered notifications.".into());
+        }
+        let clients = self
+            .spaces
+            .as_ref()
+            .map(|spaces| spaces.clients(self))
+            .unwrap_or_else(|| vec![self]);
+        let mut receipts = Vec::new();
+        let mut pending = BTreeMap::<_, Vec<(RecordId, Value)>>::new();
+        for value in delivered {
+            let Some(encoded) = value["target"].as_str() else {
+                continue;
+            };
+            let Ok(target) = self.notification_target(encoded) else {
+                continue;
+            };
+            if target.category != "message" || target.chat.is_some() {
+                continue;
+            }
+            let (Some(space), Some(stream), Some(record)) =
+                (target.space, target.stream, target.record)
+            else {
+                continue;
+            };
+            let receipt = json!({"scope":scope(route,Some((space,stream)))?,
+                "event":keyed(route,"elo.notification.event.v1",&record.to_string())?});
+            if value["scope"] != receipt["scope"] || value["event"] != receipt["event"] {
+                continue;
+            }
+            let Some((index, client)) = clients.iter().enumerate().find(|(_, client)| {
+                client
+                    .pins
+                    .iter()
+                    .any(|pin| pin.space == space && pin.stream == stream)
+            }) else {
+                continue;
+            };
+            let id = record.to_string();
+            let stream_key = stream.to_string();
+            if client
+                .read
+                .unread
+                .get(&stream_key)
+                .is_some_and(|ids| ids.contains(&id))
+            {
+                continue;
+            }
+            if client
+                .read
+                .seen
+                .get(&stream_key)
+                .is_some_and(|ids| ids.contains(&id))
+            {
+                receipts.push(receipt);
+            } else {
+                pending
+                    .entry((index, space, stream))
+                    .or_default()
+                    .push((record, receipt));
+            }
+        }
+        for ((index, space, stream), candidates) in pending {
+            let client = clients[index];
+            let Some(authority) = client
+                .authorities
+                .0
+                .iter()
+                .find(|a| a.space() == space && a.stream() == stream)
+            else {
+                continue;
+            };
+            let mut sources = Vec::new();
+            for (record, _) in &candidates {
+                sources.extend(
+                    client
+                        .store
+                        .action_sources(space, stream, Some(*record))
+                        .await?,
+                );
+            }
+            if sources.is_empty() {
+                continue;
+            }
+            // Decrypt only the delivered candidates plus existing verified
+            // action/root context, not the chat's complete message history.
+            let originals = client.originals_from(authority, sources).await?;
+            let projection = super::super::message_actions::Projection::new(&originals);
+            for (id, receipt) in candidates {
+                if originals.iter().any(|(record, _)| {
+                    record.id() == id
+                        && matches!(
+                            record.body()["kind"].as_str(),
+                            Some("chat.message" | "file.shared")
+                        )
+                        && projection.is_deleted(record)
+                }) {
+                    receipts.push(receipt);
+                }
+            }
+        }
+        Ok(receipts)
     }
     /// Produce opaque relay receipts only for messages already verified and
     /// marked read by a successful local operation, including connected Spaces.
@@ -659,7 +814,7 @@ impl ClientApp {
                 let mut complete=true;
                 for (route,credential,_) in routes.iter().filter(|(r,c,_)| c.identity()!=self.session.identity_id() && chat.audience.contains(&c.identity()) && r.since<=stored_at as u64) {
                     if !a.head()?.members.iter().any(|m|m.identity_id==credential.identity() && m.credential_ids.contains(&credential.id()) && m.capabilities.contains(&Capability::Read)) {continue;}
-                    let target=Target{chat:None,v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,expires:expires.unwrap_or(current + 86_400_000).min(current + 86_400_000)};
+                    let target=Target{chat:None,v:1,identity:credential.identity(),category:"message".into(),space:Some(chat.space_id),space_context:None,stream:Some(chat.stream_id),record:Some(id),thread:chat.payload.thread_root,call_id:None,expires:expires.unwrap_or(current + 86_400_000).min(current + 86_400_000)};
                     let mut request=wake_request(route,Some((chat.space_id,chat.stream_id)),&id.to_string(),&target,&credential.recipient())?;
                     super::super::push_sender::sign(&self.session, &route.id, &mut request)?;
                     found=true;
@@ -680,6 +835,101 @@ impl ClientApp {
             }
         }
     }
+
+    pub(in crate::app) async fn notify_ready_session(
+        &self,
+        authority: &Authority,
+        call_id: &str,
+        expires: u64,
+    ) -> Result<bool> {
+        record::hex::<16>(call_id)?;
+        crate::calls::require_member(authority, self.session.credential().id())?;
+        let hosting = self
+            .call_host
+            .as_ref()
+            .ok_or("Session unavailable.")?
+            .scope
+            .space;
+        let time = now()?.as_millis() as u64;
+        if expires <= time || expires > time + 60_000 {
+            return Ok(false);
+        }
+        let mut state = self.invitation_state()?;
+        state.session_notices.retain(|_, expires| *expires > time);
+        let event = format!(
+            "session:{}:{}:{call_id}",
+            authority.space(),
+            authority.stream()
+        );
+        if state.session_notices.contains_key(&event) || state.session_notices.len() >= 128 {
+            return Ok(false);
+        }
+        let routes = self.wake_candidates(&state, None)?;
+        // Persist before sending: repeated callbacks and process restarts cannot
+        // notify twice. Relay delivery remains a bounded best-effort handoff.
+        state.session_notices.insert(event.clone(), expires);
+        self.save_invitations(&state)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut notified = false;
+        for (route, credential, _) in routes {
+            if credential.identity() == self.identity_id()
+                || self.blocked.contains(credential.identity())
+                || crate::calls::require_member(authority, credential.id()).is_err()
+            {
+                continue;
+            }
+            let target = Target {
+                v: 1,
+                identity: credential.identity(),
+                category: "session_start".into(),
+                space: Some(authority.space()),
+                space_context: Some(hosting),
+                stream: Some(authority.stream()),
+                chat: None,
+                record: None,
+                thread: None,
+                call_id: Some(call_id.into()),
+                expires,
+            };
+            let mut body = wake_request(
+                &route,
+                Some((authority.space(), authority.stream())),
+                &event,
+                &target,
+                &credential.recipient(),
+            )?;
+            body["scope"] = json!(session_scope(
+                &route,
+                authority.space(),
+                authority.stream()
+            )?);
+            body["expires"] = json!(expires / 1000);
+            super::super::push_sender::sign(&self.session, &route.id, &mut body)?;
+            let url = endpoint(&route.endpoint, self.push_allow_loopback)?
+                .join(&format!("v1/routes/{}/wake", route.id))?;
+            if let Ok(Ok(response)) = tokio::time::timeout_at(
+                deadline,
+                client
+                    .post(url)
+                    .bearer_auth(&route.notify_key)
+                    .json(&body)
+                    .send(),
+            )
+            .await
+            {
+                notified |= response.status().is_success();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(notified)
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -688,11 +938,15 @@ struct Target {
     identity: IdentityId,
     category: String,
     space: Option<SpaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    space_context: Option<SpaceId>,
     stream: Option<StreamId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chat: Option<InvitationChat>,
     record: Option<RecordId>,
     thread: Option<RecordId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
     expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -709,6 +963,13 @@ pub fn scope(route: &Route, chat: Option<(SpaceId, StreamId)>) -> Result<String>
         &chat
             .map(|(space, stream)| format!("{space}:{stream}"))
             .unwrap_or_else(|| "invitations".into()),
+    )
+}
+fn session_scope(route: &Route, space: SpaceId, stream: StreamId) -> Result<String> {
+    keyed(
+        route,
+        "elo.notification.session.scope.v1",
+        &format!("{space}:{stream}"),
     )
 }
 fn keyed(route: &Route, domain: &str, value: &str) -> Result<String> {
@@ -737,8 +998,130 @@ fn wake_request(
 }
 
 #[cfg(test)]
+#[path = "push_delivered_tests.rs"]
+mod delivered_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn session_targets_are_encrypted_scoped_expiring_and_recheck_local_mute() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save(
+                temp.path().join("profile"),
+                "synthetic session wake password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        app.configure_push("https://notifications.example.test/", false)
+            .unwrap();
+        let authority = app.authorities.0[0].clone();
+        let hosting = SpaceId::from_bytes([0x77; 32]);
+        let mut hosting_scope = app.team_scope().unwrap();
+        hosting_scope.space = hosting;
+        app.call_host = Some(space_service::SpaceAddress {
+            service_credential: None,
+            url: "https://api.example.test/team/v1/spaces".into(),
+            scope: hosting_scope,
+            message_lifetime_seconds: 86400,
+        });
+        assert_ne!(hosting, authority.space());
+        let route = Route {
+            endpoint: "https://notifications.example.test/".into(),
+            id: "11".repeat(16),
+            notify_key: "22".repeat(32),
+            scope_key: "33".repeat(32),
+            since: 1,
+        };
+        let session = session_scope(&route, authority.space(), authority.stream()).unwrap();
+        assert_ne!(
+            session,
+            scope(&route, Some((authority.space(), authority.stream()))).unwrap()
+        );
+        let call_id = "44".repeat(16);
+        let expires = now().unwrap().as_millis() as u64 + 60_000;
+        let target = Target {
+            v: 1,
+            identity: app.identity_id(),
+            category: "session_start".into(),
+            space: Some(authority.space()),
+            space_context: Some(hosting),
+            stream: Some(authority.stream()),
+            chat: None,
+            record: None,
+            thread: None,
+            call_id: Some(call_id.clone()),
+            expires,
+        };
+        let body = wake_request(
+            &route,
+            Some((authority.space(), authority.stream())),
+            "session-event",
+            &target,
+            &app.session.credential().recipient(),
+        )
+        .unwrap();
+        assert!(!body.to_string().contains(&call_id));
+        assert!(!body.to_string().contains(&authority.space().to_string()));
+        assert!(!body.to_string().contains(&hosting.to_string()));
+        let encoded = body["target"].as_str().unwrap();
+        let opened = app.open_notification(encoded).unwrap();
+        assert_eq!(opened["call_id"], call_id);
+        assert_eq!(opened["space"], json!(authority.space()));
+        assert_eq!(opened["space_context"], json!(hosting));
+        // Identical chat authority in another hosting Space must not authorize
+        // this target or supply that other Space's mute state.
+        app.call_host.as_mut().unwrap().scope.space = authority.space();
+        assert!(app.open_notification(encoded).is_err());
+        app.call_host.as_mut().unwrap().scope.space = hosting;
+        app.read.muted_streams.insert(authority.stream());
+        assert!(app.open_notification(encoded).is_err());
+        let policy = app.notification_policy(&route).unwrap();
+        assert_eq!(
+            policy["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["scope"] == session)
+                .unwrap()["enabled"],
+            false
+        );
+        app.read.muted_streams.remove(&authority.stream());
+        assert!(app.open_notification(encoded).is_ok());
+        // No recipient route exists in this fixture; the durable attempt is
+        // nevertheless recorded before any possible network handoff.
+        assert!(
+            !app.notify_ready_session(&authority, &call_id, expires)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !app.notify_ready_session(&authority, &call_id, expires)
+                .await
+                .unwrap()
+        );
+        assert_eq!(app.invitation_state().unwrap().session_notices.len(), 1);
+        let expired = Target {
+            expires: 1,
+            ..target
+        };
+        let body = wake_request(
+            &route,
+            None,
+            "expired-session",
+            &expired,
+            &app.session.credential().recipient(),
+        )
+        .unwrap();
+        assert!(
+            app.open_notification(body["target"].as_str().unwrap())
+                .is_err()
+        );
+        app.close().await.unwrap();
+    }
     #[tokio::test]
     async fn synchronized_policy_removes_blocked_read_only_and_retired_devices() {
         let dir = tempfile::tempdir().unwrap();
@@ -921,10 +1304,12 @@ mod tests {
             identity: app.session.identity_id(),
             category: "message".into(),
             space: Some(pin.space),
+            space_context: None,
             stream: Some(pin.stream),
             chat: None,
             record: Some(RecordId::from_bytes([5; 32])),
             thread: None,
+            call_id: None,
             expires: now().unwrap().as_millis() as u64 + 60000,
         };
         let body = wake_request(

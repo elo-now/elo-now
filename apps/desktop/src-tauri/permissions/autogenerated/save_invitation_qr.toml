@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-invitation-qr"
+description = "Enables the save_invitation_qr command without any pre-configured scope."
+commands.allow = ["save_invitation_qr"]
+
+[[permission]]
+identifier = "deny-save-invitation-qr"
+description = "Denies the save_invitation_qr command without any pre-configured scope."
+commands.deny = ["save_invitation_qr"]

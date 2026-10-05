@@ -2,6 +2,8 @@
 use super::*;
 use crate::authority::CallAuthorityProof;
 
+mod witnessed_devices;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Enrollment {
@@ -18,8 +20,10 @@ impl ClientApp {
         let stream = StreamId::from_bytes(record::hex::<16>(request_id)?);
         let credential = self.session.credential();
         let root = field(credential.record().body(), "root_public_key")?.to_owned();
+        let version = if self.witness_pin.is_some() { 4 } else { 2 };
         let genesis = SpaceGenesis {
-            v: 2,
+            witness: self.witness_pin.clone(),
+            v: version,
             kind: "space.genesis".into(),
             nonce: request_id.into(),
             issuer_identity: credential.identity(),
@@ -39,7 +43,8 @@ impl ClientApp {
             stream,
         )?;
         let config = StreamConfig {
-            v: 2,
+            witness_evidence: None,
+            v: version,
             kind: "stream.config".into(),
             nonce: request_id.into(),
             space_id: authority.space(),
@@ -88,7 +93,7 @@ impl ClientApp {
         contacts: &[Packet],
         require_membership: bool,
     ) -> Result<Authority> {
-        let incoming = proof.verify(scope.space, scope.stream)?;
+        let incoming = self.verify_general_proof(proof, scope.space, scope.stream)?;
         let genesis: SpaceGenesis = incoming.genesis().decode()?;
         if !incoming.is_owner_managed()
             || incoming.is_forked()
@@ -113,6 +118,7 @@ impl ClientApp {
         if let Some(index) = index {
             let previous = &self.authorities.0[index];
             if !previous.is_owner_managed()
+                || previous.is_forked()
                 || incoming.genesis().id() != previous.genesis().id()
                 || !incoming.proves_config_at(
                     previous.head_id().ok_or("Missing configuration.")?,
@@ -183,13 +189,40 @@ impl ClientApp {
         &mut self,
         address: &space_service::SpaceAddress,
     ) -> Result<()> {
-        self.update_owner_general(address, None).await
+        self.update_owner_general(address, None, None).await
+    }
+
+    pub(in crate::app) async fn sync_owner_general_foreground(
+        &mut self,
+        address: &space_service::SpaceAddress,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        self.update_owner_general(address, None, Some(deadline))
+            .await
+    }
+
+    async fn owner_general_request(
+        &self,
+        address: &space_service::SpaceAddress,
+        action: &str,
+        body: Value,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Value> {
+        let request = self.call_space(address, action, body);
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, request)
+                .await
+                .map_err(|_| "Space server timed out.")?
+        } else {
+            request.await
+        }
     }
 
     async fn update_owner_general(
         &mut self,
         address: &space_service::SpaceAddress,
         linked: Option<&VerifiedCredential>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<()> {
         let scope = &address.scope;
         let Some(local) = self
@@ -203,8 +236,13 @@ impl ClientApp {
         if !local.is_owner_managed() || self.require_controller(local).is_err() {
             return Ok(());
         }
+        if local.witness_pin().is_some() {
+            return self.update_witnessed_owner_general(address, linked).await;
+        }
         for attempt in 0..3 {
-            let response = self.call_space(address, "authority", json!({})).await?;
+            let response = self
+                .owner_general_request(address, "authority", json!({}), deadline)
+                .await?;
             let proof: CallAuthorityProof = serde_json::from_value(response["proof"].clone())?;
             let mut authority = self.import_owner_general(scope, &proof, &[], false).await?;
             self.require_controller(&authority)?;
@@ -295,10 +333,11 @@ impl ClientApp {
             authority.apply_config(config.sign(self.session.signing_key())?)?;
             let proposed = authority.call_proof()?;
             let result = self
-                .call_space(
+                .owner_general_request(
                     address,
                     "authority_publish",
                     json!({"expected_head":expected_head,"proof":proposed}),
+                    deadline,
                 )
                 .await;
             match result {
@@ -328,15 +367,17 @@ impl ClientApp {
         credential: &VerifiedCredential,
     ) -> Result<()> {
         if let Some(address) = self.call_host.clone() {
-            self.update_owner_general(&address, Some(credential))
+            self.update_owner_general(&address, Some(credential), None)
                 .await?;
+            let _ = self.refresh_notes_access().await;
         }
         if let Some(spaces) = self.spaces.as_mut() {
             for child in spaces.children_mut().values_mut() {
                 if let Some(address) = child.call_host.clone() {
                     child
-                        .update_owner_general(&address, Some(credential))
+                        .update_owner_general(&address, Some(credential), None)
                         .await?;
+                    let _ = child.refresh_notes_access().await;
                 }
             }
         }
@@ -402,6 +443,86 @@ mod tests {
             root: body.owners[0].root_public_key.clone(),
             controller: body.controller_credential_id,
         }
+    }
+    #[tokio::test]
+    async fn native_witness_pin_rejects_legacy_owner_enrollment_and_requires_the_exact_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = profile(dir.path(), "Owner").await;
+        let legacy = app.owner_general_creation(&"72".repeat(16)).unwrap();
+        let legacy_scope = scope(&legacy);
+        let descriptor = |scope| team::TeamDescriptor {
+            v: 1,
+            url: "https://host.example.test/team/v1/enroll".into(),
+            token: "73".repeat(32),
+            scope,
+            message_lifetime_seconds: 86_400,
+            service_credential: None,
+        };
+        app.configure_team(descriptor(legacy_scope.clone()))
+            .unwrap();
+        let pin = crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(
+                ed25519_dalek::SigningKey::from_bytes(&[74; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            key_generation: 1,
+        };
+        app.configure_witness_pin(Some(pin.clone())).unwrap();
+        let reply = |proof| team::EnrollmentReply {
+            v: 2,
+            packet: STANDARD.encode(
+                serde_json::to_vec(&Enrollment {
+                    proof,
+                    contacts: Vec::new(),
+                })
+                .unwrap(),
+            ),
+        };
+        let count = app.pins.len();
+        assert!(
+            app.accept_space_enrollment(reply(legacy.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.pins.len(),
+            count,
+            "a new legacy General must not be imported"
+        );
+        let witnessed = app.owner_general_creation(&"75".repeat(16)).unwrap();
+        let witnessed_scope = scope(&witnessed);
+        app.configure_team(descriptor(witnessed_scope.clone()))
+            .unwrap();
+        app.configure_witness_pin(Some(crate::authority::WitnessPin {
+            key_generation: 2,
+            ..pin.clone()
+        }))
+        .unwrap();
+        assert!(
+            app.accept_space_enrollment(reply(witnessed.clone()))
+                .await
+                .is_err()
+        );
+        app.configure_witness_pin(Some(pin)).unwrap();
+        app.accept_space_enrollment(reply(witnessed)).await.unwrap();
+        assert_eq!(app.pins.len(), count + 1);
+        let view = app.view_local().await.unwrap();
+        let general = view["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stream| stream["is_general"] == true)
+            .unwrap();
+        assert_eq!(general["name"], "General");
+        assert_eq!(general["owner_managed"], true);
+        app.configure_witness_pin(None).unwrap();
+        assert!(
+            app.verify_general_proof(&legacy, legacy_scope.space, legacy_scope.stream)
+                .is_ok()
+        );
+        app.close().await.unwrap();
     }
     #[tokio::test]
     async fn owner_general_creation_retries_are_identical_and_have_only_the_real_owner() {
@@ -471,6 +592,24 @@ mod tests {
         bad_scope.root = "99".repeat(32);
         assert!(
             app.import_owner_general(&bad_scope, &authority.call_proof().unwrap(), &[], true)
+                .await
+                .is_err()
+        );
+        // Importing one valid branch cannot hide a locally observed fork.
+        let mut competing = authority.head().unwrap().clone();
+        competing.nonce = record::random_hex::<16>().unwrap();
+        let index = app
+            .authorities
+            .0
+            .iter()
+            .position(|a| a.space() == scope.space && a.stream() == scope.stream)
+            .unwrap();
+        app.authorities.0[index]
+            .apply_config(competing.sign(app.session.signing_key()).unwrap())
+            .unwrap();
+        assert!(app.authorities.0[index].is_forked());
+        assert!(
+            app.import_owner_general(&scope, &authority.call_proof().unwrap(), &[], true)
                 .await
                 .is_err()
         );

@@ -7,6 +7,7 @@ import {
   senderName,
   senderInitials,
   statusText,
+  spaceStatusText,
   recordTimestamp,
   visibleMembers,
   invitationCount,
@@ -14,6 +15,25 @@ import {
   type Stream,
   type View,
 } from "./model";
+describe("Space admission status", () => {
+  it("distinguishes automatic setup from a request awaiting a decision", () => {
+    expect(
+      spaceStatusText({ status: "pending", pending_reason: "owner_sync" }),
+    ).toBe("Waiting for the owner’s app to connect");
+    expect(
+      spaceStatusText({ status: "pending", pending_reason: "approval" }),
+    ).toBe("Waiting for approval");
+    expect(spaceStatusText({ status: "pending" })).toBe("Waiting for approval");
+  });
+  it("does not keep a stale waiting reason after a decision", () => {
+    expect(
+      spaceStatusText({ status: "joined", pending_reason: "owner_sync" }),
+    ).toBe("");
+    expect(
+      spaceStatusText({ status: "declined", pending_reason: "owner_sync" }),
+    ).toBe("Request declined");
+  });
+});
 describe("Signed record timestamps", () => {
   it("omits fractional seconds without rounding into the next day", () => {
     expect(recordTimestamp(new Date("2026-09-11T23:59:59.999Z"))).toBe(

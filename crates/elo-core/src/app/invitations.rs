@@ -150,6 +150,8 @@ struct Invitations {
     own_wake: Option<push::Route>,
     #[serde(default)]
     seen_notices: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_notices: BTreeMap<String, u64>,
     #[serde(default)]
     seen_activity: Vec<String>,
 }
@@ -323,6 +325,9 @@ impl ClientApp {
         &self,
         authority: &Authority,
     ) -> Result<()> {
+        if self.is_notes_authority(authority) {
+            return Err("Notes is private to this profile.".into());
+        }
         if authority.is_owner_managed() {
             return Err("Manage General members from Space settings.".into());
         }

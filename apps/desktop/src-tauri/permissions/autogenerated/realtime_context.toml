@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-realtime-context"
+description = "Enables the realtime_context command without any pre-configured scope."
+commands.allow = ["realtime_context"]
+
+[[permission]]
+identifier = "deny-realtime-context"
+description = "Denies the realtime_context command without any pre-configured scope."
+commands.deny = ["realtime_context"]

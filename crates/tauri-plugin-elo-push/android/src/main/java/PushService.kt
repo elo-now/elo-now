@@ -32,6 +32,10 @@ class PushService : FirebaseMessagingService() {
             return
         }
         if (message.data["elo_wake"] != "1") return
+        val category = message.data["elo_category"] ?: "message"
+        val expires = if (category == "session_start") {
+            SessionNotification.expiresAt(message.data["elo_expires"], System.currentTimeMillis()) ?: return
+        } else null
         val target = message.data["elo_target"] ?: return
         val scope = message.data["elo_scope"] ?: return
         val event = message.data["elo_event"] ?: return
@@ -47,18 +51,19 @@ class PushService : FirebaseMessagingService() {
         // Use fixed local copy only. Incoming payload text is never rendered.
         // Keep a silent drawer entry for launcher badges. The verified foreground UI owns alerts.
         val quiet = foreground || message.data["elo_quiet"] == "1"
-        val category = message.data["elo_category"] ?: "message"
         val (key, fallback) = when (category) {
             "invitation" -> "notifications.nativeInvitation" to R.string.notification_invitation
             "membership" -> "notifications.nativeActivity" to R.string.notification_activity
+            "session_start" -> "notifications.nativeSession" to R.string.notification_session
             else -> "notifications.nativeMessage" to R.string.notification_message
         }
-        val channel = if (category == "message") "elo_messages" else "elo_invitations"
+        val channel = if (category == "message" || category == "session_start") "elo_messages" else "elo_invitations"
         val notification = NotificationCompat.Builder(this, channel)
             .setSmallIcon(now.elo.push.R.drawable.ic_elo_notification).setContentTitle("elo.now")
             .setContentText(prefs.getString(key, getString(fallback)))
-            .addExtras(NotificationInbox.metadata(message.data["elo_registration"], scope, event))
-            .setNumber(1)
+            .addExtras(NotificationInbox.metadata(message.data["elo_registration"], scope, event, expires))
+            .setNumber(if (category == "session_start") 0 else 1)
+            .setTimeoutAfter(expires?.minus(System.currentTimeMillis())?.coerceAtLeast(1) ?: 0)
             .setContentIntent(pending).setAutoCancel(true).setOnlyAlertOnce(quiet).setSilent(quiet)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE).build()
         NotificationInbox.post(this, message.data["elo_registration"], scope, event, notification)

@@ -1,9 +1,67 @@
 import Tauri
 import UIKit
+import WebKit
 
 private struct CopyArgs: Decodable { let text: String }
 
+// This bridge controls presentation only and accepts no profile data or commands.
+private final class AppearanceHandler: NSObject, WKScriptMessageHandler {
+    weak var owner: EloPrivacyPlugin?
+    init(_ owner: EloPrivacyPlugin) { self.owner = owner }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.frameInfo.isMainFrame,
+              let preference = message.body as? String,
+              ["dark", "light", "auto"].contains(preference) else { return }
+        owner?.applyAppearance(preference)
+    }
+}
+
 final class EloPrivacyPlugin: Plugin {
+    private weak var appearanceWebView: WKWebView?
+
+    override func load(webview: WKWebView) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.appearanceWebView = webview
+            self.applyAppearance(UserDefaults.standard.string(forKey: "elo.appearance") ?? "dark")
+            let controller = webview.configuration.userContentController
+            controller.removeScriptMessageHandler(forName: "eloAppearance")
+            controller.add(AppearanceHandler(self), name: "eloAppearance")
+            let script = """
+            (() => {
+            if (location.href === "about:blank") return;
+            window.eloAppearance = {
+              ...window.eloAppearance,
+              setPreference(preference) {
+                if (["dark", "light", "auto"].includes(preference)) {
+                  window.webkit.messageHandlers.eloAppearance.postMessage(preference);
+                }
+              }
+            };
+            // Migrate the existing WebView preference on the first updated launch.
+            try {
+              const saved = localStorage.getItem("elo.appearance");
+              window.eloAppearance.setPreference(saved === "auto" || saved === "light" ? saved : "dark");
+            } catch { window.eloAppearance.setPreference("dark"); }
+            })();
+            """
+            controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            // Plugin loading may finish after the initial document has started.
+            webview.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    fileprivate func applyAppearance(_ preference: String) {
+        let mode = ["dark", "light", "auto"].contains(preference) ? preference : "dark"
+        UserDefaults.standard.set(mode, forKey: "elo.appearance")
+        guard let webview = appearanceWebView else { return }
+        webview.overrideUserInterfaceStyle = mode == "auto" ? .unspecified : (mode == "light" ? .light : .dark)
+        webview.isOpaque = false
+        let background = UIColor(named: "LaunchBackground") ?? .systemBackground
+        webview.backgroundColor = background
+        webview.scrollView.backgroundColor = background
+    }
+
     @objc func copyRecoveryCode(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(CopyArgs.self)
         guard !args.text.isEmpty, args.text.utf8.count <= 2048, !args.text.contains("\0") else {

@@ -1,5 +1,6 @@
 import type { MessageRow } from "./messageThreads";
 import type { View, Stream } from "./model";
+import { isExpiryTimestamp } from "./timestamps";
 
 export type MessageExpiryHours = 1 | 12 | 24;
 
@@ -10,7 +11,11 @@ export function expireMessageRows(
   let changed = false;
   const result = rows.map((row) => {
     const deadline = row.body.payload?.expires_at_ms;
-    if (row.body.kind === "deleted" || deadline == null || deadline > now)
+    if (
+      row.body.kind === "deleted" ||
+      !isExpiryTimestamp(deadline) ||
+      deadline > now
+    )
       return row;
     changed = true;
     return {

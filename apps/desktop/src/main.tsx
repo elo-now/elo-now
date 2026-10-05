@@ -3,7 +3,19 @@ import { UpdateGate } from "./UpdateGate";
 import { canReadVisibleMessages } from "./messageReadVisibility";
 import { PageSurface, useDesktopLayout } from "./PageSurface";
 import { ProfileEditor, type ProfilePresentation } from "./ProfileEditor";
-import { useCalls, CallButton, CallSurface } from "./calls/CallUI";
+import {
+  useCalls,
+  CallButton,
+  CallSurface,
+  ActiveSessions,
+  ActiveSessionJoin,
+  useSessionStarted,
+} from "./calls/CallUI";
+import { activeSessions } from "./calls/sessionPresence";
+import {
+  useActivityNotifications,
+  appHasAttention,
+} from "./useActivityNotifications";
 import { leaveBeforeLock } from "./calls/leaveBeforeLock";
 import { t, messageDayKey, formatMessageDay, formatFileSize } from "./i18n";
 import React, { useEffect, useRef, useState } from "react";
@@ -28,7 +40,13 @@ import { ChatGroupsBar, ChatList, ChatGroupField } from "./ChatOrganization";
 import { isDirectChat } from "./chatGroups";
 import { NewChat } from "./NewChat";
 import { Contacts } from "./Contacts";
-import { applyTheme, readTheme, type Theme } from "./theme";
+import {
+  applyTheme,
+  readTheme,
+  watchSystemTheme,
+  type Theme,
+  type ThemePreference,
+} from "./theme";
 import "./style.css";
 import { Spaces, CurrentSpace, SpaceSetup } from "./Spaces";
 import "./mobile.css";
@@ -55,6 +73,19 @@ import {
 import { MessageContent } from "./MessageContent";
 import { reminderProfileMatches, watchReminderActions } from "./reminders";
 import { ComposerInput } from "./ComposerInput";
+import {
+  useConversationDraft,
+  flushConversationDrafts,
+  retryConversationDrafts,
+} from "./conversationDrafts";
+import {
+  mentionCandidates,
+  mentionIdentities,
+  type ComposerMention,
+} from "./composerMentions";
+import { useAttachmentDrop } from "./useAttachmentDrop";
+import { desktopShortcut } from "./desktopShortcuts";
+import { KeyboardHelp, QuickSwitcher, switchableChats } from "./QuickSwitcher";
 import { ComposerExpiry } from "./ComposerExpiry";
 import type { MessageExpiryHours } from "./messageExpiry";
 import { useExpiringView } from "./useMessageExpiry";
@@ -103,7 +134,7 @@ import { usePushNotifications } from "./usePushNotifications";
 import { acceptView, type SyncResult } from "./liveSync";
 import { incomingMessages, newMessageInChat } from "./messageNotifications";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
-import { EXCHANGE_PREFIX } from "./invitationTransport";
+import { normalizeInvitationLink } from "./invitationTransport";
 import { PullToRefresh } from "./PullToRefresh";
 import {
   MessageStatusDialog,
@@ -144,9 +175,9 @@ type AttachmentTransferState = AttachmentProgress & {
 
 const ATTACHMENT_TRANSFER_CANCELLED = "Attachment transfer cancelled.";
 
-const initialTheme = readTheme();
+const initialThemePreference = readTheme();
+const initialTheme = applyTheme(initialThemePreference);
 const initialPreferences = readPreferences();
-applyTheme(initialTheme);
 applyVisualPreferences(initialPreferences, initialTheme);
 
 function LogoutDialog({
@@ -339,11 +370,17 @@ function App() {
   } = useToast();
   const [mode, setMode] = useState<ViewMode>(readViewMode);
   const [mobile, setMobile] = useState(false);
+  const [biometricSupported, setBiometricSupported] = useState(false);
   useEffect(() => {
     let alive = true;
-    void invoke<{ mobile: boolean }>("profile_environment")
+    void invoke<{ mobile: boolean; biometric_supported: boolean }>(
+      "profile_environment",
+    )
       .then((value) => {
-        if (alive) setMobile(value.mobile);
+        if (alive) {
+          setMobile(value.mobile);
+          setBiometricSupported(value.biometric_supported);
+        }
       })
       .catch(() => {});
     return () => {
@@ -376,7 +413,6 @@ function App() {
     key: number;
   }>();
   const [threadComposeRevision, setThreadComposeRevision] = useState(0);
-  const [threadDrafts, setThreadDrafts] = useState<Record<string, string>>({});
   const [membersOpen, setMembersOpen] = useState(false);
   const [addPeopleOpen, setAddPeopleOpen] = useState(false);
   const [newChat, setNewChat] = useState<{
@@ -386,16 +422,31 @@ function App() {
   } | null>(null);
   const [invitationRoute, setInvitationRoute] =
     useState<InvitationRoute | null>(null);
+  const [spaceInvitation, setSpaceInvitation] = useState<{
+    id: number;
+    link: string;
+  } | null>(null);
+  const spaceInvitationSerial = useRef(0);
+  const openSpaceInvitation = (link: string) => {
+    setSpaceInvitation({ id: ++spaceInvitationSerial.current, link });
+  };
   useEffect(() => {
     let alive = true;
     let dispose: (() => void) | undefined;
     const accept = (urls: string[]) => {
-      const link = urls.find(
-        (url) =>
-          url.startsWith(EXCHANGE_PREFIX) && url.length <= 2 * 1024 * 1024,
-      );
-      if (alive && link)
-        setInvitationRoute({ page: "scan", link, unscoped: true });
+      const invitation = urls
+        .map(normalizeInvitationLink)
+        .find((item) => item !== null);
+      if (!alive || !invitation) return;
+      if (invitation.kind === "space") openSpaceInvitation(invitation.link);
+      else {
+        setSpaceInvitation(null);
+        setInvitationRoute({
+          page: "scan",
+          link: invitation.link,
+          unscoped: true,
+        });
+      }
     };
     void onOpenUrl(accept)
       .then((fn) => {
@@ -432,6 +483,10 @@ function App() {
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [desktopProfileEditing, setDesktopProfileEditing] = useState(false);
+  const [keyboardPanel, setKeyboardPanel] = useState<"switch" | "help" | null>(
+    null,
+  );
+  const macKeyboard = /Mac|iPhone|iPad/.test(navigator.platform);
   const [headerMenu, setHeaderMenu] = useState<{
     anchor: DOMRect;
     conversation: boolean;
@@ -450,8 +505,6 @@ function App() {
     setSettingsPage(page);
     setSettingsOpen(true);
   };
-  const [pendingAttachment, setPendingAttachment] =
-    useState<SelectedAttachment | null>(null);
   const [attachmentTransfer, setAttachmentTransfer] =
     useState<AttachmentTransferState>();
   const [attachmentStates, setAttachmentStates] = useState<
@@ -529,6 +582,9 @@ function App() {
     return () => document.removeEventListener("keydown", key);
   }, [settingsOpen, settingsPage, desktopProfileEditing]);
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(
+    initialThemePreference,
+  );
   const [preferences, setPreferences] =
     useState<UserPreferences>(initialPreferences);
   const [systemScale, setSystemScale] = useState(1);
@@ -538,11 +594,22 @@ function App() {
     applyVisualPreferences(value, theme, systemScale);
     setPreferences(value);
   };
-  const changeTheme = (value: Theme) => {
-    applyTheme(value);
-    applyVisualPreferences(preferences, value, systemScale);
-    setTheme(value);
+  const changeTheme = (value: ThemePreference) => {
+    const resolved = applyTheme(value);
+    applyVisualPreferences(preferences, resolved, systemScale);
+    setThemePreference(value);
+    setTheme(resolved);
   };
+  useEffect(() => {
+    if (themePreference !== "auto") return;
+    const update = () => {
+      const resolved = applyTheme("auto");
+      applyVisualPreferences(preferences, resolved, systemScale);
+      setTheme(resolved);
+    };
+    update();
+    return watchSystemTheme(update);
+  }, [themePreference, preferences, systemScale]);
   useEffect(() => {
     const update = () =>
       void readSystemTextScale().then((value) => {
@@ -562,15 +629,12 @@ function App() {
     [selected, setSelected] = useState(""),
     [busy, setBusy] = useState(false),
     [syncSummary, setSyncSummary] = useState(""),
-    [text, setText] = useState(""),
     [action, setAction] = useState<Action | null>(null),
     [values, setValues] = useState<Record<string, string | boolean>>({});
   const view = useExpiringView(storedView);
-  const [messageExpiry, setMessageExpiry] = useState<MessageExpiryHours>();
-  useEffect(
-    () => setMessageExpiry(undefined),
-    [view?.identity, view?.active_space, selected],
-  );
+  useEffect(() => {
+    if (view && spaceInvitation) openSettings("spaces");
+  }, [view?.identity, spaceInvitation]);
   const setView: React.Dispatch<React.SetStateAction<View | null>> = (next) =>
     storeView((current) =>
       typeof next === "function"
@@ -596,8 +660,6 @@ function App() {
     }
   };
   useEffect(() => {
-    setText("");
-    setThreadDrafts({});
     setAction(null);
 
     setNewChat(null);
@@ -647,7 +709,6 @@ function App() {
   const [messageQuery, setMessageQuery] = useState("");
   useEffect(() => {
     setThreadRoot(undefined);
-    setThreadDrafts({});
   }, [view?.identity]);
   const threadActive =
     !!threadRoot &&
@@ -689,35 +750,6 @@ function App() {
   useEffect(() => {
     setMessageQuery("");
   }, [view?.identity, selected, conversationOpen]);
-  useEffect(() => {
-    if (!desktopLayout) return;
-    const shortcut = (event: KeyboardEvent) => {
-      if (
-        !(event.metaKey || event.ctrlKey) ||
-        event.altKey ||
-        document.querySelector("dialog[open]")
-      )
-        return;
-      const selector =
-        event.key.toLowerCase() === "k"
-          ? ".desktop-sidebar .search-input"
-          : event.key.toLowerCase() === "f" &&
-              messagesActive &&
-              !desktopProfileEditing
-            ? ".conversation .search-input"
-            : undefined;
-      const field = selector
-        ? document.querySelector<HTMLInputElement>(selector)
-        : null;
-      if (field) {
-        event.preventDefault();
-        field.focus();
-        field.select();
-      }
-    };
-    document.addEventListener("keydown", shortcut);
-    return () => document.removeEventListener("keydown", shortcut);
-  }, [desktopLayout, messagesActive, desktopProfileEditing]);
   const [groupDraft, setGroupDraft] = useState(false);
   const streamSummary =
     view?.streams.find((s) => s.stream === selected) ?? view?.streams[0];
@@ -750,6 +782,55 @@ function App() {
   ]);
   const currentConversationScope = useRef(conversationScope);
   currentConversationScope.current = conversationScope;
+  const {
+    text,
+    mentions: draftMentions,
+    setContent: setDraftContent,
+    ready: draftReady,
+    clearSubmitted: clearSubmittedDraft,
+    expiry: messageExpiry,
+    setExpiry: setMessageExpiry,
+    attachment: pendingAttachment,
+    setAttachment: setPendingAttachment,
+    clear: clearComposerDrafts,
+  } = useConversationDraft(
+    view ? JSON.stringify([view.identity, view.credential]) : undefined,
+    conversationScope,
+    (attachment) =>
+      void invoke("discard_exchange", { path: attachment.path }).catch(
+        () => {},
+      ),
+    view && streamSummary
+      ? {
+          identity: view.identity,
+          credential: view.credential,
+          active_space: view.active_space ?? null,
+          space: streamSummary.space,
+          stream: streamSummary.stream,
+          thread: null,
+        }
+      : undefined,
+    reportError,
+  );
+  const threadDraftScope =
+    view && streamSummary && threadRoot
+      ? {
+          identity: view.identity,
+          credential: view.credential,
+          active_space: view.active_space ?? null,
+          space: streamSummary.space,
+          stream: streamSummary.stream,
+          thread: threadRoot,
+        }
+      : undefined;
+  const threadComposerDraft = useConversationDraft(
+    view ? JSON.stringify([view.identity, view.credential]) : undefined,
+    JSON.stringify(threadDraftScope),
+    () => {},
+    threadDraftScope,
+    reportError,
+  );
+  const selectingAttachment = useRef(false);
   const postingMessage = useRef(false);
   const outgoing = useOutgoingMessages(
     JSON.stringify([view?.identity, view?.credential]),
@@ -798,7 +879,6 @@ function App() {
           threadRoot,
         )
       : undefined;
-  const threadDraftKey = `${stream?.space}:${stream?.stream}:${threadRoot}`;
   const messageEntrance = useMessageEntrance(
     JSON.stringify([
       messageScope,
@@ -892,6 +972,7 @@ function App() {
     value: string,
     thread?: string,
     expiry?: MessageExpiryHours,
+    mentions: ComposerMention[] = [],
   ) => {
     if (!view || !stream)
       return Promise.reject(new Error("The profile is locked"));
@@ -907,6 +988,7 @@ function App() {
         identity: view.identity,
         credential: view.credential,
         text: value,
+        mentions: mentionIdentities(value, mentions),
         createdAt,
         logicalTime,
         thread,
@@ -918,6 +1000,7 @@ function App() {
           space: stream.space,
           stream: stream.stream,
           text: value,
+          mentions: mentionIdentities(value, mentions),
           created_at: createdAt,
           expires_in_hours: expiry,
           ...(thread ? { reply_to: thread } : {}),
@@ -926,47 +1009,98 @@ function App() {
       },
     );
   };
-  const chooseAttachment = () =>
+  const chooseAttachment = () => {
+    if (
+      busy ||
+      selectingAttachment.current ||
+      !stream?.can_post ||
+      stream.forked ||
+      awaitingDirect
+    )
+      return;
+    selectingAttachment.current = true;
+    const scope = conversationScope;
     void perform(async () => {
-      const selected = await invoke<SelectedAttachment | null>(
-        "choose_attachment",
-      );
-      if (!selected) return;
-      if (pendingAttachment)
-        await invoke("discard_exchange", { path: pendingAttachment.path });
-      setPendingAttachment(selected);
-    });
-  const stageMediaAttachment = (file: File | undefined) => {
-    if (!file) return;
-    void perform(async () => {
-      if (file.size > 5 * 1024 * 1024)
-        throw new Error("Attachment files cannot exceed 5 MB.");
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = () =>
-          reject(new Error("Could not safely open this attachment."));
-        reader.readAsDataURL(file);
-      });
-      const separator = dataUrl.indexOf(",");
-      if (separator < 0)
-        throw new Error("Could not safely open this attachment.");
-      const selected = await invoke<SelectedAttachment>("stage_attachment", {
-        name: file.name || "attachment.bin",
-        data: dataUrl.slice(separator + 1),
-      });
-      if (pendingAttachment)
-        await invoke("discard_exchange", { path: pendingAttachment.path });
-      setPendingAttachment(selected);
+      try {
+        const selected = await invoke<SelectedAttachment | null>(
+          "choose_attachment",
+        );
+        if (!selected) return;
+        if (currentConversationScope.current !== scope) {
+          await invoke("discard_exchange", { path: selected.path });
+          return;
+        }
+        if (
+          currentView.current?.identity === view?.identity &&
+          currentView.current?.credential === view?.credential
+        )
+          setPendingAttachment(selected);
+        else await invoke("discard_exchange", { path: selected.path });
+      } finally {
+        selectingAttachment.current = false;
+      }
     });
   };
+  const stageMediaAttachment = (file: File | undefined) => {
+    if (
+      !file ||
+      busy ||
+      selectingAttachment.current ||
+      !stream?.can_post ||
+      stream.forked ||
+      awaitingDirect
+    )
+      return;
+    selectingAttachment.current = true;
+    const scope = conversationScope;
+    void perform(async () => {
+      try {
+        if (file.size > 5 * 1024 * 1024)
+          throw new Error("Attachment files cannot exceed 5 MB.");
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () =>
+            reject(new Error("Could not safely open this attachment."));
+          reader.readAsDataURL(file);
+        });
+        const separator = dataUrl.indexOf(",");
+        if (separator < 0)
+          throw new Error("Could not safely open this attachment.");
+        if (currentConversationScope.current !== scope) return;
+        const selected = await invoke<SelectedAttachment>("stage_attachment", {
+          name: file.name || "attachment.bin",
+          data: dataUrl.slice(separator + 1),
+        });
+        if (currentConversationScope.current !== scope) {
+          await invoke("discard_exchange", { path: selected.path });
+          return;
+        }
+        if (
+          currentView.current?.identity === view?.identity &&
+          currentView.current?.credential === view?.credential
+        )
+          setPendingAttachment(selected);
+        else await invoke("discard_exchange", { path: selected.path });
+      } finally {
+        selectingAttachment.current = false;
+      }
+    });
+  };
+  const attachmentDrop = useAttachmentDrop({
+    desktop: desktopLayout && !mobile,
+    enabled:
+      messagesActive &&
+      !busy &&
+      !!stream?.can_post &&
+      !stream.forked &&
+      !awaitingDirect,
+    scope: conversationScope,
+    onFile: stageMediaAttachment,
+    onError: reportError,
+  });
   const discardAttachment = () => {
-    const selected = pendingAttachment;
     setPendingAttachment(null);
-    if (selected)
-      void invoke("discard_exchange", { path: selected.path }).catch(
-        reportError,
-      );
   };
   const cancelAttachmentTransfer = () => {
     const transfer = attachmentTransfer;
@@ -1060,6 +1194,7 @@ function App() {
   };
   const refresh = () =>
     perform(async () => {
+      retryConversationDrafts();
       // Keep a manual refresh bounded; the foreground worker drains the rest.
       try {
         const result = await call({ op: "sync_live" });
@@ -1232,6 +1367,96 @@ function App() {
       reportError(error);
     });
   };
+  const openSessionChat = async (chat: Stream) => {
+    const current = currentView.current;
+    if (!current) return;
+    const identity = current.identity;
+    const context = chat.space_context ?? current.active_space;
+    let next = current;
+    if (context && context !== current.active_space) {
+      const result = await invoke<{ view: View }>("operate", {
+        request: {
+          op: "space_select",
+          id: context,
+          expected_identity: identity,
+        },
+      });
+      if (
+        currentView.current?.identity !== identity ||
+        result.view.identity !== identity
+      )
+        return;
+      next = result.view;
+      setView(next);
+    }
+    const verified = next.streams.find(
+      (item) =>
+        item.space === chat.space &&
+        item.stream === chat.stream &&
+        (item.space_context ?? next.active_space) === context &&
+        !item.forked &&
+        item.members.some(
+          (member) =>
+            member.identity_id === identity &&
+            member.capabilities.includes("READ"),
+        ),
+    );
+    if (!verified) return;
+    clearMessages();
+    openHome("chats");
+    setSelected(verified.stream);
+    setMessageQuery("");
+    setSessionUnread(new Set());
+    setConversationOpen(true);
+    // A notification opens the verified conversation only. Join always needs
+    // a separate user action and the latest signed session state.
+  };
+  const activityNotifications = useActivityNotifications({
+    view,
+    mobile,
+    ready:
+      !!view &&
+      !view.space_setup &&
+      !biometricOfferPending &&
+      !biometricOfferName,
+    onMessage: async (entry) => {
+      setCollection(null);
+      setInvitationRoute(null);
+      setNewChat(null);
+      setMembersOpen(false);
+      return openStreamMessage(entry);
+    },
+    onChat: openSessionChat,
+    onInbox: () => openHome("stream"),
+    onError: reportError,
+    isSessionAvailable: (target) =>
+      !!view &&
+      activeSessions(view, calls.getSnapshot().available).some(
+        ({ call, chat }) =>
+          call.call_id === target.call_id &&
+          chat.space === target.space &&
+          chat.stream === target.stream &&
+          chat.space_context === target.space_context,
+      ),
+  });
+  useSessionStarted(calls, (event) => {
+    const sameChat =
+      appHasAttention() &&
+      (messagesActive || threadActive) &&
+      stream?.space === event.chat.space &&
+      stream.stream === event.chat.stream &&
+      (stream.space_context ?? view?.active_space) === event.chat.space_context;
+    if (sameChat) return;
+    activityNotifications.session(
+      event.chat,
+      event.call.call_id,
+      t("calls.sessionStartedInSpace", {
+        name: event.starterName,
+        chat: event.chat.name,
+        space: event.spaceName,
+      }),
+    );
+  });
   const storageNotices = useRef(new Map<string, number>());
   useEffect(() => {
     storageNotices.current.clear();
@@ -1287,16 +1512,13 @@ function App() {
           key: ++messageTargetSerial.current,
         });
     }
-    if (
-      fresh.length > 0 ||
-      document.visibilityState !== "visible" ||
-      isOpeningPush() ||
-      document.querySelector("dialog[open]")
-    )
-      return;
+    if (fresh.length > 0 || isOpeningPush()) return;
     const location =
-      stream && (messagesActive || threadActive)
+      appHasAttention() && stream && (messagesActive || threadActive)
         ? {
+            space: stream.space,
+            space_context:
+              stream.space_context ?? view?.active_space ?? undefined,
             stream: stream.stream,
             thread: threadActive ? threadRoot : undefined,
           }
@@ -1307,6 +1529,7 @@ function App() {
       location,
     );
     if (!entries.length) {
+      if (!appHasAttention() || document.querySelector("dialog[open]")) return;
       const invites = invitationCount(result.view) > invitationCount(view!);
       const notifications =
         notificationCount(result.view) > notificationCount(view!);
@@ -1336,38 +1559,7 @@ function App() {
       }
       return;
     }
-    const entry = entries.at(-1)!;
-    const label =
-      entries.length > 1
-        ? t("notifications.messages", { count: entries.length })
-        : t(
-            entry.chat.chat_kind === "direct" && entry.chat.members.length === 2
-              ? "notifications.directMessage"
-              : "notifications.message",
-            {
-              name: senderName(
-                result.view,
-                entry.row.body.issuer_identity,
-                entry.chat,
-              ),
-              chat: entry.chat.name,
-              message: (entry.row.body.payload?.text ?? "")
-                .slice(0, 160)
-                .replace(/\s+/g, " "),
-            },
-          );
-    showMessage(label, () => {
-      setCollection(null);
-      setInvitationRoute(null);
-      setNewChat(null);
-      setMembersOpen(false);
-      if (
-        entries.length > 1 &&
-        entries.every((item) => item.chat.space_context === view?.active_space)
-      )
-        openHome("stream");
-      else openStreamMessage(entry);
-    });
+    activityNotifications.messages(entries, result.view);
   }
   const remoteSync = useRef<(space: string) => void>(() => {});
   const realtime = useRealtime(
@@ -1503,23 +1695,22 @@ function App() {
       if (action.id !== "remove_member") notify(t("notice.confirmed"));
     });
   const clearProfileSession = () => {
+    clearComposerDrafts();
+    setKeyboardPanel(null);
     setView(null);
-    setThreadDrafts({});
     setChatQuery("");
     setMessageQuery("");
     setInvitationRoute(null);
+    setSpaceInvitation(null);
     setMembersOpen(false);
     setNewChat(null);
     setMessageStatus(null);
     setHeaderMenu(null);
     setIdentifiersOpen(false);
     setCollection(null);
-    setText("");
 
     setAction(null);
     setValues({});
-
-    setPendingAttachment(null);
 
     setLogoutOpen(false);
     setActiveDemoProfile(undefined);
@@ -1535,6 +1726,7 @@ function App() {
   };
   const lockProfile = () =>
     void perform(async () => {
+      await flushConversationDrafts();
       try {
         await leaveBeforeLock(calls, () => invoke("lock"));
       } finally {
@@ -1561,17 +1753,111 @@ function App() {
       );
       dismissBiometricOffer();
     });
+  const biometricOffer = biometricOfferName && (
+    <BiometricOfferDialog
+      name={biometricOfferName}
+      busy={busy}
+      onDecline={dismissBiometricOffer}
+      onAccept={acceptBiometricOffer}
+    />
+  );
+  useEffect(() => {
+    if (
+      !desktopLayout ||
+      mobile ||
+      !view ||
+      view.space_setup ||
+      busy ||
+      biometricOfferPending ||
+      biometricOfferName ||
+      notificationOpening
+    )
+      return;
+    const key = (event: KeyboardEvent) => {
+      if (document.querySelector("dialog[open]") || desktopProfileEditing)
+        return;
+      const command = desktopShortcut(event, macKeyboard);
+      if (!command) return;
+      if (command === "switch" || command === "help") {
+        event.preventDefault();
+        setKeyboardPanel(command);
+        return;
+      }
+      if (command === "search") {
+        if (!messagesActive) return;
+        const field = document.querySelector<HTMLInputElement>(
+          ".conversation .search-input",
+        );
+        if (field) {
+          event.preventDefault();
+          field.focus();
+          field.select();
+        }
+      } else if (command === "compose") {
+        event.preventDefault();
+        begin(actions[0], { chat_kind: "direct" });
+      } else if (command === "preferences") {
+        event.preventDefault();
+        openSettings("appearance");
+      } else if (command === "attach") {
+        if (
+          !messagesActive ||
+          !stream?.can_post ||
+          stream.forked ||
+          awaitingDirect
+        )
+          return;
+        event.preventDefault();
+        chooseAttachment();
+      } else {
+        const chats = switchableChats(view).filter(
+          (chat) => chat.space_context === view.active_space,
+        );
+        const current = chats.findIndex(
+          (chat) =>
+            chat.space === stream?.space && chat.stream === stream.stream,
+        );
+        const direction =
+          command === "previous" || command === "unreadPrevious" ? -1 : 1;
+        const unreadOnly = command.startsWith("unread");
+        for (let offset = 1; offset <= chats.length; offset++) {
+          const next =
+            chats[
+              (current + direction * offset + chats.length * 2) % chats.length
+            ];
+          if (
+            !unreadOnly ||
+            (next.unread_count ?? 0) > 0 ||
+            next.rows.some((row) => row.unread)
+          ) {
+            event.preventDefault();
+            void openSessionChat(next).catch(reportError);
+            break;
+          }
+        }
+      }
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  });
   if (!view)
     return (
       <ProfileGate
         appearance={<Appearance theme={theme} onChange={changeTheme} compact />}
         theme={theme}
         onTheme={changeTheme}
-        onOpen={(value, isMobile, verifiedPassword, demoProfile) => {
+        onOpen={(
+          value,
+          isMobile,
+          verifiedPassword,
+          demoProfile,
+          supportsBiometrics,
+        ) => {
           const epoch = ++authenticationEpoch.current;
           setBiometricOfferPending(false);
           storeView(value);
           setMobile(isMobile);
+          setBiometricSupported(!!supportsBiometrics);
           setActiveDemoProfile(demoProfile);
           setConversationOpen(false);
           setMembersOpen(false);
@@ -1579,7 +1865,7 @@ function App() {
           setChatFilter("overview");
           setHomeTab("chats");
           setMessageTarget(undefined);
-          if (isMobile && (verifiedPassword || demoProfile)) {
+          if (supportsBiometrics && (verifiedPassword || demoProfile)) {
             setBiometricOfferPending(true);
             biometricOfferCredential.current = {
               password: verifiedPassword ?? "",
@@ -1619,12 +1905,18 @@ function App() {
     );
   if (view.space_setup)
     return (
-      <SpaceSetup
-        view={view}
-        mobile={mobile}
-        onView={setView}
-        onLock={lockProfile}
-      />
+      <>
+        <SpaceSetup
+          key={spaceInvitation?.id ?? 0}
+          view={view}
+          mobile={mobile}
+          onView={setView}
+          onLock={lockProfile}
+          initialLink={spaceInvitation?.link}
+          onLinkClosed={() => setSpaceInvitation(null)}
+        />
+        {biometricOffer}
+      </>
     );
   const actionButton = (a: Action) => (
     <button
@@ -1678,6 +1970,22 @@ function App() {
         onUnread={markUnread}
         onOpen={openStreamMessage}
       >
+        {keyboardPanel === "switch" && (
+          <QuickSwitcher
+            key={view.identity}
+            view={view}
+            onClose={() => setKeyboardPanel(null)}
+            onOpen={async (chat) => {
+              await openSessionChat(chat).catch(reportError);
+            }}
+          />
+        )}
+        {keyboardPanel === "help" && (
+          <KeyboardHelp
+            mac={macKeyboard}
+            onClose={() => setKeyboardPanel(null)}
+          />
+        )}
         <div
           className="shell"
           inert={notificationOpening}
@@ -1754,6 +2062,17 @@ function App() {
             onRefresh={refresh}
             onRead={readStreamMessage}
             onOpen={openStreamMessage}
+            activity={
+              mobile ? (
+                <ActiveSessions
+                  calls={calls}
+                  view={view}
+                  onOpen={(chat) =>
+                    void openSessionChat(chat).catch(reportError)
+                  }
+                />
+              ) : undefined
+            }
           />
           {threadActive && stream && selectedThread && (
             <ThreadView
@@ -1765,18 +2084,17 @@ function App() {
               hideAvatars={preferences.hideAvatars}
               mobile={mobile}
               busy={busy}
-              draft={threadDrafts[threadDraftKey] ?? ""}
-              onDraft={(value) => {
-                if (
-                  currentView.current?.identity !== view.identity ||
-                  currentView.current?.credential !== view.credential ||
-                  currentView.current?.active_space !== view.active_space
-                )
-                  return;
-                setThreadDrafts((current) => ({
-                  ...current,
-                  [threadDraftKey]: value,
-                }));
+              savedDraft={threadComposerDraft}
+              onFollow={async (followed) => {
+                await perform(async () => {
+                  await call({
+                    op: "thread_follow",
+                    space: stream.space,
+                    stream: stream.stream,
+                    message: selectedThread.rootId,
+                    followed,
+                  });
+                });
               }}
               onBack={closeThread}
               onRefresh={refresh}
@@ -1806,10 +2124,10 @@ function App() {
               onNewer={threadHistory.loadNewer}
               onRetry={threadHistory.retry}
               onOlder={threadHistory.loadMore}
-              onSend={async (text, expiry) => {
+              onSend={async (text, expiry, mentions) => {
                 let sent = false;
                 await perform(async () => {
-                  await sendText(text, selectedThread.rootId, expiry);
+                  await sendText(text, selectedThread.rootId, expiry, mentions);
                   sent = true;
                 });
                 return sent;
@@ -1941,6 +2259,15 @@ function App() {
                       </small>
                     </div>
                   )}
+                  {mobile && (
+                    <ActiveSessions
+                      calls={calls}
+                      view={view}
+                      onOpen={(chat) =>
+                        void openSessionChat(chat).catch(reportError)
+                      }
+                    />
+                  )}
                   <ChatList
                     view={view}
                     filter={chatFilter}
@@ -2063,7 +2390,16 @@ function App() {
             />
           )}
           <div id="desktop-page-outlet" />
-          <main className="conversation content-pane">
+          <main
+            className="conversation content-pane"
+            {...attachmentDrop.handlers}
+            data-file-drag={attachmentDrop.dragging || undefined}
+          >
+            {attachmentDrop.dragging && (
+              <div className="attachment-drop-hint" role="status">
+                {t("file.dropToAttach")}
+              </div>
+            )}
             <ScreenHeader
               title={stream?.name ?? t("channel.start")}
               search={
@@ -2129,6 +2465,9 @@ function App() {
                 </>
               }
             />
+            {stream && (
+              <ActiveSessionJoin calls={calls} view={view} chat={stream} />
+            )}
             {stream?.forked && <p className="error">{t("warning.forked")}</p>}
             {mode === "expert" && syncSummary && (
               <p className="notice" role="status">
@@ -2403,6 +2742,7 @@ function App() {
                   stream &&
                   !busy &&
                   !postingMessage.current &&
+                  draftReady &&
                   stream.can_post &&
                   !stream.forked &&
                   !awaitingDirect &&
@@ -2412,20 +2752,23 @@ function App() {
                   void perform(async () => {
                     let committed = false;
                     if (text) {
-                      setText("");
+                      const submittedDraft = {
+                        text,
+                        expiry: messageExpiry,
+                        mentions: draftMentions,
+                        attachment: pendingAttachment,
+                      };
                       setMessageTarget(undefined);
                       setOwnSendRevision((revision) => revision + 1);
                       try {
-                        await sendText(text, undefined, messageExpiry);
-                        if (
-                          currentConversationScope.current === conversationScope
-                        )
-                          setMessageExpiry(undefined);
+                        await sendText(
+                          text,
+                          undefined,
+                          messageExpiry,
+                          draftMentions,
+                        );
+                        clearSubmittedDraft(submittedDraft);
                       } catch (error) {
-                        if (
-                          currentConversationScope.current === conversationScope
-                        )
-                          setText((current) => current || text);
                         throw error;
                       }
                       committed = true;
@@ -2461,12 +2804,8 @@ function App() {
                         if (uploaded.view) setView(uploaded.view);
                         setPendingAttachment(null);
                         requestSync();
-                        // The message is committed at this point. Temporary-file
-                        // cleanup must not delay the chat or turn a successful
-                        // send into an error when it queues behind background work.
-                        void invoke("discard_exchange", {
-                          path: selected.path,
-                        }).catch(() => {});
+                        // The draft store releases the native staging capability
+                        // after persisting the cleared attachment selection.
                       } catch (error) {
                         if (
                           String(error).includes(ATTACHMENT_TRANSFER_CANCELLED)
@@ -2604,9 +2943,28 @@ function App() {
               )}
               <ComposerInput
                 aria-label={t("composer.label")}
-                resetRevision={ownSendRevision}
+                onPasteImage={stageMediaAttachment}
                 value={text}
-                onChange={(e) => setText(e.target.value)}
+                mentions={draftMentions}
+                mentionCandidates={
+                  stream ? mentionCandidates(view, stream) : []
+                }
+                onDraftChange={setDraftContent}
+                editTarget={
+                  stream?.can_post && !stream.forked
+                    ? (() => {
+                        const row = [...stream.rows]
+                          .reverse()
+                          .find(
+                            (row) =>
+                              row.body.kind === "chat.message" &&
+                              row.body.issuer_identity === view.identity &&
+                              !row.local_echo,
+                          );
+                        return row ? { chat: stream, row } : undefined;
+                      })()
+                    : undefined
+                }
                 placeholder={
                   stream?.can_post && !awaitingDirect
                     ? t("composer.placeholder")
@@ -2643,6 +3001,7 @@ function App() {
                   aria-label={t("composer.send")}
                   title={t("composer.send")}
                   disabled={
+                    !draftReady ||
                     (!text && !pendingAttachment) ||
                     !stream?.can_post ||
                     stream.forked ||
@@ -2699,6 +3058,7 @@ function App() {
               </>
             ) : (
               <UserSettings
+                biometricSupported={biometricSupported}
                 blockedUsersPage={<BlockedUsers view={view} />}
                 serviceRequests={
                   <ServiceRequests view={view} mobile={mobile} />
@@ -2711,11 +3071,17 @@ function App() {
                 }
                 spacesPage={
                   <Spaces
+                    key={spaceInvitation?.id ?? 0}
                     view={view}
                     mobile={mobile}
                     hideAvatars={preferences.hideAvatars}
                     onView={setView}
-                    onBack={() => setSettingsPage("profile")}
+                    initialPage={spaceInvitation ? "join" : "list"}
+                    initialLink={spaceInvitation?.link}
+                    onBack={() => {
+                      setSpaceInvitation(null);
+                      setSettingsPage("profile");
+                    }}
                   />
                 }
                 page={settingsPage}
@@ -2728,6 +3094,7 @@ function App() {
                 )}
                 onReminders={() => setCollection({ kind: "reminders" })}
                 theme={theme}
+                themePreference={themePreference}
                 mode={mode}
                 preferences={preferences}
                 identity={view.identity}
@@ -2749,7 +3116,10 @@ function App() {
                   setInvitationRoute({ page: "notifications", unscoped: true })
                 }
                 onCode={() => setInvitationRoute({ page: "contact" })}
-                notificationSettings={pushSettings}
+                notificationSettings={
+                  mobile ? pushSettings : activityNotifications.settings
+                }
+                soundSettings={activityNotifications.soundSettings}
               />
             )}
           </section>
@@ -2797,8 +3167,10 @@ function App() {
           {invitationRoute && (
             <InvitationFlow
               active={!desktopProfileEditing}
-              onSpaces={() => {
+              onSpaces={(link) => {
                 setInvitationRoute(null);
+                if (link) openSpaceInvitation(link);
+                else setSpaceInvitation(null);
                 setSettingsOpen(true);
                 setSettingsPage("spaces");
               }}
@@ -2829,15 +3201,9 @@ function App() {
             onCancel={() => setLogoutOpen(false)}
             onConfirm={lockProfile}
           />
-          {biometricOfferName && (
-            <BiometricOfferDialog
-              name={biometricOfferName}
-              busy={busy}
-              onDecline={dismissBiometricOffer}
-              onAccept={acceptBiometricOffer}
-            />
-          )}
+          {biometricOffer}
           {notificationOffer}
+          {activityNotifications.offer}
           {messageUnavailableOpen && (
             <ActionDialog
               title={t("messageUnavailable.title")}

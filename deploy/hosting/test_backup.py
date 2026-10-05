@@ -24,7 +24,10 @@ class BackupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
+        self.access_key = self.root / 'backup.key'
+        self.access_key.write_text('a' * 64)
+        self.access_key.chmod(0o600)
         self.state = patch.object(backup, 'STATE', self.root / 'resume.json')
         self.state.start()
         self.addCleanup(self.state.stop)
@@ -64,7 +67,7 @@ class BackupTests(unittest.TestCase):
         manifest = {'version': 1, 'spaces': {space: {'revision': 'c' * 64,
                     'objects': [{'object': obj, 'size': len(content),
                                  'sha256': hashlib.sha256(content).hexdigest()}]}}}
-        self.config['attachments'] = {'operator_url': 'http://127.0.0.1:18901'}
+        self.config['attachments'] = {'operator_url': 'http://127.0.0.1:18901', 'access_key_file': str(self.access_key)}
         job = AttachmentSnapshot(self.config['attachments'])
         with patch.object(backup, 'AttachmentSnapshot', return_value=job), patch.object(
                 job, 'request', side_effect=lambda path: io.BytesIO(
@@ -131,6 +134,22 @@ class BackupTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob('.snapshot-*')))
         self.assertFalse(self.calls)
 
+    def test_replaced_source_or_parent_symlink_cannot_copy_an_external_file(self):
+        from online_snapshot import regular_source
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'secret').write_bytes(b'not backup input')
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'file').symlink_to(outside / 'secret')
+        with self.assertRaises(OSError), regular_source(source / 'file'):
+            self.fail('A file symlink was followed')
+        (source / 'file').unlink()
+        source.rmdir()
+        source.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError), regular_source(source / 'secret'):
+            self.fail('A parent symlink was followed')
+
     def test_write_to_a_previously_copied_database_rejects_mixed_snapshot(self):
         from online_snapshot import capture, inventory, SourceChanged
         first = self.root / 'first.sqlite'
@@ -155,9 +174,30 @@ class BackupTests(unittest.TestCase):
 
 
 class RetentionTests(unittest.TestCase):
+    def test_privileged_config_cannot_redirect_root_reads(self):
+        with patch.object(backup.os, 'geteuid', return_value=0), patch.object(backup.os, 'open') as opened:
+            with self.assertRaises(ValueError):
+                backup.load_config('/etc/shadow')
+            opened.assert_not_called()
+
+    def test_config_must_be_private_and_cannot_be_a_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / 'config.json'
+            path.write_text('{}')
+            with patch.object(backup, 'CONFIG', path):
+                path.chmod(0o644)
+                with self.assertRaises(ValueError):
+                    backup.load_config(path)
+                path.chmod(0o600)
+                self.assertEqual(backup.load_config(path), {})
+                link = path.with_name('link')
+                link.symlink_to(path)
+                with patch.object(backup, 'CONFIG', link), self.assertRaises(OSError):
+                    backup.load_config(link)
+
     def test_interrupted_plain_staging_cleanup_preserves_archives_and_symlink_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary).resolve()
             staging = directory / '.snapshot-1234abcd'
             staging.mkdir()
             (staging / 'private.txt').write_text('synthetic')

@@ -184,6 +184,7 @@ mod tests {
         let plan = crypto::plan(content.len() as u64).unwrap();
         let encrypted = crypto::encrypt_file(&source, &ciphertext, &plan, |_| {}).unwrap();
         let descriptor = AttachmentDescriptor {
+            external_storage: None,
             id: "11".repeat(16).parse().unwrap(),
             object_id: "22".repeat(16).parse().unwrap(),
             name: "photo.jpg".into(),
@@ -200,6 +201,12 @@ mod tests {
                 ciphertext_sha256: encrypted.ciphertext_sha256.clone(),
             },
         };
+        let legacy = serde_json::to_value(&descriptor).unwrap();
+        assert!(legacy.get("external_storage").is_none());
+        assert_eq!(
+            serde_json::from_value::<AttachmentDescriptor>(legacy).unwrap(),
+            descriptor
+        );
         store(root.path(), &ciphertext, &encrypted.ciphertext_sha256).unwrap();
         fs::remove_file(source).unwrap();
         fs::remove_file(ciphertext).unwrap();

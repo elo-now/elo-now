@@ -1,11 +1,4 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
-import { Phone } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon, NewIndicator } from "./Icon";
 import { SearchField } from "./Search";
 import { chatActivity, isDirectChat } from "./chatGroups";
@@ -19,7 +12,7 @@ import {
 } from "./model";
 import type { SettingsPage } from "./UserSettings";
 import type { Calls } from "./calls/controller";
-import { scopeKey } from "./calls/types";
+import { ActiveSessions } from "./calls/ActiveSessions";
 import { t } from "./i18n";
 import { ProfileAvatar } from "./ProfileEditor";
 import { DirectOnlineIndicator } from "./useRealtime";
@@ -146,7 +139,6 @@ export function DesktopSidebar({
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menu = useRef<HTMLDivElement>(null);
-  const callState = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
   const activeSpace = view.spaces?.find(
     (space) => space.id === view.active_space,
   );
@@ -189,9 +181,6 @@ export function DesktopSidebar({
     !normalized || chat.name.toLocaleLowerCase().includes(normalized);
   const visibleChats = chats.filter(matches);
   const visibleDirect = direct.filter(matches);
-  const activeCalls = view.streams.filter(
-    (chat) => !!callState.available[scopeKey(chat)],
-  );
   const groups = useMemo(() => {
     const output: { id: string; title?: string; chats: Stream[] }[] = [];
     const general = visibleChats.filter((chat) => chat.is_general);
@@ -417,26 +406,12 @@ export function DesktopSidebar({
           </button>
         </nav>
 
-        {activeCalls.length > 0 && (
-          <section className="desktop-nav-section">
-            <h2>{t("desktop.calls")}</h2>
-            {activeCalls.map((chat) => (
-              <button
-                type="button"
-                className="desktop-nav-item"
-                key={chat.stream}
-                onClick={() => navigate(() => onOpen(chat))}
-              >
-                <Phone size={17} />
-                <span className="desktop-nav-label">{chat.name}</span>
-                <span
-                  className="desktop-call-live"
-                  aria-label={t("desktop.callAvailable")}
-                />
-              </button>
-            ))}
-          </section>
-        )}
+        <ActiveSessions
+          calls={calls}
+          view={view}
+          compact
+          onOpen={(chat) => navigate(() => onOpen(chat))}
+        />
 
         {
           <section className="desktop-nav-section desktop-chats-heading">

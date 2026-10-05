@@ -115,7 +115,15 @@ try {
         assert.equal(layout.header.height, 68, `${name} header height differs`);
         assert.equal(layout.headerBackground, layout.background, `${name} header has a different background`);
         if (reference) {
-          assert.deepEqual(layout.body, reference.body, `${name} has a different content area`);
+          if (name === 'Buzz') {
+            const filters = await page.locator('.buzz-filters').boundingBox();
+            assert.ok(filters && filters.height > 0, 'Buzz filters must have their own visible row');
+            assert.deepEqual(layout.body, {
+              ...reference.body,
+              y: reference.body.y + filters.height,
+              height: reference.body.height - filters.height,
+            }, 'Buzz may reserve only the filter row above its content');
+          } else assert.deepEqual(layout.body, reference.body, `${name} has a different content area`);
           assert.equal(layout.background, reference.background, `${name} background differs`);
           assert.equal(layout.motif, reference.motif, `${name} decoration differs`);
         } else reference = layout;
@@ -195,7 +203,7 @@ try {
       await page.getByRole('textbox', { name: 'Message text', exact: true }).press('Shift+Enter');
       assert.equal(await page.getByRole('textbox', { name: 'Message text', exact: true }).inputValue(), 'Two lines\n');
       await page.getByRole('textbox', { name: 'Message text', exact: true }).fill('');
-      await page.keyboard.press('Control+f');
+      await page.keyboard.press(await page.evaluate(() => /Mac/.test(navigator.platform) ? 'Meta+f' : 'Control+f'));
       await headerSearch(page, 'Search messages');
       assert.equal(await page.getByRole('searchbox', { name: 'Search messages', exact: true }).evaluate(node => document.activeElement === node), true);
       await page.getByRole('searchbox', { name: 'Search messages', exact: true }).fill('missing phrase');
@@ -304,9 +312,51 @@ try {
       await page.getByRole('button', { name: 'Back to devices', exact: true }).click();
       await page.locator('.devices-page[data-device-screen="list"] .linked-devices').waitFor();
     });
-    await check(`${width}: workspace search shortcut`, async () => {
-      await page.keyboard.press('Control+k');
-      assert.equal(await page.getByRole('searchbox', { name: 'Search chats' }).evaluate(node => document.activeElement === node), true);
+    await check(`${width}: keyboard navigation, scoped drafts and file drop`, async () => {
+      const mod = await page.evaluate(() => /Mac/.test(navigator.platform) ? 'Meta' : 'Control');
+      const switchTo = async name => {
+        await page.keyboard.press(`${mod}+k`);
+        await page.getByRole('combobox').fill(name);
+        await page.getByRole('combobox').press('Enter');
+        await page.getByRole('dialog').waitFor({ state: 'hidden' });
+      };
+      await switchTo('General');
+      const input = page.locator('.conversation .composer textarea');
+      const height = () => input.evaluate(node => node.getBoundingClientRect().height);
+      const before = await height();
+      assert.ok(await page.locator('.composer-expiry').isVisible());
+      await input.focus();
+      assert.equal(await height(), before, 'Desktop focus must not expand the input');
+      await input.fill(Array.from({ length: 30 }, (_, i) => `Long draft line ${i}`).join('\n'));
+      assert.ok(await height() > before, 'Text must grow the input');
+      assert.equal(await input.evaluate(node => getComputedStyle(node).overflowY), 'auto');
+      await input.fill('General draft');
+      assert.equal(await height(), before, 'Short drafts must shrink back');
+      await page.locator('.composer-expiry').getByRole('button', { name: '24h', exact: true }).click();
+      await switchTo('Design');
+      assert.equal(await input.inputValue(), '');
+      await input.fill('Design draft');
+      await switchTo('General');
+      assert.equal(await input.inputValue(), 'General draft');
+      assert.equal(await page.locator('.composer-expiry').getByRole('button', { name: '24h', exact: true }).getAttribute('aria-pressed'), 'true');
+      await page.keyboard.press(`${mod}+f`);
+      assert.ok(await page.getByRole('searchbox', { name: 'Search messages' }).evaluate(node => document.activeElement === node));
+      await page.keyboard.press(`${mod}+/`);
+      await page.getByRole('dialog', { name: 'Keyboard shortcuts' }).waitFor();
+      await page.keyboard.press('Escape');
+      await page.getByRole('dialog').waitFor({ state: 'hidden' });
+      await page.locator('.conversation').evaluate(node => {
+        const data = new DataTransfer();
+        data.items.add(new File(['Fictional attachment'], 'dropped.txt', { type: 'text/plain' }));
+        node.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: data }));
+      });
+      await page.getByText('dropped.txt', { exact: true }).waitFor();
+      assert.equal(await page.evaluate(() => window.__desktopQA.calls.filter(call => call.command === 'attachment_transfer').length), 0, 'Drop must not send without confirmation');
+      await switchTo('Design');
+      assert.equal(await input.inputValue(), 'Design draft');
+      assert.equal(await page.getByText('dropped.txt', { exact: true }).count(), 0);
+      await switchTo('General');
+      assert.ok(await page.getByText('dropped.txt', { exact: true }).isVisible());
     });
     await check(`${width}: Compact reduces spacing and navigation height`, async () => {
       const measure = () => page.evaluate(() => {

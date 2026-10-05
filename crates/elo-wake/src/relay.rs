@@ -77,6 +77,8 @@ struct Wake {
     #[serde(default = "message_category")]
     category: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sender: Option<Value>,
 }
 fn message_category() -> String {
@@ -845,7 +847,7 @@ async fn wake(
     let key = auth(&headers)?;
     if !matches!(
         input.category.as_str(),
-        "message" | "invitation" | "membership"
+        "message" | "invitation" | "membership" | "session_start"
     ) || !hex(&input.event, 32)
         || !hex(&input.scope, 32)
         || input.target.len() > 2048
@@ -855,6 +857,14 @@ async fn wake(
         return Err(StatusCode::BAD_REQUEST);
     }
     let time = now()?;
+    if (input.category == "session_start"
+        && input
+            .expires
+            .is_none_or(|expires| expires <= time as u64 || expires > time as u64 + 60))
+        || (input.category != "session_start" && input.expires.is_some())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     relay.db.call(move |db| {
     let saved = row(db, &id)?.ok_or(StatusCode::NOT_FOUND)?;
     if !saved.active || saved.expires <= time || !matches(&saved.notify, &key) {
@@ -941,6 +951,10 @@ async fn wake(
             |r| r.get(0),
         )
         .map_err(db_error)?;
+    // Session hints never inherit introduction or open-scope exceptions.
+    if input.category == "session_start" && (enabled != Some(true) || !authorized) {
+        return Ok(StatusCode::ACCEPTED);
+    }
     let open: bool = db
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM open_scopes WHERE route=? AND scope=?)",
@@ -1013,7 +1027,8 @@ async fn wake(
         tx.execute("DELETE FROM queue WHERE route=? AND NOT EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=queue.route AND a.scope=queue.scope AND a.credential=queue.credential)", [&id]).map_err(db_error)?;
         tx.execute("INSERT INTO untrusted_wakes VALUES(?,?) ON CONFLICT(route) DO UPDATE SET next=excluded.next", params![id,time+300]).map_err(db_error)?;
     }
-    tx.execute("INSERT INTO queue(route,scope,event,target,next,expires,sender,credential,category) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event,target=excluded.target,expires=excluded.expires,sender=excluded.sender,credential=excluded.credential,category=excluded.category",params![id,input.scope,input.event,input.target,time+2,time+86400,sender,credential,input.category]).map_err(db_error)?;
+    let expires = input.expires.map(|value| value as i64).unwrap_or(time+86400);
+    tx.execute("INSERT INTO queue(route,scope,event,target,next,expires,sender,credential,category) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(route,scope) DO UPDATE SET event=excluded.event,target=excluded.target,expires=excluded.expires,sender=excluded.sender,credential=excluded.credential,category=excluded.category",params![id,input.scope,input.event,input.target,time+2,expires,sender,credential,input.category]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(StatusCode::ACCEPTED)
     }).await
@@ -1029,9 +1044,9 @@ impl Relay {
                 .map_err(db_error)?;
             db.execute("DELETE FROM queue WHERE expires<=?", [time])
                 .map_err(db_error)?;
-            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures,q.category FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.credential IS NOT NULL AND (s.scope IS NULL OR EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=q.route AND o.scope=q.scope) OR EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=q.route AND a.scope=q.scope AND a.credential=q.credential)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?,r.get::<_,String>(6)?))).optional().map_err(db_error)
+            db.query_row("SELECT q.route,q.scope,q.event,q.target,r.token,q.failures,q.category,q.expires FROM queue q JOIN routes r ON q.route=r.id JOIN policy_versions p ON p.route=q.route LEFT JOIN scopes s ON s.route=q.route AND s.scope=q.scope WHERE r.active=1 AND NOT EXISTS(SELECT 1 FROM blocked_senders b WHERE b.route=q.route AND b.sender=q.sender) AND NOT (q.sender IS NULL AND EXISTS(SELECT 1 FROM sender_policy sp WHERE sp.route=q.route AND sp.authenticated=1)) AND (s.enabled=1 OR (s.scope IS NULL AND p.introductions=1)) AND q.credential IS NOT NULL AND (s.scope IS NULL OR EXISTS(SELECT 1 FROM open_scopes o WHERE o.route=q.route AND o.scope=q.scope) OR EXISTS(SELECT 1 FROM scope_senders a WHERE a.route=q.route AND a.scope=q.scope AND a.credential=q.credential)) AND q.next<=? AND r.next_send<=? ORDER BY q.next,q.route LIMIT 1",params![time,time],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u32>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?))).optional().map_err(db_error)
         }).await?;
-        let Some((route, scope, event, target, token, failures, category)) = item else {
+        let Some((route, scope, event, target, token, failures, category, expires)) = item else {
             return Ok(false);
         };
         // Only an explicitly repeatable, authorized scope can alert again before
@@ -1054,6 +1069,7 @@ impl Relay {
                     registration: route.clone(),
                     scope: scope.clone(),
                     event: event.clone(),
+                    expires: (category == "session_start").then_some(expires as u64),
                     category,
                     target,
                     quiet,

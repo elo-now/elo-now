@@ -4,8 +4,11 @@ import {
   streamSwipe,
   swipeDirection,
   messageScrollTop,
+  filterBuzzEntries,
+  followedThread,
 } from "./streamFeed";
 import { markVisibleMessagesRead, type Stream, type View } from "./model";
+import { expireView } from "./messageExpiry";
 const row = (
   id: string,
   date?: string,
@@ -21,6 +24,109 @@ const row = (
     payload: { text: id },
   },
   ...extra,
+});
+
+describe("Buzz Mentions and Threads", () => {
+  const reply = (
+    id: string,
+    root: string,
+    author = "other",
+    mentions: string[] = [],
+  ) =>
+    row(id, undefined, {
+      body: {
+        kind: "chat.message",
+        issuer_identity: author,
+        payload: { text: "@me", thread_root: root, mentions },
+      },
+    });
+
+  it("matches verified mention identities rather than visible names and keeps read/mute exclusions", () => {
+    const source = view([
+      chat("a", [
+        row("plain", undefined, {
+          body: {
+            kind: "chat.message",
+            issuer_identity: "other",
+            payload: { text: "@me" },
+          },
+        }),
+        reply("mention", "root", "other", ["me"]),
+        reply("other", "root", "other", ["someone-else"]),
+        { ...reply("read", "root", "other", ["me"]), unread: false },
+      ]),
+      { ...chat("b", [reply("muted", "root", "other", ["me"])]), muted: true },
+    ]);
+    expect(
+      filterBuzzEntries(unreadStreamEntries(source), "mentions", "me").map(
+        ({ row }) => row.id,
+      ),
+    ).toEqual(["mention"]);
+    expect(
+      source.streams[0].rows.find((row) => row.id === "mention")?.unread,
+    ).toBe(true);
+  });
+
+  it("shows unread replies to own or participated threads and respects explicit follow overrides", () => {
+    const source = view([
+      chat("a", [
+        row("own-root", undefined, {
+          unread: false,
+          body: { kind: "chat.message", issuer_identity: "me" },
+        }),
+        reply("to-own", "own-root"),
+        { ...reply("own-reply", "participated", "me"), unread: false },
+        reply("participating", "participated"),
+        reply("watched", "following"),
+        reply("unrelated", "other-root"),
+      ]),
+    ]);
+    source.streams[0].followed_threads = ["following"];
+    source.streams[0].unfollowed_threads = ["own-root"];
+    expect(
+      filterBuzzEntries(unreadStreamEntries(source), "threads", "me").map(
+        ({ row }) => row.id,
+      ),
+    ).toEqual(["participating", "watched"]);
+    expect(followedThread(source.streams[0], "own-root", "me")).toBe(false);
+  });
+
+  it("never follows identical root IDs in a different chat and leaves All unchanged", () => {
+    const one = chat("one", [reply("first", "root")]);
+    one.followed_threads = ["root"];
+    const two = chat("two", [reply("second", "root")]);
+    const entries = unreadStreamEntries(view([one, two]));
+    expect(
+      filterBuzzEntries(entries, "threads", "me").map(({ row }) => row.id),
+    ).toEqual(["first"]);
+    expect(filterBuzzEntries(entries, "all", "me")).toBe(entries);
+  });
+  it("retains participation outside the visible history page and excludes expired or deleted mentions", () => {
+    const source = view([
+      chat("a", [
+        reply("older-thread", "old-root"),
+        reply("expiring", "old-root", "other", ["me"]),
+        row("deleted", undefined, {
+          body: {
+            kind: "deleted",
+            issuer_identity: "other",
+            payload: { mentions: ["me"] },
+          },
+        }),
+      ]),
+    ]);
+    source.streams[0].participating_threads = ["old-root"];
+    source.streams[0].rows[1].body.payload!.expires_at_ms = 1000;
+    const expired = expireView(source, 1001)!;
+    expect(
+      filterBuzzEntries(unreadStreamEntries(expired), "mentions", "me"),
+    ).toEqual([]);
+    expect(
+      filterBuzzEntries(unreadStreamEntries(expired), "threads", "me").map(
+        ({ row }) => row.id,
+      ),
+    ).toEqual(["older-thread"]);
+  });
 });
 const chat = (stream: string, rows: Stream["rows"]): Stream => ({
   name: stream,

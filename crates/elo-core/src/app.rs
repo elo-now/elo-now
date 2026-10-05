@@ -64,6 +64,8 @@ mod blocking;
 mod calls;
 mod chats;
 mod devices;
+pub mod drafts;
+mod external_storage;
 mod groups;
 mod history_reader;
 mod invitations;
@@ -74,7 +76,13 @@ pub mod pairing;
 #[cfg(test)]
 mod performance;
 mod presentation;
+mod private_settings;
 pub mod push_sender;
+pub mod witness_admission;
+mod witness_client;
+mod witness_commands;
+pub mod witness_durable_admission;
+mod witnessed_spaces;
 pub use history_reader::HistorySnapshot;
 use history_reader::Shared;
 mod profile;
@@ -115,17 +123,14 @@ struct Workspace {
     #[serde(default)]
     groups: Vec<ChatGroup>,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Default)]
 struct ReadState {
     v: u8,
     seen: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
     unread: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
     reminders: Vec<message_actions::Reminder>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     muted_streams: BTreeSet<StreamId>,
+    private_settings: Option<private_settings::State>,
 }
 impl ReadState {
     fn validate(&self) -> Result<()> {
@@ -150,6 +155,9 @@ impl ReadState {
             {
                 return Err("invalid read state".into());
             }
+        }
+        if let Some(settings) = &self.private_settings {
+            settings.validate()?;
         }
         Ok(())
     }
@@ -204,11 +212,18 @@ pub struct ClientApp {
     peers: Vec<Peer>,
     allow_loopback: bool,
     sync_round: usize,
+    private_settings_retry: Option<std::time::Instant>,
     push_endpoint: Option<String>,
+    attachment_storage_endpoint: Option<String>,
     push_allow_loopback: bool,
     team: Option<team::TeamDescriptor>,
     call_host: Option<space_service::SpaceAddress>,
     membership_checks: membership::MembershipChecks,
+    witness_pin: Option<crate::authority::WitnessPin>,
+    invitation_api_origin: Option<String>,
+    witness_floor_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    witness_test_url: Option<String>,
     space_http_client: reqwest::Client,
     team_next: u64,
     spaces: Option<Box<spaces::Spaces>>,
@@ -420,7 +435,9 @@ impl ClientApp {
                     peers,
                     allow_loopback,
                     sync_round: 0,
+                    private_settings_retry: None,
                     push_endpoint: None,
+                    attachment_storage_endpoint: None,
                     push_allow_loopback: false,
                     team: None,
                     team_next: 0,
@@ -428,6 +445,11 @@ impl ClientApp {
                     presentation: Default::default(),
                     call_host: None,
                     membership_checks: Default::default(),
+                    witness_pin: None,
+                    invitation_api_origin: None,
+                    witness_floor_lock: Default::default(),
+                    #[cfg(test)]
+                    witness_test_url: None,
                     space_http_client,
                 };
                 if migrate_workspace && let Err(error) = app.persist_workspace() {
@@ -443,6 +465,7 @@ impl ClientApp {
         }
     }
     pub async fn close(mut self) -> Result<()> {
+        self.invalidate_membership_checks().await;
         if let Some(spaces) = self.spaces.take() {
             spaces.close().await?;
         }
@@ -628,7 +651,7 @@ impl ClientApp {
                     && team.scope.stream == p.stream
                     && team.scope.root == p.root
             });
-            streams.push(json!({"name":p.name.clone(),"is_general":is_general,"owner_managed":a.is_owner_managed(),"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":if a.is_owner_managed() { json!(a.head()?.members.iter().filter(|member| member.capabilities.contains(&Capability::Manage)).map(|member| Owner { identity_id: member.identity_id, root_public_key: member.root_public_key.clone() }).collect::<Vec<_>>()) } else { a.genesis().body()["owners"].clone() },"rows":rows,"unread_count":unread_count,"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":!is_general && self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
+            streams.push(json!({"name":p.name.clone(),"is_general":is_general,"owner_managed":a.is_owner_managed(),"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":if a.is_owner_managed() { json!(a.head()?.members.iter().filter(|member| member.capabilities.contains(&Capability::Manage)).map(|member| Owner { identity_id: member.identity_id, root_public_key: member.root_public_key.clone() }).collect::<Vec<_>>()) } else { a.genesis().body()["owners"].clone() },"rows":rows,"unread_count":unread_count,"followed_threads":self.private_thread_follows(p.stream,true),"unfollowed_threads":self.private_thread_follows(p.stream,false),"participating_threads":self.private_thread_participation(p.stream),"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":!is_general && !self.is_notes_authority(a) && self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
         }
         // A one-to-one title belongs to the other participant. Derive it from
         // verified names without rewriting historical signed chat records.
@@ -648,12 +671,15 @@ impl ClientApp {
         }
         for stream in &mut streams {
             if let Some(team) = &self.team {
-                if stream["stream"] == json!(team.scope.stream) && stream["owner_managed"] != true {
-                    if let Some(authority) = self
-                        .authorities
-                        .0
-                        .iter()
-                        .find(|a| a.stream() == team.scope.stream)
+                if stream["space"] == json!(team.scope.space)
+                    && stream["stream"] == json!(team.scope.stream)
+                {
+                    if stream["owner_managed"] != true
+                        && let Some(authority) = self
+                            .authorities
+                            .0
+                            .iter()
+                            .find(|a| a.stream() == team.scope.stream)
                     {
                         stream["member_names"][authority.controller().identity().to_string()] =
                             json!("elo.now");
@@ -703,6 +729,7 @@ impl ClientApp {
         let root = card.recover_root(session.identity_id())?;
         let c = session.credential();
         let g = SpaceGenesis {
+            witness: None,
             v: 1,
             kind: "space.genesis".into(),
             nonce: record::random_hex::<16>()?,
@@ -735,6 +762,7 @@ impl ClientApp {
             stream,
         )?;
         let config = StreamConfig {
+            witness_evidence: None,
             chat_kind: Some(ChatKind::Chat),
             recovery: None,
             v: 1,
@@ -846,6 +874,9 @@ impl ClientApp {
         result
     }
     async fn operate_local(&mut self, v: Value) -> Result<Value> {
+        if v["op"] == "call_notify_ready" {
+            return self.notify_call_ready(&v).await;
+        }
         if matches!(
             v["op"].as_str(),
             Some("call_authorization" | "call_encrypt_signal" | "call_open_signal")
@@ -1013,7 +1044,6 @@ impl ClientApp {
                 if !self.authorities.space_ready(a) {
                     return Err("Space controller transition incomplete or conflicting".into());
                 }
-                let time = now()?;
                 let mut originals = self.originals(a).await?;
                 if let Some(target) = v.get("reply_to").and_then(Value::as_str) {
                     let record = self.message_record(a, target.parse()?).await?;
@@ -1054,6 +1084,7 @@ impl ClientApp {
                         Some(root)
                     }
                 };
+                let time = now()?;
                 let highest = originals
                     .iter()
                     .map(|(r, _)| history_reader::record_presentation_time(r))
@@ -1080,6 +1111,9 @@ impl ClientApp {
                         created_at: field(&v, "created_at")?.into(),
                         parents: vec![],
                         payload: TextPayload {
+                            mentions: serde_json::from_value(
+                                v.get("mentions").cloned().unwrap_or_else(|| json!([])),
+                            )?,
                             text: field(&v, "text")?.into(),
                             expires_at_ms: expires_in_hours
                                 .map(|hours| time.as_millis() as u64 + hours * 3_600_000),
@@ -1150,6 +1184,7 @@ impl ClientApp {
                         created_at: chat.created_at.clone(),
                         parents: vec![],
                         payload: TextPayload {
+                            mentions: vec![],
                             text: String::new(),
                             expires_at_ms: chat.payload.expires_at_ms,
                             sender_name: None,
@@ -1211,6 +1246,11 @@ impl ClientApp {
                         time,
                     )?)
                     .await?;
+                let _ = self.note_private_participation(
+                    chat.space_id,
+                    chat.stream_id,
+                    chat.payload.thread_root.unwrap_or(r.id()),
+                );
                 sent = Some(
                     json!({"id":r.id(),"logical_time":r.body()["logical_time"],"expires_at_ms":r.body()["payload"]["expires_at_ms"]}),
                 );
@@ -1289,11 +1329,26 @@ impl ClientApp {
                     // evidence cannot be inspected; durable receive still succeeds.
                     self.invalidate_membership_checks().await;
                 }
+                // Receive messages before optional private transport discovery.
+                // Local read changes are already durable and never wait here.
+                let private_queued = !receive_only
+                    && matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            self.prepare_private_settings_sync()
+                        )
+                        .await,
+                        Ok(Ok(true))
+                    );
+                let private_changed = self.receive_private_settings().await?;
                 if !receive_only {
                     self.send_wakes().await;
                 }
+                let mut result = serde_json::to_value(&report)?;
+                result["private_settings_changed"] = json!(u64::from(private_changed));
+                result["more"] = json!(report.more || private_queued);
                 return Ok(
-                    json!({"view":if !live || report.changes_view() { Some(self.view().await?) } else { None },"result":report,"delivery":delivery["delivery"]}),
+                    json!({"view":if !live || report.changes_view() || private_changed { Some(self.view().await?) } else { None },"result":result,"delivery":delivery["delivery"]}),
                 );
             }
             "invite_create" => {
@@ -1468,8 +1523,8 @@ impl ClientApp {
                 let originals = self.originals(a).await?;
                 let projection = message_actions::Projection::new(&originals);
                 let mut available = originals
-                    .into_iter()
-                    .map(|(r, _)| r)
+                    .iter()
+                    .map(|(r, _)| r.clone())
                     .filter(|r| r.body()["kind"] == "chat.message" && !projection.is_deleted(r))
                     .collect::<Vec<_>>();
                 let selection = if field(&v, "op")? == "history_preview" {
@@ -1496,16 +1551,39 @@ impl ClientApp {
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?
                 };
-                let grant = history::approve(
+                let selected_authors = selection
+                    .iter()
+                    .map(|r| Ok((r.id(), r.chat()?.issuer_identity)))
+                    .collect::<record::Result<BTreeMap<_, _>>>()?;
+                let related_actions = originals
+                    .iter()
+                    .filter_map(|(r, _)| {
+                        let chat = r.chat().ok()?;
+                        let action = chat.payload.action?;
+                        matches!(
+                            action,
+                            record::MessageAction::Edit { .. }
+                                | record::MessageAction::Delete { .. }
+                                | record::MessageAction::Expiry { .. }
+                        )
+                        .then_some(())
+                        .filter(|_| {
+                            selected_authors.get(&action.target()) == Some(&chat.issuer_identity)
+                        })
+                        .map(|_| r.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let grant = history::approve_with_actions(
                     a,
                     &request,
                     self.session.credential().id(),
                     &selection,
+                    &related_actions,
                     self.session.signing_key(),
                 )?;
                 if field(&v, "op")? == "history_preview" {
                     return Ok(
-                        json!({"request_id":request.id(),"recipient":requested.issuer_identity,"selection":selection.iter().map(|r|json!({"id":r.id(),"text":r.body()["payload"]["text"]})).collect::<Vec<_>>()}),
+                        json!({"request_id":request.id(),"recipient":requested.issuer_identity,"selection":selection.iter().map(|r|json!({"id":r.id(),"text":projection.body(r)["payload"]["text"]})).collect::<Vec<_>>()}),
                     );
                 }
                 self.require_fresh_membership(a).await?;
@@ -1638,9 +1716,11 @@ impl ClientApp {
             "remind" | "reminder_remove" => {
                 self.update_reminder(&v).await?;
             }
+            "thread_follow" => {
+                self.set_private_thread_follow(&v).await?;
+            }
             "mark_read" | "mark_unread" => {
                 let i = self.authority_index(&v)?;
-                let stream = self.pins[i].stream.to_string();
                 let ids = v["records"]
                     .as_array()
                     .ok_or("invalid read marker")?
@@ -1654,29 +1734,28 @@ impl ClientApp {
                     self.message_record(&self.authorities.0[i], id.parse()?)
                         .await?;
                 }
-                let mut read = (*self.read).clone();
-                let unread = read.unread.entry(stream.clone()).or_default();
-                let seen = read.seen.entry(stream).or_default();
-                if field(&v, "op")? == "mark_unread" {
-                    seen.retain(|id| !ids.contains(&id.as_str()));
-                    unread.extend(ids.into_iter().map(str::to_owned));
-                } else {
-                    unread.retain(|id| !ids.contains(&id.as_str()));
-                    seen.extend(ids.into_iter().map(str::to_owned));
-                }
-                unread.sort();
-                unread.dedup();
-                seen.sort();
-                seen.dedup();
-                self.write_read_state(&read)?;
-                self.read = read.into();
+                self.set_private_read_markers(
+                    self.pins[i].space,
+                    self.pins[i].stream,
+                    ids.iter()
+                        .map(|id| id.parse())
+                        .collect::<std::result::Result<Vec<RecordId>, _>>()?,
+                    field(&v, "op")? == "mark_unread",
+                )?;
             }
             _ => return Err("unsupported operation".into()),
         }
         let view = if self.presentation.enabled()
             && matches!(
                 v["op"].as_str(),
-                Some("send" | "message_action" | "mark_read" | "mark_unread" | "set_chat_muted")
+                Some(
+                    "send"
+                        | "message_action"
+                        | "mark_read"
+                        | "mark_unread"
+                        | "set_chat_muted"
+                        | "thread_follow"
+                )
             ) {
             let index = self.authority_index(&v)?;
             let mut view = self.view_local_scope(Some(self.pins[index].stream)).await?;

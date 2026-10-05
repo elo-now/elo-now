@@ -34,6 +34,37 @@ async fn owner_managed_general_rejects_legacy_membership_and_private_chat_source
     let general_stream = general.stream();
     app.authorities.0.insert(0, general);
     app.pins.insert(0, pin);
+    app.team = Some(team::TeamDescriptor {
+        v: 1,
+        url: "https://example.invalid/team/v1/enroll".into(),
+        token: "00".repeat(32),
+        scope: team::TeamScope {
+            space: general_space,
+            stream: general_stream,
+            root: personal.root.clone(),
+            controller: app.session.credential().id(),
+        },
+        message_lifetime_seconds: 86400,
+        service_credential: None,
+    });
+    let private = app.private_device_genesis().unwrap();
+    assert_eq!(
+        app.private_device_genesis().unwrap().bytes(),
+        private.bytes()
+    );
+    let original_vault = app.session.seal(PASSWORD.into()).unwrap();
+    app.session =
+        Session::restore_backup(&original_vault, PASSWORD.into(), app.session.identity_id())
+            .unwrap();
+    assert!(app.private_device_genesis().is_err());
+    // Even explicit recovery of General control must not recreate and grant
+    // the previous private namespace from a restored copy of the same key.
+    app.session
+        .activate_new_space_controller(general_space)
+        .unwrap();
+    assert_ne!(app.private_device_genesis().unwrap().id(), private.id());
+    app.session =
+        Session::open(&original_vault, PASSWORD.into(), app.session.identity_id()).unwrap();
     let other = crate::vault::Session::create().unwrap().0.identity_id();
     for operation in [
         json!({"op":"invitation_create", "post":true, "automatic":false}),

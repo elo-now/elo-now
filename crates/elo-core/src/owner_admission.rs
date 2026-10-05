@@ -256,6 +256,13 @@ pub fn verify_owner_policy(
         }
         let (record, signer) = evidence(item)?;
         if record.body()["kind"] == "device.revoked" {
+            if !(if index < committed.len() {
+                enrolled_ever(authority, signer.id())?
+            } else {
+                enrolled_at(authority, head, signer.id())?
+            }) {
+                return Err("Only an admitted device can be revoked from this Space.".into());
+            }
             if let Some(encoded) = record.body()["authorizing_device"].as_str() {
                 let authorizer = credential(encoded)?;
                 let admitted = if index < committed.len() {
@@ -379,7 +386,11 @@ pub fn verify_owner_policy(
             }
             "device_revoke" => {
                 let proof = signed(field(&command.body, "proof")?)?;
-                revoked.insert(DeviceRevocation::verify_request(&proof, &signer)?.id());
+                let target = DeviceRevocation::verify_request(&proof, &signer)?;
+                if !enrolled_at(authority, authorization_head, target.id())? {
+                    return Err("Only an admitted device can be revoked from this Space.".into());
+                }
+                revoked.insert(target.id());
             }
             _ => return Err("Unsupported or unauthorized Space administration intent.".into()),
         }
@@ -913,6 +924,35 @@ mod tests {
     fn device_revocation_requires_an_active_authorizer_and_duplicate_proof_is_idempotent() {
         let (owner, mut authority, creation) = fixture();
         let companion = owner.linked_companion().unwrap();
+        let invented = owner.linked_companion().unwrap();
+        let invented_proof = DeviceRevocation::issue_from_device(
+            owner.credential(),
+            owner.signing_key(),
+            invented.credential(),
+        )
+        .unwrap();
+        for unauthorized in [
+            AdminEvidence {
+                record: STANDARD.encode(invented_proof.bytes()),
+                credential: STANDARD.encode(invented.credential().record().bytes()),
+            },
+            intent(
+                &authority,
+                &owner,
+                "device_revoke",
+                json!({"proof":STANDARD.encode(invented_proof.bytes())}),
+            ),
+        ] {
+            assert!(
+                verify_owner_policy(
+                    &authority,
+                    &status(&authority, &creation, &[], &[unauthorized], vec![]),
+                    1000,
+                )
+                .is_err(),
+                "a minted credential alone cannot consume administration history"
+            );
+        }
         authority.add_credential(companion.credential().clone());
         let mut members = authority.head().unwrap().members.clone();
         members[0].credential_ids.push(companion.credential().id());

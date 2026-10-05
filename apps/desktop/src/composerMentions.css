@@ -1,0 +1,37 @@
+.composer-mention-menu {
+  z-index: 1200;
+  max-height: min(240px, 32dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--elo-line);
+  border-radius: var(--elo-radius-panel);
+  background: var(--elo-surface);
+  color: var(--elo-text);
+  box-shadow: 0 8px 24px #0002;
+  padding: 4px;
+}
+.composer-mention-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+.composer-mention-menu button[aria-selected="true"] {
+  background: color-mix(in srgb, var(--elo-accent) 18%, var(--elo-surface));
+}
+.composer-mention-menu button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-mention-menu small {
+  color: var(--elo-muted);
+}

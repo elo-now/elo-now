@@ -1,7 +1,8 @@
 declare global {
   interface Window {
     eloAppearance?: {
-      setDarkMode(dark: boolean): void;
+      setDarkMode?(dark: boolean): void;
+      setPreference?(preference: "dark" | "light" | "auto"): void;
       getTextScale?(): number;
       revealApp?(): void;
     };

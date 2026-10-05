@@ -19,6 +19,9 @@ import {
 export type NotificationTarget = {
   identity: string;
   category?: string;
+  space_context?: string;
+  call_id?: string;
+  expires?: number;
   space?: string | null;
   stream?: string | null;
   record?: string | null;
@@ -30,17 +33,22 @@ export function notificationChat(
   view: View,
   target: NotificationTarget | null,
 ): Stream | undefined {
-  if (
-    target?.identity !== view.identity ||
-    target.category !== "invitation" ||
-    !target.chat ||
-    target.record
-  )
-    return;
+  if (target?.identity !== view.identity || target.record) return;
+  const scope =
+    target.category === "invitation"
+      ? target.chat
+      : target.category === "session_start" &&
+          target.call_id &&
+          /^[0-9a-f]{32}$/.test(target.call_id)
+        ? target
+        : undefined;
+  if (!scope?.space || !scope.stream) return;
   return (view.all_streams ?? view.streams).find(
     (chat) =>
-      chat.space === target.chat!.space &&
-      chat.stream === target.chat!.stream &&
+      chat.space === scope.space &&
+      chat.stream === scope.stream &&
+      !chat.forked &&
+      matchesNotificationContext(view, chat, target) &&
       chat.members.some(
         (member) =>
           member.identity_id === view.identity &&
@@ -48,6 +56,18 @@ export function notificationChat(
       ),
   );
 }
+
+function matchesNotificationContext(
+  view: View,
+  chat: Stream,
+  target: NotificationTarget,
+) {
+  return (
+    !target.space_context ||
+    (chat.space_context ?? view.active_space) === target.space_context
+  );
+}
+
 type Opened = { id: string; target: NotificationTarget | null };
 type Status = {
   available: boolean;
@@ -69,7 +89,10 @@ export function notificationEntry(
 ): StreamEntry | undefined {
   if (target?.identity !== view.identity) return;
   const chat = (view.all_streams ?? view.streams).find(
-    (s) => s.space === target.space && s.stream === target.stream,
+    (s) =>
+      s.space === target.space &&
+      s.stream === target.stream &&
+      matchesNotificationContext(view, s, target),
   );
   const row = chat?.rows.find((r) => r.id === target.record);
   if (chat && row)
@@ -85,7 +108,10 @@ export async function resolveNotificationEntry(
   if (!view.paged) return loaded;
   if (target?.identity !== view.identity || !target.record) return;
   const chat = (view.all_streams ?? view.streams).find(
-    (s) => s.space === target.space && s.stream === target.stream,
+    (s) =>
+      s.space === target.space &&
+      s.stream === target.stream &&
+      matchesNotificationContext(view, s, target),
   );
   if (!chat) return;
   const context = chat.space_context ?? view.active_space;
@@ -166,7 +192,10 @@ export function notificationCatchUpRequest(
 ): Record<string, unknown> | undefined {
   if (target?.identity !== view.identity) return;
   const chat = (view.all_streams ?? view.streams).find(
-    (s) => s.space === target.space && s.stream === target.stream,
+    (s) =>
+      s.space === target.space &&
+      s.stream === target.stream &&
+      matchesNotificationContext(view, s, target),
   );
   const context =
     chat?.space_context ??
@@ -488,6 +517,8 @@ export function usePushNotifications(
         notificationChat(view, opened.target) ||
         notificationPage(view, opened.target) ||
         !opened.target ||
+        (opened.target.category === "session_start" &&
+          (!opened.target.expires || opened.target.expires <= Date.now())) ||
         Date.now() - opened.received >= 60000
       ) {
         void finish(entry);
@@ -540,18 +571,17 @@ export function usePushNotifications(
   const toggle = async (enable = !status.enabled) => {
     if (!view || changing) return;
     const identity = view.identity;
-    dismissOffer();
+    if (!enable) dismissOffer();
     settingsRevision.current++;
     latest.current.changing = true;
     setChanging(true);
     try {
-      receive(
-        await invoke<Status>("push_task", {
-          op: enable ? "enable" : "disable",
-          expectedIdentity: identity,
-        }),
-        identity,
-      );
+      const updated = await invoke<Status>("push_task", {
+        op: enable ? "enable" : "disable",
+        expectedIdentity: identity,
+      });
+      receive(updated, identity);
+      if (updated.enabled) dismissOffer();
       if (latest.current.view?.identity === identity)
         latest.current.requestSync(true);
     } catch (error) {

@@ -13,13 +13,14 @@ import {
 import { shareText } from "@choochmeque/tauri-plugin-sharekit-api";
 import { t } from "./i18n";
 import { ScreenHeader } from "./ScreenHeader";
+import { QrScanner } from "./QrScanner";
 import { EmptyState } from "./EmptyState";
 import { SpaceJoinRequests } from "./SpaceJoinRequests";
 import { PullToRefresh } from "./PullToRefresh";
 import { Icon } from "./Icon";
 import { OnlineIndicator } from "./useRealtime";
 import { useToast } from "./Toast";
-import { QrParts } from "./invitationTransport";
+import { normalizeInvitationLink, QrParts } from "./invitationTransport";
 import { profileName, type View, type Stream } from "./model";
 import "./invitations.css";
 
@@ -116,7 +117,7 @@ export function InvitationFlow({
   route: InvitationRoute;
   embedded?: boolean;
   active?: boolean;
-  onSpaces?: () => void;
+  onSpaces?: (link?: string) => void;
   onInvite?: () => void;
   onScan?: () => void;
   stream?: Stream;
@@ -158,6 +159,7 @@ export function InvitationFlow({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState({ received: 0, total: 0 });
   const scanningRef = useRef(false);
+  const scanGeneration = useRef(0);
   const mounted = useRef(true);
   const contactRequest = useRef<Promise<Reply> | null>(null);
   const initialName = useRef(profileName(view));
@@ -208,7 +210,17 @@ export function InvitationFlow({
     if (page === "activity" || page === "notifications") await loadActivity();
     if (page === "requests" || page === "invitations") await load();
   };
-  const inspect = async (link: string) => {
+  const inspect = async (value: string) => {
+    const invitation = normalizeInvitationLink(value);
+    if (!invitation || (invitation.kind === "space" && !onSpaces)) {
+      showError(t("invite.invalidCode"));
+      return;
+    }
+    if (invitation.kind === "space") {
+      onSpaces!(invitation.link);
+      return;
+    }
+    const link = invitation.link;
     const p = await invoke<Preview>("operate", {
       request: {
         op: route.contacts ? "contact_preview" : "invitation_preview",
@@ -225,21 +237,26 @@ export function InvitationFlow({
     }
   };
   const stopScan = () => {
+    const wasScanning = scanningRef.current;
+    scanGeneration.current += 1;
     scanningRef.current = false;
-    setScanning(false);
-    document.documentElement.classList.remove("elo-scanning");
-    void cancel().catch(() => {});
+    if (mounted.current) setScanning(false);
+    if (mobile && wasScanning) void cancel().catch(() => {});
   };
   useEffect(() => {
     mounted.current = true;
     pageRef.current?.focus();
     return () => {
       mounted.current = false;
+      scanGeneration.current += 1;
+      const wasScanning = scanningRef.current;
       scanningRef.current = false;
-      document.documentElement.classList.remove("elo-scanning");
-      if (mobile) void cancel().catch(() => {});
+      if (mobile && wasScanning) void cancel().catch(() => {});
     };
   }, [mobile]);
+  useEffect(() => {
+    if (!active && scanningRef.current) stopScan();
+  }, [active]);
   const listContext = useRef("");
   const lastSeen = useRef("");
   useEffect(() => {
@@ -380,26 +397,30 @@ export function InvitationFlow({
     return () => document.removeEventListener("keydown", key, true);
   });
   const startScan = async () => {
-    if (scanningRef.current) return;
-    let started = false;
+    if (scanningRef.current || !mounted.current || !active) return;
+    const generation = ++scanGeneration.current;
+    const current = () =>
+      mounted.current &&
+      scanningRef.current &&
+      scanGeneration.current === generation;
+    const parts = new QrParts();
+    scanningRef.current = true;
+    setScanning(true);
+    setProgress(parts.progress);
     try {
-      const permission = await checkPermissions();
-      if (
-        permission !== "granted" &&
-        (await requestPermissions()) !== "granted"
-      ) {
+      let permission = await checkPermissions();
+      if (!current()) return;
+      if (permission !== "granted") {
+        permission = await requestPermissions();
+        if (!current()) return;
+      }
+      if (permission !== "granted") {
         showError(t("invite.cameraDenied"));
         return;
       }
-      const parts = new QrParts();
-      scanningRef.current = true;
-      started = true;
-      setScanning(true);
-      setProgress(parts.progress);
-      document.documentElement.classList.add("elo-scanning");
-      while (scanningRef.current) {
+      while (current()) {
         const result = await scan({ formats: [Format.QRCode], windowed: true });
-        if (!scanningRef.current) break;
+        if (!current()) return;
         const link = parts.add(result.content);
         setProgress(parts.progress);
         if (link) {
@@ -409,7 +430,7 @@ export function InvitationFlow({
         }
       }
     } catch (error) {
-      if (!started || scanningRef.current) {
+      if (current()) {
         const reason = error instanceof Error ? error.message : "";
         if (reason === "invitationMixedCodes")
           showError(t("invite.mixedCodes"));
@@ -420,7 +441,8 @@ export function InvitationFlow({
           showError(t("invite.invalidCode"));
         else reportError(error);
       }
-      stopScan();
+    } finally {
+      if (current()) stopScan();
     }
   };
   const title = output
@@ -489,7 +511,7 @@ export function InvitationFlow({
   const notices = notificationsPage ? (activity.notices ?? []) : [];
   return (
     <section
-      className={`${inline ? "invitation-panel" : "invitation-page content-pane"}${scanning ? " invitation-scanner" : ""}`}
+      className={inline ? "invitation-panel" : "invitation-page content-pane"}
       ref={pageRef}
       tabIndex={-1}
       aria-label={title}
@@ -516,24 +538,20 @@ export function InvitationFlow({
         !scanning &&
         onSpaces &&
         otherSpaceRequests > 0 && (
-          <button onClick={onSpaces}>
+          <button onClick={() => onSpaces()}>
             {t("spaces.otherRequests", { count: otherSpaceRequests })}
           </button>
         )}
       {scanning ? (
-        <>
-          <div className="scan-window" aria-label={t("invite.camera")}>
-            <span />
-          </div>
-          <div className="scan-controls">
-            <p aria-live="polite">
-              {progress.total
-                ? t("invite.scannedParts", { ...progress })
-                : t("invite.scanHint")}
-            </p>
-            <button onClick={stopScan}>{t("invite.cancel")}</button>
-          </div>
-        </>
+        <QrScanner
+          title={title}
+          hint={
+            progress.total
+              ? t("invite.scannedParts", { ...progress })
+              : t("invite.scanHint")
+          }
+          onCancel={stopScan}
+        />
       ) : (
         <PullToRefresh
           className={`invitation-scroll page-content${page === "activity" && ownedSpace && !selected && !preview && !output ? " has-join-requests" : ""}`}
@@ -1332,7 +1350,10 @@ export function InvitationFlow({
 function Person({ name, identity }: { name: string; identity: string }) {
   return (
     <div className="invitation-person">
-      <span className="avatar">{name.slice(0, 2).toUpperCase()}<OnlineIndicator identity={identity} /></span>
+      <span className="avatar">
+        {name.slice(0, 2).toUpperCase()}
+        <OnlineIndicator identity={identity} />
+      </span>
       <strong>{name}</strong>
       <code>
         {identity.slice(0, 8)} · {identity.slice(-8)}
@@ -1408,6 +1429,7 @@ export function InvitationCode({
     !matchMedia("(prefers-reduced-motion: reduce)").matches,
   );
   const [qrError, setQrError] = useState(false);
+  const savingImage = useRef(false);
   useEffect(() => {
     let active = true;
     setFrames([]);
@@ -1439,7 +1461,25 @@ export function InvitationCode({
   return (
     <div className="invitation-code">
       {frames.length ? (
-        <img src={frames[index]} alt={t("invite.code")} />
+        <img
+          src={frames[index]}
+          alt={t("invite.code")}
+          onContextMenu={
+            mobile
+              ? undefined
+              : (event) => {
+                  // WKWebView's image download does not save data URLs reliably.
+                  event.preventDefault();
+                  if (!link || savingImage.current) return;
+                  savingImage.current = true;
+                  void invoke<boolean>("save_invitation_qr", { link })
+                    .catch(reportError)
+                    .finally(() => {
+                      savingImage.current = false;
+                    });
+                }
+          }
+        />
       ) : (
         <div
           className="invitation-qr-placeholder"

@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
   type PointerEvent,
 } from "react";
 import { MessageContent } from "./MessageContent";
@@ -20,6 +21,8 @@ import {
   streamSwipe,
   swipeDirection,
   unreadStreamEntries,
+  filterBuzzEntries,
+  type BuzzFilter,
   type StreamEntry,
 } from "./streamFeed";
 
@@ -42,7 +45,11 @@ type Gesture = {
 function EntryBody({ entry }: { entry: StreamEntry }) {
   const { row } = entry;
   return row.body.kind === "deleted" ? (
-    <p className="deleted-message">{t(row.body.expired ? "messageActions.expired" : "messageActions.deleted")}</p>
+    <p className="deleted-message">
+      {t(
+        row.body.expired ? "messageActions.expired" : "messageActions.deleted",
+      )}
+    </p>
   ) : row.body.kind === "unavailable" ? (
     <p>
       <span className="stream-text">{t("messageUnavailable.title")}</span>
@@ -70,8 +77,10 @@ export function MessageStream({
   onRefresh,
   onRead,
   onOpen,
+  activity,
 }: {
   view: View;
+  activity?: ReactNode;
   active: boolean;
   mobile: boolean;
   busy: boolean;
@@ -80,7 +89,12 @@ export function MessageStream({
   onRead: (entry: StreamEntry) => Promise<boolean>;
   onOpen: (entry: StreamEntry) => void;
 }) {
-  const entries = useMemo(() => unreadStreamEntries(view), [view]);
+  const [filter, setFilter] = useState<BuzzFilter>("all");
+  const unreadEntries = useMemo(() => unreadStreamEntries(view), [view]);
+  const entries = useMemo(
+    () => filterBuzzEntries(unreadEntries, filter, view.identity),
+    [unreadEntries, filter, view.identity],
+  );
   const [limit, setLimit] = useState(60);
   const viewport = useRef<HTMLDivElement>(null);
   const more = useRef<HTMLButtonElement>(null);
@@ -98,17 +112,25 @@ export function MessageStream({
   const returnTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
+  useLayoutEffect(() => {
+    setFilter("all");
+    setLift(null);
+    setSlide(null);
+    setLimit(60);
+  }, [view.identity]);
   useEffect(() => {
     if (!lift) return;
     const chat = (view.all_streams ?? view.streams).find(
-      (chat) => chat.stream === lift.entry.chat.stream,
+      (chat) =>
+        chat.space === lift.entry.chat.space &&
+        chat.stream === lift.entry.chat.stream,
     );
-    if (
-      chat?.rows.some(
-        (row) => row.id === lift.entry.row.id && row.body.kind === "deleted",
-      )
-    )
-      setLift(null);
+    const row = chat?.rows.find((row) => row.id === lift.entry.row.id);
+    if (!chat || !row || row.body.kind === "deleted") setLift(null);
+    else if (row !== lift.entry.row || chat !== lift.entry.chat)
+      setLift((current) =>
+        current ? { ...current, entry: { ...current.entry, chat, row } } : null,
+      );
   }, [view, lift]);
   const liftRef = useRef(lift);
   liftRef.current = lift;
@@ -330,6 +352,28 @@ export function MessageStream({
         title={t("nav.stream")}
         actions={!mobile && <RefreshButton onRefresh={onRefresh} />}
       />
+      <div
+        className="buzz-filters"
+        role="group"
+        aria-label={t("stream.filters")}
+      >
+        {(["all", "mentions", "threads"] as const).map((value) => (
+          <button
+            key={value}
+            type="button"
+            className="quiet"
+            aria-pressed={filter === value}
+            onClick={() => {
+              setFilter(value);
+              setLimit(60);
+              setLift(null);
+              setSlide(null);
+            }}
+          >
+            {t(`stream.filter.${value}`)}
+          </button>
+        ))}
+      </div>
       <div className="stream-viewport" ref={viewport}>
         <div
           className="stream-list-host"
@@ -342,7 +386,18 @@ export function MessageStream({
             onRefresh={onRefresh}
             resetKey={view.identity}
           >
-            {!entries.length && <EmptyState message={t("stream.empty")} />}
+            {activity}
+            {!entries.length && (
+              <EmptyState
+                message={t(
+                  filter === "mentions"
+                    ? "stream.emptyMentions"
+                    : filter === "threads"
+                      ? "stream.emptyThreads"
+                      : "stream.empty",
+                )}
+              />
+            )}
             {entries.slice(0, limit).map((entry, index) => {
               const shifted = slide?.key === entry.key;
               return (

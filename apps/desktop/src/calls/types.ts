@@ -12,6 +12,7 @@ export type Participant = {
   identity_id: string;
   credential_id: string;
   media: MediaState;
+  ready?: boolean;
 };
 export type ActiveCall = {
   call_id: string;
@@ -23,6 +24,9 @@ export type ActiveCall = {
   key_epoch: number;
   started_by: string;
   started_at: number;
+  /** The initiator has admitted media and can receive peers, not necessarily a connected peer. */
+  ready?: boolean;
+  ready_at?: number;
 };
 export type MediaAccess = {
   provider: "livekit" | "p2p";

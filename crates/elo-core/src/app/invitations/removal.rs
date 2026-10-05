@@ -198,6 +198,9 @@ impl ClientApp {
     /// A hosted Space is the device roster authority; the chat controller keeps
     /// the existing identities and permissions while updating their recipient keys.
     pub(in crate::app) async fn refresh_chat_devices(&mut self) -> Result<()> {
+        // Notes recipient updates have their own atomic registry. A pending
+        // first grant must not block synchronization of unrelated chats.
+        let _ = self.refresh_notes_access().await;
         let Some(address) = &self.call_host else {
             return Ok(());
         };

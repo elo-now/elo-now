@@ -30,6 +30,8 @@ use tower::ServiceExt;
 mod account_deletion;
 mod backup;
 mod calls;
+mod freshness;
+mod invitation_descriptors;
 mod lifecycle;
 mod service;
 use elo_core::public_space::PublicSpaceService;
@@ -38,6 +40,8 @@ use service::HostedService;
 mod owner_managed_tests;
 #[cfg(test)]
 mod realtime_tests;
+#[cfg(test)]
+mod witnessed_tests;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +56,9 @@ pub(super) struct HostConfig {
     pub mailbox_quota_bytes: u64,
     #[serde(default)]
     pub operator_snapshot: Option<PathBuf>,
+    /// A dedicated private bearer key for the loopback backup endpoints.
+    #[serde(default)]
+    pub backup_access_key: Option<PathBuf>,
     #[serde(default)]
     pub call_admission_key: Option<PathBuf>,
     #[serde(default)]
@@ -61,6 +68,9 @@ pub(super) struct HostConfig {
     pub recovery_recipient: Option<String>,
     #[serde(default)]
     pub client_policy: elo_core::client_policy::ClientPolicy,
+    /// Independently installed trust anchor, never learned from a Space request.
+    #[serde(default)]
+    pub witness: Option<elo_core::authority::WitnessPin>,
 }
 fn default_max_spaces() -> usize {
     128
@@ -131,6 +141,7 @@ struct Host {
     config: HostConfig,
     revocations: elo_core::identity::revocations::Revocations,
     call_admission_key: Option<Zeroizing<Vec<u8>>>,
+    backup_access_key: Option<Zeroizing<Vec<u8>>>,
     spaces: RwLock<BTreeMap<String, Arc<HostedSpace>>>,
     // A single admitted creator bounds Argon2 work and makes reservations atomic.
     creation: Mutex<()>,
@@ -140,6 +151,9 @@ struct Host {
     started: std::time::Instant,
     allow_loopback: bool,
     attachment_storage: Option<Arc<dyn AttachmentStorage>>,
+    invitation_store: Option<Mutex<invitation_descriptors::Store>>,
+    invitation_ingress: invitation_descriptors::Ingress,
+    witness: Option<freshness::WitnessGate>,
 }
 fn current() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
@@ -199,6 +213,9 @@ impl Host {
     async fn open(config: HostConfig, allow_loopback: bool) -> Result<Arc<Self>> {
         elo_core::store::ClientStore::configure_shared_workers(4)?;
         config.client_policy.validate()?;
+        if let Some(pin) = &config.witness {
+            pin.validate()?;
+        }
         if let Some(recipient) = &config.recovery_recipient {
             recipient.parse::<age::x25519::Recipient>()?;
         }
@@ -217,6 +234,14 @@ impl Host {
         private_directory(&config.root.join("deleted"))?;
         private_directory(&config.root.join("account-deletions"))?;
         private_directory(&config.root.join("account-receipts"))?;
+        let witness_root = config.root.join("witness-freshness");
+        let witness = match config.witness.clone() {
+            Some(pin) => Some(freshness::WitnessGate::open(&witness_root, pin)?),
+            None if witness_root.exists() => {
+                return Err("Cannot disable the existing hosting witness pin.".into());
+            }
+            None => None,
+        };
         if config.root.join("replica").exists() {
             return Err("Shared Replica storage requires a separate migration. Use a new hosting directory.".into());
         }
@@ -224,11 +249,22 @@ impl Host {
             Some(storage) => Some(storage.open().await?),
             None => None,
         };
+        let invitation_store = if witness.is_some() {
+            let directory = config.root.join("invitation-descriptors");
+            private_directory(&directory)?;
+            Some(Mutex::new(
+                invitation_descriptors::Store::open(&directory)
+                    .map_err(|_| "Invitation storage unavailable.")?,
+            ))
+        } else {
+            None
+        };
         let host = Arc::new(Self {
             revocations: elo_core::identity::revocations::Revocations::open(
                 config.root.join("revoked-devices"),
             )?,
             call_admission_key: calls::load_key(config.call_admission_key.as_deref())?,
+            backup_access_key: backup::load_key(config.backup_access_key.as_deref())?,
             config,
             spaces: RwLock::new(BTreeMap::new()),
             creation: Mutex::new(()),
@@ -238,6 +274,9 @@ impl Host {
             started: std::time::Instant::now(),
             allow_loopback,
             attachment_storage,
+            invitation_store,
+            invitation_ingress: invitation_descriptors::Ingress::new(),
+            witness,
         });
         host.load_spaces().await?;
         Ok(host)
@@ -284,8 +323,11 @@ impl Host {
                 {
                     return Err("Public-only Space contains an unexpected profile.".into());
                 }
-                let service =
-                    PublicSpaceService::open(path.join("public-service"), self.allow_loopback)?;
+                let service = PublicSpaceService::open_with_witness(
+                    path.join("public-service"),
+                    self.allow_loopback,
+                    self.config.witness.clone(),
+                )?;
                 if config.address.service_credential.as_deref()
                     != Some(service.transport_credential().as_str())
                 {
@@ -419,7 +461,7 @@ impl Host {
         creator: IdentityId,
         network: Option<String>,
     ) -> Result<(String, Reservation)> {
-        self.provision_from_network_inner(command, creator, network, None)
+        self.provision_from_network_inner(command, creator, network, None, None)
             .await
     }
     async fn provision_from_network_inner(
@@ -428,9 +470,34 @@ impl Host {
         creator: IdentityId,
         network: Option<String>,
         creation_evidence: Option<elo_core::public_space::AdminEvidence>,
+        freshness: Option<(
+            &elo_core::authority::Authority,
+            &elo_core::witness::VerifiedFreshness,
+        )>,
     ) -> Result<(String, Reservation)> {
         // Never allocate a new server-owned profile, including through internal callers.
         require_owner_managed_creation(command)?;
+        if let Some((authority, _)) = freshness {
+            let proof = command
+                .authority
+                .as_ref()
+                .ok_or("Missing creation authority.")?;
+            let pin = self
+                .config
+                .witness
+                .as_ref()
+                .ok_or("Missing hosting witness pin.")?;
+            let requested = proof.verify_witnessed(authority.space(), authority.stream(), pin)?;
+            if requested.head_id() != authority.head_id() {
+                return Err("Creation witness lease belongs to another authority.".into());
+            }
+        }
+        let check_freshness = || match (&self.witness, freshness) {
+            (Some(gate), Some((authority, lease))) => gate.check(authority, lease),
+            (None, None) => Ok(()),
+            _ => Err("Missing hosting creation witness lease.".into()),
+        };
+        check_freshness()?;
         let id = reservation_id(creator, &command.request_id);
         let path = self.config.root.join("spaces").join(&id);
         if self
@@ -503,6 +570,7 @@ impl Host {
                 *count += 1;
             }
             budget.count += 1;
+            check_freshness()?;
             save(&budget_path, &budget)?;
             let value = Reservation {
                 creator: Some(creator),
@@ -582,13 +650,14 @@ impl Host {
                         private_directory(&directory)?;
                         std::fs::remove_dir_all(&directory)?;
                     }
-                    HostedService::Public(Box::new(PublicSpaceService::create(
+                    HostedService::Public(Box::new(PublicSpaceService::create_with_witness(
                         directory,
                         proof.clone(),
                         &[creator],
                         reservation.contact_email.clone(),
                         self.allow_loopback,
                         reservation.creation_evidence.clone(),
+                        self.config.witness.clone(),
                     )?))
                 } else {
                     // Only General's service holds a sending capability. New members
@@ -626,16 +695,18 @@ impl Host {
                     contact_email: reservation.contact_email.clone(),
                     peer,
                 };
+                check_freshness()?;
                 save(&path.join("config.json"), &config)?;
                 prepared = Some(client);
             }
-            self.spaces.write().await.insert(
-                id.clone(),
-                self.open_ready(&id, &reservation, prepared).await?,
-            );
+            let ready = self.open_ready(&id, &reservation, prepared).await?;
+            let mut spaces = self.spaces.write().await;
+            check_freshness()?;
+            spaces.insert(id.clone(), ready);
         }
-        if reservation.invitation.is_none()
-            || current()?.saturating_sub(reservation.invitation_issued) > 23 * 3_600_000
+        if freshness.is_none()
+            && (reservation.invitation.is_none()
+                || current()?.saturating_sub(reservation.invitation_issued) > 23 * 3_600_000)
         {
             let space = self
                 .spaces
@@ -644,11 +715,10 @@ impl Host {
                 .get(&id)
                 .cloned()
                 .ok_or("Space unavailable.")?;
+            let client = space.client.lock().await;
+            check_freshness()?;
             reservation.invitation = Some(
-                space
-                    .client
-                    .lock()
-                    .await
+                client
                     .as_ref()
                     .ok_or("Space was deleted.")?
                     .bootstrap_space_invitation(
@@ -657,8 +727,10 @@ impl Host {
                     )?,
             );
             reservation.invitation_issued = current()?;
+            check_freshness()?;
             save(&reservation_path, &reservation)?;
         }
+        check_freshness()?;
         Ok((id, reservation))
     }
 }
@@ -679,10 +751,11 @@ async fn create(
         .try_read()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let expected = format!("{}/spaces/v1/create", host.config.public_url);
-    let (command, credential) = space_host::verify_create(
+    let (command, credential) = space_host::verify_create_with_witness(
         &request,
         &expected,
         current().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+        host.config.witness.as_ref(),
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
     require_owner_managed_creation(&command).map_err(|_| StatusCode::UPGRADE_REQUIRED)?;
@@ -700,11 +773,33 @@ async fn create(
     if host.account_requested(credential.identity()) {
         return Err(StatusCode::GONE);
     }
+    // A signed initial configuration alone does not prove that the independent
+    // witness registered it or that its owner is still current.
+    let freshness = if let Some(gate) = &host.witness {
+        let authority = space_host::verify_creation_authority_with_witness(
+            &command,
+            &credential,
+            host.config.witness.as_ref(),
+        )
+        .map_err(|_| StatusCode::FORBIDDEN)?
+        .ok_or(StatusCode::FORBIDDEN)?;
+        let lease = gate
+            .require(&authority)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Some((authority, lease))
+    } else {
+        None
+    };
     let _permit = host
         .creation
         .try_lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let (_, reservation) = host
+    if let (Some(gate), Some((authority, lease))) = (&host.witness, &freshness) {
+        gate.check(authority, lease)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    }
+    let (id, reservation) = host
         .provision_from_network_inner(
             &command,
             credential.identity(),
@@ -713,6 +808,9 @@ async fn create(
                 record: request.record.clone(),
                 credential: request.credential.clone(),
             }),
+            freshness
+                .as_ref()
+                .map(|(authority, lease)| (authority, lease.as_ref())),
         )
         .await
         .map_err(|e| {
@@ -722,16 +820,30 @@ async fn create(
                 StatusCode::SERVICE_UNAVAILABLE
             }
         })?;
-    space_host::seal_creation(
-        &credential,
-        &command,
-        reservation
-            .invitation
-            .as_deref()
-            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?,
-    )
-    .map(Json)
-    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    if let (Some(gate), Some((authority, lease))) = (&host.witness, &freshness) {
+        gate.check(authority, lease)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    }
+    let reply = if freshness.is_some() {
+        let space = host
+            .spaces
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        space_host::seal_witnessed_creation(&credential, &command, &space.config.address)
+    } else {
+        space_host::seal_creation(
+            &credential,
+            &command,
+            reservation
+                .invitation
+                .as_deref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?,
+        )
+    };
+    reply.map(Json).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 async fn command(
     State(host): State<Arc<Host>>,
@@ -778,6 +890,13 @@ async fn command(
         .command_slots
         .try_acquire()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    // Serialize authority/ACL transitions with admitted Replica requests.
+    let mut serving = tokio::time::timeout(Duration::from_secs(2), space.serving.write())
+        .await
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    if !*serving {
+        return Err(StatusCode::GONE);
+    }
     let mut guard = tokio::time::timeout(Duration::from_secs(2), space.client.lock())
         .await
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
@@ -798,6 +917,25 @@ async fn command(
             return Err(StatusCode::FORBIDDEN);
         }
     }
+    let witnessed = if client
+        .witnessed_authority()
+        .map_err(|_| StatusCode::FORBIDDEN)?
+        .is_some()
+    {
+        let authority = client
+            .witnessed_request_authority(&request)
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        let gate = host.witness.as_ref().ok_or(StatusCode::FORBIDDEN)?;
+        let lease = gate
+            .require(&authority)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        gate.check(&authority, &lease)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Some((authority, lease))
+    } else {
+        None
+    };
     if let Some(receipt) = client
         .authorize_space_deletion(&space.config, &request)
         .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -821,16 +959,27 @@ async fn command(
         drop(guard);
         // Drain admitted Replica requests, then close the transport gate before
         // acknowledging deletion. The background worker owns physical cleanup.
-        *space.serving.write().await = false;
+        *serving = false;
         closed
             .close()
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         return Ok((StatusCode::GONE, Json(receipt)).into_response());
     }
-    let reply = client
-        .serve_hosted_space(&space.config, request, &space.replica)
-        .await;
+    let reply = if let Some((authority, lease)) = &witnessed {
+        host.witness
+            .as_ref()
+            .ok_or(StatusCode::FORBIDDEN)?
+            .check(authority, lease)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        client
+            .serve_hosted_witnessed_space(&space.config, request, &space.replica, lease)
+            .await
+    } else {
+        client
+            .serve_hosted_space(&space.config, request, &space.replica)
+            .await
+    };
     space
         .replica
         .set_space_members(
@@ -1153,11 +1302,33 @@ fn system_statistics() -> Value {
     });
     json!({"load_average":load,"memory":memory})
 }
+impl Host {
+    async fn require_current_replica(&self, space: &HostedSpace) -> Result<()> {
+        let client = tokio::time::timeout(Duration::from_secs(2), space.client.lock()).await?;
+        let client = client.as_ref().ok_or("Space unavailable.")?;
+        if let Some(authority) = client.witnessed_authority()? {
+            let gate = self.witness.as_ref().ok_or("Missing witness pin.")?;
+            let lease = gate.require(&authority).await?;
+            space
+                .replica
+                .set_space_members(space.mailbox, client.space_access_members()?)
+                .await?;
+            space
+                .replica
+                .set_admitted_devices(client.space_access_devices()?)?;
+            gate.check(&authority, &lease)?;
+        }
+        Ok(())
+    }
+}
 // Route by the stable reservation in the path, never by profile or backend IP.
 async fn replica_request(
     State(host): State<Arc<Host>>,
     request: Request,
 ) -> axum::response::Response {
+    let Ok(_accounts) = host.accounts.try_read() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let Some((id, _)) = request
         .uri()
         .path()
@@ -1177,6 +1348,9 @@ async fn replica_request(
     if !*serving {
         return StatusCode::GONE.into_response();
     }
+    if host.require_current_replica(&space).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     // No prefix rewriting: the inner router checks the complete signed URI.
     space.transport.clone().oneshot(request).await.unwrap()
 }
@@ -1188,12 +1362,14 @@ impl elo_core::realtime::Resolver for Host {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ReplicaStore>> + Send + 'a>>
     {
         Box::pin(async move {
+            let _accounts = self.accounts.try_read().ok()?;
             let id = replica
                 .strip_prefix("/spaces/")?
                 .strip_suffix("/replica/")?;
             id.parse::<ObjectId>().ok()?;
             let space = self.spaces.read().await.get(id).cloned()?;
-            if !*space.serving.read().await {
+            let serving = space.serving.read().await;
+            if !*serving || self.require_current_replica(&space).await.is_err() {
                 return None;
             }
             Some(space.replica.clone())
@@ -1211,6 +1387,14 @@ fn app(host: Arc<Host>) -> Router {
     Router::new()
         .route(elo_core::client_policy::PATH, get(client_policy))
         .route("/spaces/v1/create", post(create))
+        .route(
+            "/spaces/{id}/invitations/v1",
+            post(invitation_descriptors::upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/invitations/v1/{digest}",
+            get(invitation_descriptors::download),
+        )
         .route(
             elo_core::app::account_deletion::PATH,
             post(account_deletion::request),
@@ -1267,6 +1451,16 @@ pub(super) async fn run(config: PathBuf, bind: std::net::SocketAddr) -> Result<(
                 eprintln!("Unpublished Space reservation cleanup will be retried.");
             }
             cleanup_host.retry_deletions().await;
+            if let Some(store) = &cleanup_host.invitation_store {
+                let mut store = store.lock().await;
+                if current()
+                    .ok()
+                    .and_then(|now| store.cleanup(now).ok())
+                    .is_none()
+                {
+                    eprintln!("Invitation ciphertext cleanup will be retried.");
+                }
+            }
         }
     });
     let worker = host.clone();
@@ -1470,8 +1664,10 @@ mod tests {
             max_space_creations_per_day: 1,
             mailbox_quota_bytes: 150_000_000,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };
@@ -1554,7 +1750,7 @@ mod tests {
             assert_eq!(error.to_string(), "Hosting capacity reached.");
         }
         let other = creation_network(Some("192.0.2.2".parse().unwrap()), &HeaderMap::new());
-        host.provision_from_network_inner(&command, creator, Some(other), Some(evidence))
+        host.provision_from_network_inner(&command, creator, Some(other), Some(evidence), None)
             .await
             .unwrap();
         close_host(host).await;
@@ -1601,8 +1797,10 @@ mod tests {
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 256 * 1024 * 1024,
                 operator_snapshot: None,
+                backup_access_key: None,
                 call_admission_key: None,
                 client_policy: Default::default(),
+                witness: None,
                 attachment_storage: None,
                 recovery_recipient: None,
             },
@@ -2061,8 +2259,10 @@ mod tests {
             mailbox_quota_bytes: 32 * 1024 * 1024,
             recovery_recipient: None,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: Some(AttachmentStorageConfig::Local {
                 root: external.clone(),
             }),
@@ -2320,7 +2520,7 @@ mod tests {
                 .windows(content.len())
                 .any(|window| window == content)
         );
-        let Json(manifest) = backup::inventory(State(host.clone())).await.unwrap();
+        let Json(manifest) = backup::inventory_inner(&host).await.unwrap();
         let (hosted_id, inventory) = manifest["spaces"]
             .as_object()
             .unwrap()
@@ -2335,15 +2535,10 @@ mod tests {
             elo_core::record::encode_hex(&Sha256::digest(&encrypted))
         );
         assert!(!manifest.to_string().contains("family-photo.txt"));
-        let response = backup::download(
-            State(host.clone()),
-            Path((
-                hosted_id.clone(),
-                objects[0]["object"].as_str().unwrap().into(),
-            )),
-        )
-        .await
-        .unwrap();
+        let response =
+            backup::download_inner(&host, hosted_id, objects[0]["object"].as_str().unwrap())
+                .await
+                .unwrap();
         assert_eq!(
             axum::body::to_bytes(response.into_body(), 6 * 1024 * 1024)
                 .await
@@ -2512,8 +2707,10 @@ mod tests {
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };
@@ -2764,8 +2961,10 @@ mod tests {
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };
@@ -2895,8 +3094,10 @@ mod tests {
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };
@@ -3434,8 +3635,10 @@ mod tests {
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
             operator_snapshot: None,
+            backup_access_key: None,
             call_admission_key: None,
             client_policy: Default::default(),
+            witness: None,
             attachment_storage: None,
             recovery_recipient: None,
         };

@@ -90,7 +90,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "cipher 0.4.4",
  "cookie-factory",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "hpke",
  "i18n-embed",
@@ -120,7 +120,7 @@ dependencies = [
  "bech32",
  "chacha20poly1305 0.10.1",
  "cookie-factory",
- "hkdf",
+ "hkdf 0.12.4",
  "hpke",
  "io_tee",
  "nom",
@@ -1690,7 +1690,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf",
+ "hkdf 0.12.4",
  "rand_core 0.6.4",
  "sec1",
  "subtle",
@@ -1745,11 +1745,13 @@ dependencies = [
  "base64 0.23.1",
  "bip39",
  "chacha20poly1305 0.11.0",
+ "chrono",
  "ed25519-dalek",
  "flate2",
  "fs2",
  "futures-util",
  "getrandom 0.4.3",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
  "image",
  "reqwest",
@@ -1780,6 +1782,8 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "jni 0.22.4",
+ "mac-usernotifications",
+ "notify-rust",
  "qrcode",
  "reqwest",
  "rqrr",
@@ -1806,6 +1810,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "elo-storage"
+version = "1.0.5"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chacha20poly1305 0.11.0",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "elo-core",
+ "fs2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
 name = "elo-team"
 version = "1.0.5"
 dependencies = [
@@ -1816,11 +1849,13 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "elo-core",
  "flate2",
  "futures-util",
  "hmac 0.13.0",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1849,6 +1884,27 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "elo-witness"
+version = "1.0.5"
+dependencies = [
+ "age",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "ed25519-dalek",
+ "elo-core",
+ "fs2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2255,6 +2311,12 @@ name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 
 [[package]]
 name = "futures-util"
@@ -2738,6 +2800,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2766,7 +2837,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "digest 0.10.7",
  "generic-array",
- "hkdf",
+ "hkdf 0.12.4",
  "hmac 0.12.1",
  "p256",
  "rand_core 0.6.4",
@@ -3605,6 +3676,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mac-usernotifications"
+version = "0.3.1"
+dependencies = [
+ "block2",
+ "futures-channel",
+ "futures-lite",
+ "futures-timer",
+ "log",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-user-notifications",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4043,7 +4130,10 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
 dependencies = [
+ "bitflags 2.13.2",
+ "block2",
  "objc2",
+ "objc2-core-location",
  "objc2-foundation",
 ]
 

@@ -28,9 +28,9 @@ internal object ChatSessions {
     private val handler = Handler(Looper.getMainLooper())
     private val pending = mutableMapOf<Long, (String?) -> Unit>()
 
-    fun update(activity: Activity, id: String, active: Boolean, camera: Boolean, completed: (String?) -> Unit) {
+    fun update(activity: Activity, id: String, activation: String, active: Boolean, camera: Boolean, completed: (String?) -> Unit) {
         if (!active) {
-            stop(activity, id.takeIf { it.isNotEmpty() })
+            if (ChatSessionAudio.owns(id, activation)) stop(activity, id)
             completed(null)
             return
         }
@@ -50,6 +50,7 @@ internal object ChatSessions {
             }
         }, 4_000)
         try {
+            ChatSessionAudio.begin(activity, session.id, activation)
             ContextCompat.startForegroundService(activity, Intent(activity, ChatSessionService::class.java)
                 .setAction(ChatSessionState.ACTION)
                 .putExtra(ChatSessionState.SESSION_ID, session.id)
@@ -66,6 +67,7 @@ internal object ChatSessions {
 
     fun stop(context: Context, id: String? = null) {
         if (!state.end(id)) return
+        ChatSessionAudio.stop(id)
         pending.values.toList().also { pending.clear() }.forEach { it("The chat session ended.") }
         context.stopService(Intent(context, ChatSessionService::class.java))
         context.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
@@ -149,7 +151,7 @@ class ChatSessionService : Service() {
     }
 
     override fun onDestroy() {
-        owned?.let { ChatSessions.state.end(it.id, it.revision) }
+        owned?.let { if (ChatSessions.state.end(it.id, it.revision)) ChatSessionAudio.stop(it.id) }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

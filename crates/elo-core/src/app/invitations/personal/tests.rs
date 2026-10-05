@@ -50,6 +50,188 @@ fn update(
 }
 
 #[tokio::test]
+async fn linked_general_owner_can_create_private_dm_without_old_device_key_or_recovery_card() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut alex = profile(temp.path(), "Alex").await;
+    let mut maya = profile(temp.path(), "Maya").await;
+    let old_personal = alex.authorities.0[0].space();
+    let old_device = alex.session.credential().id();
+    let mut linked = alex.session.linked_companion().unwrap();
+    let request = "ae".repeat(16);
+    let proof = alex.owner_general_creation(&request).unwrap();
+    let genesis = decode_record(&proof.genesis).unwrap();
+    let mut general = proof
+        .verify(
+            genesis.id().to_string().parse().unwrap(),
+            request.parse().unwrap(),
+        )
+        .unwrap();
+    general.add_credential(linked.credential().clone());
+    let mut config = general.head().unwrap().clone();
+    config.sequence += 1;
+    config.previous_config_id = general.head_id();
+    config.nonce = "af".repeat(16);
+    config.action.operation = "replace".into();
+    config.members[0]
+        .credential_ids
+        .push(linked.credential().id());
+    config.members[0].credential_ids.sort();
+    config.owner_credential_ids = config.members[0].credential_ids.clone();
+    general
+        .apply_config(config.sign(alex.session.signing_key()).unwrap())
+        .unwrap();
+    let general = general
+        .merge_into_store(
+            None,
+            &alex.store,
+            alex.session.age_identity(),
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+    linked.activate_linked_owner_controller(&general).unwrap();
+    let mut pin = alex.pins[0].clone();
+    pin.space = general.space();
+    pin.stream = general.stream();
+    pin.personal_seed = Some(false);
+    alex.team = Some(team::TeamDescriptor {
+        v: 1,
+        url: "https://example.invalid/team/v1/enroll".into(),
+        token: "00".repeat(32),
+        scope: team::TeamScope {
+            space: general.space(),
+            stream: general.stream(),
+            root: pin.root.clone(),
+            controller: old_device,
+        },
+        message_lifetime_seconds: 86400,
+        service_credential: None,
+    });
+    alex.pins.push(pin);
+    alex.authorities.0.push(general.clone());
+    alex.session = linked;
+    alex.persist_vault().unwrap();
+    alex.persist_workspace().unwrap();
+    assert!(!alex.session.can_control(old_personal));
+
+    // A roster alone must not reactivate a restored or retired vault, and an
+    // imported General must not grant ownership of unrelated private chats.
+    let grants = alex.session.controller_spaces.clone();
+    for mode in [
+        vault::ControllerMode::Follower,
+        vault::ControllerMode::Retired,
+    ] {
+        alex.session.controller_mode = mode;
+        assert!(
+            alex.create_chat("Forbidden", None, ChatKind::Direct)
+                .await
+                .is_err()
+        );
+    }
+    alex.session.controller_mode = vault::ControllerMode::Active;
+    alex.session.controller_spaces = Some(vec![]);
+    assert!(
+        alex.create_chat("Forbidden", None, ChatKind::Direct)
+            .await
+            .is_err()
+    );
+    alex.session.controller_spaces = grants;
+    alex.team.as_mut().unwrap().scope.stream = StreamId::from_bytes([0; 16]);
+    assert!(
+        alex.create_chat("Forbidden", None, ChatKind::Direct)
+            .await
+            .is_err()
+    );
+    alex.team.as_mut().unwrap().scope.stream = general.stream();
+    assert_eq!(alex.pins.len(), 2);
+
+    let card = maya
+        .operate(json!({"op":"contact_create", "name":"Maya"}))
+        .await
+        .unwrap();
+    let preview = alex
+        .operate(json!({"op":"contact_preview", "link":card["link"]}))
+        .await
+        .unwrap();
+    alex.operate(
+        json!({"op":"contact_add", "link":card["link"], "trusted":true,
+        "confirmed_contact":preview["id"]}),
+    )
+    .await
+    .unwrap();
+    let created = alex
+        .operate(
+            json!({"op":"contact_open", "identity":maya.session.identity_id(),
+        "name":"Maya"}),
+        )
+        .await
+        .unwrap();
+    let authority = alex.authorities.0.last().unwrap();
+    assert_eq!(authority.head().unwrap().v, 3);
+    assert!(!authority.is_owner_managed());
+    assert_ne!(authority.space(), old_personal);
+    assert_ne!(authority.space(), general.space());
+    assert_eq!(
+        authority.initial_controller().id(),
+        alex.session.credential().id()
+    );
+    assert_eq!(
+        authority.head().unwrap().owner_credential_ids,
+        vec![alex.session.credential().id()]
+    );
+    assert!(
+        !authority
+            .head()
+            .unwrap()
+            .members
+            .iter()
+            .any(|m| m.credential_ids.contains(&old_device))
+    );
+    assert!(!alex.session.can_control(old_personal));
+    let private_space = authority.space();
+    let private_stream = authority.stream();
+    let state = alex.invitation_state().unwrap();
+    let direct = packet(
+        &state.personal[&maya.session.identity_id().to_string()],
+        authority,
+        maya.session.credential(),
+    );
+    maya.verify_personal(&direct).unwrap();
+    maya.import_personal(&direct).await.unwrap();
+    assert_eq!(
+        maya.authorities.0.last().unwrap().head_id(),
+        authority.head_id()
+    );
+    assert!(
+        maya.require_private_chat_controller(maya.authorities.0.last().unwrap())
+            .is_err()
+    );
+
+    // The new namespace is durable; subsequent chats reuse one grant, while
+    // the signed General and original device's private namespace are unchanged.
+    let general_head = general.head_id();
+    alex.close().await.unwrap();
+    let mut alex = ClientApp::open(
+        temp.path().join("Alex"),
+        "synthetic personal DM password".into(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(alex.session.can_control(private_space));
+    assert!(!alex.session.can_control(old_personal));
+    assert_eq!(alex.authorities.0[1].head_id(), general_head);
+    alex.create_chat("Another private chat", None, ChatKind::Chat)
+        .await
+        .unwrap();
+    assert_eq!(alex.authorities.0.last().unwrap().space(), private_space);
+    assert_ne!(alex.authorities.0.last().unwrap().stream(), private_stream);
+    assert_eq!(created["stream"], json!(private_stream));
+    alex.close().await.unwrap();
+    maya.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn personal_bootstrap_rejects_signed_expansion_permission_changes_and_replays_after_removal()
 {
     let temp = tempfile::tempdir().unwrap();

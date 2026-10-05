@@ -40,6 +40,15 @@ pub async fn get_data<R: Runtime>(
     command_scope: CommandScope<ScopeEntry>,
 ) -> Result<DataResponse> {
     scope::check(&command_scope, &options.domain, &options.name)?;
+    #[cfg(target_os = "macos")]
+    {
+        // SecItemCopyMatching waits for Touch ID. Keep this wait off the
+        // shared async workers used by networking and profile operations.
+        tauri::async_runtime::spawn_blocking(move || app.biometry().get_data(window, options))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+    #[cfg(not(target_os = "macos"))]
     app.biometry().get_data(window, options)
 }
 
@@ -51,6 +60,14 @@ pub async fn set_data<R: Runtime>(
     command_scope: CommandScope<ScopeEntry>,
 ) -> Result<()> {
     scope::check(&command_scope, &options.domain, &options.name)?;
+    #[cfg(target_os = "macos")]
+    {
+        // Replacing an existing protected entry can also require authentication.
+        tauri::async_runtime::spawn_blocking(move || app.biometry().set_data(window, options))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+    #[cfg(not(target_os = "macos"))]
     app.biometry().set_data(window, options)
 }
 

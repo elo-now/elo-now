@@ -23,6 +23,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const first = { id: "profile", identity: "identity-one" };
 const second = { id: "profile-second", identity: "identity-two" };
 let selected = first;
+let mobile = true;
 const keychain = new Map<string, string>();
 const preferences = new Map<string, string>();
 
@@ -53,6 +54,7 @@ beforeEach(() => {
   keychain.clear();
   preferences.clear();
   selected = first;
+  mobile = true;
   vi.stubGlobal("localStorage", {
     getItem: (key: string) => preferences.get(key) ?? null,
     setItem: (key: string, value: string) => preferences.set(key, value),
@@ -61,9 +63,11 @@ beforeEach(() => {
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "profile_task") {
       const request = (args as { request: { op: string; id: string } }).request;
-      return request.op === "biometric_enroll" ? { key: `AGE-SECRET-KEY-1${request.id}` } : {};
+      return request.op === "biometric_enroll"
+        ? { key: `AGE-SECRET-KEY-1${request.id}` }
+        : {};
     }
-    return { saved_profiles: [{ ...selected, active: true }] };
+    return { mobile, saved_profiles: [{ ...selected, active: true }] };
   });
   vi.mocked(checkStatus).mockResolvedValue({
     isAvailable: true,
@@ -140,6 +144,63 @@ describe("mobile biometric bridge", () => {
       type: BiometryType.None,
     });
     expect(hasData).not.toHaveBeenCalled();
+  });
+});
+
+describe("macOS biometric bridge", () => {
+  beforeEach(() => {
+    mobile = false;
+  });
+
+  it("keeps native Touch ID distinct from the mobile Face ID enum", async () => {
+    vi.mocked(checkStatus).mockResolvedValue({
+      isAvailable: true,
+      biometryType: BiometryType.TouchID,
+    });
+    await enableBiometricUnlock("profile password", undefined, first);
+    const state = await readBiometricState();
+    expect(state).toMatchObject({
+      available: true,
+      enabled: true,
+      type: BiometryType.TouchID,
+    });
+    expect(biometricName(state.type)).toBe("Touch ID");
+    expect(await readBiometricCredential("Unlock", first)).toEqual({
+      key: "AGE-SECRET-KEY-1profile",
+    });
+    expect(vi.mocked(getData).mock.lastCall?.[0]).toMatchObject({
+      reason: "Unlock",
+      cancelTitle: "Cancel",
+    });
+  });
+
+  it("does not offer enrollment when the app signature cannot access the protected keychain", async () => {
+    vi.mocked(hasData).mockRejectedValue(
+      "[keychainUnavailable] - This app signature cannot access the protected keychain",
+    );
+    expect(await readBiometricState()).toMatchObject({
+      available: false,
+      enabled: false,
+      error: "keychainUnavailable",
+    });
+    expect(getData).not.toHaveBeenCalled();
+    expect(setData).not.toHaveBeenCalled();
+  });
+
+  it("preserves other keychain failures instead of treating them as missing enrollment", async () => {
+    vi.mocked(hasData).mockRejectedValue(new Error("keychainError"));
+    await expect(readBiometricState()).rejects.toThrow("keychainError");
+  });
+
+  it("removes the local wrapper if the protected keychain rejects enrollment", async () => {
+    vi.mocked(setData).mockRejectedValue(new Error("keychainUnavailable"));
+    await expect(
+      enableBiometricUnlock("profile password", undefined, first),
+    ).rejects.toThrow("keychainUnavailable");
+    expect(invoke).toHaveBeenLastCalledWith("profile_task", {
+      request: { op: "biometric_forget", ...first },
+    });
+    expect((await readBiometricState()).enabled).toBe(false);
   });
 });
 
@@ -237,7 +298,8 @@ describe("profile-bound biometric unlock", () => {
       "elo-biometry:v1:{}",
       "elo-biometry:v2:null",
       "elo-biometry:v3:null",
-      "elo-biometry:v3:" + JSON.stringify({version: 3, ...second, key: "AGE-SECRET-KEY-1wrong"}),
+      "elo-biometry:v3:" +
+        JSON.stringify({ version: 3, ...second, key: "AGE-SECRET-KEY-1wrong" }),
       "elo-biometry:v2:" +
         JSON.stringify({ version: 2, ...second, password: "other password" }),
     ]) {

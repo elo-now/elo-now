@@ -18,7 +18,7 @@ abstract class GenerateNotificationResources : DefaultTask() {
     @TaskAction
     fun generate() {
         val copy = JsonSlurper().parse(catalog.get().asFile) as Map<*, *>
-        val names = mapOf("notification_message" to "notifications.nativeMessage", "notification_invitation" to "notifications.nativeInvitation", "notification_activity" to "notifications.nativeActivity", "notification_channel_messages" to "notifications.channelMessages", "notification_channel_invitations" to "notifications.channelInvitations", "notification_chat_session" to "calls.nativeOngoing", "notification_channel_chat_sessions" to "calls.nativeChannel")
+        val names = mapOf("notification_message" to "notifications.nativeMessage", "notification_invitation" to "notifications.nativeInvitation", "notification_activity" to "notifications.nativeActivity", "notification_session" to "notifications.nativeSession", "notification_channel_messages" to "notifications.channelMessages", "notification_channel_invitations" to "notifications.channelInvitations", "notification_chat_session" to "calls.nativeOngoing", "notification_channel_chat_sessions" to "calls.nativeChannel")
         val file = outputDirectory.get().file("values/notification_strings.xml").asFile
         file.parentFile.mkdirs()
         file.writeText("<resources>\n" + names.entries.joinToString("\n") { (name, key) ->

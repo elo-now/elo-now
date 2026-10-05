@@ -34,6 +34,7 @@
   min-width: 190px;
   max-width: calc(100vw - 16px);
   max-height: calc(var(--app-viewport-height, 100dvh) - 16px);
+  border: 1px solid var(--elo-line);
   border-radius: 14px;
   box-shadow: 0 8px 30px #0002;
 }
@@ -326,4 +327,16 @@
 }
 .dialog.message-action-menu .message-delete {
   color: var(--elo-danger, #b13c35);
+}
+
+.message-editor textarea {
+  width: 100%;
+  min-height: 88px;
+  resize: none;
+}
+.message-edited {
+  display: block;
+  color: var(--elo-muted);
+  font-size: var(--elo-type-caption);
+  margin-top: 4px;
 }

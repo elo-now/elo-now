@@ -1,11 +1,33 @@
 import { describe, it, expect } from "vitest";
-import { t, warningText, formatTimestamp, formatFileSize, formatAttachmentExpiry } from "./i18n";
+import {
+  t,
+  warningText,
+  formatTimestamp,
+  formatFileSize,
+  formatAttachmentExpiry,
+} from "./i18n";
+import { MAX_TIMESTAMP_MS } from "./timestamps";
 
 describe("English presentation without changing user data", () => {
   it("shows an attachment deadline in the reader's time zone without the year", () => {
     const time = Date.parse("2026-09-30T23:30:00Z");
     expect(formatAttachmentExpiry(time, "UTC")).toBe("Sep 30, 23:30");
     expect(formatAttachmentExpiry(time, "Europe/Warsaw")).toBe("Oct 1, 01:30");
+  });
+  it("does not pass invalid persisted deadlines into Intl.DateTimeFormat", () => {
+    for (const value of [
+      MAX_TIMESTAMP_MS + 1,
+      Number.MAX_SAFE_INTEGER,
+      Infinity,
+      NaN,
+      -1,
+      0,
+      1.5,
+    ])
+      expect(formatAttachmentExpiry(value)).toBe("");
+    expect(formatAttachmentExpiry(MAX_TIMESTAMP_MS, "UTC")).toBe(
+      "Sep 13, 00:00",
+    );
   });
   it("inserts user values literally and requires every named value", () => {
     expect(t("preview.recipient", { recipient: "A {count} <B>" })).toBe(

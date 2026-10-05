@@ -29,6 +29,7 @@ impl Fixture {
         let third = Session::create().unwrap().0;
         let root = card.recover_root(owner.identity_id()).unwrap();
         let genesis = SpaceGenesis {
+            witness: None,
             v: 1,
             kind: "space.genesis".into(),
             nonce: random_hex::<16>().unwrap(),
@@ -89,6 +90,7 @@ impl Fixture {
         authority.add_credential(peer_device.credential().clone());
         members.sort_by_key(|person| person.identity_id);
         let config = StreamConfig {
+            witness_evidence: None,
             v: 1,
             kind: "stream.config".into(),
             nonce: random_hex::<16>().unwrap(),

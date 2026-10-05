@@ -18,6 +18,7 @@ mod erasure;
 mod model;
 mod notifications;
 mod presentation;
+mod private_settings;
 mod repair;
 mod shared;
 pub use inbox::{DisplaySource, InboxItem, PeerCursor};
@@ -55,7 +56,9 @@ const NOTIFICATION_MIGRATION: &str =
 const RETENTION_MIGRATION: &str = include_str!("../../../../migrations/007_client_retention.sql");
 const LOCATOR_MIGRATION: &str =
     include_str!("../../../../migrations/008_client_message_locators.sql");
-const SCHEMA_VERSION: i64 = 8;
+const PRIVATE_SETTINGS_MIGRATION: &str =
+    include_str!("../../../../migrations/009_client_private_settings.sql");
+const SCHEMA_VERSION: i64 = 9;
 const INSERT_OBJECT: &str = include_str!("sql/insert_object.sql");
 const INSERT_RECORD: &str = include_str!("sql/insert_record.sql");
 const INSERT_SOURCE: &str = include_str!("sql/insert_source.sql");
@@ -94,7 +97,7 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("client directory is already open by another worker/process")]
     AlreadyOpen,
-    #[error("unsupported schema version {found}; expected 8")]
+    #[error("unsupported schema version {found}; expected 9")]
     UnsupportedSchema { found: i64 },
     #[error("database is not an unmodified elo.now client schema; refusing to adopt it")]
     UnrecognizedSchema,
@@ -438,7 +441,7 @@ fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
     let schema = read_schema(&connection)?;
     match version {
         0 if schema.is_empty() => {}
-        1 | 2 | 3 | 4 | 5 | 6 | 7 | SCHEMA_VERSION => validate_schema(&connection)?,
+        1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | SCHEMA_VERSION => validate_schema(&connection)?,
         0 => return Err(StoreError::UnrecognizedSchema),
         found => return Err(StoreError::UnsupportedSchema { found }),
     }
@@ -476,6 +479,9 @@ fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
     }
     if version < 8 {
         connection.execute_batch(LOCATOR_MIGRATION)?;
+    }
+    if version < 9 {
+        connection.execute_batch(PRIVATE_SETTINGS_MIGRATION)?;
     }
     validate_schema(&connection)?;
     let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
@@ -564,6 +570,9 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     }
     if version >= 8 {
         expected.execute_batch(LOCATOR_MIGRATION)?;
+    }
+    if version >= 9 {
+        expected.execute_batch(PRIVATE_SETTINGS_MIGRATION)?;
     }
     if read_schema(connection)? != read_schema(&expected)? {
         return Err(StoreError::UnrecognizedSchema);

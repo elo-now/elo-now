@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   unpublishTrack: vi.fn(async () => {}),
   events: new Map<string, () => void>(),
   participants: new Map(),
+  permissions: { canPublish: true, canPublishSources: [] as number[] },
 }));
 
 vi.mock("livekit-client/e2ee-worker?worker", () => ({
@@ -26,6 +27,7 @@ vi.mock("livekit-client", () => ({
   Room: class {
     remoteParticipants = mocks.participants;
     localParticipant = {
+      permissions: mocks.permissions,
       publishTrack: mocks.publishTrack,
       unpublishTrack: mocks.unpublishTrack,
     };
@@ -46,10 +48,15 @@ vi.mock("livekit-client", () => ({
     TrackUnmuted: "trackUnmuted",
     ActiveSpeakersChanged: "activeSpeakersChanged",
     ParticipantDisconnected: "participantDisconnected",
+    ParticipantPermissionsChanged: "participantPermissionsChanged",
     EncryptionError: "encryptionError",
     Disconnected: "disconnected",
   },
   Track: {
+    sourceToProto: (source: string) =>
+      ({ camera: 1, microphone: 2, screenShare: 3 })[
+        source as "camera" | "microphone" | "screenShare"
+      ],
     Source: {
       Microphone: "microphone",
       Camera: "camera",
@@ -68,6 +75,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.events.clear();
   mocks.participants.clear();
+  mocks.permissions.canPublish = true;
+  mocks.permissions.canPublishSources = [];
 });
 
 it("keeps playback attached while speakers change and replaces only changed tracks", () => {
@@ -231,6 +240,116 @@ it("stops the screen clone before waiting for provider unpublication", async () 
   ).rejects.toThrow("network");
   expect(stop).toHaveBeenCalledOnce();
 });
+
+it.each([
+  ["microphone", 2],
+  ["camera", 1],
+  ["screenShare", 3],
+] as const)(
+  "waits for the provider's delayed %s grant before publishing",
+  async (source, grantedSource) => {
+    mocks.permissions.canPublishSources = [4];
+    const clone = { stop: vi.fn() };
+    const original = { clone: vi.fn(() => clone) };
+    const capture = {
+      getAudioTracks: () => (source === "microphone" ? [original] : []),
+      getVideoTracks: () => (source === "camera" ? [original] : []),
+    } as unknown as MediaStream;
+    const screen = {
+      getVideoTracks: () => (source === "screenShare" ? [original] : []),
+    } as unknown as MediaStream;
+    const media = new GroupMedia(vi.fn(), vi.fn());
+    const publishing = media.update(
+      {
+        audio_muted: source !== "microphone",
+        video_published: source === "camera",
+        screen_published: source === "screenShare",
+      },
+      capture,
+      screen,
+    );
+    await Promise.resolve();
+    expect(original.clone).not.toHaveBeenCalled();
+    expect(mocks.publishTrack).not.toHaveBeenCalled();
+
+    mocks.events.get("participantPermissionsChanged")!();
+    await Promise.resolve();
+    expect(mocks.publishTrack).not.toHaveBeenCalled();
+
+    mocks.permissions.canPublishSources = [grantedSource];
+    mocks.events.get("participantPermissionsChanged")!();
+    await publishing;
+    expect(mocks.publishTrack).toHaveBeenCalledExactlyOnceWith(clone, {
+      source,
+    });
+    await media.stop();
+  },
+);
+
+it("does not publish if the provider never grants screen permission", async () => {
+  vi.useFakeTimers();
+  try {
+    mocks.permissions.canPublish = false;
+    const original = { clone: vi.fn() };
+    const media = new GroupMedia(vi.fn(), vi.fn());
+    const publishing = media.update(
+      { audio_muted: true, video_published: false, screen_published: true },
+      {
+        getAudioTracks: () => [],
+        getVideoTracks: () => [],
+      } as unknown as MediaStream,
+      { getVideoTracks: () => [original] } as unknown as MediaStream,
+    );
+    const failed = expect(publishing).rejects.toThrow(
+      "media_permission_timeout",
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    await failed;
+    expect(original.clone).not.toHaveBeenCalled();
+    expect(mocks.publishTrack).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    await media.stop();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each(["leave", "disconnect"])(
+  "cancels a pending screen grant on %s without publishing later",
+  async (ending) => {
+    vi.useFakeTimers();
+    try {
+      mocks.permissions.canPublishSources = [2];
+      const original = { clone: vi.fn() };
+      const media = new GroupMedia(vi.fn(), vi.fn());
+      const publishing = media.update(
+        { audio_muted: true, video_published: false, screen_published: true },
+        {
+          getAudioTracks: () => [],
+          getVideoTracks: () => [],
+        } as unknown as MediaStream,
+        { getVideoTracks: () => [original] } as unknown as MediaStream,
+      );
+      if (ending === "leave") {
+        await media.stop();
+        await publishing;
+      } else {
+        const failed = expect(publishing).rejects.toThrow("disconnected");
+        mocks.events.get("disconnected")!();
+        await failed;
+      }
+      mocks.permissions.canPublishSources = [3];
+      mocks.events.get("participantPermissionsChanged")!();
+      await Promise.resolve();
+      expect(original.clone).not.toHaveBeenCalled();
+      expect(mocks.publishTrack).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      await media.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 it.each([false, true])(
   "shares the pending teardown and its result with repeated stops (reject=%s)",

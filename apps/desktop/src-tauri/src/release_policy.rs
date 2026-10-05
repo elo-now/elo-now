@@ -123,6 +123,7 @@ fn local_operation(request: &serde_json::Value) -> bool {
         | "space_setup_done"
         | "mark_read"
         | "mark_unread"
+        | "thread_follow"
         | "remind"
         | "reminder_remove"
         | "create_group"

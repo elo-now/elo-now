@@ -63,6 +63,7 @@ pub enum Notice {
         category: String,
         target: String,
         quiet: bool,
+        expires: Option<u64>,
     },
 }
 
@@ -86,6 +87,7 @@ pub fn payload(installation_id: &str, notice: &Notice) -> Value {
             category,
             target,
             quiet,
+            expires,
         } => {
             let copy: Value = serde_json::from_str(include_str!(
                 "../../../apps/desktop/src/locales/native.en.json"
@@ -94,6 +96,7 @@ pub fn payload(installation_id: &str, notice: &Notice) -> Value {
             let key = match category.as_str() {
                 "invitation" => "notifications.nativeInvitation",
                 "membership" => "notifications.nativeActivity",
+                "session_start" => "notifications.nativeSession",
                 _ => "notifications.nativeMessage",
             };
             let mut aps = json!({"badge":1,"thread-id":scope,"interruption-level":if *quiet {"passive"} else {"active"},
@@ -101,12 +104,28 @@ pub fn payload(installation_id: &str, notice: &Notice) -> Value {
             if !quiet {
                 aps["sound"] = json!("default");
             }
-            json!({
+            let mut message = json!({
             "fid":installation_id,
             "data":{"elo_wake":"1", "elo_registration":registration, "elo_scope":scope, "elo_event":event, "elo_category":category, "elo_target":target, "elo_quiet":if *quiet {"1"} else {"0"}},
             "android":{"priority":"HIGH", "ttl":"86400s"},
             "apns":{"headers":{"apns-push-type":"alert","apns-priority":"10","apns-collapse-id":scope},
-                "payload":{"aps":aps}}})
+                "payload":{"aps":aps}}});
+            if category == "session_start" {
+                let time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let expires = expires.unwrap_or(time);
+                message["data"]["elo_expires"] = json!(expires.to_string());
+                message["android"]["ttl"] =
+                    json!(format!("{}s", expires.saturating_sub(time).min(60)));
+                message["apns"]["headers"]["apns-expiration"] = json!(expires.to_string());
+                message["apns"]["payload"]["aps"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("badge");
+            }
+            message
         }
     };
     json!({"message":message})
@@ -243,7 +262,14 @@ impl Fcm {
     }
 
     pub async fn send(&self, installation_id: &str, notice: &Notice) -> Result<(), Error> {
+        if expired_session(notice) {
+            return Ok(());
+        }
         let access = self.access_token().await?;
+        // Refreshing provider authentication must not renew a short-lived hint.
+        if expired_session(notice) {
+            return Ok(());
+        }
         let response = self
             .client
             .post(format!(
@@ -272,6 +298,15 @@ impl Fcm {
         }
         Err(Error::Delivery)
     }
+}
+
+fn expired_session(notice: &Notice) -> bool {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    matches!(notice,Notice::Wake{category,expires,..}
+        if category == "session_start" && expires.is_none_or(|until| until <= time))
 }
 
 async fn bounded(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
@@ -303,6 +338,7 @@ mod tests {
                 category: "message".into(),
                 target: "ciphertext".into(),
                 quiet: false,
+                expires: None,
             },
         ];
         for notice in notices {
@@ -323,6 +359,7 @@ mod tests {
             category: "message".into(),
             target: "ciphertext".into(),
             quiet,
+            expires: None,
         };
         let first = payload("token", &notice(false));
         let next = payload("token", &notice(true));
@@ -356,6 +393,7 @@ mod tests {
                 category: "invitation".into(),
                 target: "encrypted-target".into(),
                 quiet: true,
+                expires: None,
             },
         );
         let message = &value["message"];
@@ -381,6 +419,7 @@ mod tests {
                 category: "message".into(),
                 target: "encrypted-target".into(),
                 quiet: false,
+                expires: None,
             },
         );
         assert_eq!(

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ActionDialog } from "./ActionDialog";
 import { formatTimestamp, t, type MessageKey } from "./i18n";
 import { statusText } from "./model";
+import { timestampIso } from "./timestamps";
 import { useToast } from "./Toast";
 import type { Stream } from "./model";
 import "./messageDebug.css";
@@ -98,7 +99,7 @@ const events: Record<string, MessageKey> = {
   REPAIRED: "messageDebug.REPAIRED",
   REPAIR_FAILED: "messageDebug.REPAIR_FAILED",
 };
-const timestamp = (ms: number) => formatTimestamp(new Date(ms).toISOString());
+const timestamp = (ms: number) => formatTimestamp(timestampIso(ms));
 const short = (id: string) => id.slice(0, 12) + "…";
 
 export function MessageDebug({

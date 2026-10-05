@@ -20,6 +20,9 @@ const FILES: &[&str] = &[
     "profile-details.age",
     "read-state.age",
     "blocked.age",
+    "witness-floors.age",
+    "witness-invitations.age",
+    "witness-admissions.age",
     "invitations.age",
     "spaces.age",
     "device-revocations.age",
@@ -327,7 +330,16 @@ impl ClientApp {
                 }
             }
         }
-        Ok(self.store.message_backup_plan(targets).await?)
+        Ok(self
+            .store
+            .message_backup_plan(
+                targets,
+                self.read
+                    .private_settings
+                    .as_ref()
+                    .map_or(0, private_settings::State::cursor),
+            )
+            .await?)
     }
 
     pub async fn export_recovery_backup(&self, words: &str) -> Result<Vec<u8>> {
@@ -379,7 +391,14 @@ async fn database_images(
             app.store.backup_image(remaining).await?
         } else {
             app.store
-                .selected_message_backup_image(remaining, selections.map(|s| s[index].clone()))
+                .selected_message_backup_image(
+                    remaining,
+                    selections.map(|s| s[index].clone()),
+                    app.read
+                        .private_settings
+                        .as_ref()
+                        .map_or(0, private_settings::State::cursor),
+                )
                 .await?
         };
         remaining -= image.len();
@@ -494,6 +513,7 @@ mod tests {
                     created_at: "2026-09-13T12:00:00Z".into(),
                     parents: vec![],
                     payload: TextPayload {
+                        mentions: vec![],
                         expires_at_ms: None,
                         text: if action.is_some() {
                             String::new()
@@ -538,6 +558,42 @@ mod tests {
             .await
             .unwrap();
         record.id()
+    }
+
+    #[tokio::test]
+    async fn profile_backup_preserves_encrypted_witness_rollback_floors() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = profile(temp.path().join("source")).await;
+        let floors = serde_json::to_vec(
+            &json!({"entries":{"12".repeat(32):{"sequence":9,"record_id":"34".repeat(32)}}}),
+        )
+        .unwrap();
+        let sealed = crypto::seal_bytes(
+            &floors,
+            &[app.session.age_identity().to_public()],
+            32 * 1024,
+        )
+        .unwrap();
+        vault::write_private(&app.directory.join("witness-floors.age"), &sealed, false).unwrap();
+        let exported = app.export_profile(PASSWORD.into()).await.unwrap();
+        let restored = ClientApp::restore_profile(
+            temp.path().join("restored"),
+            &exported,
+            PASSWORD.into(),
+            app.identity_id(),
+            PASSWORD.into(),
+            false,
+        )
+        .await
+        .unwrap();
+        let copied = vault::read_private(&restored.directory.join("witness-floors.age")).unwrap();
+        assert_eq!(copied, sealed);
+        assert_eq!(
+            crypto::open_bytes(&copied, restored.session.age_identity(), 32 * 1024).unwrap(),
+            floors
+        );
+        restored.close().await.unwrap();
+        app.close().await.unwrap();
     }
 
     #[tokio::test]

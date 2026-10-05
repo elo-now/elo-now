@@ -101,11 +101,21 @@ pub struct AttachmentDescriptor {
     pub created_at_ms: u64,
     pub expires_at_ms: Option<u64>,
     pub object_id: AttachmentObjectId,
+    /// The independently configured broker; no provider path or credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_storage: Option<String>,
     pub encryption: AttachmentEncryption,
 }
 
 impl AttachmentDescriptor {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .external_storage
+            .as_ref()
+            .is_some_and(|value| value.len() > 2048 || value.chars().any(char::is_control))
+        {
+            return Err("Invalid attachment storage service.");
+        }
         if self.name.is_empty()
             || self.name.len() > 255
             || self.name == "."

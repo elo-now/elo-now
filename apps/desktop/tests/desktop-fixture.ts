@@ -19,7 +19,8 @@ if (params.has("composer-blur")) {
 }
 mockWindows("main");
 localStorage.clear();
-localStorage.setItem("elo.appearance", params.get("theme") ?? "light");
+if (params.get("theme") !== "default")
+  localStorage.setItem("elo.appearance", params.get("theme") ?? "light");
 localStorage.setItem("elo.biometricOffer.v1", "handled");
 localStorage.setItem("elo.notificationOffer.v1", "handled");
 const names = { alex: "Alex", maya: "Maya", sam: "Sam" };
@@ -206,6 +207,16 @@ Object.assign(window, {
     failures,
     pairing,
     clearAttachmentPreviews,
+    async buzzMessages() {
+      const ownRoot = { id: "buzz-own-root", state: "STORED", body: { kind: "chat.message", issuer_identity: view.identity, created_at: new Date().toISOString(), payload: { text: "My thread" } } };
+      const mention = { id: "buzz-mention", state: "STORED", unread: true, body: { kind: "chat.message", issuer_identity: "maya", created_at: new Date().toISOString(), payload: { text: "@Alex please review", mentions: [view.identity] } } };
+      const reply = { id: "buzz-reply", state: "STORED", unread: true, body: { kind: "chat.message", issuer_identity: "sam", created_at: new Date().toISOString(), payload: { text: "A reply for you", thread_root: ownRoot.id } } };
+      general.rows.push(ownRoot, mention, reply);
+      general.unread_count = general.rows.filter(row => row.unread).length;
+      general.participating_threads = [...(general.participating_threads ?? []), ownRoot.id];
+      view.revision = (view.revision ?? 0) + 1;
+      await emit("desktop-sync", structuredClone({ view, identity: view.identity, result: {} }));
+    },
     async transferProgress(received: number, total = 1048576) {
       for (const transfer_id of transfers.keys())
         await emit("attachment-transfer-progress", {
@@ -266,6 +277,7 @@ Object.assign(window, {
     },
   },
 });
+const conversationDrafts = new Map<string, unknown>();
 const qr =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="white"/><path fill="black" d="M10 10h25v25H10zM65 10h25v25H65zM10 65h25v25H10zM55 55h20v20H55z"/></svg>';
 mockIPC(
@@ -281,6 +293,15 @@ mockIPC(
     if (failure) throw new Error(failure);
     const delay = latency[args?.request?.op ?? command];
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    if (command === "draft_load") {
+      const scope = (payload as any).scope;
+      return { session: "fixture-session", draft: conversationDrafts.get(JSON.stringify(scope)) ?? { text: "", expiry: null, mentions: [], attachment: null } };
+    }
+    if (command === "draft_save") {
+      const value = payload as any;
+      conversationDrafts.set(JSON.stringify(value.scope), { ...value.content, attachment: value.attachment });
+      return;
+    }
     if (command === "prepare_export") return "/fixture/download";
     if (command === "save_export") return false;
     if (command === "attachment_preview") {
@@ -293,6 +314,10 @@ mockIPC(
       return canvas.toDataURL("image/png");
     }
     if (command === "share_cached_attachment") return null;
+    if (command === "stage_attachment") {
+      const input = payload as { name: string; data: string };
+      return { path: `/fixture/staged-${sequence++}`, name: input.name, size_bytes: atob(input.data).length };
+    }
     if (command === "choose_attachment")
       return {
         path: "/fixture/attachment",
@@ -454,6 +479,13 @@ mockIPC(
         row.pinned = false;
         row.reactions = [];
       }
+      if (request.op === "message_action" && request.action?.type === "edit" && stream) {
+        const row = stream.rows.find((row) => row.id === request.action.target);
+        if (!row || row.body.issuer_identity !== view.identity || row.body.kind !== "chat.message")
+          throw new Error("Only the author can edit this message.");
+        row.body.payload = { ...row.body.payload, text: request.action.text,
+          mentions: request.action.mentions ?? [], edited_at_ms: Date.now() };
+      }
       let result: object = {};
       if (request.op === "message_action" && request.action?.type === "expiry" && stream) {
         const row = stream.rows.find((row) => row.id === request.action.target);
@@ -472,6 +504,11 @@ mockIPC(
           if (request.records?.includes(row.id)) row.unread = false;
         stream.unread_count = stream.rows.filter((row) => row.unread).length;
       }
+      if (request.op === "thread_follow" && stream) {
+        stream.followed_threads = (stream.followed_threads ?? []).filter(id => id !== request.message);
+        stream.unfollowed_threads = (stream.unfollowed_threads ?? []).filter(id => id !== request.message);
+        (request.followed ? stream.followed_threads : stream.unfollowed_threads).push(request.message);
+      }
       if (["create_chat", "contact_create_chat"].includes(request.op)) {
         created = `created-${sequence++}`;
         view.streams.push(
@@ -489,7 +526,7 @@ mockIPC(
             logical_time: sent.logical_time,
             issuer_identity: "alex",
             created_at: new Date().toISOString(),
-            payload: { text: request.text, thread_root: request.reply_to,
+            payload: { text: request.text, mentions: request.mentions ?? [], thread_root: request.reply_to,
               expiry_hours: request.expires_in_hours ?? null,
               expires_at_ms: request.expires_in_hours ? Date.now() + request.expires_in_hours * 3_600_000 : undefined },
           },

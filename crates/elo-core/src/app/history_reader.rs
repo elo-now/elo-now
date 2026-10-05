@@ -198,6 +198,11 @@ impl HistoryView<'_> {
         let mut rows = self.open_sources(a, sources).await?;
         let projection = message_actions::Projection::new(&rows);
         let mut targets = projection.pinned();
+        targets.extend(rows.iter().filter_map(|(r, _)| {
+            r.body()["payload"]["thread_root"]
+                .as_str()
+                .and_then(|id| id.parse::<RecordId>().ok())
+        }));
         targets.extend(
             self.read
                 .reminders
@@ -256,8 +261,7 @@ impl HistoryView<'_> {
                 let grant: history::HistoryGrant = outer.decode()?;
                 outer.verify_signature(a.credential(grant.issuer_credential)?.key())?;
                 let selected = grant
-                    .selection
-                    .get(source.index as usize)
+                    .source(source.index as usize)
                     .ok_or("history source index")?;
                 decode_record(&selected.signed_record_base64)?
             };
@@ -384,7 +388,7 @@ impl HistoryView<'_> {
                     });
                     let matching_query = query.is_empty()
                         || (!projection.is_deleted(r)
-                            && r.body()["payload"]["text"]
+                            && projection.body(r)["payload"]["text"]
                                 .as_str()
                                 .or_else(|| r.body()["filename"].as_str())
                                 .unwrap_or("")

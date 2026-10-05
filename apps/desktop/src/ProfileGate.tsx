@@ -26,6 +26,7 @@ import {
 
 type Environment = {
   mobile: boolean;
+  biometric_supported: boolean;
   directory: string;
   has_profile: boolean;
   demo_helpers: boolean;
@@ -46,6 +47,7 @@ export function ProfileGate({
     mobile: boolean,
     verifiedPassword?: string,
     demoProfile?: string,
+    biometricSupported?: boolean,
   ) => void;
 }) {
   const introFrame = useBrandIntro();
@@ -71,7 +73,8 @@ export function ProfileGate({
         setExisting(env.has_profile);
         // Unbound legacy entries are never read. Failed cleanup must not block
         // password login (e.g. while the device keychain is unavailable).
-        if (env.mobile) void clearLegacyBiometricUnlock().catch(() => {});
+        if (env.biometric_supported)
+          void clearLegacyBiometricUnlock().catch(() => {});
       })
       .catch((e: unknown) => {
         if (live) reportError(e);
@@ -89,7 +92,7 @@ export function ProfileGate({
   }, [environmentPending]);
   useEffect(() => {
     setBiometric(null);
-    if (!environment?.mobile || !environment.has_profile) return;
+    if (!environment?.biometric_supported || !environment.has_profile) return;
     let live = true;
     void readBiometricState()
       .then((value) => {
@@ -141,6 +144,8 @@ export function ProfileGate({
       view,
       environment.mobile,
       offerBiometrics ? unlockPassword : undefined,
+      undefined,
+      environment.biometric_supported,
     );
   };
   const unlocking = existing && !card;
@@ -163,7 +168,13 @@ export function ProfileGate({
         const view = await invoke<View>("open_demo", {
           person: credential.demoProfile,
         });
-        onOpen(view, environment.mobile, undefined, credential.demoProfile);
+        onOpen(
+          view,
+          environment.mobile,
+          undefined,
+          credential.demoProfile,
+          environment.biometric_supported,
+        );
       } else {
         const view = await invoke<View>("unlock", {
           directory: environment.directory,
@@ -175,7 +186,13 @@ export function ProfileGate({
         });
         acceptLegal(view.identity);
         setPassword("");
-        onOpen(view, environment.mobile);
+        onOpen(
+          view,
+          environment.mobile,
+          undefined,
+          undefined,
+          environment.biometric_supported,
+        );
       }
     } catch (error) {
       if (!biometricCancelled(error)) reportError(error);
@@ -189,7 +206,15 @@ export function ProfileGate({
         mobile={environment.mobile}
         hasProfile={environment.has_profile}
         onBack={() => setRecovering(false)}
-        onOpen={(view, password) => onOpen(view, environment.mobile, password)}
+        onOpen={(view, password) =>
+          onOpen(
+            view,
+            environment.mobile,
+            password,
+            undefined,
+            environment.biometric_supported,
+          )
+        }
       />
     );
   const menu = (
@@ -217,7 +242,10 @@ export function ProfileGate({
     />
   );
   return (
-    <main className={`unlock${card ? " recovery" : ""}`}>
+    <main
+      className={`unlock${card ? " recovery" : ""}`}
+      data-mobile={environment?.mobile}
+    >
       <div className={card ? "unlock-brand" : "unlock-tools"}>
         {card && <Brand />}
         {environment && !pinAppearance && (card ? appearance : menu)}
@@ -266,7 +294,7 @@ export function ProfileGate({
             }}
           >
             {unlocking && needsLegalNotice && <LegalNotice unlocking />}
-            {unlocking && environment?.mobile && biometric?.enabled && (
+            {unlocking && biometric?.enabled && (
               <>
                 <button
                   className="biometric-unlock"
@@ -301,12 +329,15 @@ export function ProfileGate({
                 <label>
                   {t("unlock.password")}
                   <PasswordInput
+                    name={existing ? "password" : "new-password"}
                     required
                     minLength={existing ? undefined : 12}
                     maxLength={1024}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    autoComplete="off"
+                    autoComplete={
+                      existing ? "current-password" : "new-password"
+                    }
                     autoCapitalize="none"
                     autoCorrect="off"
                     spellCheck={false}
@@ -318,12 +349,13 @@ export function ProfileGate({
                     <label>
                       {t("onboarding.confirmPassword")}
                       <PasswordInput
+                        name="confirm-password"
                         required
                         minLength={12}
                         maxLength={1024}
                         value={repeat}
                         onChange={(e) => setRepeat(e.target.value)}
-                        autoComplete="off"
+                        autoComplete="new-password"
                       />
                     </label>
                   </>

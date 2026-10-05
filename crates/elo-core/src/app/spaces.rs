@@ -21,6 +21,8 @@ struct Entry {
     name: String,
     root: bool,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reason: Option<String>,
     owner: bool,
     #[serde(default)]
     contact_email: Option<String>,
@@ -42,6 +44,8 @@ struct Entry {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreationIntent {
+    #[serde(default)]
+    attachment_storage_pending: bool,
     #[serde(default)]
     contact_email: String,
     host: String,
@@ -74,6 +78,12 @@ struct Catalog {
     garbage: Vec<String>,
     root_disconnected: bool,
     personal_genesis: Option<String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PollMode {
+    Regular,
+    Foreground,
+    Notification,
 }
 pub(super) struct Spaces {
     catalog: Catalog,
@@ -118,9 +128,14 @@ fn remove_child(path: &Path) -> Result<()> {
     let files = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
     let mut empty_transfer_cache = None;
     let mut attachment_cache = None;
+    let mut draft_cache = None;
     for file in &files {
         let name = file.file_name();
         let name = name.to_str().ok_or("Unexpected Space file.")?;
+        if name == "drafts" {
+            draft_cache = Some((file.path(), super::drafts::removable_files(&file.path())?));
+            continue;
+        }
         if name == "attachment-cache" {
             let cached = crate::attachments::cache::removable_files(&file.path())?;
             attachment_cache = Some((file.path(), cached));
@@ -139,6 +154,9 @@ fn remove_child(path: &Path) -> Result<()> {
                     "profile.json",
                     "profile-details.age",
                     "blocked.age",
+                    "witness-floors.age",
+                    "witness-invitations.age",
+                    "witness-admissions.age",
                     "vault.age",
                     VAULT_CACHE,
                     ".elo-client.lock",
@@ -153,7 +171,7 @@ fn remove_child(path: &Path) -> Result<()> {
     if let Some(cache) = &empty_transfer_cache {
         std::fs::remove_dir(cache)?;
     }
-    if let Some((directory, files)) = &attachment_cache {
+    for (directory, files) in attachment_cache.iter().chain(draft_cache.iter()) {
         for file in files {
             std::fs::remove_file(file)?;
         }
@@ -162,6 +180,7 @@ fn remove_child(path: &Path) -> Result<()> {
     for file in files {
         if empty_transfer_cache.as_ref() != Some(&file.path())
             && attachment_cache.as_ref().map(|(path, _)| path) != Some(&file.path())
+            && draft_cache.as_ref().map(|(path, _)| path) != Some(&file.path())
         {
             std::fs::remove_file(file.path())?;
         }
@@ -289,6 +308,7 @@ impl ClientApp {
                 name: "Demo".into(),
                 root: true,
                 status: "joined".into(),
+                pending_reason: None,
                 owner: false,
                 contact_email: None,
                 message_lifetime_seconds: address.message_lifetime_seconds,
@@ -343,7 +363,8 @@ impl ClientApp {
                 .0
                 .iter()
                 .find(|a| {
-                    self.require_controller(a).is_ok()
+                    !a.is_owner_managed()
+                        && self.require_controller(a).is_ok()
                         && a.controller().identity() == self.identity_id()
                         && a.initial_controller().id() == self.session.credential().id()
                 })
@@ -366,6 +387,7 @@ impl ClientApp {
                     .into(),
                     root: true,
                     status: "joined".into(),
+                    pending_reason: None,
                     owner: false,
                     contact_email: None,
                     message_lifetime_seconds: address
@@ -458,6 +480,7 @@ impl ClientApp {
                 child.configure_space_team(address)?;
             }
             child.push_endpoint = self.push_endpoint.clone();
+            child.configure_witness_pin(self.witness_pin.clone())?;
             child.push_allow_loopback = self.push_allow_loopback;
             child.profile_details = self.profile_details.clone();
             child.blocked = self.blocked.clone();
@@ -576,6 +599,29 @@ impl ClientApp {
             .as_ref()
             .and_then(|s| s.catalog.active.as_deref())
     }
+    pub(super) fn draft_space_client(&self, id: Option<&str>) -> Result<&ClientApp> {
+        let Some(spaces) = &self.spaces else {
+            return if id.is_none() {
+                Ok(self)
+            } else {
+                Err("Unknown draft Space.".into())
+            };
+        };
+        let entry = spaces
+            .catalog
+            .entries
+            .iter()
+            .find(|entry| Some(entry.id.as_str()) == id && entry.status == "joined")
+            .ok_or("Unknown draft Space.")?;
+        if entry.root {
+            Ok(self)
+        } else {
+            spaces
+                .children
+                .get(&entry.id)
+                .ok_or_else(|| "Unknown draft Space.".into())
+        }
+    }
     pub(super) fn selected_space_client(&self) -> Result<&ClientApp> {
         let Some(spaces) = &self.spaces else {
             return Ok(self);
@@ -640,6 +686,15 @@ pub(super) fn restore_file_removed(
     Ok(catalog.root_disconnected && DATA_FILES.contains(&name))
 }
 impl Spaces {
+    pub(super) fn configure_witness_pin(
+        &mut self,
+        pin: Option<crate::authority::WitnessPin>,
+    ) -> Result<()> {
+        for child in self.children.values_mut() {
+            child.configure_witness_pin(pin.clone())?;
+        }
+        Ok(())
+    }
     fn save(&self, root: &ClientApp) -> Result<()> {
         let plain = Zeroizing::new(serde_json::to_vec(&self.catalog)?);
         vault::write_private(
@@ -760,11 +815,12 @@ impl Spaces {
         view["active_space"] = json!(self.catalog.active);
         view["space_setup"] =
             json!(self.catalog.setup || !self.catalog.entries.iter().any(|e| e.status == "joined"));
+        view["attachment_storage_available"] = json!(root.attachment_storage_endpoint.is_some());
         view["space_creation"] = self
             .catalog
             .creation
             .as_ref()
-            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"require_approval":c.require_approval,"space":c.space,"invitation":c.invitation}))
+            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"require_approval":c.require_approval,"space":c.space,"invitation":if c.attachment_storage_pending { None } else { c.invitation.as_ref() },"attachment_storage_pending":c.attachment_storage_pending}))
             .unwrap_or(Value::Null);
         view["space_role_requests"] = json!(self.catalog.entries.iter().flat_map(|e|e.role_requests.iter().map(|request|json!({"space_id":e.id,"space_name":e.name,"revision":e.roles_revision,"request":request}))).collect::<Vec<_>>());
         if let Some(streams) = view["streams"].as_array_mut() {
@@ -773,7 +829,7 @@ impl Spaces {
             }
         }
 
-        view["spaces"] = json!(self.catalog.entries.iter().map(|e|json!({"id":e.id,"name":e.name,"status":e.status,"owner":e.owner,"requests":e.requests,"managed":e.address.is_some(),"role":e.role,"contact_email":e.contact_email,"message_lifetime_seconds":e.message_lifetime_seconds,"roles_revision":e.roles_revision,"deletable":e.address.as_ref().and_then(|a|reqwest::Url::parse(&a.url).ok()).is_some_and(|u|u.path().starts_with("/spaces/"))})).collect::<Vec<_>>());
+        view["spaces"] = json!(self.catalog.entries.iter().map(|e|json!({"id":e.id,"name":e.name,"status":e.status,"pending_reason":e.pending_reason,"owner":e.owner,"requests":e.requests,"managed":e.address.is_some(),"role":e.role,"contact_email":e.contact_email,"message_lifetime_seconds":e.message_lifetime_seconds,"roles_revision":e.roles_revision,"deletable":e.address.as_ref().and_then(|a|reqwest::Url::parse(&a.url).ok()).is_some_and(|u|u.path().starts_with("/spaces/"))})).collect::<Vec<_>>());
         view["space_requests"] = json!(
             self.catalog
                 .entries
@@ -826,6 +882,12 @@ impl Spaces {
         Ok(view)
     }
     async fn purge_root(&self, root: &mut ClientApp) -> Result<()> {
+        let draft_directory = root.directory.join("drafts");
+        let draft_files = if draft_directory.try_exists()? {
+            Some(super::drafts::removable_files(&draft_directory)?)
+        } else {
+            None
+        };
         for name in DATA_FILES {
             let path = root.directory.join(name);
             if path.try_exists()? {
@@ -851,6 +913,12 @@ impl Spaces {
                 }
                 std::fs::remove_file(path)?;
             }
+        }
+        if let Some(files) = draft_files {
+            for file in files {
+                std::fs::remove_file(file)?;
+            }
+            std::fs::remove_dir(draft_directory)?;
         }
         root.pins.clear();
         root.groups.clear();
@@ -919,6 +987,13 @@ impl Spaces {
         if let Err(error) = self.save(root) {
             self.catalog = previous;
             return Err(error);
+        }
+        for pending in root
+            .witness_durable_admissions()?
+            .into_iter()
+            .filter(|pending| pending.address.scope.space.to_string() == id)
+        {
+            root.witness_cancel_durable_admission(pending.request_id)?;
         }
         if let Some(child) = self.children.remove(id) {
             child.close().await?;
@@ -1121,6 +1196,7 @@ impl Spaces {
                     child.profile_details = root.profile_details.clone();
                     child.blocked = root.blocked.clone();
                     child.configure_space_team(&address)?;
+                    child.configure_witness_pin(root.witness_pin.clone())?;
                     child.push_endpoint = root.push_endpoint.clone();
                     child.push_allow_loopback = root.push_allow_loopback;
                     child.accept_space_enrollment(enrollment).await?;
@@ -1164,6 +1240,14 @@ impl Spaces {
                 status
             }
             .into(),
+            pending_reason: if status == "pending" {
+                result["pending_reason"]
+                    .as_str()
+                    .filter(|reason| matches!(*reason, "approval" | "owner_sync"))
+                    .map(str::to_owned)
+            } else {
+                None
+            },
             owner: result["owner"] == true,
             contact_email: result["contact_email"]
                 .as_str()
@@ -1207,6 +1291,15 @@ impl Spaces {
         Ok(id)
     }
     async fn create(&mut self, root: &mut ClientApp, request: &Value) -> Result<()> {
+        let storage_enabled = request["attachment_storage"]["enabled"]
+            .as_bool()
+            .unwrap_or(false);
+        if storage_enabled {
+            if root.attachment_storage_endpoint.is_none() {
+                return Err("Attachment storage is unavailable in this build.".into());
+            }
+            super::external_storage::provider(&request["attachment_storage"])?;
+        }
         let host = field(request, "host")?;
         super::space_host::validate_host(host, root.allow_loopback)?;
         let email = field(request, "contact_email")?.trim();
@@ -1258,6 +1351,7 @@ impl Spaces {
                     && intent.require_approval == require_approval
             });
             self.catalog.creation = Some(retry.unwrap_or(CreationIntent {
+                attachment_storage_pending: storage_enabled,
                 contact_email: email.into(),
                 host: host.into(),
                 request_id: record::random_hex::<16>()?,
@@ -1280,15 +1374,62 @@ impl Spaces {
             self.catalog.creation.as_mut().unwrap().contact_email = email.into();
             self.save(root)?;
         }
+        if let Some(intent) = self
+            .catalog
+            .creation
+            .as_mut()
+            .filter(|intent| intent.space.is_none())
+        {
+            // Only the nonsecret preference survives an allocation retry.
+            // Credentials must be entered again after the form is closed.
+            intent.attachment_storage_pending = storage_enabled;
+            self.save(root)?;
+        }
         let intent = self
             .catalog
             .creation
             .clone()
             .ok_or("Space creation unavailable.")?;
         if intent.invitation.is_some() {
-            return Ok(());
+            return self.finish_creation_storage(root, request).await;
         }
-        let link = root
+        if root.witness_pin.is_some()
+            && let Some(id) = &intent.space
+        {
+            let entry = self
+                .catalog
+                .entries
+                .iter()
+                .find(|entry| &entry.id == id)
+                .ok_or("Space unavailable.")?;
+            let address = entry.address.clone().ok_or("Space unavailable.")?;
+            let client = if entry.root {
+                &*root
+            } else {
+                self.children.get(id).ok_or("Space unavailable.")?
+            };
+            let authority = client
+                .authorities
+                .0
+                .iter()
+                .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
+                .ok_or("General unavailable.")?
+                .clone();
+            let link = root
+                .mint_witnessed_invitation(
+                    &authority,
+                    &address,
+                    &intent.name,
+                    86_400,
+                    intent.require_approval,
+                )
+                .await?;
+            self.catalog.creation.as_mut().unwrap().invitation = Some(link);
+            self.catalog.creation_retry = None;
+            self.save(root)?;
+            return self.finish_creation_storage(root, request).await;
+        }
+        let hosted = root
             .create_hosted(
                 host,
                 &intent.request_id,
@@ -1298,25 +1439,37 @@ impl Spaces {
                 intent.require_approval,
             )
             .await?;
-        let invite = SpaceInvitation::parse(&link, root.allow_loopback)?;
-        let enrollment = root.team_enrollment_request(&invite.address.scope)?;
-        let response = root
-            .call_space(
-                &invite.address,
-                "join",
-                json!({"token":invite.token,"enrollment":enrollment}),
-            )
-            .await?;
+        let (address, response, legacy_link) = match hosted {
+            super::space_host::HostedCreation::Legacy(link) => {
+                let invite = SpaceInvitation::parse(&link, root.allow_loopback)?;
+                let enrollment = root.team_enrollment_request(&invite.address.scope)?;
+                let response = root
+                    .call_space(
+                        &invite.address,
+                        "join",
+                        json!({"token":invite.token,"enrollment":enrollment}),
+                    )
+                    .await?;
+                (invite.address, response, Some(link))
+            }
+            super::space_host::HostedCreation::Witnessed(address) => {
+                let created = root.owner_general_creation(&intent.request_id)?;
+                let authority =
+                    root.verify_general_proof(&created, address.scope.space, address.scope.stream)?;
+                let current = root.witness_read_authority(&authority).await?;
+                let response = root.sync_witnessed_host(&address, &current).await?;
+                (address, response, None)
+            }
+        };
         if response["status"] != "approved" || response["role"] != "primary_owner" {
             return Err("The hosting service did not confirm your Space ownership.".into());
         }
-        let id = self
-            .add_joined(root, invite.address.clone(), response)
-            .await?;
+        let id = self.add_joined(root, address.clone(), response).await?;
         // Control is granted only in this locally initiated creation path, not
         // while importing a roster into an ordinary restored profile.
         let created = root.owner_general_creation(&intent.request_id)?;
-        let expected = created.verify(invite.address.scope.space, invite.address.scope.stream)?;
+        let expected =
+            root.verify_general_proof(&created, address.scope.space, address.scope.stream)?;
         if let Some(child) = self.children.get_mut(&id) {
             let authority = child
                 .authorities
@@ -1337,10 +1490,151 @@ impl Spaces {
         self.catalog.active = Some(id.clone());
         self.catalog.creation.as_mut().unwrap().space = Some(id);
         self.save(root)?;
-        // The host's reusable bootstrap invitation uses the selected approval
-        // policy. Reuse it for sharing instead of creating a second offer.
+        let link = match legacy_link {
+            Some(link) => link,
+            None => {
+                root.mint_witnessed_invitation(
+                    &expected,
+                    &address,
+                    &intent.name,
+                    86_400,
+                    intent.require_approval,
+                )
+                .await?
+            }
+        };
         self.catalog.creation.as_mut().unwrap().invitation = Some(link);
         self.catalog.creation_retry = None;
+        self.save(root)?;
+        self.finish_creation_storage(root, request).await
+    }
+
+    async fn finish_witnessed_join(
+        &mut self,
+        root: &mut ClientApp,
+        pending: &super::witness_durable_admission::DurableAdmissionRequest,
+        approval: Option<&SignedRecord>,
+    ) -> Result<String> {
+        use super::witness_durable_admission::DurableAdmissionOutcome;
+        let origin = root.invitation_origin()?.to_owned();
+        if !self
+            .catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == pending.address.scope.space.to_string())
+        {
+            // Retain the retry path before any mutation, including an uncertain
+            // response or a crash before the public relay acknowledges it.
+            self.add_joined(root, pending.address.clone(), json!({"name":pending.name,"status":"pending",
+                "pending_reason":"approval","message_lifetime_seconds":pending.address.message_lifetime_seconds})).await?;
+        }
+        match root
+            .witness_finalize_durable_admission(pending.request_id, &origin, approval)
+            .await?
+        {
+            DurableAdmissionOutcome::Admitted(authority) => {
+                self.complete_witnessed_join(root, pending, &authority)
+                    .await
+            }
+            DurableAdmissionOutcome::ApprovalRequired => {
+                root.call_space(
+                    &pending.address,
+                    "witness_request",
+                    json!({"request":pending}),
+                )
+                .await?;
+                self.add_joined(root, pending.address.clone(), json!({"name":pending.name,"status":"pending",
+                    "pending_reason":"approval","message_lifetime_seconds":pending.address.message_lifetime_seconds})).await
+            }
+        }
+    }
+
+    async fn complete_witnessed_join(
+        &mut self,
+        root: &mut ClientApp,
+        pending: &super::witness_durable_admission::DurableAdmissionRequest,
+        authority: &Authority,
+    ) -> Result<String> {
+        let response = root
+            .sync_witnessed_host(&pending.address, authority)
+            .await?;
+        let id = self
+            .add_joined(root, pending.address.clone(), response)
+            .await?;
+        root.witness_complete_durable_admission(pending.request_id, authority)?;
+        self.catalog.active = Some(id.clone());
+        self.save(root)?;
+        Ok(id)
+    }
+
+    async fn finish_creation_storage(
+        &mut self,
+        root: &mut ClientApp,
+        request: &Value,
+    ) -> Result<()> {
+        use crate::attachments::broker::{Operation, Response};
+        let Some(intent) = self
+            .catalog
+            .creation
+            .as_ref()
+            .filter(|intent| intent.attachment_storage_pending)
+        else {
+            return Ok(());
+        };
+        let id = intent.space.as_ref().ok_or("Space creation unavailable.")?;
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|entry| &entry.id == id)
+            .ok_or("Space unavailable.")?;
+        let address = entry.address.as_ref().ok_or("Space unavailable.")?;
+        let client = if entry.root {
+            &*root
+        } else {
+            let child = self.children.get_mut(id).ok_or("Space unavailable.")?;
+            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
+            child.configure_witness_pin(root.witness_pin.clone())?;
+            &*child
+        };
+        let status = client.external_storage_status(address).await?;
+        let enabled = request["attachment_storage"]["enabled"]
+            .as_bool()
+            .ok_or("Configure attachment storage for the created Space to continue.")?;
+        let response = if enabled {
+            client
+                .external_storage_command(
+                    address,
+                    Operation::Configure {
+                        expected_revision: status.revision,
+                        retention_hours: status.retention_hours.unwrap_or(1),
+                        provider: super::external_storage::provider(
+                            &request["attachment_storage"],
+                        )?,
+                    },
+                )
+                .await?
+        } else if status.enabled {
+            client
+                .external_storage_command(
+                    address,
+                    Operation::Disable {
+                        expected_revision: status.revision,
+                    },
+                )
+                .await?
+        } else {
+            Response::Status { status }
+        };
+        if !matches!(response, Response::Status { status } if status.enabled == enabled && (!enabled || status.configured))
+        {
+            return Err("Invalid attachment storage response.".into());
+        }
+        self.catalog
+            .creation
+            .as_mut()
+            .unwrap()
+            .attachment_storage_pending = false;
         self.save(root)
     }
     async fn poll(&mut self, root: &mut ClientApp) -> Result<()> {
@@ -1350,7 +1644,7 @@ impl Spaces {
         }
         self.next_poll = time + 30_000;
         for entry in self.catalog.entries.clone() {
-            self.poll_entry(root, entry, false).await?;
+            self.poll_entry(root, entry, PollMode::Regular).await?;
         }
         self.save(root)
     }
@@ -1358,14 +1652,96 @@ impl Spaces {
         &mut self,
         root: &mut ClientApp,
         entry: Entry,
-        foreground: bool,
+        mode: PollMode,
     ) -> Result<bool> {
-        let Some(address) = entry.address else {
+        let Some(address) = entry.address.clone() else {
             return Ok(false);
         };
-        // Foreground discovery keeps its short read-only deadline. Membership
-        // commits run during regular synchronization or an explicit decision.
-        let owner_sync_failed = if foreground {
+        if root.witness_pin.is_some() {
+            let origin = root.invitation_origin()?.to_owned();
+            if let Some((pending, authority)) = root
+                .witness_reconcile_pending_scope(&address.scope, &origin)
+                .await?
+            {
+                self.complete_witnessed_join(root, &pending, &authority)
+                    .await?;
+                return Ok(false);
+            }
+            if let Some(pending) = root
+                .witness_durable_admissions()?
+                .into_iter()
+                .find(|p| p.address.scope.space == address.scope.space)
+            {
+                // An earlier Admit may already have committed. Reconcile its
+                // durable witness state before consulting a relay that can still
+                // have the old General head or an expired public request.
+                match root
+                    .witness_finalize_durable_admission(pending.request_id, &origin, None)
+                    .await?
+                {
+                    super::witness_durable_admission::DurableAdmissionOutcome::Admitted(
+                        authority,
+                    ) => {
+                        self.complete_witnessed_join(root, &pending, &authority)
+                            .await?;
+                        return Ok(false);
+                    }
+                    super::witness_durable_admission::DurableAdmissionOutcome::ApprovalRequired => {
+                    }
+                }
+                // Only an unresolved signed approval policy needs the public
+                // relay. This also covers an explicit readmission requirement.
+                root.call_space(&address, "witness_request", json!({"request":pending}))
+                    .await?;
+                let approval = root
+                    .call_space(
+                        &address,
+                        "witness_pending",
+                        json!({"request_id":pending.request_id}),
+                    )
+                    .await?;
+                if approval["status"] == "declined" {
+                    // Relay status cannot erase recovery material after an
+                    // uncertain admission. Only local cancellation clears it.
+                    self.add_joined(
+                        root,
+                        address.clone(),
+                        json!({"name":pending.name,"status":"declined"}),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                let approval = approval["approval"]
+                    .as_str()
+                    .map(decode_record)
+                    .transpose()?;
+                if let Some(approval) = approval {
+                    self.finish_witnessed_join(root, &pending, Some(&approval))
+                        .await?;
+                }
+                return Ok(false);
+            }
+            let client = if entry.root {
+                &*root
+            } else {
+                self.children.get(&entry.id).ok_or("Space unavailable.")?
+            };
+            let known = client
+                .authorities
+                .0
+                .iter()
+                .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
+                .ok_or("General unavailable.")?
+                .clone();
+            let current = root.witness_read_authority(&known).await?;
+            let response = root.sync_witnessed_host(&address, &current).await?;
+            self.add_joined(root, address, response).await?;
+            return Ok(false);
+        }
+        let foreground = mode != PollMode::Regular;
+        // Notification navigation remains read-only. Periodic foreground
+        // discovery can maintain General when the signed status requests it.
+        let mut owner_sync_failed = if foreground {
             false
         } else if entry.root {
             root.sync_owner_general(&address).await.is_err()
@@ -1400,6 +1776,8 @@ impl Spaces {
         let status =
             tokio::time::timeout_at(deadline, root.call_space(&address, "status", body)).await;
         if let Ok(Ok(result)) = status {
+            let maintain_owner =
+                mode == PollMode::Foreground && result["owner_sync_needed"] == true;
             let confirmations = json!({"chat_heads":result["chat_heads"]});
             if self
                 .add_joined(root, address.clone(), result)
@@ -1419,6 +1797,17 @@ impl Spaces {
                         .accept_membership_probe(probe, &confirmations)
                         .await?;
                 }
+            }
+            if maintain_owner {
+                // This never runs in the message loop, and an unchanged status
+                // adds no requests. Only HTTP is bounded; local commits finish.
+                owner_sync_failed = if entry.root {
+                    root.sync_owner_general_foreground(&address).await.is_err()
+                } else if let Some(child) = self.children.get_mut(&entry.id) {
+                    child.sync_owner_general_foreground(&address).await.is_err()
+                } else {
+                    false
+                };
             }
         } else {
             return Ok(true);
@@ -1469,6 +1858,10 @@ impl Spaces {
         F: Fn(u64, u64) + Send + Sync + 'static,
         A: Fn(AttachmentActivity) + Send + Sync + 'static,
     {
+        for child in self.children.values_mut() {
+            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
+            child.configure_witness_pin(root.witness_pin.clone())?;
+        }
         if v.get("expected_identity")
             .is_some_and(|id| id != &json!(root.identity_id()))
         {
@@ -1535,6 +1928,10 @@ impl Spaces {
         Ok(response)
     }
     pub(super) async fn operate(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+        for child in self.children.values_mut() {
+            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
+            child.configure_witness_pin(root.witness_pin.clone())?;
+        }
         // Inner operations only mutate/report. Build one combined snapshot at
         // the Space boundary, or return the affected chat's partial snapshot.
         let _root_view = root.presentation.defer_view();
@@ -1601,6 +1998,16 @@ impl Spaces {
                 }
             }
             "space_setup_done" => {
+                if self
+                    .catalog
+                    .creation
+                    .as_ref()
+                    .is_some_and(|intent| intent.attachment_storage_pending)
+                {
+                    return Err(
+                        "Configure attachment storage for the created Space to continue.".into(),
+                    );
+                }
                 if !self.catalog.entries.iter().any(|e| e.status == "joined") {
                     return Err("Create or join a Space first.".into());
                 }
@@ -1629,6 +2036,35 @@ impl Spaces {
                     return Err("Confirm disconnecting this Space.".into());
                 }
                 self.disconnect(root, field(&v, "id")?).await?;
+            }
+            "space_preview" if field(&v, "link")?.starts_with(crate::witness::link::PREFIX) => {
+                let invite = root.open_witnessed_invitation(field(&v, "link")?).await?;
+                result["preview"] = json!({"name":invite.descriptor().name,"require_approval":invite.policy().require_approval,
+                    "expires_at":invite.policy().expires_at_ms,"message_lifetime_seconds":invite.descriptor().address.message_lifetime_seconds});
+            }
+            "space_join" if field(&v, "link")?.starts_with(crate::witness::link::PREFIX) => {
+                let invite = root.open_witnessed_invitation(field(&v, "link")?).await?;
+                let existing_id = invite.descriptor().address.scope.space.to_string();
+                if self
+                    .catalog
+                    .entries
+                    .iter()
+                    .any(|e| e.id == existing_id && e.status == "joined")
+                {
+                    self.catalog.active = Some(existing_id.clone());
+                    self.save(root)?;
+                    result["joined"] = json!(existing_id);
+                    result["view"] = self.view(root).await?;
+                    return Ok(result);
+                }
+                let name = root
+                    .profile_details
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .ok_or("Set your profile name first.")?;
+                let pending = root.witness_prepare_durable_admission(&invite, &name)?;
+                let id = self.finish_witnessed_join(root, &pending, None).await?;
+                result["joined"] = json!(id);
             }
             "space_preview" => {
                 let invite = SpaceInvitation::parse(field(&v, "link")?, root.allow_loopback)?;
@@ -1674,6 +2110,33 @@ impl Spaces {
                 }
                 result["joined"] = json!(id);
             }
+            "space_external_storage_status"
+            | "space_external_storage_configure"
+            | "space_external_storage_disable"
+            | "space_attachment_retention"
+                if op != "space_attachment_retention"
+                    || root.attachment_storage_endpoint.is_some() =>
+            {
+                let id = field(&v, "id")?;
+                let entry = self
+                    .catalog
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id && entry.status == "joined")
+                    .ok_or("Space unavailable.")?;
+                if op != "space_external_storage_status" && !entry.owner {
+                    return Err("Only a Space owner can configure attachment storage.".into());
+                }
+                let address = entry.address.as_ref().ok_or("Space unavailable.")?;
+                let client = if entry.root {
+                    &*root
+                } else {
+                    self.children.get(id).ok_or("Space unavailable.")?
+                };
+                result["result"] = client
+                    .external_storage_settings(address, op, &v["body"])
+                    .await?;
+            }
             "space_manage"
             | "space_invite"
             | "space_revoke"
@@ -1703,6 +2166,111 @@ impl Spaces {
                 let action = op.strip_prefix("space_").ok_or("Invalid action.")?;
                 let entry_root = entry.root;
                 let mut body = v["body"].clone();
+                if root.witness_pin.is_some()
+                    && matches!(action, "invite" | "revoke" | "manage" | "decide")
+                {
+                    let client = if entry_root {
+                        &*root
+                    } else {
+                        self.children.get(id).ok_or("Space unavailable.")?
+                    };
+                    let authority = client
+                        .authorities
+                        .0
+                        .iter()
+                        .find(|a| {
+                            a.space() == address.scope.space && a.stream() == address.scope.stream
+                        })
+                        .ok_or("General unavailable.")?
+                        .clone();
+                    let name = entry.name.clone();
+                    result["result"] = match action {
+                        "invite" => {
+                            json!({"link":root.mint_witnessed_invitation(&authority, &address, &name,
+                            body["lifetime"].as_u64().ok_or("Choose an invitation lifetime.")?,
+                            body["require_approval"].as_bool().ok_or("Choose an approval policy.")?).await?})
+                        }
+                        "revoke" => {
+                            root.revoke_witnessed_offer(&authority, field(&body, "id")?.parse()?)
+                                .await?;
+                            json!({})
+                        }
+                        "manage" => {
+                            let current = root.witness_read_authority(&authority).await?;
+                            let response = root.sync_witnessed_host(&address, &current).await?;
+                            self.add_joined(root, address.clone(), response).await?;
+                            let mut management =
+                                root.call_space(&address, "manage", json!({})).await?;
+                            management["offers"] = root.witnessed_offer_list(&address)?;
+                            if let Some(entry) =
+                                self.catalog.entries.iter_mut().find(|entry| entry.id == id)
+                            {
+                                entry.requests =
+                                    management["requests"].as_array().map(Vec::len).unwrap_or(0);
+                            }
+                            self.save(root)?;
+                            for row in management["requests"]
+                                .as_array_mut()
+                                .ok_or("Invalid admission requests.")?
+                            {
+                                let packet: super::witness_durable_admission::DurableAdmissionRequest = serde_json::from_value(row["request"].clone())?;
+                                row["name"] = json!(root.verify_witnessed_relay_request(
+                                    &current,
+                                    &address,
+                                    &packet,
+                                    field(row, "id")?.parse()?
+                                )?);
+                            }
+                            management
+                        }
+                        "decide" => {
+                            let authority = root.witness_read_authority(&authority).await?;
+                            let synced = root.sync_witnessed_host(&address, &authority).await?;
+                            self.add_joined(root, address.clone(), synced).await?;
+                            let pending = root
+                                .call_space(
+                                    &address,
+                                    "witness_pending",
+                                    json!({"request_id":body["id"]}),
+                                )
+                                .await?;
+                            let packet: super::witness_durable_admission::DurableAdmissionRequest =
+                                serde_json::from_value(pending["request"].clone())?;
+                            root.verify_witnessed_relay_request(
+                                &authority,
+                                &address,
+                                &packet,
+                                field(&body, "id")?.parse()?,
+                            )?;
+                            if body["approve"] == true {
+                                if let Some(encoded) = pending["approval"].as_str() {
+                                    let approval = decode_record(encoded)?;
+                                    root.witness_verify_existing_durable_approval(
+                                        &authority, &packet, &approval,
+                                    )?;
+                                    result["result"] =
+                                        json!({"request_id":packet.request_id,"status":"approved"});
+                                    result["view"] = self.view(root).await?;
+                                    return Ok(result);
+                                }
+                                let approval = root
+                                    .witness_approve_durable_admission(&authority, &packet, false)
+                                    .await?;
+                                root.call_space(&address,"witness_approve",json!({"request_id":packet.request_id,"approval":STANDARD.encode(approval.bytes())})).await?
+                            } else {
+                                root.call_space(
+                                    &address,
+                                    "witness_decline",
+                                    json!({"request_id":packet.request_id}),
+                                )
+                                .await?
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    result["view"] = self.view(root).await?;
+                    return Ok(result);
+                }
                 if address.service_credential.is_some()
                     && matches!(
                         action,
@@ -1874,7 +2442,9 @@ impl Spaces {
                     // status and outbound work stay on the regular sync worker;
                     // this pass grants no fresh lease for sending messages.
                     if !receive_discovery {
-                        poll_retry = self.poll_entry(root, entry.clone(), true).await?;
+                        poll_retry = self
+                            .poll_entry(root, entry.clone(), PollMode::Notification)
+                            .await?;
                         self.save(root)?;
                     }
                     Some((entry.id, false))
@@ -1884,7 +2454,9 @@ impl Spaces {
                     self.invitation_force |= v["force"] == true;
                     let entry = self.catalog.entries[index].clone();
                     let rest = index + 1 < self.catalog.entries.len();
-                    poll_retry = self.poll_entry(root, entry.clone(), true).await?;
+                    poll_retry = self
+                        .poll_entry(root, entry.clone(), PollMode::Foreground)
+                        .await?;
                     self.save(root)?;
                     Some((entry.id, rest))
                 } else {
@@ -2014,6 +2586,7 @@ impl Spaces {
                     "repair_downloaded",
                     "repair_expired",
                     "repair_pending",
+                    "private_settings_changed",
                 ]
                 .iter()
                 .any(|key| summary.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0);
@@ -2053,13 +2626,16 @@ impl Spaces {
                 let call_operation = matches!(
                     op,
                     "call_authorization"
+                        | "call_notify_ready"
                         | "call_encrypt_signal"
                         | "call_open_signal"
                         | "call_endpoint"
                 );
                 let target = if call_operation
-                    || matches!(op, "remind" | "reminder_remove" | "message_action")
-                {
+                    || matches!(
+                        op,
+                        "remind" | "reminder_remove" | "message_action" | "thread_follow"
+                    ) {
                     v["target_space"].as_str()
                 } else {
                     None
@@ -2128,7 +2704,8 @@ impl ClientApp {
     ) -> Result<Option<Authority>> {
         let signed = decode_record(encoded)?;
         let genesis: SpaceGenesis = signed.decode()?;
-        if genesis.owners.len() != 1
+        if !matches!(genesis.v, 1 | 3)
+            || genesis.owners.len() != 1
             || genesis.owners[0].identity_id != session.identity_id()
             || genesis.controller_credential_id != session.credential().id()
         {
@@ -2156,8 +2733,9 @@ impl ClientApp {
         let root = genesis.owners[0].root_public_key.clone();
         let c = self.session.credential();
         let config = StreamConfig {
+            witness_evidence: None,
             chat_kind: Some(ChatKind::Chat),
-            v: 1,
+            v: genesis.v,
             kind: "stream.config".into(),
             nonce: record::random_hex::<16>()?,
             space_id: space,
@@ -2326,6 +2904,297 @@ mod tests {
         id
     }
     #[tokio::test]
+    async fn witnessed_pending_poll_reconciles_lost_admission_before_relay_after_reopen() {
+        use crate::authority::{
+            WitnessApprovalV2, WitnessChallengeV2, WitnessInvitationPolicy, WitnessJoinRequest,
+            WitnessPin,
+        };
+        use crate::witness::{
+            Command, Operation, Receipt, Request, Response,
+            link::{self, Descriptor, InvitationSeed},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        fn signed(value: &impl Serialize, key: &ed25519_dalek::SigningKey) -> String {
+            STANDARD.encode(
+                SignedRecord::sign(&serde_json::to_vec(value).unwrap(), key)
+                    .unwrap()
+                    .bytes(),
+            )
+        }
+        struct Running(tokio::task::JoinHandle<()>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut owner = profile(temp.path(), "owner").await;
+        let mut candidate = profile(temp.path(), "candidate").await;
+        candidate.begin_space_setup().await.unwrap();
+        let witness_key = ed25519_dalek::SigningKey::from_bytes(&[83; 32]);
+        let pin = WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(witness_key.verifying_key().as_bytes()),
+            key_generation: 1,
+        };
+        owner.configure_witness_pin(Some(pin.clone())).unwrap();
+        candidate.configure_witness_pin(Some(pin.clone())).unwrap();
+        let proof = owner.owner_general_creation(&"84".repeat(16)).unwrap();
+        let authority = proof
+            .verify_witnessed(
+                decode_record(&proof.genesis)
+                    .unwrap()
+                    .id()
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+                StreamId::from_bytes([0x84; 16]),
+                &pin,
+            )
+            .unwrap();
+
+        // An unavailable relay cannot prevent recovery from the independent
+        // witness. Accept and drop connections so a regression fails promptly.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("https://{}", relay.local_addr().unwrap());
+        let relay_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = relay_attempts.clone();
+        let _relay = Running(tokio::spawn(async move {
+            while let Ok((socket, _)) = relay.accept().await {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        }));
+        let host = format!("{origin}/spaces/v1/create");
+        candidate.configure_invitation_host(&host).unwrap();
+        let at = now().unwrap().as_millis() as u64;
+        let seed = InvitationSeed::generate().unwrap();
+        let invitation_public_key =
+            record::encode_hex(seed.invitation_public_key().unwrap().as_bytes());
+        let policy = WitnessInvitationPolicy {
+            v: 1,
+            kind: "witness.invitation".into(),
+            nonce: "85".repeat(16),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            authority_head: authority.head_id().unwrap(),
+            issuer_credential_id: owner.session.credential().id(),
+            invitation_public_key: invitation_public_key.clone(),
+            not_before_ms: at,
+            expires_at_ms: at + 3_600_000,
+            require_approval: true,
+            max_uses: 5,
+            witness_key_generation: 1,
+        };
+        let descriptor = Descriptor {
+            v: 1,
+            kind: "witness.invitation.descriptor".into(),
+            name: "Recovery Space".into(),
+            address: SpaceAddress {
+                url: format!("{origin}/spaces/{}/team/v1/spaces", "86".repeat(32)),
+                scope: team::TeamScope {
+                    space: authority.space(),
+                    stream: authority.stream(),
+                    root: owner.session.credential().record().body()["root_public_key"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    controller: owner.session.credential().id(),
+                },
+                message_lifetime_seconds: 21_600,
+                service_credential: None,
+            },
+            witness: pin.clone(),
+            proof,
+            policy: signed(&policy, owner.session.signing_key()),
+            invitation_public_key,
+        };
+        let encrypted = link::seal(
+            &descriptor,
+            owner.session.signing_key(),
+            seed,
+            &origin,
+            &pin,
+            at,
+        )
+        .unwrap();
+        let invitation = encrypted
+            .link
+            .open(&encrypted.ciphertext, &origin, &pin, at)
+            .unwrap();
+        let pending = candidate
+            .witness_prepare_durable_admission(&invitation, "Candidate")
+            .unwrap();
+        let id = attach(
+            &mut candidate,
+            pending.address.clone(),
+            json!({
+                "name":pending.name,"status":"pending","pending_reason":"approval",
+                "message_lifetime_seconds":pending.address.message_lifetime_seconds
+            }),
+        )
+        .await;
+        let approval = decode_record(&signed(
+            &WitnessApprovalV2 {
+                v: 2,
+                kind: "witness.approval".into(),
+                nonce: "87".repeat(16),
+                space_id: authority.space(),
+                stream_id: authority.stream(),
+                authority_head: authority.head_id().unwrap(),
+                issuer_credential_id: owner.session.credential().id(),
+                request_id: pending.request_id,
+                readmission: false,
+                expires_at_ms: pending.expires_at_ms,
+            },
+            owner.session.signing_key(),
+        ))
+        .unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let calls = commands.clone();
+        let accepted = Arc::new(Mutex::new(authority));
+        let current = accepted.clone();
+        let credential = candidate.session.credential().clone();
+        let audience = pin.url.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        candidate.witness_test_url = Some(endpoint.clone());
+        let router = axum::Router::new().route(
+            "/command",
+            axum::routing::post(move |axum::Json(request): axum::Json<Request>| {
+                let calls = calls.clone();
+                let current = current.clone();
+                let credential = credential.clone();
+                let key = witness_key.clone();
+                let audience = audience.clone();
+                async move {
+                    let record = decode_record(&request.command).unwrap();
+                    record.verify_signature(credential.key()).unwrap();
+                    let command: Command = record.decode().unwrap();
+                    let at = now().unwrap().as_millis() as u64;
+                    let mut authority = current.lock().unwrap();
+                    match command.operation {
+                        Operation::ChallengeV2 {
+                            request,
+                            client_nonce,
+                            ..
+                        } => {
+                            calls.lock().unwrap().push("challenge");
+                            let join: WitnessJoinRequest = decode_record(&request.device_request)
+                                .unwrap()
+                                .decode()
+                                .unwrap();
+                            let challenge = WitnessChallengeV2 {
+                                v: 2,
+                                kind: "witness.challenge".into(),
+                                nonce: "88".repeat(32),
+                                client_nonce,
+                                space_id: authority.space(),
+                                stream_id: authority.stream(),
+                                policy_id: join.policy_id,
+                                credential_id: credential.id(),
+                                request_id: decode_record(&request.device_request).unwrap().id(),
+                                authority_head: authority.head_id().unwrap(),
+                                issued_at_ms: at,
+                                expires_at_ms: (at + 120_000).min(join.expires_at_ms),
+                                witness_key_generation: 1,
+                            };
+                            let receipt = Receipt {
+                                v: 1,
+                                kind: "witness.receipt".into(),
+                                audience,
+                                sequence: 1,
+                                previous: None,
+                                request_id: record.id(),
+                                space_id: authority.space(),
+                                authority_head: authority.head_id().unwrap(),
+                                state_digest: "89".repeat(32),
+                                accepted_at_ms: at,
+                                event: "invitation.challenged_v2".into(),
+                                witness_key_generation: 1,
+                            };
+                            Ok(axum::Json(Response {
+                                receipt: Some(signed(&receipt, &key)),
+                                proof: None,
+                                challenge: Some(signed(&challenge, &key)),
+                            }))
+                        }
+                        Operation::AdmitV2 { mut evidence, .. } => {
+                            calls.lock().unwrap().push("admit");
+                            authority.add_credential(credential);
+                            evidence.admitted_at_ms = at;
+                            let config = authority
+                                .prepare_witness_admission_v2(evidence, &key)
+                                .unwrap();
+                            authority.apply_config(config).unwrap();
+                            // Commit succeeded; its HTTP acknowledgement is lost.
+                            Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                        }
+                        Operation::Read => {
+                            calls.lock().unwrap().push("read");
+                            // Keep the recovery unfinished to verify its durable state
+                            // survives even when the next independent read also fails.
+                            Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                        }
+                        _ => panic!("unexpected witness operation"),
+                    }
+                }
+            }),
+        );
+        let _server = Running(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        assert!(
+            candidate
+                .witness_finalize_durable_admission(pending.request_id, &origin, Some(&approval))
+                .await
+                .is_err()
+        );
+        assert_eq!(*commands.lock().unwrap(), ["challenge", "admit"]);
+        assert_eq!(accepted.lock().unwrap().head().unwrap().sequence, 2);
+        candidate.close().await.unwrap();
+        let mut candidate = ClientApp::open(temp.path().join("candidate"), PASSWORD.into(), true)
+            .await
+            .unwrap();
+        candidate.configure_witness_pin(Some(pin)).unwrap();
+        candidate.configure_invitation_host(&host).unwrap();
+        candidate.witness_test_url = Some(endpoint);
+        // Native startup loads the saved catalog after configuring the build.
+        candidate.enable_spaces().await.unwrap();
+        let mut spaces = candidate.spaces.take().unwrap();
+        let entry = spaces
+            .catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .clone();
+        assert!(
+            spaces
+                .poll_entry(&mut candidate, entry, PollMode::Regular)
+                .await
+                .is_err()
+        );
+        candidate.spaces = Some(spaces);
+        assert_eq!(*commands.lock().unwrap(), ["challenge", "admit", "read"]);
+        assert_eq!(
+            relay_attempts.load(Ordering::SeqCst),
+            0,
+            "relay must not precede durable reconciliation"
+        );
+        assert_eq!(
+            candidate.witness_durable_admissions().unwrap()[0].request_id,
+            pending.request_id
+        );
+        candidate.close().await.unwrap();
+        owner.close().await.unwrap();
+    }
+    #[tokio::test]
     async fn signed_status_reuses_unchanged_enrollment_and_read_checks_do_not_write_state() {
         let temp = tempfile::tempdir().unwrap();
         let mut server = profile(temp.path(), "service").await;
@@ -2469,7 +3338,12 @@ mod tests {
             .unwrap()
             .clone();
         spaces.children[&id].invalidate_membership_checks().await;
-        assert!(!spaces.poll_entry(&mut owner, entry, false).await.unwrap());
+        assert!(
+            !spaces
+                .poll_entry(&mut owner, entry, PollMode::Regular)
+                .await
+                .unwrap()
+        );
         let child = &spaces.children[&id];
         let general = child
             .authorities
@@ -2859,6 +3733,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let first = profile(temp.path(), "first").await;
         let second = profile(temp.path(), "second").await;
+        let general = first.owner_general_creation(&"91".repeat(16)).unwrap();
+        assert!(
+            ClientApp::personal_chat_authority(&first.session, &general.genesis)
+                .unwrap()
+                .is_none(),
+            "General must never become a private seed"
+        );
+        let mut private: SpaceGenesis = decode_record(&general.genesis).unwrap().decode().unwrap();
+        private.v = 3;
+        let private = SignedRecord::sign(
+            &serde_json::to_vec(&private).unwrap(),
+            first.session.signing_key(),
+        )
+        .unwrap();
+        assert!(
+            ClientApp::personal_chat_authority(&first.session, &STANDARD.encode(private.bytes()))
+                .unwrap()
+                .is_some()
+        );
         let encoded = STANDARD.encode(first.authorities.0[0].genesis().bytes());
         let foreign = second.authorities.0[0].space();
         let mut session = first.session.isolated_space();
@@ -3473,5 +4366,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+    #[test]
+    fn removing_a_space_cleans_encrypted_local_drafts_without_unchecked_recursion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let space = temporary.path().join("space");
+        std::fs::create_dir(&space).unwrap();
+        let drafts = space.join("drafts");
+        std::fs::create_dir(&drafts).unwrap();
+        let text = drafts.join(format!("{}.age", "1".repeat(64)));
+        let attachment = drafts.join(format!("file-{}.age", "2".repeat(64)));
+        std::fs::write(&text, b"synthetic ciphertext").unwrap();
+        std::fs::write(&attachment, b"synthetic ciphertext").unwrap();
+        let unexpected = drafts.join("unrecognized.txt");
+        std::fs::write(&unexpected, b"preserve").unwrap();
+        assert!(remove_child(&space).is_err());
+        assert!(text.exists() && attachment.exists() && unexpected.exists());
+        std::fs::remove_file(unexpected).unwrap();
+        remove_child(&space).unwrap();
+        assert!(!space.exists());
     }
 }

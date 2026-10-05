@@ -5,6 +5,9 @@ import { MessageContent } from "./MessageContent";
 import { TypingIndicator } from "./useRealtime";
 import { ComposerInput } from "./ComposerInput";
 import { ComposerExpiry } from "./ComposerExpiry";
+import type { useConversationDraft } from "./conversationDrafts";
+import { mentionCandidates, type ComposerMention } from "./composerMentions";
+import { ThreadFollowButton } from "./ThreadFollowButton";
 import type { MessageExpiryHours } from "./messageExpiry";
 import { EmptyState } from "./EmptyState";
 import { PullToRefresh } from "./PullToRefresh";
@@ -20,7 +23,11 @@ import type { MessageStatusSelection } from "./MessageStatus";
 import type { MessageRow, MessageThread } from "./messageThreads";
 import { messageIdentity } from "./messageThreads";
 import { UnavailableMessage } from "./UnavailableMessage";
-import { AttachmentButton, type AttachmentProgress, type AttachmentUnavailable } from "./AttachmentButton";
+import {
+  AttachmentButton,
+  type AttachmentProgress,
+  type AttachmentUnavailable,
+} from "./AttachmentButton";
 
 export function ThreadView({
   view,
@@ -30,8 +37,8 @@ export function ThreadView({
   hideAvatars,
   mobile,
   busy,
-  draft,
-  onDraft,
+  savedDraft,
+  onFollow,
   onBack,
   onRefresh,
   onRead,
@@ -63,12 +70,16 @@ export function ThreadView({
   hideAvatars: boolean;
   mobile: boolean;
   busy: boolean;
-  draft: string;
-  onDraft: (text: string) => void;
+  savedDraft: ReturnType<typeof useConversationDraft>;
+  onFollow: (followed: boolean) => Promise<void>;
   onBack: () => void;
   onRefresh: () => Promise<void>;
   onRead: (ids: string[]) => void;
-  onSend: (text: string, expiry?: MessageExpiryHours) => Promise<boolean>;
+  onSend: (
+    text: string,
+    expiry?: MessageExpiryHours,
+    mentions?: ComposerMention[],
+  ) => Promise<boolean>;
   onStatus: (selection: MessageStatusSelection) => void;
   onFile: (row: MessageRow) => void;
   downloadingAttachment?: string;
@@ -91,7 +102,11 @@ export function ThreadView({
 }) {
   const [seen, setSeen] = useState(new Set<string>());
   const [ownSendRevision, setOwnSendRevision] = useState(0);
-  const [messageExpiry, setMessageExpiry] = useState<MessageExpiryHours>();
+  const {
+    text: draft,
+    expiry: messageExpiry,
+    setExpiry: setMessageExpiry,
+  } = savedDraft;
   const [scrollTarget, setScrollTarget] = useState(target);
   const composer = useRef<HTMLTextAreaElement>(null);
   const posting = useRef(false);
@@ -102,15 +117,21 @@ export function ThreadView({
     if (composeRevision > 0 && canReply) composer.current?.focus();
   }, [composeRevision, canReply]);
   const submit = async () => {
-    if (posting.current || busy || !canReply || !draft.trim()) return;
+    if (
+      posting.current ||
+      busy ||
+      !savedDraft.ready ||
+      !canReply ||
+      !draft.trim()
+    )
+      return;
     posting.current = true;
-    const submitted = draft;
-    onDraft("");
+    const submitted = savedDraft;
     setScrollTarget(undefined);
     setOwnSendRevision((value) => value + 1);
     try {
-      if (!(await onSend(submitted, messageExpiry))) onDraft(submitted);
-      else setMessageExpiry(undefined);
+      if (await onSend(submitted.text, submitted.expiry, submitted.mentions))
+        savedDraft.clearSubmitted(submitted);
     } finally {
       posting.current = false;
     }
@@ -124,6 +145,15 @@ export function ThreadView({
         title={t("thread.title")}
         onBack={onBack}
         backLabel={t("thread.back")}
+        actions={
+          <ThreadFollowButton
+            chat={chat}
+            root={thread.rootId}
+            identity={view.identity}
+            busy={busy}
+            onFollow={onFollow}
+          />
+        }
       />
       <div className="searchable-list" ref={messageListRef}>
         <PullToRefresh
@@ -227,22 +257,42 @@ export function ThreadView({
       >
         <ComposerInput
           inputRef={composer}
-          resetRevision={ownSendRevision}
           aria-label={t("thread.reply")}
           placeholder={
             canReply ? t("thread.placeholder") : t("composer.unavailable")
           }
           value={draft}
-          onChange={(e) => onDraft(e.target.value)}
+          mentions={savedDraft.mentions}
+          mentionCandidates={mentionCandidates(view, chat)}
+          onDraftChange={savedDraft.setContent}
+          editTarget={
+            canReply
+              ? (() => {
+                  const row = [...thread.replies]
+                    .reverse()
+                    .find(
+                      (row) =>
+                        row.body.kind === "chat.message" &&
+                        row.body.issuer_identity === view.identity &&
+                        !row.local_echo,
+                    );
+                  return row ? { chat, row } : undefined;
+                })()
+              : undefined
+          }
           disabled={busy || !canReply}
           maxLength={16384}
         />
         <div className="composer-actions">
-          <ComposerExpiry value={messageExpiry} onChange={setMessageExpiry} disabled={busy || !canReply} />
+          <ComposerExpiry
+            value={messageExpiry}
+            onChange={setMessageExpiry}
+            disabled={busy || !canReply}
+          />
           <button
             aria-label={t("composer.send")}
             title={t("composer.send")}
-            disabled={busy || !canReply || !draft.trim()}
+            disabled={busy || !savedDraft.ready || !canReply || !draft.trim()}
           >
             <Icon name="up" />
           </button>
@@ -321,7 +371,13 @@ function ThreadMessage({
           onStatus={row.body.kind === "unavailable" ? undefined : onStatus}
         >
           {row.body.kind === "deleted" ? (
-            <p className="deleted-message">{t(row.body.expired ? "messageActions.expired" : "messageActions.deleted")}</p>
+            <p className="deleted-message">
+              {t(
+                row.body.expired
+                  ? "messageActions.expired"
+                  : "messageActions.deleted",
+              )}
+            </p>
           ) : row.body.kind === "unavailable" ? (
             <UnavailableMessage
               disabled={busy}
@@ -334,10 +390,16 @@ function ThreadMessage({
             <AttachmentButton
               row={row}
               serverState={serverState}
-              context={view.active_space ? {
-                expected_identity: view.identity, expected_space: view.active_space,
-                space: chat.space, stream: chat.stream,
-              } : undefined}
+              context={
+                view.active_space
+                  ? {
+                      expected_identity: view.identity,
+                      expected_space: view.active_space,
+                      space: chat.space,
+                      stream: chat.stream,
+                    }
+                  : undefined
+              }
               disabled={busy}
               download={
                 downloadingAttachment === row.id

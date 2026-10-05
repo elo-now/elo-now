@@ -188,7 +188,16 @@ pub fn forget(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn update(app: &tauri::AppHandle, result: &Value) {
     #[cfg(all(mobile, feature = "mobile-push"))]
-    mobile::update(app, result);
+    {
+        mobile::update(app, result);
+        if result["result"]["private_settings_changed"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            mobile::schedule_private_read_cleanup(app);
+        }
+    }
     #[cfg(not(all(mobile, feature = "mobile-push")))]
     let _ = (app, result);
 }
@@ -523,6 +532,15 @@ mod mobile {
         let receipts = client
             .notification_read_receipts(&device.route, request)
             .map_err(|_| "Could not update read notifications")?;
+        record_read_receipts(app, &mut device, receipts)?;
+        schedule_reconcile(app);
+        Ok(())
+    }
+    fn record_read_receipts(
+        app: &tauri::AppHandle,
+        device: &mut Device,
+        receipts: Vec<Value>,
+    ) -> Result<(), String> {
         let expires = time() + 86400;
         device.reads.retain(|r| r.expires > time());
         device.cleared.retain(|r| r.expires > time());
@@ -543,8 +561,73 @@ mod mobile {
         device.reads.drain(..excess);
         let excess = device.cleared.len().saturating_sub(1024);
         device.cleared.drain(..excess);
-        save(app, &device)?;
-        schedule_reconcile(app);
+        save(app, device)
+    }
+    static PRIVATE_READ_CLEANUP_RUNNING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static PRIVATE_READ_CLEANUP_PENDING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn schedule_private_read_cleanup(app: &tauri::AppHandle) {
+        use std::sync::atomic::Ordering::SeqCst;
+        PRIVATE_READ_CLEANUP_PENDING.store(true, SeqCst);
+        if PRIVATE_READ_CLEANUP_RUNNING.swap(true, SeqCst) {
+            return;
+        }
+        let app = app.clone();
+        // Remote read state must clear that chat's delivered notifications even
+        // while another chat remains unread. This needs no relay network request
+        // and runs after the operation releases its profile lock.
+        tauri::async_runtime::spawn(async move {
+            loop {
+                PRIVATE_READ_CLEANUP_PENDING.store(false, SeqCst);
+                let state = app.state::<crate::State>();
+                let runtime = state.lock().await;
+                if let Some(client) = runtime.client.as_ref() {
+                    if let Ok(Some(mut device)) = load(&app, env!("ELO_CONFIGURED_WAKE")) {
+                        if device.enabled && device.identity == client.identity_id().to_string() {
+                            let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
+                            if let Ok(native) = adapter.call("status", json!({})) {
+                                let _ =
+                                    reconcile_delivered(&app, client, &mut device, &native).await;
+                                schedule_reconcile(&app);
+                            }
+                        }
+                    }
+                }
+                drop(runtime);
+                if PRIVATE_READ_CLEANUP_PENDING.load(SeqCst) {
+                    continue;
+                }
+                PRIVATE_READ_CLEANUP_RUNNING.store(false, SeqCst);
+                if !PRIVATE_READ_CLEANUP_PENDING.load(SeqCst)
+                    || PRIVATE_READ_CLEANUP_RUNNING.swap(true, SeqCst)
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn reconcile_delivered(
+        app: &tauri::AppHandle,
+        client: &ClientApp,
+        device: &mut Device,
+        native: &Value,
+    ) -> Result<(), String> {
+        if native["registration"] != device.route.id || native["enabled"] != true {
+            return Ok(());
+        }
+        let Some(delivered) = native["delivered"].as_array() else {
+            return Ok(());
+        };
+        let receipts = client
+            .notification_delivered_read_receipts(&device.route, delivered)
+            .await
+            .map_err(|_| "Could not update read notifications")?;
+        if !receipts.is_empty() {
+            record_read_receipts(app, device, receipts)?;
+        }
         Ok(())
     }
     async fn flush_reads(app: &tauri::AppHandle, device: &mut Device) -> Result<(), String> {
@@ -688,6 +771,17 @@ mod mobile {
                 let enabled = prefs.enabled && native["permission"] == true;
                 return Ok(json!({"available":true,"enabled":enabled,"pending":true,"wake":false}));
             }
+        }
+        // Local delivery cleanup must finish before any registration/policy
+        // network attempt can fail while the phone is offline.
+        if matches!(op.as_str(), "status" | "maintain") {
+            let local = if let Some(saved) = device.as_mut() {
+                reconcile_delivered(&app, client, saved, &native).await
+            } else {
+                Ok(())
+            };
+            schedule_reconcile(&app);
+            local?;
         }
         let automatic = preferences::should_resume(
             prefs.enabled,

@@ -4,6 +4,7 @@ import {
   MessageReactions,
 } from "./MessageActions";
 import type { ReactNode } from "react";
+import { isExpiryTimestamp, timestampIso } from "./timestamps";
 import {
   formatMessageTime,
   formatTimestamp,
@@ -47,6 +48,7 @@ export function MessageContent({
   onStatus?: (selection: MessageStatusSelection) => void;
 }) {
   const createdAt = messageCreatedAt(row);
+  const expiresAt = row.body.payload?.expires_at_ms;
   return (
     <>
       {!hideAvatars && (
@@ -126,16 +128,24 @@ export function MessageContent({
           )}
         </div>
         {children}
+        {row.body.kind === "chat.message" &&
+          isExpiryTimestamp(row.body.payload?.edited_at_ms) && (
+            <time
+              className="message-edited"
+              dateTime={timestampIso(row.body.payload!.edited_at_ms!)}
+              title={formatTimestamp(
+                timestampIso(row.body.payload!.edited_at_ms!),
+              )}
+            >
+              {t("messageActions.edited")}
+            </time>
+          )}
         {["chat.message", "unavailable"].includes(row.body.kind) &&
-          row.body.payload?.expires_at_ms != null && (
+          isExpiryTimestamp(expiresAt) && (
             <div className="message-expiry">
-              <time
-                dateTime={new Date(
-                  row.body.payload.expires_at_ms,
-                ).toISOString()}
-              >
+              <time dateTime={timestampIso(expiresAt)}>
                 {t("messageActions.expiresAt", {
-                  date: formatAttachmentExpiry(row.body.payload.expires_at_ms),
+                  date: formatAttachmentExpiry(expiresAt),
                 })}
               </time>
             </div>

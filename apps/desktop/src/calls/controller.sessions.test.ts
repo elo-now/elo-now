@@ -74,6 +74,7 @@ const media: MediaState = {
 const participant = (identity: string, credential: string) => ({
   identity_id: identity,
   credential_id: credential,
+  ready: true,
   media: { ...media },
 });
 function setup() {
@@ -122,6 +123,8 @@ function setup() {
     stream: "chat",
     head: "head",
     can_post: true,
+    name: "General",
+    member_names: { peer: "Alex" },
     chat_kind: "direct",
     members: [
       { identity_id: "me", credential_ids: ["a"], capabilities: ["POST"] },
@@ -136,6 +139,7 @@ function setup() {
     key_epoch: 1,
     started_by: "me",
     started_at: 1,
+    ready: true,
     scope: {
       hosting_space_id: "host",
       conversation: { space_id: "space", stream_id: "chat" },
@@ -160,7 +164,11 @@ function setup() {
           call: Object.keys(current.participants).length ? current : null,
         };
       if (operation.type === "start")
-        current = { ...current, participants: { me: participant("me", "a") } };
+        current = {
+          ...current,
+          ready: false,
+          participants: { me: { ...participant("me", "a"), ready: false } },
+        };
       if (operation.type === "join")
         current = {
           ...current,
@@ -170,9 +178,14 @@ function setup() {
       if (operation.type === "media")
         current = {
           ...current,
+          ready: true,
           participants: {
             ...current.participants,
-            me: { ...current.participants.me, media: operation.state },
+            me: {
+              ...current.participants.me,
+              ready: true,
+              media: operation.state,
+            },
           },
         };
       if (operation.type === "leave") {
@@ -192,7 +205,7 @@ function setup() {
     identity: "me",
     credential: "a",
     streams: [chat],
-    spaces: [{ id: "host", managed: true, status: "joined" }],
+    spaces: [{ id: "host", name: "Friends", managed: true, status: "joined" }],
   } as unknown as View;
   Object.assign(calls, { view, command });
   const controller = calls as any;
@@ -488,6 +501,11 @@ it("does not open media when the initial microphone admission is rejected", asyn
   expect(f.calls.snapshot.error).toBe("unauthorized");
   expect(f.calls.localCapture()).toBeUndefined();
   expect(f.audio.stop).toHaveBeenCalled();
+  expect(
+    runtime.operate.mock.calls.some(
+      ([request]) => request.op === "call_notify_ready",
+    ),
+  ).toBe(false);
   f.calls.dispose();
 });
 
@@ -689,5 +707,161 @@ it("finishes cleanup of a cancelled server Start before starting again", async (
     "media",
   ]);
   expect(f.calls.snapshot.active?.participants.me).toBeDefined();
+  f.calls.dispose();
+});
+
+it("keeps a successor session active when an old mute command fails late", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  let rejectMute!: (reason: Error) => void;
+  f.controller.adapter = {
+    stop: async () => {},
+    setSpeakerMuted: () =>
+      new Promise<void>((_, reject) => {
+        rejectMute = reject;
+      }),
+  };
+  const muting = f.calls.setSpeakerMuted(true);
+  await f.calls.leave();
+  await f.calls.start(f.chat);
+  const active = f.calls.snapshot.active;
+  rejectMute(new Error("ended"));
+  await muting;
+  expect(f.calls.snapshot.active).toBe(active);
+  expect(f.calls.snapshot.error).toBeUndefined();
+  expect(f.controller.speakerMuted).toBe(false);
+  f.calls.dispose();
+});
+
+it("reports local playback failure without changing microphone state or ending the session", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const active = f.calls.snapshot.active;
+  f.controller.adapter = {
+    stop: async () => {},
+    setSpeakerMuted: async () => {
+      throw new Error("route changed");
+    },
+  };
+  expect(await f.calls.setSpeakerMuted(true)).toBe(false);
+  expect(f.calls.snapshot.active).toBe(active);
+  expect(f.calls.snapshot.media.audio_muted).toBe(false);
+  expect(f.calls.snapshot.error).toBe("audio_unavailable");
+  expect(f.controller.speakerMuted).toBe(false);
+  f.calls.dispose();
+});
+
+it("announces only a newly ready session once without acquiring media", async () => {
+  const f = setup();
+  const listener = vi.fn();
+  f.calls.subscribeSessionStarted(listener);
+  f.controller.subscribed.set("host:space:chat", "head");
+  const call = {
+    ...f.current(),
+    started_by: "peer",
+    participants: { peer: participant("peer", "b") },
+  };
+  await f.controller.event({
+    type: "presence",
+    call: {
+      ...call,
+      ready: false,
+      participants: { peer: { ...call.participants.peer, ready: false } },
+    },
+  });
+  expect(f.calls.snapshot.available).toEqual({});
+  expect(listener).not.toHaveBeenCalled();
+  await f.controller.event({ type: "presence", call });
+  await f.controller.event({ type: "presence", call });
+  expect(listener).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      call,
+      spaceName: "Friends",
+      starterName: "Alex",
+      participantNames: ["Alex"],
+    }),
+  );
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  expect(runtime.activity).not.toHaveBeenCalled();
+  f.calls.dispose();
+});
+
+it("suppresses old snapshots, own starts, and muted sessions even after repeats", async () => {
+  const f = setup();
+  const listener = vi.fn();
+  f.calls.subscribeSessionStarted(listener);
+  f.current().started_by = "peer";
+  await f.controller.subscribeChats();
+  await f.controller.event({ type: "presence", call: f.current() });
+  const own = { ...f.current(), call_id: "own", started_by: "me" };
+  await f.controller.event({ type: "presence", call: own });
+  f.chat.muted = true;
+  const mutedCall = { ...f.current(), call_id: "muted" };
+  await f.controller.event({ type: "presence", call: mutedCall });
+  f.chat.muted = false;
+  await f.controller.event({ type: "presence", call: mutedCall });
+  expect(listener).not.toHaveBeenCalled();
+  expect(Object.values(f.calls.snapshot.available)).toEqual([mutedCall]);
+  f.calls.dispose();
+});
+
+it("cannot revive an ended or revoked session with a queued presence", async () => {
+  const f = setup();
+  f.controller.subscribed.set("host:space:chat", "head");
+  const listener = vi.fn();
+  f.calls.subscribeSessionStarted(listener);
+  const call = { ...f.current(), started_by: "peer" };
+  await f.controller.event({
+    type: "ended",
+    call_id: call.call_id,
+    scope: call.scope,
+  });
+  await f.controller.event({ type: "presence", call });
+  expect(f.calls.snapshot.available).toEqual({});
+  const next = { ...call, call_id: "next" };
+  await f.controller.event({ type: "presence", call: next });
+  expect(listener).toHaveBeenCalledOnce();
+  await f.controller.event({ type: "access_revoked", scope: call.scope });
+  await f.controller.event({ type: "presence", call: next });
+  expect(f.calls.snapshot.available).toEqual({});
+  expect(listener).toHaveBeenCalledOnce();
+  f.calls.dispose();
+});
+
+it("notifies after microphone admission and keeps a session when push delivery fails", async () => {
+  const f = setup();
+  const original = f.command.getMockImplementation()!;
+  f.command.mockImplementation(async (chat, operation) => {
+    if (operation.type === "media")
+      expect(runtime.operate).not.toHaveBeenCalled();
+    return original(chat, operation);
+  });
+  runtime.operate.mockRejectedValue(new Error("unavailable"));
+  await f.calls.start(f.chat);
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  expect(runtime.operate).toHaveBeenCalledExactlyOnceWith({
+    expected_identity: "me",
+    target_space: "host",
+    hosting_space_id: "host",
+    space: "space",
+    stream: "chat",
+    op: "call_notify_ready",
+    call_id: f.current().call_id,
+  });
+  expect(f.calls.snapshot.error).toBeUndefined();
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  await f.calls.leave();
+  f.calls.dispose();
+});
+
+it("does not send a session start notification for an explicit Join", async () => {
+  const f = setup();
+  await f.calls.start(f.chat, f.current());
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  expect(
+    runtime.operate.mock.calls.some(
+      ([request]) => request.op === "call_notify_ready",
+    ),
+  ).toBe(false);
   f.calls.dispose();
 });

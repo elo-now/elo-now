@@ -24,6 +24,7 @@ export class GroupMedia implements MediaAdapter {
   private stopped = false;
   private stopping?: Promise<void>;
   private remoteTiles = new Map<string, RemoteTile>();
+  private permissionWaiters = new Set<(error?: Error) => void>();
   constructor(
     private tiles: (value: MediaTile[]) => void,
     private failure: (reason: string) => void,
@@ -47,10 +48,15 @@ export class GroupMedia implements MediaAdapter {
     this.room.on(RoomEvent.TrackUnmuted, () => this.refresh());
     this.room.on(RoomEvent.ActiveSpeakersChanged, () => this.refresh());
     this.room.on(RoomEvent.ParticipantDisconnected, () => this.refresh());
+    this.room.on(RoomEvent.ParticipantPermissionsChanged, () => {
+      for (const check of this.permissionWaiters) check();
+    });
     this.room.on(RoomEvent.EncryptionError, () =>
       this.failure("encryption_error"),
     );
     this.room.on(RoomEvent.Disconnected, () => {
+      for (const check of this.permissionWaiters)
+        check(new Error("disconnected"));
       if (!this.stopped) this.failure("disconnected");
     });
   }
@@ -112,6 +118,34 @@ export class GroupMedia implements MediaAdapter {
     this.remoteTiles = current;
     this.tiles(tiles);
   }
+  private waitForPublicationPermission(source: Track.Source) {
+    const allowed = () => {
+      const permissions = this.room.localParticipant.permissions;
+      return (
+        permissions?.canPublish &&
+        (permissions.canPublishSources.length === 0 ||
+          permissions.canPublishSources.includes(Track.sourceToProto(source)))
+      );
+    };
+    if (this.stopped || allowed()) return Promise.resolve();
+    // Call control and LiveKit use separate connections. Its grant can arrive
+    // before the SDK receives the corresponding participant permission update.
+    return new Promise<void>((resolve, reject) => {
+      const check = (error?: Error) => {
+        if (!error && !this.stopped && !allowed()) return;
+        clearTimeout(timer);
+        this.permissionWaiters.delete(check);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () => check(new Error("media_permission_timeout")),
+        5000,
+      );
+      this.permissionWaiters.add(check);
+      check();
+    });
+  }
   async update(state: MediaState, capture: MediaStream, screen?: MediaStream) {
     const desired: [Track.Source, MediaStreamTrack | undefined][] = [
       [
@@ -141,6 +175,8 @@ export class GroupMedia implements MediaAdapter {
       }
       if (this.stopped) return;
       if (track) {
+        await this.waitForPublicationPermission(source);
+        if (this.stopped) return;
         // The provider may stop its tracks when an epoch's room is revoked.
         // Keep ownership of the original capture in the call controller.
         const clone = track.clone();
@@ -166,6 +202,7 @@ export class GroupMedia implements MediaAdapter {
   }
   private async stopOnce() {
     this.stopped = true;
+    for (const check of this.permissionWaiters) check();
     for (const track of this.published.values()) track.clone.stop();
     try {
       await this.room.disconnect();

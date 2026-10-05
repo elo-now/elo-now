@@ -29,10 +29,18 @@ impl Host {
                 .and_then(|bytes| {
                     serde_json::from_slice::<Reservation>(&Zeroizing::new(bytes)).ok()
                 });
-            let Some(reservation) = reservation else {
+            let Some(mut reservation) = reservation else {
                 continue;
             };
-            if (reservation.invitation.is_some() && !reservation.reclaim_if_unclaimed)
+            let configured = match std::fs::symlink_metadata(path.join("config.json")) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if ((reservation.invitation.is_some()
+                || configured
+                || reservation.invitation_issued != 0)
+                && !reservation.reclaim_if_unclaimed)
                 || reservation.reserved_at == 0
                 || now.saturating_sub(reservation.reserved_at) < 86_400_000
             {
@@ -42,6 +50,9 @@ impl Host {
             // this Space is retained forever, including after members leave.
             let space = self.spaces.read().await.get(&id).cloned();
             if let Some(space) = space {
+                let Ok(mut serving) = space.serving.try_write() else {
+                    continue;
+                };
                 let Ok(mut guard) = space.client.try_lock() else {
                     continue;
                 };
@@ -49,15 +60,27 @@ impl Host {
                     continue;
                 };
                 if !client.space_reservation_is_unused(now).unwrap_or(false) {
+                    // An unexpired invitation alone is not a permanent claim.
+                    // With all invite lifetimes elapsed, false means stored use.
+                    if reservation.reclaim_if_unclaimed
+                        && matches!(client.space_reservation_is_unused(u64::MAX), Ok(false))
+                    {
+                        reservation.reclaim_if_unclaimed = false;
+                        save(&path.join("reservation.json"), &reservation)?;
+                    }
                     continue;
                 }
                 private_directory(&path)?;
-                *space.serving.write().await = false;
+                *serving = false;
                 let client = guard.take().unwrap();
                 client.close().await?;
                 self.spaces.write().await.remove(&id);
-            } else if reservation.invitation.is_some() {
-                // Never infer emptiness from an unavailable or damaged service.
+            } else if reservation.invitation.is_some()
+                || reservation.invitation_issued != 0
+                || configured
+            {
+                // A missing in-memory service is not proof of an empty reservation.
+                // In particular, account erasure can clear its original invitation.
                 continue;
             }
             private_directory(&path)?;
@@ -193,6 +216,9 @@ mod tests {
             (2, true, 1),
             (3, false, 0),
             (4, false, current().unwrap()),
+            // A creator deletion cleared the invite; the configured Space then
+            // failed to load. Its surviving data must never be reclaimed.
+            (5, false, 1),
         ] {
             let id = format!("{index:064x}");
             let path = host.config.root.join("spaces").join(&id);
@@ -214,10 +240,13 @@ mod tests {
                     invitation_issued: 0,
                     reserved_at: time,
                     creation_network: None,
-                    reclaim_if_unclaimed: false,
+                    reclaim_if_unclaimed: index == 5,
                 },
             )
             .unwrap();
+            if index == 5 {
+                vault::write_private(&path.join("config.json"), b"{damaged", false).unwrap();
+            }
             host.allocations.lock().unwrap().insert(id, None);
         }
         host.expire_unpublished_reservations().await.unwrap();
@@ -229,7 +258,7 @@ mod tests {
                 .join(format!("{:064x}", 1))
                 .exists()
         );
-        for index in 2..=4 {
+        for index in 2..=5 {
             assert!(
                 host.config
                     .root
@@ -238,7 +267,7 @@ mod tests {
                     .exists()
             );
         }
-        assert_eq!(host.allocations.lock().unwrap().len(), 3);
+        assert_eq!(host.allocations.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -326,7 +355,7 @@ mod reservation_limits_tests {
             super::super::tests::creation_command(&temp.path().join("creator"), "Never joined")
                 .await;
         let (id, reservation) = host
-            .provision_from_network_inner(&command, creator, None, Some(evidence))
+            .provision_from_network_inner(&command, creator, None, Some(evidence), None)
             .await
             .unwrap();
         host.expire_reservations_at(reservation.invitation_issued + 86_399_000)

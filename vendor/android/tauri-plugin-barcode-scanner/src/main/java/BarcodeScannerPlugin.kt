@@ -296,6 +296,11 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     }
 
     override fun analyze(image: ImageProxy) {
+        val scanInvoke = savedInvoke
+        if (scanInvoke == null) {
+            image.close()
+            return
+        }
         @SuppressLint("UnsafeOptInUsageError") val mediaImage = image.image
         if (mediaImage != null) {
             val inputImage =
@@ -303,6 +308,7 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
             scanner
                 ?.process(inputImage)
                 ?.addOnSuccessListener { barcodes ->
+                    if (savedInvoke !== scanInvoke) return@addOnSuccessListener
                     if (barcodes.isNotEmpty())  {
                         val barcode = barcodes[0]
                         val bounds = barcode.boundingBox
@@ -323,7 +329,7 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
                         jsObject.put("format", format)
                         jsObject.put("bounds", s)
 
-                        savedInvoke?.resolve(jsObject)
+                        scanInvoke.resolve(jsObject)
                         destroy()
                     }
                 }
@@ -352,8 +358,9 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
 
     @Command
     fun cancel(invoke: Invoke) {
+        val scanInvoke = savedInvoke
         destroy()
-        savedInvoke?.reject("cancelled")
+        scanInvoke?.reject("cancelled")
         invoke.resolve()
     }
 

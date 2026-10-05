@@ -61,11 +61,11 @@ jobs:
       - name: Verify GLib security backport on Linux
         if: runner.os == 'Linux'
         run: |
-          # A patched dependency is not a workspace member, so test its unchanged
-          # source in an isolated package. Installer dependencies stay locked.
+          # A patched dependency is not a workspace member. Its isolated tests
+          # use the vendored Cargo.lock, including upstream dev dependencies.
           cp -R vendor/glib "$RUNNER_TEMP/elo-glib-test"
           printf '\n[workspace]\n' >> "$RUNNER_TEMP/elo-glib-test/Cargo.toml"
-          cargo test --manifest-path "$RUNNER_TEMP/elo-glib-test/Cargo.toml" --lib variant_iter::tests
+          cargo test --locked --manifest-path "$RUNNER_TEMP/elo-glib-test/Cargo.toml" --lib variant_iter::tests
       - name: Verify Windows downloaded-file protection
         if: runner.os == 'Windows'
         run: cargo test --locked -p elo-desktop --lib download_protection::windows_tests

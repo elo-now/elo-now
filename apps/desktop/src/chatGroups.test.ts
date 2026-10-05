@@ -54,6 +54,13 @@ const person = (identity: string) => ({
 });
 
 describe("Personal chat groups", () => {
+  it("keeps one-person Notes with several accepted devices in Messages", () => {
+    const notes = { ...chat(1), name: "Notes", chat_kind: "direct" as const };
+    expect(isDirectChat(notes, "me")).toBe(true);
+    expect(chatIconName(notes, "me")).toBe("person");
+    expect(chatSections(view([notes]), "dms")[0].chats).toEqual([notes]);
+    expect(isDirectChat(notes, "another-profile")).toBe(false);
+  });
   it("keeps the verified General above five recent chats, without pinning a same-named ordinary chat", () => {
     const general = { ...chat(1, "work"), name: "General", is_general: true };
     const namesake = { ...chat(9), name: "General" };

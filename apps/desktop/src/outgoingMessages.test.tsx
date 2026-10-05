@@ -140,3 +140,31 @@ test("pending messages have a noninteractive status and no record actions", () =
   expect(html).not.toContain("<button");
   expect(html).not.toContain("Synced");
 });
+
+test("a reply echo keeps its own deadline until the native receipt provides its signed deadline", async () => {
+  const store = new OutgoingMessages();
+  const write = deferred();
+  const send = store.send(
+    { ...draft, thread: "root", expiresAt: 20_000 },
+    () => write.promise,
+  );
+  expect(store.snapshot()[0].row.body.payload).toMatchObject({
+    expires_at_ms: 20_000,
+    thread_root: "root",
+  });
+  write.resolve({ id: "reply", logical_time: 20, expires_at_ms: 20_005 });
+  await send;
+  expect(store.snapshot()[0].row.body.payload).toMatchObject({
+    expires_at_ms: 20_005,
+    thread_root: "root",
+  });
+});
+
+test("an explicit native deadline cancellation wins over the optimistic reply deadline", async () => {
+  const store = new OutgoingMessages();
+  await store.send(
+    { ...draft, thread: "root", expiresAt: 100_000 },
+    async () => ({ id: "reply", logical_time: 20, expires_at_ms: null }),
+  );
+  expect(store.snapshot()[0].row.body.payload?.expires_at_ms).toBeNull();
+});

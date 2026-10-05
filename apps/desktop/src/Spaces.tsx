@@ -8,19 +8,21 @@ import {
   Format,
 } from "@tauri-apps/plugin-barcode-scanner";
 import { ScreenHeader } from "./ScreenHeader";
+import { QrScanner } from "./QrScanner";
 import { ActionDialog } from "./ActionDialog";
 import { InvitationCode } from "./InvitationFlow";
 import { Icon, NewIndicator } from "./Icon";
 import { useToast } from "./Toast";
 import { t, formatInvitationValidity } from "./i18n";
 import { pauseBackgroundSync } from "./backgroundSyncPause";
-import type { View, SpaceSummary } from "./model";
+import { spaceStatusText, type View, type SpaceSummary } from "./model";
 import "./spaces.css";
 import { SpaceCreate } from "./SpaceCreate";
 import { ServiceRequests } from "./ServiceRequests";
 import { SpaceDetails } from "./SpaceDetails";
 import { EmptyState } from "./EmptyState";
 import { SpaceMembers, type SpaceManagement } from "./SpaceRoles";
+import { normalizeInvitationLink, QrParts } from "./invitationTransport";
 
 const LicenseSettings = lazy(() => import("./LicenseSettings"));
 
@@ -52,14 +54,18 @@ export function SpaceSetup({
   mobile,
   onView,
   onLock,
+  initialLink,
+  onLinkClosed,
 }: {
   view: View;
   mobile: boolean;
   onView: (view: View) => void;
   onLock: () => void;
+  initialLink?: string;
+  onLinkClosed?: () => void;
 }) {
   const [page, setPage] = useState<"choices" | "create" | "join" | "legal">(
-    view.space_creation ? "create" : "choices",
+    initialLink ? "join" : view.space_creation ? "create" : "choices",
   );
   const [busy, setBusy] = useState(false);
   const refreshing = useRef(false);
@@ -131,7 +137,11 @@ export function SpaceSetup({
           mobile={mobile}
           onView={onView}
           initialPage="join"
-          onBack={() => setPage("choices")}
+          initialLink={initialLink}
+          onBack={() => {
+            onLinkClosed?.();
+            setPage("choices");
+          }}
         />
       ) : (
         <>
@@ -162,15 +172,7 @@ export function SpaceSetup({
               .map((space) => (
                 <div className="space-row" key={space.id}>
                   <strong>{space.name}</strong>
-                  <p className="muted">
-                    {t(
-                      space.status === "checking"
-                        ? "spaces.checking"
-                        : space.status === "pending"
-                          ? "spaces.pending"
-                          : "spaces.declined",
-                    )}
-                  </p>
+                  <p className="muted">{spaceStatusText(space)}</p>
                 </div>
               ))}
             {!!view.spaces?.length && (
@@ -229,6 +231,7 @@ export function Spaces({
   onView,
   onBack,
   initialPage = "list",
+  initialLink,
 }: {
   view: View;
   mobile: boolean;
@@ -236,6 +239,7 @@ export function Spaces({
   onView: (view: View) => void;
   onBack: () => void;
   initialPage?: "list" | "join";
+  initialLink?: string;
 }) {
   const { reportError, showError } = useToast();
   const [page, setPage] = useState<"list" | "join" | "manage" | "create">(
@@ -246,7 +250,7 @@ export function Spaces({
   const [managementTab, setManagementTab] = useState<
     "details" | "invitations" | "members"
   >("details");
-  const [link, setLink] = useState("");
+  const [link, setLink] = useState(initialLink ?? "");
   const [preview, setPreview] = useState<Reply["preview"]>();
   const [joinNote, setJoinNote] = useState("");
   const [code, setCode] = useState<string>();
@@ -270,23 +274,28 @@ export function Spaces({
       setPage("list");
   }, [view.spaces, page, selected]);
   const scanningRef = useRef(false);
+  const scanGeneration = useRef(0);
+  const mounted = useRef(true);
   useEffect(() => {
     if (page === "join" || page === "create") return pauseBackgroundSync();
   }, [page]);
   const stopScan = () => {
+    const wasScanning = scanningRef.current;
+    scanGeneration.current += 1;
     scanningRef.current = false;
-    setScanning(false);
-    document.documentElement.classList.remove("elo-scanning");
-    void cancel().catch(() => {});
+    if (mounted.current) setScanning(false);
+    if (mobile && wasScanning) void cancel().catch(() => {});
   };
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      scanGeneration.current += 1;
+      const wasScanning = scanningRef.current;
       scanningRef.current = false;
-      document.documentElement.classList.remove("elo-scanning");
-      if (mobile) void cancel().catch(() => {});
-    },
-    [mobile],
-  );
+      if (mobile && wasScanning) void cancel().catch(() => {});
+    };
+  }, [mobile]);
   const call = async (request: Record<string, unknown>) => {
     const reply = await invoke<Reply>("operate", {
       request: { ...request, expected_identity: view.identity },
@@ -307,10 +316,20 @@ export function Spaces({
     }
   };
   const inspect = async (value: string) => {
-    setLink(value);
+    const invitation = normalizeInvitationLink(value);
+    if (invitation?.kind !== "space") {
+      showError(t("spaces.invalidCode"));
+      return;
+    }
+    setLink(invitation.link);
     setJoinNote("");
-    setPreview((await call({ op: "space_preview", link: value })).preview);
+    setPreview(
+      (await call({ op: "space_preview", link: invitation.link })).preview,
+    );
   };
+  useEffect(() => {
+    if (initialLink) void perform(() => inspect(initialLink));
+  }, [initialLink]);
   const manage = async (space: SpaceSummary) => {
     setSelected(space);
     setManagement(
@@ -319,11 +338,13 @@ export function Spaces({
     setPage("manage");
   };
   const share = async (space: SpaceSummary) => {
-    const result = (await call({
-      op: "space_manage",
-      id: space.id,
-      body: {},
-    })).result;
+    const result = (
+      await call({
+        op: "space_manage",
+        id: space.id,
+        body: {},
+      })
+    ).result;
     const newest = result?.offers
       .filter((offer) => !offer.revoked && offer.expires_at > Date.now())
       .sort(
@@ -338,29 +359,43 @@ export function Spaces({
     setPage("manage");
   };
   const startScan = async () => {
-    if (scanningRef.current) return;
+    if (scanningRef.current || !mounted.current) return;
+    const generation = ++scanGeneration.current;
+    const current = () =>
+      mounted.current &&
+      scanningRef.current &&
+      scanGeneration.current === generation;
+    scanningRef.current = true;
+    setScanning(true);
+    const parts = new QrParts();
     try {
-      if (
-        (await checkPermissions()) !== "granted" &&
-        (await requestPermissions()) !== "granted"
-      ) {
+      let permission = await checkPermissions();
+      if (!current()) return;
+      if (permission !== "granted") {
+        permission = await requestPermissions();
+        if (!current()) return;
+      }
+      if (permission !== "granted") {
         showError(t("invite.cameraDenied"));
         return;
       }
-      scanningRef.current = true;
-      setScanning(true);
-      document.documentElement.classList.add("elo-scanning");
-      const result = await scan({ formats: [Format.QRCode], windowed: true });
-      if (!scanningRef.current) return;
-      stopScan();
-      if (!result.content.trim().startsWith("elo://space/v1#")) {
-        showError(t("spaces.invalidCode"));
-        return;
+      while (current()) {
+        const result = await scan({ formats: [Format.QRCode], windowed: true });
+        if (!current()) return;
+        const value = parts.add(result.content);
+        if (!value) continue;
+        stopScan();
+        await perform(() => inspect(value));
+        break;
       }
-      await perform(() => inspect(result.content));
     } catch (error) {
-      if (scanningRef.current) reportError(error);
-      stopScan();
+      if (current()) {
+        if (error instanceof Error && error.message.startsWith("invitation"))
+          showError(t("spaces.invalidCode"));
+        else reportError(error);
+      }
+    } finally {
+      if (current()) stopScan();
     }
   };
   const back = () => {
@@ -381,11 +416,7 @@ export function Spaces({
       />
     );
   return (
-    <section
-      className={
-        scanning ? "invitation-page invitation-scanner" : "spaces-page"
-      }
-    >
+    <section className="spaces-page">
       <ScreenHeader
         desktopRoot={page === "list" && !scanning && !code && !preview}
         title={
@@ -411,15 +442,11 @@ export function Spaces({
         }
       />
       {scanning ? (
-        <>
-          <div className="scan-window" aria-label={t("invite.camera")}>
-            <span />
-          </div>
-          <div className="scan-controls">
-            <p>{t("spaces.scanHint")}</p>
-            <button onClick={stopScan}>{t("invite.cancel")}</button>
-          </div>
-        </>
+        <QrScanner
+          title={t("spaces.join")}
+          hint={t("spaces.scanHint")}
+          onCancel={stopScan}
+        />
       ) : (
         <div
           className={`settings-page${page === "manage" && !code ? " space-management-page" : ""}`}
@@ -458,13 +485,7 @@ export function Spaces({
                           ) : (
                             space.status !== "joined" && (
                               <small className="muted">
-                                {t(
-                                  space.status === "checking"
-                                    ? "spaces.checking"
-                                    : space.status === "pending"
-                                      ? "spaces.pending"
-                                      : "spaces.declined",
-                                )}
+                                {spaceStatusText(space)}
                               </small>
                             )
                           )}
@@ -714,6 +735,9 @@ export function Spaces({
                         identity={view.identity}
                         space={selected}
                         management={management}
+                        attachmentStorageAvailable={
+                          view.attachment_storage_available
+                        }
                         onChanged={() => manage(selected)}
                         onView={onView}
                       />

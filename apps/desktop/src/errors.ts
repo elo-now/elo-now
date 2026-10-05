@@ -15,6 +15,7 @@ const known: Record<string, MessageKey> = {
   message_expiry_unavailable: "error.messageExpiryUnavailable",
   profile_password_weak: "error.passwordWeak",
   file_export_failed: "error.fileExport",
+  invitation_qr_image_too_large: "invite.qrImageTooLarge",
   profile_logout_notifications_pending: "profile.logoutNotificationsPending",
   profile_logout_cleanup_pending: "profile.logoutCleanupPending",
   updateRequired: "update.banner",
@@ -40,6 +41,8 @@ const known: Record<string, MessageKey> = {
   "Space has a newer or conflicting controller recovery":
     "control.error.conflict",
   "Chat permissions need to be refreshed.": "error.chatPermissionsStale",
+  "This Space uses an unsupported access protocol.":
+    "error.spaceProtocolUnsupported",
   "Chat devices have changed. The chat owner needs to update access.":
     "error.chatDevicesChanged",
   "Chat controller recovery is required.": "error.chatControllerRecovery",
@@ -83,8 +86,10 @@ const known: Record<string, MessageKey> = {
   "This role request has already been handled.": "error.spaceRequestHandled",
   "Space request limit reached.": "error.spaceRequestLimit",
   "Space member limit reached.": "error.spaceMemberLimit",
-  "Too many pending attachments. Finish or cancel an upload.": "error.attachmentPendingLimit",
-  "Attachment file limit reached. Remove old files.": "error.attachmentFileLimit",
+  "Too many pending attachments. Finish or cancel an upload.":
+    "error.attachmentPendingLimit",
+  "Attachment file limit reached. Remove old files.":
+    "error.attachmentFileLimit",
   "Invalid Space creation proof.": "error.verification",
   "Space creation proof timed out.": "error.serverBusy",
   "Revoke an unused invitation first.": "error.spaceInvitationLimit",
@@ -274,9 +279,25 @@ const known: Record<string, MessageKey> = {
   "transport request failed: Http(507)": "error.replicaFull",
   "object unavailable": "error.fileUnavailable",
   "Attachment files cannot exceed 5 MB.": "error.attachmentTooLarge",
+  "Attach one file at a time.": "error.attachmentOneAtATime",
+  "Drop a file, not a folder.": "error.attachmentFolder",
   "The selected attachment changed or is too large.":
     "error.attachmentTooLarge",
   "Attachments are disabled for this Space.": "error.attachmentDisabled",
+  "Attachment storage is unavailable in this build.":
+    "spaces.attachments.unavailable",
+  "Could not configure attachment storage. Check the details and try again.":
+    "spaces.attachments.saveFailed",
+  "Could not contact attachment storage. Try again.":
+    "spaces.attachments.loadFailed",
+  "Attachment storage settings changed. Refresh and try again.":
+    "spaces.attachments.changed",
+  "Configure attachment storage for the created Space to continue.":
+    "spaces.attachments.creationPending",
+  "Invalid attachment storage configuration.": "spaces.attachments.saveFailed",
+  "Invalid attachment storage response.": "spaces.attachments.saveFailed",
+  "Refresh attachment storage settings first.": "spaces.attachments.changed",
+  "Only a Space owner can configure attachment storage.": "error.notAllowed",
   "Could not safely open this attachment.": "error.exchangeFile",
   "Could not upload this attachment. Try again.": "error.attachmentUpload",
   "Could not upload this attachment. Check your connection and try again.":

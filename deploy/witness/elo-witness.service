@@ -1,0 +1,50 @@
+[Unit]
+Description=elo.now independent authorization witness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elo-witness
+Group=elo-witness
+ExecStart=/opt/elo/bin/elo-witness --config /etc/elo/witness/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=elo-witness
+StateDirectoryMode=0700
+RuntimeDirectory=elo-witness
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/elo-witness /run/elo-witness
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+LimitNOFILE=4096
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=64
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -39,8 +39,20 @@ function render(
       mobile={mobile}
       hideAvatars
       busy={false}
-      draft=""
-      onDraft={noop}
+      savedDraft={{
+        text: "A reply with its own deadline",
+        expiry: undefined,
+        mentions: [],
+        attachment: null,
+        ready: true,
+        setExpiry: noop,
+        setText: noop,
+        setContent: noop,
+        setAttachment: noop,
+        clearSubmitted: noop,
+        clear: noop,
+      }}
+      onFollow={done}
       onBack={noop}
       onRefresh={done}
       onRead={noop}
@@ -84,6 +96,43 @@ describe.each([true, false])(
       for (const paging of [{ hasOlder: true }, { hasNewer: true }]) {
         expect(render(mobile, paging)).not.toContain(t("thread.empty"));
       }
+    });
+    it("always offers a reply its own expiry even when the original has a deadline", () => {
+      expect(render(mobile)).toContain('aria-label="Delete after:"');
+      const expiring = {
+        ...root,
+        body: {
+          ...root.body,
+          payload: {
+            ...root.body.payload,
+            expires_at_ms: Date.now() + 3_600_000,
+          },
+        },
+      };
+      const html = render(mobile, { thread: { ...thread, root: expiring } });
+      expect(html).toContain('aria-label="Delete after:"');
+      expect(html).not.toContain(
+        'placeholder="' + t("composer.unavailable") + '"',
+      );
+    });
+    it("keeps reply controls available after a known original expires", () => {
+      const expired = {
+        ...root,
+        body: {
+          ...root.body,
+          kind: "deleted",
+          expired: true,
+          payload: undefined,
+        },
+      };
+      const html = render(mobile, {
+        thread: { ...thread, root: expired },
+      });
+      expect(html).not.toContain(
+        'placeholder="' + t("composer.unavailable") + '"',
+      );
+      expect(html).toContain('aria-label="Delete after:"');
+      expect(html).not.toMatch(/<button[^>]*aria-label="Send"[^>]*disabled=""/);
     });
   },
 );

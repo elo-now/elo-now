@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh elo.now operator statistics
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

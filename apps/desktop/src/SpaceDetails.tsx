@@ -13,12 +13,14 @@ export function SpaceDetails({
   identity,
   space,
   management,
+  attachmentStorageAvailable = false,
   onView,
   onChanged,
 }: {
   identity: string;
   space: SpaceSummary;
   management: SpaceManagement;
+  attachmentStorageAvailable?: boolean;
   onView: (view: View) => void;
   onChanged: () => Promise<void>;
 }) {
@@ -45,6 +47,7 @@ export function SpaceDetails({
           identity={identity}
           space={space}
           value={management.attachments}
+          storageAvailable={attachmentStorageAvailable}
           onChanged={onChanged}
         />
       )}

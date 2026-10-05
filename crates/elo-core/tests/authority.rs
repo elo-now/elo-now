@@ -37,6 +37,7 @@ fn member(p: &Person, capabilities: Vec<Capability>) -> Member {
 fn setup() -> (Person, Authority, StreamConfig) {
     let owner = person(10);
     let g = SpaceGenesis {
+        witness: None,
         v: 1,
         kind: "space.genesis".into(),
         nonce: random_hex::<16>().unwrap(),
@@ -57,6 +58,7 @@ fn setup() -> (Person, Authority, StreamConfig) {
     )
     .unwrap();
     let c = StreamConfig {
+        witness_evidence: None,
         chat_kind: None,
         recovery: None,
         v: 1,

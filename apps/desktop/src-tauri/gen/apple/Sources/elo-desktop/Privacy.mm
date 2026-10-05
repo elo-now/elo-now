@@ -53,6 +53,12 @@ void elo_protect_task_previews(void) {
                     for (UIWindow *window in ((UIWindowScene *)scene).windows) {
                         if (!window.isKeyWindow) continue;
                         UIView *cover = [[UIView alloc] initWithFrame:window.bounds];
+                        // The launch storyboard is always dark; task previews follow
+                        // the saved app preference rather than only the system theme.
+                        NSString *appearance = [NSUserDefaults.standardUserDefaults stringForKey:@"elo.appearance"];
+                        cover.overrideUserInterfaceStyle = [appearance isEqualToString:@"auto"]
+                            ? UIUserInterfaceStyleUnspecified
+                            : ([appearance isEqualToString:@"light"] ? UIUserInterfaceStyleLight : UIUserInterfaceStyleDark);
                         cover.backgroundColor = [UIColor colorNamed:@"LaunchBackground"] ?: UIColor.systemBackgroundColor;
                         cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
                         cover.userInteractionEnabled = NO;

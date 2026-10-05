@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-notification-task"
+description = "Enables the desktop_notification_task command without any pre-configured scope."
+commands.allow = ["desktop_notification_task"]
+
+[[permission]]
+identifier = "deny-desktop-notification-task"
+description = "Denies the desktop_notification_task command without any pre-configured scope."
+commands.deny = ["desktop_notification_task"]

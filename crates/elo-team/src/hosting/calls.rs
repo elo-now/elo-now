@@ -93,6 +93,21 @@ pub(super) async fn admit(
     let Some(client) = client.as_ref() else {
         return Ok(Json(json!({"allowed":false})));
     };
+    if let Some(authority) = client
+        .witnessed_authority()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
+        let gate = host
+            .witness
+            .as_ref()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let lease = gate
+            .require(&authority)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        gate.check(&authority, &lease)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    }
     let allowed = client
         .space_access_members()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -126,8 +141,10 @@ mod tests {
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
                 operator_snapshot: None,
+                backup_access_key: None,
                 call_admission_key: Some(key_path),
                 client_policy: Default::default(),
+                witness: None,
                 attachment_storage: None,
                 recovery_recipient: None,
             },
@@ -189,8 +206,10 @@ mod tests {
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
                 operator_snapshot: None,
+                backup_access_key: None,
                 call_admission_key: Some(key_path),
                 client_policy: Default::default(),
+                witness: None,
                 attachment_storage: None,
                 recovery_recipient: None,
             },

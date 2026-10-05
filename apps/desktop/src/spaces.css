@@ -343,6 +343,14 @@
 .space-contact-form {
   margin: 0;
 }
+.attachment-storage-form {
+  display: grid;
+  gap: 16px;
+}
+.attachment-storage-form > p,
+.attachment-storage-form > .check {
+  margin: 0;
+}
 .space-contact-form > button {
   width: 100%;
   margin-top: 16px;
@@ -402,6 +410,13 @@
   display: grid;
   gap: calc(24px * var(--elo-content-density, 1));
   margin-top: calc(24px * var(--elo-content-density, 1));
+}
+.space-attachment-configuration {
+  margin-top: 0;
+  margin-bottom: calc(24px * var(--elo-content-density, 1));
+}
+.space-attachment-configuration > p {
+  margin: 0;
 }
 .space-attachment-cleanup {
   display: grid;

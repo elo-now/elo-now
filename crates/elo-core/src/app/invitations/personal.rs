@@ -3,6 +3,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+mod notes;
 #[cfg(test)]
 mod tests;
 
@@ -28,12 +29,12 @@ impl ClientApp {
             return Err("Unblock this user before contacting them.".into());
         }
         let own = self.session.identity_id();
-        if person == own {
-            return Err("Choose another person.".into());
-        }
         let name = field(&v, "name")?.trim();
         if name.is_empty() || name.len() > 120 || name.chars().any(char::is_control) {
             return Err("Invalid name.".into());
+        }
+        if person == own {
+            return self.open_notes(name).await;
         }
         // Do not reopen a removed membership, match a group DM, or silently
         // alter an existing conversation's permissions/devices.

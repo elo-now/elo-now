@@ -15,6 +15,11 @@ export function callErrorCopy(code: string) {
         title: "calls.screenFailed",
         message: "calls.screenRetry",
       } as const;
+    case "audio_unavailable":
+      return {
+        title: "calls.audioFailed",
+        message: "calls.audioRetry",
+      } as const;
     case "encryption_unavailable":
       return { title: "calls.failed", message: "calls.unsupported" } as const;
     case "NotAllowedError":

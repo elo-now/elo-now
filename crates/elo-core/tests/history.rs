@@ -3,7 +3,7 @@ use elo_core::{
     authority::{Authority, Capability, ConfigAction, Member, Owner, SpaceGenesis, StreamConfig},
     history::{self, VerifiedBundle},
     identity::{DeviceCredential, VerifiedCredential},
-    record::{SignedRecord, encode_hex, random_hex},
+    record::{MessageAction, SignedRecord, encode_hex, random_hex},
     store::{ClientStore, LocalTime},
 };
 struct Person {
@@ -23,6 +23,7 @@ fn setup() -> (Person, Person, Authority, Vec<SignedRecord>) {
     let owner = person(10);
     let reader = person(20);
     let g = SpaceGenesis {
+        witness: None,
         v: 1,
         kind: "space.genesis".into(),
         nonce: random_hex::<16>().unwrap(),
@@ -56,6 +57,7 @@ fn setup() -> (Person, Person, Authority, Vec<SignedRecord>) {
         external: false,
     };
     let mut c = StreamConfig {
+        witness_evidence: None,
         chat_kind: None,
         recovery: None,
         v: 1,
@@ -259,4 +261,108 @@ fn newer_config_quarantines_the_old_disclosure_instead_of_executing_it() {
     config.nonce = random_hex::<16>().unwrap();
     a.apply_config(config.sign(&owner.key).unwrap()).unwrap();
     assert!(VerifiedBundle::open(&bytes, &reader.age, reader.c.id(), &a, &request).is_err());
+}
+
+#[tokio::test]
+async fn related_author_actions_are_verified_and_imported_without_consuming_message_slots() {
+    let (owner, reader, a, messages) = setup();
+    let request =
+        history::create_request(&a, reader.c.id(), 1, Some(messages[0].id()), &reader.key).unwrap();
+    let action = |clock, action| {
+        let mut chat = messages[0].chat().unwrap();
+        chat.kind = "chat.action".into();
+        chat.logical_time = clock;
+        chat.nonce = random_hex::<16>().unwrap();
+        chat.payload.text.clear();
+        chat.payload.action = Some(action);
+        a.prepare_chat(chat, &owner.key).unwrap()
+    };
+    let edit = action(
+        200,
+        MessageAction::Edit {
+            target: messages[0].id(),
+            text: "Corrected history text".into(),
+            mentions: vec![],
+        },
+    );
+    let expiry = action(
+        201,
+        MessageAction::Expiry {
+            target: messages[0].id(),
+            hours: None,
+        },
+    );
+    let unrelated = action(
+        202,
+        MessageAction::Edit {
+            target: messages[1].id(),
+            text: "Do not disclose".into(),
+            mentions: vec![],
+        },
+    );
+    let grant = history::approve_with_actions(
+        &a,
+        &request,
+        owner.c.id(),
+        &messages[..1],
+        &[expiry.clone(), edit.clone()],
+        &owner.key,
+    )
+    .unwrap();
+    let cipher = history::seal(&a, &grant).unwrap();
+    let open = || VerifiedBundle::open(&cipher, &reader.age, reader.c.id(), &a, &request).unwrap();
+    let verified = open();
+    assert_eq!(verified.grant().count, 1);
+    assert_eq!(verified.grant().selection.len(), 1);
+    assert_eq!(verified.grant().related_actions.len(), 2);
+    assert_eq!(verified.originals()[0].bytes(), messages[0].bytes());
+    assert_eq!(verified.originals()[1].bytes(), edit.bytes());
+    assert_eq!(verified.originals()[2].bytes(), expiry.bytes());
+    assert!(
+        history::approve_with_actions(
+            &a,
+            &request,
+            owner.c.id(),
+            &messages[..1],
+            &[unrelated],
+            &owner.key
+        )
+        .is_err()
+    );
+    assert!(
+        history::approve_with_actions(
+            &a,
+            &request,
+            owner.c.id(),
+            &messages[..1],
+            &[edit.clone(), edit],
+            &owner.key
+        )
+        .is_err()
+    );
+    let mut tampered: history::HistoryGrant = grant.decode().unwrap();
+    tampered.related_actions[0].record_id = messages[1].id();
+    let signed = SignedRecord::sign(&serde_json::to_vec(&tampered).unwrap(), &owner.key).unwrap();
+    let changed = history::seal(&a, &signed).unwrap();
+    assert!(VerifiedBundle::open(&changed, &reader.age, reader.c.id(), &a, &request).is_err());
+    let tmp = tempfile::tempdir().unwrap();
+    let store = ClientStore::open(tmp.path().join("history.sqlite"))
+        .await
+        .unwrap();
+    store
+        .import_history(open(), LocalTime::from_millis(1).unwrap())
+        .await
+        .unwrap();
+    let raw = rusqlite::Connection::open(tmp.path().join("history.sqlite/client.sqlite")).unwrap();
+    assert_eq!(
+        raw.query_row::<i64, _, _>(
+            "SELECT count(*) FROM records WHERE kind='chat.action'",
+            [],
+            |row| row.get(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(store.stats().await.unwrap().records, 4);
+    store.close().await.unwrap();
 }

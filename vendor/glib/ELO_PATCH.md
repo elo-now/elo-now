@@ -8,3 +8,8 @@ backporting the upstream fix for
 Keep the upstream licenses. Remove this patch when the GTK stack permits a
 compatible upgrade to an upstream fixed release. Version-based audit tools may
 still flag 0.18.5; do not suppress that warning without checking this patch.
+
+The included `Cargo.lock` pins the standalone regression-test dependencies,
+including upstream dev dependencies. The release workflow copies this package
+outside the workspace and runs its tests with `--locked`; installer dependencies
+continue to use the repository's root lockfile.

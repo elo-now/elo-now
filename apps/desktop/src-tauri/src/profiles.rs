@@ -313,7 +313,7 @@ fn svg(code: &str) -> Result<String> {
         .min_dimensions(768, 768)
         .build())
 }
-fn qr_png(code: &str) -> Result<Vec<u8>> {
+pub(crate) fn qr_png(code: &str) -> Result<Vec<u8>> {
     let qr = qr(code)?;
     let width = qr.width();
     let scale = 8u32;
@@ -681,7 +681,9 @@ async fn run(
             }
             crate::team_replica::configure(&mut client)?;
             crate::push::configure_client(&mut client)?;
+            crate::witness::configure_client(&mut client)?;
             client.enable_spaces().await?;
+            client.configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))?;
             client.enable_paged_views();
             if state.backup.is_some() && !name.is_empty() {
                 client
@@ -745,7 +747,7 @@ async fn run(
             .ok_or("Device list loading was cancelled.")?;
         }
         "device_revoke" => {
-            let client = state.client.as_ref().ok_or("The profile is locked")?;
+            let client = state.client.as_mut().ok_or("The profile is locked")?;
             confirm_device_removal(&v)?;
             let result = client.revoke_linked_device(text(&v, "credential")?).await;
             crate::realtime::refresh(app, Some(client));
@@ -822,7 +824,9 @@ async fn run(
             let mut client = target.finish_linked(path.clone()).await?;
             crate::team_replica::configure(&mut client)?;
             crate::push::configure_client(&mut client)?;
+            crate::witness::configure_client(&mut client)?;
             client.enable_spaces().await?;
+            client.configure_attachment_storage_endpoint(Some(env!("ELO_CONFIGURED_STORAGE")))?;
             client.enable_paged_views();
             let view = client.view().await?;
             if let Err(e) = select(app, &path) {
@@ -895,13 +899,16 @@ async fn run(
                 // Retain only read-only random receipts, never credentials or passwords.
                 // This allows completion feedback after all profile keys are removed.
                 let receipts_path = base(app)?.join("account-deletion-receipts.json");
-                let mut receipts: Vec<elo_core::app::account_deletion::Receipt> = if receipts_path
-                    .try_exists()?
-                {
-                    serde_json::from_value(serde_json::from_slice::<Value>(&vault::read_private(&receipts_path)?)?["receipts"].clone())?
-                } else {
-                    Vec::new()
-                };
+                let mut receipts: Vec<elo_core::app::account_deletion::Receipt> =
+                    if receipts_path.try_exists()? {
+                        serde_json::from_value(
+                            serde_json::from_slice::<Value>(&vault::read_private(&receipts_path)?)?
+                                ["receipts"]
+                                .clone(),
+                        )?
+                    } else {
+                        Vec::new()
+                    };
                 for receipt in outcome.receipts {
                     if !receipts.contains(&receipt) {
                         receipts.push(receipt);
@@ -913,7 +920,7 @@ async fn run(
                     receipts_path.try_exists()?,
                 )?;
             }
-            #[cfg(mobile)]
+            #[cfg(any(mobile, target_os = "macos"))]
             {
                 use tauri_plugin_biometry::BiometryExt;
                 // Each local profile has its own unlock secret, including
@@ -924,10 +931,21 @@ async fn run(
                         .file_name()
                         .and_then(|id| id.to_str())
                         .ok_or("Invalid profile selection")?;
-                    app.biometry().remove_data(serde_json::from_value(json!({
-                        "domain":"now.elo.profile",
-                        "name":format!("vault-password-v2:{identity}:{id}"),
-                    }))?)?;
+                    for version in ["vault-key-v3", "vault-password-v2"] {
+                        let result = app.biometry().remove_data(serde_json::from_value(json!({
+                            "domain":"now.elo.profile",
+                            "name":format!("{version}:{identity}:{id}"),
+                        }))?);
+                        if let Err(error) = result {
+                            // Ad hoc Mac builds cannot enroll or address the
+                            // protected keychain; local removal must still work.
+                            if !cfg!(target_os = "macos")
+                                || !error.to_string().contains("keychainUnavailable")
+                            {
+                                return Err(error.into());
+                            }
+                        }
+                    }
                 }
             }
             app.state::<crate::background_history::BackgroundHistory>()

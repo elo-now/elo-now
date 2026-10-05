@@ -4,6 +4,8 @@ use url::Url;
 pub struct Endpoints {
     pub host: String,
     pub wake: String,
+    pub storage: Option<String>,
+    pub witness: Option<(String, String, u64)>,
 }
 
 pub fn from_environment(
@@ -22,8 +24,39 @@ pub fn from_environment(
     };
     let api = setting("ELO_API_URL")?;
     let host = setting("ELO_SPACE_HOST_URL")?;
+    let storage = setting("ELO_STORAGE_URL")?;
+    let witness_url = setting("ELO_WITNESS_URL")?;
+    let witness_key = setting("ELO_WITNESS_PUBLIC_KEY")?;
+    let witness_generation = setting("ELO_WITNESS_KEY_GENERATION")?;
     let wake = read("TAURI_ELO_WAKE_URL");
-    resolve(api.as_deref(), host.as_deref(), wake.as_deref(), debug)
+    let mut endpoints = resolve(api.as_deref(), host.as_deref(), wake.as_deref(), debug)?;
+    // Storage credentials have a separate trust boundary. Never derive this
+    // endpoint from the API host or silently enable a shared provider.
+    endpoints.storage = storage
+        .map(|value| address(&value, "/storage/v1", debug).map(String::from))
+        .transpose()?;
+    endpoints.witness = match (witness_url, witness_key, witness_generation) {
+        (None, None, None) => None,
+        (Some(url), Some(key), Some(generation)) => {
+            // An independent production anchor is never inferred from hosting.
+            let url = address(&url, "/witness/v1", false)?;
+            let generation = generation
+                .parse::<u64>()
+                .map_err(|_| "Invalid witness key generation")?;
+            if key.len() != 64
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || generation == 0
+                || generation > (1_u64 << 53) - 1
+            {
+                return Err("Invalid witness signing-key pin");
+            }
+            Some((url.into(), key, generation))
+        }
+        _ => return Err("Witness URL, public key and key generation must be configured together"),
+    };
+    Ok(endpoints)
 }
 
 fn address(value: &str, path: &str, debug: bool) -> Result<Url, &'static str> {
@@ -78,12 +111,61 @@ pub fn resolve(
     Ok(Endpoints {
         host: host.into(),
         wake: wake.into(),
+        storage: None,
+        witness: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn witness_configuration_requires_all_three_independent_native_pins() {
+        assert!(from_environment(|_| None, false).unwrap().witness.is_none());
+        assert!(
+            from_environment(
+                |name| (name == "ELO_WITNESS_URL")
+                    .then(|| "https://witness.example.test/witness/v1".into()),
+                false
+            )
+            .is_err()
+        );
+        let configuration = |name: &str| match name {
+            "TAURI_ELO_WITNESS_URL" => Some("https://witness.example.test/witness/v1".into()),
+            "TAURI_ELO_WITNESS_PUBLIC_KEY" => Some("12".repeat(32)),
+            "TAURI_ELO_WITNESS_KEY_GENERATION" => Some("2".into()),
+            _ => None,
+        };
+        let pin = from_environment(configuration, false)
+            .unwrap()
+            .witness
+            .unwrap();
+        assert_eq!(pin.2, 2);
+        assert_eq!(pin.0, "https://witness.example.test/witness/v1");
+        assert!(
+            from_environment(
+                |name| if name == "TAURI_ELO_WITNESS_URL" {
+                    Some("http://127.0.0.1/witness/v1".into())
+                } else {
+                    configuration(name)
+                },
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            from_environment(
+                |name| if name == "TAURI_ELO_WITNESS_KEY_GENERATION" {
+                    Some("0".into())
+                } else {
+                    configuration(name)
+                },
+                false
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn mobile_forwarded_configuration_and_conflicting_aliases() {
@@ -102,6 +184,32 @@ mod tests {
                     _ => None,
                 },
                 false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn independent_storage_endpoint_is_explicit_and_never_inferred_from_api() {
+        let endpoints = from_environment(
+            |name| match name {
+                "TAURI_ELO_API_URL" => Some("https://api.example.test".into()),
+                "TAURI_ELO_STORAGE_URL" => Some("https://storage.example.test/storage/v1".into()),
+                _ => None,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoints.storage.as_deref(),
+            Some("https://storage.example.test/storage/v1")
+        );
+        assert_eq!(endpoints.host, "https://api.example.test/spaces/v1/create");
+        assert!(from_environment(|_| None, false).unwrap().storage.is_none());
+        assert!(
+            from_environment(
+                |name| (name == "TAURI_ELO_STORAGE_URL").then(|| "https://api.example.test".into()),
+                false
             )
             .is_err()
         );

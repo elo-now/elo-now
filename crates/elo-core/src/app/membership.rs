@@ -17,6 +17,8 @@ struct Key {
     stream: StreamId,
     head: RecordId,
     general_head: RecordId,
+    witness: Option<crate::authority::WitnessPin>,
+    general_scope: Option<(SpaceId, StreamId)>,
 }
 
 #[derive(Clone)]
@@ -43,17 +45,31 @@ impl Started {
 
 struct Entry {
     key: Key,
+    generation: u64,
     started: Started,
     outcome: std::result::Result<(), String>,
+    witness_freshness: Option<crate::witness::VerifiedFreshness>,
 }
 
 impl Entry {
-    fn fresh(&self) -> bool {
-        self.started.fresh(if self.outcome.is_ok() {
-            LEASE
-        } else {
-            FAILURE_BACKOFF
-        })
+    fn fresh(&self, generation: u64) -> bool {
+        self.generation == generation
+            && self.started.fresh(if self.outcome.is_ok() {
+                LEASE
+            } else {
+                FAILURE_BACKOFF
+            })
+            && self
+                .witness_freshness
+                .as_ref()
+                .is_none_or(|fresh| now().is_ok_and(|now| fresh.is_valid(now.as_millis() as u64)))
+    }
+
+    fn permits(&self, generation: u64) -> bool {
+        self.outcome.is_ok()
+            && self.fresh(generation)
+            && (self.key.general_scope != Some((self.key.space, self.key.stream))
+                || self.witness_freshness.is_some())
     }
 }
 
@@ -67,6 +83,19 @@ pub(super) struct MembershipChecks {
     generation: Arc<std::sync::atomic::AtomicU64>,
     snapshot_keys: Arc<RwLock<Option<ScopeKeys>>>,
     focused: Arc<RwLock<Option<(SpaceId, StreamId)>>>,
+}
+
+impl MembershipChecks {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(super) fn clear_now(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Ok(mut entries) = self.entries.try_lock() {
+            entries.clear();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -94,9 +123,24 @@ impl MembershipSnapshot {
         let Ok(entries) = self.checks.entries.try_lock() else {
             return false;
         };
-        entries
-            .iter()
-            .any(|entry| entry.key == *key && entry.outcome.is_ok() && entry.started.fresh(LEASE))
+        let generation = self.checks.generation();
+        let permits = |key: &Key| {
+            entries
+                .iter()
+                .any(|entry| entry.key == *key && entry.permits(generation))
+        };
+        if !permits(key) {
+            return false;
+        }
+        if let Some(scope) = key.general_scope {
+            let Some(general) = keys.get(&scope) else {
+                return false;
+            };
+            return current.as_ref().and_then(|keys| keys.get(&scope)) == Some(general)
+                && permits(general)
+                && generation == self.checks.generation();
+        }
+        generation == self.checks.generation()
     }
 
     pub(super) fn prioritize(&self, scope: Option<(SpaceId, StreamId)>) {
@@ -115,7 +159,9 @@ pub(super) struct MembershipProbe {
 
 impl ClientApp {
     pub(super) fn membership_snapshot(&self) -> MembershipSnapshot {
-        let keys = self.call_host.as_ref().map(|_| {
+        let keys = (self.call_host.is_some()
+            || self.authorities.0.iter().any(|a| a.witness_pin().is_some()))
+        .then(|| {
             self.authorities
                 .0
                 .iter()
@@ -138,24 +184,43 @@ impl ClientApp {
     }
 
     fn membership_key(&self, authority: &Authority) -> Result<Key> {
-        let address = self.call_host.as_ref().ok_or("Space unavailable.")?;
+        let address = self.call_host.as_ref();
         let head = authority
             .head_id()
             .ok_or("Chat permissions need to be refreshed.")?;
-        let general_head = self
-            .authorities
-            .0
-            .iter()
-            .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
-            .and_then(Authority::head_id)
+        let general = if let Some(address) = address {
+            self.authorities
+                .0
+                .iter()
+                .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
+                .ok_or("Chat permissions need to be refreshed.")?
+        } else if authority.witness_pin().is_some() {
+            authority
+        } else {
+            return Err("Space unavailable.".into());
+        };
+        let general_head = general
+            .head_id()
             .ok_or("Chat permissions need to be refreshed.")?;
+        if address.is_some() && self.witness_pin.is_some() {
+            self.trusted_witness(general)?;
+        }
+        let witness = if general.witness_pin().is_some() {
+            Some(self.trusted_witness(general)?.clone())
+        } else {
+            None
+        };
         Ok(Key {
-            address: serde_json::to_string(address)?,
+            address: serde_json::to_string(&address)?,
             credential: self.session.credential().id(),
             space: authority.space(),
             stream: authority.stream(),
             head,
             general_head,
+            general_scope: witness
+                .as_ref()
+                .map(|_| (general.space(), general.stream())),
+            witness,
         })
     }
 
@@ -183,7 +248,11 @@ impl ClientApp {
         let keys = focus
             .into_iter()
             .chain(keys)
-            .take(MAX_ENTRIES)
+            .filter(|authority| authority.witness_pin().is_none())
+            .take(
+                MAX_ENTRIES
+                    - usize::from(self.authorities.0.iter().any(|a| a.witness_pin().is_some())),
+            )
             .map(|a| self.membership_key(a))
             .collect::<Result<Vec<_>>>()?;
         Ok(MembershipProbe {
@@ -232,13 +301,16 @@ impl ClientApp {
             if self.membership_key(authority)? != key {
                 continue;
             }
+            if authority.witness_pin().is_some() {
+                continue;
+            }
             if entries
                 .iter()
                 .any(|entry| entry.key == key && entry.started.monotonic > probe.started.monotonic)
             {
                 continue;
             }
-            entries.retain(|entry| entry.key != key && entry.fresh());
+            entries.retain(|entry| entry.key != key && entry.fresh(probe.generation));
             let outcome = if result["head"] == json!(key.head) && result["error"].is_null() {
                 Ok(())
             } else {
@@ -252,27 +324,71 @@ impl ClientApp {
             }
             entries.push(Entry {
                 key,
+                generation: probe.generation,
                 started: probe.started.clone(),
                 outcome,
+                witness_freshness: None,
             });
         }
         Ok(())
     }
 
     pub(super) async fn check_host_membership(&self, authority: &Authority) -> Result<()> {
+        let general = if let Some(address) = &self.call_host {
+            self.authorities
+                .0
+                .iter()
+                .find(|general| {
+                    general.space() == address.scope.space
+                        && general.stream() == address.scope.stream
+                })
+                .ok_or("Chat permissions need to be refreshed.")?
+        } else {
+            authority
+        };
+        if self.call_host.is_some() && self.witness_pin.is_some() {
+            self.trusted_witness(general)?;
+        }
+        if authority.witness_pin().is_some()
+            && (authority.space() != general.space() || authority.stream() != general.stream())
+        {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
+        if general.witness_pin().is_some() {
+            if self
+                .invalidate_membership_from_waiting(Some(general))
+                .await?
+            {
+                return Err("Chat permissions need to be refreshed.".into());
+            }
+            self.check_witness_membership(general).await?;
+            if authority.space() == general.space() && authority.stream() == general.stream() {
+                return Ok(());
+            }
+        }
         let Some(address) = &self.call_host else {
+            if self.authorities.0.iter().any(|a| a.witness_pin().is_some()) {
+                return Err("Chat permissions need to be refreshed.".into());
+            }
             return Ok(());
         };
         let key = self.membership_key(authority)?;
         let head = key.head;
         let mut entries = self.membership_checks.entries.lock().await;
-        entries.retain(Entry::fresh);
-        if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
+        entries.retain(|entry| entry.fresh(self.membership_checks.generation()));
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.key == key && entry.fresh(self.membership_checks.generation()))
+        {
             return entry.outcome.clone().map_err(Into::into);
         }
         // Start the lease before sending: slow delivery cannot extend the
         // freshness of a valid signed answer. Cache hits never renew it.
         let started = Started::now();
+        let generation = self
+            .membership_checks
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let outcome = match self
             .call_space(
                 address,
@@ -287,6 +403,14 @@ impl ClientApp {
             Ok(_) => Err("Chat permissions need to be refreshed.".to_owned()),
             Err(error) => Err(error.to_string()),
         };
+        if generation
+            != self
+                .membership_checks
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
         let started = if outcome.is_ok() {
             started
         } else {
@@ -297,18 +421,76 @@ impl ClientApp {
         }
         entries.push(Entry {
             key,
+            generation,
             started,
             outcome: outcome.clone(),
+            witness_freshness: None,
         });
         outcome.map_err(Into::into)
     }
 
     pub(super) async fn invalidate_membership_checks(&self) {
+        self.membership_checks.clear_now();
+        self.membership_checks.entries.lock().await.clear();
+    }
+
+    async fn check_witness_membership(&self, authority: &Authority) -> Result<()> {
+        let key = self.membership_key(authority)?;
+        crate::calls::require_member(authority, self.session.credential().id())?;
         let mut entries = self.membership_checks.entries.lock().await;
-        self.membership_checks
+        entries.retain(|entry| entry.fresh(self.membership_checks.generation()));
+        if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
+            return if entry.permits(self.membership_checks.generation()) {
+                Ok(())
+            } else {
+                Err(entry
+                    .outcome
+                    .clone()
+                    .err()
+                    .unwrap_or_else(|| "Chat permissions need to be refreshed.".into())
+                    .into())
+            };
+        }
+        let started = Started::now();
+        let generation = self
+            .membership_checks
             .generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        entries.clear();
+            .load(std::sync::atomic::Ordering::Acquire);
+        let (outcome, freshness) = match self
+            .fetch_witness_freshness(authority, started.monotonic)
+            .await
+        {
+            Ok(fresh) if started.fresh(LEASE) => (Ok(()), Some(fresh)),
+            Ok(_) => (
+                Err("Chat permissions need to be refreshed.".to_owned()),
+                None,
+            ),
+            Err(error) => (Err(error.to_string()), None),
+        };
+        if generation
+            != self
+                .membership_checks
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err("Chat permissions need to be refreshed.".into());
+        }
+        if entries.len() == MAX_ENTRIES {
+            entries.remove(0);
+        }
+        let started = if outcome.is_ok() {
+            started
+        } else {
+            Started::now()
+        };
+        entries.push(Entry {
+            key,
+            generation,
+            started,
+            outcome: outcome.clone(),
+            witness_freshness: freshness,
+        });
+        outcome.map_err(Into::into)
     }
 }
 
@@ -320,6 +502,71 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn native_witness_pin_disables_legacy_host_leases_but_preserves_standalone_streams() {
+        let (_temp, mut app, hits, server) = fixture().await;
+        let authority = app.authorities.0[0].clone();
+        app.require_fresh_membership(&authority).await.unwrap();
+        let before_pin = app.membership_snapshot();
+        assert!(before_pin.allows(authority.space(), authority.stream()));
+        app.configure_witness_pin(Some(crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(
+                ed25519_dalek::SigningKey::from_bytes(&[78; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            key_generation: 1,
+        }))
+        .unwrap();
+        assert!(!before_pin.allows(authority.space(), authority.stream()));
+        assert!(
+            !app.membership_snapshot()
+                .allows(authority.space(), authority.stream())
+        );
+        assert!(app.membership_probe().is_err());
+        assert!(app.require_fresh_membership(&authority).await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "legacy hosting cannot renew a native witness lease"
+        );
+        let host = app.call_host.take();
+        app.require_fresh_membership(&authority).await.unwrap();
+        assert!(
+            app.membership_snapshot()
+                .allows(authority.space(), authority.stream())
+        );
+        app.call_host = host;
+        app.configure_witness_pin(None).unwrap();
+        app.require_fresh_membership(&authority).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_a_locked_cache_cannot_resurrect_a_lease() {
+        let (_temp, app, hits, server) = fixture().await;
+        let authority = &app.authorities.0[0];
+        app.require_fresh_membership(authority).await.unwrap();
+        let snapshot = app.membership_snapshot();
+        assert!(snapshot.allows(authority.space(), authority.stream()));
+        let entries = app.membership_checks.entries.lock().await;
+        app.membership_checks.clear_now();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a contended cache cannot be cleared synchronously"
+        );
+        drop(entries);
+        assert!(!snapshot.allows(authority.space(), authority.stream()));
+        app.require_fresh_membership(authority).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+        app.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn live_snapshots_share_permission_expiry_invalidation_and_current_keys() {

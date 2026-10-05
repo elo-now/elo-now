@@ -241,6 +241,9 @@ impl Authority {
     }
     pub(super) fn validate_controller_transition(&self, c: &StreamConfig) -> Result<()> {
         let parent = c.previous_config_id.map(|id| self.config(id)).transpose()?;
+        if self.witness_pin().is_some() && c.sequence > 1 {
+            return self.validate_witness_transition(c);
+        }
         if self.is_owner_managed() {
             if c.recovery.is_some()
                 || c.action.operation == "controller.recovered"

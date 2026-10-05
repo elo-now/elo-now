@@ -31,5 +31,8 @@ pub mod files;
 pub mod app;
 pub mod vault;
 
+pub(crate) mod notes;
 pub mod owner_admission;
 pub mod public_space;
+
+pub mod witness;

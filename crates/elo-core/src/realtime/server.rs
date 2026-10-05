@@ -17,8 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Semaphore, mpsc};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Notify, Semaphore, mpsc};
 
 const QUEUE: usize = 64;
 const MAX_CONNECTIONS: usize = 1024;
@@ -55,25 +54,19 @@ impl RateBudget {
     }
 }
 
-enum Event {
-    Changed,
-    Ephemeral {
-        envelope: Arc<str>,
-        actor: Actor,
-        companion: bool,
-    },
-}
 struct Notice {
     id: String,
     slot: Arc<AtomicBool>,
-    event: Event,
+    envelope: Arc<str>,
+    actor: Actor,
+    companion: bool,
 }
 struct Listener {
     id: String,
     mailbox: MailboxId,
     identity: IdentityId,
     sender: mpsc::Sender<Notice>,
-    cancel: CancellationToken,
+    changed: Arc<Notify>,
     hint_pending: Arc<AtomicBool>,
     queued_bytes: Arc<AtomicUsize>,
 }
@@ -102,18 +95,11 @@ impl Events {
     }
     pub(crate) fn changed(&self, mailbox: MailboxId) {
         for listener in self.listeners.lock().unwrap().values() {
-            if listener.mailbox == mailbox
-                && !listener.hint_pending.swap(true, Ordering::AcqRel)
-                && listener
-                    .sender
-                    .try_send(Notice {
-                        id: listener.id.clone(),
-                        slot: listener.hint_pending.clone(),
-                        event: Event::Changed,
-                    })
-                    .is_err()
-            {
-                listener.cancel.cancel();
+            if listener.mailbox == mailbox && !listener.hint_pending.swap(true, Ordering::AcqRel) {
+                // Durable hints never compete for the ephemeral queue. One bit
+                // per live subscription and one wakeup per connection coalesce
+                // bursts without losing a hint when a recipient is slow.
+                listener.changed.notify_one();
             }
         }
     }
@@ -136,7 +122,6 @@ impl Events {
                     })
                     .is_err()
                 {
-                    listener.cancel.cancel();
                     continue;
                 }
                 if listener
@@ -144,15 +129,17 @@ impl Events {
                     .try_send(Notice {
                         id: listener.id.clone(),
                         slot: listener.hint_pending.clone(),
-                        event: Event::Ephemeral {
-                            envelope: envelope.clone(),
-                            actor,
-                            companion,
-                        },
+                        envelope: envelope.clone(),
+                        actor,
+                        companion,
                     })
                     .is_err()
                 {
-                    listener.cancel.cancel();
+                    // Dropping transient data must not disconnect its recipient
+                    // or retain the byte reservation for an unqueued message.
+                    listener
+                        .queued_bytes
+                        .fetch_sub(envelope.len(), Ordering::AcqRel);
                 }
             }
         }
@@ -166,6 +153,19 @@ struct Subscription {
     store: ReplicaStore,
     hint_pending: Arc<AtomicBool>,
     _registration: Registration,
+}
+fn duplicate_subscription(
+    subscriptions: &BTreeMap<String, Subscription>,
+    store: &ReplicaStore,
+    request: &SubscriptionRequest,
+    actor: Actor,
+) -> bool {
+    subscriptions.values().any(|existing| {
+        existing.store.key() == store.key()
+            && existing.request.mailbox == request.mailbox
+            && existing.actor.identity == actor.identity
+            && existing.actor.credential == actor.credential
+    })
 }
 #[derive(Default)]
 struct Connections {
@@ -381,7 +381,7 @@ async fn connected(server: Arc<Server>, mut socket: WebSocket) {
         server: server.clone(),
     };
     let (sender, mut receiver) = mpsc::channel::<Notice>(QUEUE);
-    let cancel = CancellationToken::new();
+    let changed = Arc::new(Notify::new());
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let mut subscriptions = BTreeMap::<String, Subscription>::new();
     let authentication = tokio::time::sleep(Duration::from_secs(5));
@@ -393,7 +393,6 @@ async fn connected(server: Arc<Server>, mut socket: WebSocket) {
     let mut publications = RateBudget::new(seen, PUBLICATIONS_PER_SECOND, Duration::from_secs(1));
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
             _ = &mut authentication, if subscriptions.is_empty() => break,
             incoming = socket.recv() => {
                 seen = tokio::time::Instant::now();
@@ -411,10 +410,14 @@ async fn connected(server: Arc<Server>, mut socket: WebSocket) {
                         let Ok(Ok((store, actor, companion))) = result else {
                             let _ = send(&mut socket, ServerFrame::Error { code: "unauthorized".into() }).await; break;
                         };
+                        if duplicate_subscription(&subscriptions, &store, &request, actor) {
+                            if !send(&mut socket, ServerFrame::Error { code: "duplicate_subscription".into() }).await { break; }
+                            continue;
+                        }
                         if !server.connections.lock().unwrap().admit(connection.id, actor) { break; }
                         let hint_pending = Arc::new(AtomicBool::new(false));
                         let registration = store.realtime.subscribe(Listener { id: request.id.clone(), mailbox: request.mailbox,
-                            identity: actor.identity, sender: sender.clone(), cancel: cancel.clone(), hint_pending: hint_pending.clone(), queued_bytes: queued_bytes.clone() });
+                            identity: actor.identity, sender: sender.clone(), changed: changed.clone(), hint_pending: hint_pending.clone(), queued_bytes: queued_bytes.clone() });
                         let id = request.id.clone();
                         subscriptions.insert(id.clone(), Subscription { request, actor, companion, store, hint_pending, _registration: registration });
                         if !send(&mut socket, ServerFrame::Subscribed { id: id.clone() }).await { break; }
@@ -433,8 +436,23 @@ async fn connected(server: Arc<Server>, mut socket: WebSocket) {
                     }
                 }
             }
+            _ = changed.notified() => {
+                let pending = subscriptions.iter()
+                    .filter(|(_, subscription)| subscription.hint_pending.swap(false, Ordering::AcqRel))
+                    .map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                for id in pending {
+                    let Some(subscription) = subscriptions.get(&id) else { continue; };
+                    let frame = if server.authorized(subscription).await.is_err() {
+                        subscriptions.remove(&id);
+                        ServerFrame::Revoked { id }
+                    } else {
+                        ServerFrame::Changed { id }
+                    };
+                    if !send(&mut socket, frame).await { return; }
+                }
+            }
             Some(notice) = receiver.recv() => {
-                if let Event::Ephemeral { envelope, .. } = &notice.event { queued_bytes.fetch_sub(envelope.len(), Ordering::AcqRel); }
+                queued_bytes.fetch_sub(notice.envelope.len(), Ordering::AcqRel);
                 let Some(subscription) = subscriptions.get(&notice.id) else { continue; };
                 if !Arc::ptr_eq(&notice.slot, &subscription.hint_pending) { continue; }
                 if server.authorized(subscription).await.is_err() {
@@ -442,19 +460,11 @@ async fn connected(server: Arc<Server>, mut socket: WebSocket) {
                     if !send(&mut socket, ServerFrame::Revoked { id: notice.id }).await { break; }
                     continue;
                 }
-                let frame = match notice.event {
-                    Event::Changed => {
-                        subscription.hint_pending.store(false, Ordering::Release);
-                        ServerFrame::Changed { id: notice.id }
-                    }
-                    Event::Ephemeral { actor, envelope, companion } => {
-                        // A queued event never extends a revoked sender's access.
-                        if subscription.store.require_active_device(actor.credential).is_err()
-                            || (companion && subscription.store.require_admitted_companion(actor.credential).is_err())
-                            || subscription.store.authorize_identity(subscription.request.mailbox, Some(actor.identity)).await.is_err() { continue; }
-                        ServerFrame::Ephemeral { id: notice.id, envelope: envelope.to_string(), identity: actor.identity, credential: actor.credential }
-                    }
-                };
+                // A queued event never extends a revoked sender's access.
+                if subscription.store.require_active_device(notice.actor.credential).is_err()
+                    || (notice.companion && subscription.store.require_admitted_companion(notice.actor.credential).is_err())
+                    || subscription.store.authorize_identity(subscription.request.mailbox, Some(notice.actor.identity)).await.is_err() { continue; }
+                let frame = ServerFrame::Ephemeral { id: notice.id, envelope: notice.envelope.to_string(), identity: notice.actor.identity, credential: notice.actor.credential };
                 if !send(&mut socket, frame).await { break; }
             }
             _ = tick.tick() => {

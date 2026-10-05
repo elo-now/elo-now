@@ -29,6 +29,64 @@ fn valid(bytes: &[u8]) -> bool {
         .is_ok()
 }
 #[test]
+fn message_and_locator_expiry_stay_inside_the_client_date_range() {
+    use elo_core::record::{MAX_EXPIRY_TIMESTAMP_MS, MAX_INTEGER};
+    let original: Value = serde_json::from_slice(BODY).unwrap();
+    for kind in ["chat.message", "chat.locator"] {
+        let mut body = original.clone();
+        body["kind"] = json!(kind);
+        if kind == "chat.locator" {
+            body["payload"] = json!({"text": ""});
+            body["locator"] = json!({
+                "message_record_id": "ab".repeat(32),
+                "body_object_id": "cd".repeat(32),
+                "locator_nonce": "ef".repeat(16),
+            });
+        }
+        for expiry in [json!(1), json!(MAX_EXPIRY_TIMESTAMP_MS), Value::Null] {
+            body["payload"]["expires_at_ms"] = expiry;
+            assert!(valid(&raw(&serde_json::to_vec(&body).unwrap())), "{body}");
+        }
+        for expiry in [
+            json!(0),
+            json!(MAX_EXPIRY_TIMESTAMP_MS + 1),
+            json!(MAX_INTEGER),
+            json!(-1),
+            json!(1.5),
+            json!("8640000000000001"),
+        ] {
+            body["payload"]["expires_at_ms"] = expiry;
+            assert!(!valid(&raw(&serde_json::to_vec(&body).unwrap())), "{body}");
+        }
+    }
+}
+#[test]
+fn a_reply_deadline_is_signed_without_changing_legacy_fixture_bytes() {
+    let legacy = SignedRecord::parse(RECORD).unwrap().chat().unwrap();
+    assert_eq!(legacy.sign(&key()).unwrap().bytes(), RECORD);
+    let mut body: Value = serde_json::from_slice(BODY).unwrap();
+    body["payload"]["thread_root"] = json!("ab".repeat(32));
+    body["payload"]["expires_at_ms"] = json!(10_000);
+    let signed = raw(&serde_json::to_vec(&body).unwrap());
+    assert!(valid(&signed));
+    let mut changed = signed.clone();
+    let deadline = changed
+        .windows(5)
+        .position(|bytes| bytes == b"10000")
+        .unwrap();
+    changed[deadline] = b'9';
+    assert!(!valid(&changed));
+    assert_eq!(
+        SignedRecord::parse(&signed)
+            .unwrap()
+            .chat()
+            .unwrap()
+            .payload
+            .expires_at_ms,
+        Some(10_000)
+    );
+}
+#[test]
 fn python_fixture_matches_signature_bytes_and_all_ids() {
     let expected: Value = serde_json::from_slice(include_bytes!(
         "../../../protocol/fixtures/chat-message-v1.expected.json"
@@ -430,4 +488,36 @@ fn message_actions_are_strict_typed_signed_events_without_changing_legacy_bytes(
         body["payload"]["action"] = json!({"type":"expiry","target":legacy.id(),"hours":hours});
         assert!(!valid(&raw(&serde_json::to_vec(&body).unwrap())));
     }
+}
+
+#[test]
+fn mentions_are_signed_bounded_and_limited_to_the_message_audience() {
+    let base: Value = serde_json::from_slice(BODY).unwrap();
+    let person = base["audience"][0].clone();
+    for editing in [false, true] {
+        let mut body = base.clone();
+        if editing {
+            body["kind"] = json!("chat.action");
+            body["payload"] = json!({"text":"","action":{"type":"edit","target":"ab".repeat(32),"text":"Corrected @person","mentions":[person]}});
+        } else {
+            body["payload"]["mentions"] = json!([person]);
+        }
+        assert!(valid(&raw(&serde_json::to_vec(&body).unwrap())));
+        for invalid in [
+            json!([person, person]),
+            json!(["ee".repeat(32)]),
+            json!(["not-an-identity"]),
+            json!(vec![person.clone(); 33]),
+        ] {
+            if editing {
+                body["payload"]["action"]["mentions"] = invalid;
+            } else {
+                body["payload"]["mentions"] = invalid;
+            }
+            assert!(!valid(&raw(&serde_json::to_vec(&body).unwrap())));
+        }
+    }
+    let original = SignedRecord::parse(RECORD).unwrap().chat().unwrap();
+    assert!(original.payload.mentions.is_empty());
+    assert_eq!(original.sign(&key()).unwrap().bytes(), RECORD);
 }

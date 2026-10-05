@@ -17,7 +17,9 @@ closest-higher-then-lower fallback. Camera framing and scan controls are unchang
 The plugin lifecycle also releases document-specific state after a WebView renderer
 crash and rebinds plugins to the replacement view. The scanner stops its camera
 and drops the dead WebView; stale camera-provider results cannot attach to a new
-document. Unused WebView references in the deep-link plugin are removed.
+document. Cancelling a scan also rejects its pending invocation;
+late barcode results cannot complete a replacement scanning session. Unused
+WebView references in the deep-link plugin are removed.
 
 `apps/desktop/src-tauri/gen/android/settings.gradle` selects these modules after
 Tauri generates its module list. It checks these versions against `Cargo.lock`

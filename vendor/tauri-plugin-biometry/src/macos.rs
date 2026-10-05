@@ -4,12 +4,12 @@ use objc2_core_foundation::{
 };
 use objc2_local_authentication::{LABiometryType, LAContext, LAError, LAPolicy};
 use objc2_security::{
-    errSecDuplicateItem, errSecInteractionNotAllowed, errSecItemNotFound, errSecSuccess,
-    errSecUserCanceled, kSecAttrAccessControl, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-    kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecMatchLimit,
-    kSecMatchLimitOne, kSecReturnData, kSecUseAuthenticationContext, kSecUseDataProtectionKeychain,
-    kSecValueData, SecAccessControl, SecAccessControlCreateFlags, SecItemAdd, SecItemCopyMatching,
-    SecItemDelete, SecItemUpdate,
+    errSecDuplicateItem, errSecInteractionNotAllowed, errSecItemNotFound, errSecMissingEntitlement,
+    errSecSuccess, errSecUserCanceled, kSecAttrAccessControl,
+    kSecAttrAccessibleWhenUnlockedThisDeviceOnly, kSecAttrAccount, kSecAttrService, kSecClass,
+    kSecClassGenericPassword, kSecMatchLimit, kSecMatchLimitOne, kSecReturnData,
+    kSecUseAuthenticationContext, kSecUseDataProtectionKeychain, kSecValueData, SecAccessControl,
+    SecAccessControlCreateFlags, SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
 };
 use serde::de::DeserializeOwned;
 use std::ffi::c_void;
@@ -258,6 +258,11 @@ impl<R: Runtime> Biometry<R> {
                 Ok(true)
             } else if status == errSecItemNotFound {
                 Ok(false)
+            } else if status == errSecMissingEntitlement {
+                Err(reject(
+                    "keychainUnavailable",
+                    "This app signature cannot access the protected keychain",
+                ))
             } else {
                 Err(reject(
                     "keychainError",
@@ -283,6 +288,12 @@ impl<R: Runtime> Biometry<R> {
             let auth_ctx = LAContext::new();
             let reason_ns = objc2_foundation::NSString::from_str(&options.reason);
             auth_ctx.setLocalizedReason(&reason_ns);
+            auth_ctx.setTouchIDAuthenticationAllowableReuseDuration(0.0);
+            auth_ctx.setLocalizedFallbackTitle(Some(&objc2_foundation::NSString::from_str("")));
+            if let Some(title) = &options.cancel_title {
+                auth_ctx
+                    .setLocalizedCancelTitle(Some(&objc2_foundation::NSString::from_str(title)));
+            }
             let auth_ctx_cf: &CFType = &*std::ptr::addr_of!(*auth_ctx).cast::<CFType>();
 
             let true_ref = CFBoolean::new(true).as_ref();
@@ -319,21 +330,22 @@ impl<R: Runtime> Biometry<R> {
             let status = SecItemCopyMatching(&query, &mut out);
 
             if status == errSecSuccess {
-                if out.is_null() {
-                    Err(reject(
-                        "dataError",
-                        "SecItemCopyMatching returned null data",
-                    ))
-                } else {
-                    let cf_data: &CFData = &*out.cast::<CFData>();
-                    let bytes = cf_data.byte_ptr();
-                    let data = std::slice::from_raw_parts(bytes, cf_data.len() as usize);
-                    Ok(DataResponse {
-                        domain: options.domain,
-                        name: options.name,
-                        data: String::from_utf8_lossy(data).to_string(),
-                    })
-                }
+                let out = std::ptr::NonNull::new(out.cast_mut())
+                    .ok_or_else(|| reject("dataError", "SecItemCopyMatching returned null data"))?;
+                // CopyMatching transfers ownership. Release the copied secret even
+                // when its type or encoding is invalid.
+                let value = CFRetained::from_raw(out);
+                let cf_data = value
+                    .downcast::<CFData>()
+                    .map_err(|_| reject("dataError", "Keychain item is not data"))?;
+                let data = cf_data.to_vec();
+                let data = String::from_utf8(data)
+                    .map_err(|_| reject("dataError", "Keychain item is not valid UTF-8"))?;
+                Ok(DataResponse {
+                    domain: options.domain,
+                    name: options.name,
+                    data,
+                })
             } else if status == errSecItemNotFound {
                 Err(reject(
                     "itemNotFound",
@@ -370,11 +382,13 @@ impl<R: Runtime> Biometry<R> {
             let cf_service: CFRetained<CFString> = CFString::from_str(&options.domain);
             let cf_value: CFRetained<CFData> = CFData::from_bytes(options.data.as_bytes());
 
-            // Create SecAccessControl(userPresence)
+            // Match iOS: only the currently enrolled biometrics may release
+            // this device-local key. A Mac account password is not a fallback.
+            // Changing the enrolled fingerprints requires enrollment again.
             let ac_ref = SecAccessControl::with_flags(
                 None,
                 kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-                SecAccessControlCreateFlags::UserPresence,
+                SecAccessControlCreateFlags::BiometryCurrentSet,
                 std::ptr::null_mut(),
             )
             .ok_or_else(|| reject("internalError", "Failed to create SecAccessControl"))?;
@@ -533,6 +547,11 @@ impl<R: Runtime> Biometry<R> {
 
             if status == errSecSuccess || status == errSecItemNotFound {
                 Ok(())
+            } else if status == errSecMissingEntitlement {
+                Err(reject(
+                    "keychainUnavailable",
+                    "This app signature cannot access the protected keychain",
+                ))
             } else {
                 Err(reject(
                     "keychainError",

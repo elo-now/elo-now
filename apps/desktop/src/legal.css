@@ -26,6 +26,9 @@
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+.unlock[data-mobile="false"] .legal-notice {
+  white-space: pre-line;
+}
 .service-request-list {
   list-style: none;
   padding: 0;

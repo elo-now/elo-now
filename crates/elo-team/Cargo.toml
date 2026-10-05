@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+rusqlite.workspace = true
 age.workspace = true
 base64.workspace = true
 elo-core.workspace = true
@@ -29,6 +30,8 @@ sha2.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 flate2 = "1"
 tempfile.workspace = true
 tokio-tungstenite = "0.30"

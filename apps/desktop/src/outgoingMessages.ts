@@ -1,13 +1,18 @@
 import { mergeHistory } from "./messageHistory";
 import { messageIdentity, type MessageRow } from "./messageThreads";
 
-export type SendReceipt = { id: string; logical_time: number; expires_at_ms?: number };
+export type SendReceipt = {
+  id: string;
+  logical_time: number;
+  expires_at_ms?: number | null;
+};
 type Echo = { key: string; scope: string; row: MessageRow };
 type Draft = {
   scope: string;
   identity: string;
   credential: string;
   text: string;
+  mentions?: string[];
   createdAt: string;
   logicalTime: number;
   thread?: string;
@@ -46,13 +51,22 @@ export class OutgoingMessages {
             issuer_credential: draft.credential,
             created_at: draft.createdAt,
             logical_time: draft.logicalTime,
-            payload: { text: draft.text, thread_root: draft.thread, expires_at_ms: draft.expiresAt },
+            payload: {
+              text: draft.text,
+              mentions: draft.mentions,
+              thread_root: draft.thread,
+              expires_at_ms: draft.expiresAt,
+            },
           },
         },
       },
     ]);
     try {
       const receipt = await commit();
+      const expiresAt =
+        receipt.expires_at_ms === undefined
+          ? draft.expiresAt
+          : receipt.expires_at_ms;
       this.update(
         this.echoes.map((echo) =>
           echo.key === key
@@ -66,7 +80,10 @@ export class OutgoingMessages {
                   body: {
                     ...echo.row.body,
                     logical_time: receipt.logical_time,
-                    payload: { ...echo.row.body.payload, expires_at_ms: receipt.expires_at_ms ?? draft.expiresAt },
+                    payload: {
+                      ...echo.row.body.payload,
+                      expires_at_ms: expiresAt,
+                    },
                   },
                 },
               }

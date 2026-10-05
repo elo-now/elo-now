@@ -205,6 +205,25 @@ impl ExchangeFiles {
     }
 }
 
+/// Restore only attachment bytes authenticated by the local encrypted draft store.
+pub(crate) fn restore_draft_attachment(
+    app: &tauri::AppHandle,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let path = new_path(app, "draft")?;
+    elo_core::vault::write_private(&path, bytes, false).map_err(|error| error.to_string())?;
+    match app
+        .state::<ExchangeFiles>()
+        .issue(path.clone(), Purpose::Upload)
+    {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            Err(error)
+        }
+    }
+}
+
 // Renderer values are capabilities issued by native pickers, never filesystem paths.
 pub(crate) fn resolve_transfer(
     app: &tauri::AppHandle,
@@ -277,13 +296,7 @@ pub async fn invitation_qr(
     if state.lock().await.client.is_none() {
         return Err("The profile is locked".into());
     }
-    if !(link.starts_with("elo://exchange/v1#")
-        || link.starts_with(elo_core::app::space_service::PREFIX))
-        || !link.is_ascii()
-        || link.len() > 64 * 1024
-    {
-        return Err("This response is too large for QR. Use Share instead.".into());
-    }
+    validate_invitation_qr_link(&link)?;
     // Frames are a transport container only. The Rust core verifies the complete
     // signed exchange after reassembly; a frame identifier never grants trust.
     let id = elo_core::ids::RecordId::of_record_bytes(link.as_bytes()).to_string();
@@ -313,6 +326,57 @@ pub async fn invitation_qr(
                 .build())
         })
         .collect()
+}
+
+fn validate_invitation_qr_link(link: &str) -> Result<(), String> {
+    if link.starts_with(elo_core::witness::link::PREFIX) {
+        return elo_core::witness::link::InvitationLink::parse(link)
+            .map(|_| ())
+            .map_err(|_| {
+                "This is not a Space invitation. Ask the Space owner for a new code.".into()
+            });
+    }
+    if !(link.starts_with("elo://exchange/v1#")
+        || link.starts_with(elo_core::app::space_service::PREFIX))
+        || !link.is_ascii()
+        || link.len() > 64 * 1024
+    {
+        return Err("This response is too large for QR. Use Share instead.".into());
+    }
+    Ok(())
+}
+
+fn invitation_png(link: &str) -> Result<Vec<u8>, String> {
+    validate_invitation_qr_link(link)?;
+    if link.len() > 4096 {
+        return Err("invitation_qr_image_too_large".into());
+    }
+    // Export the complete invitation, never just the currently displayed frame.
+    crate::profiles::qr_png(link).map_err(|error| {
+        if matches!(
+            error.downcast_ref::<qrcode::types::QrError>(),
+            Some(qrcode::types::QrError::DataTooLong)
+        ) {
+            "invitation_qr_image_too_large".into()
+        } else {
+            "file_export_failed".into()
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn save_invitation_qr(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+    link: String,
+) -> Result<bool, String> {
+    if state.lock().await.client.is_none() {
+        return Err("The profile is locked".into());
+    }
+    let png = invitation_png(&link)?;
+    crate::profiles::save(&app, &png, "elo-invitation.png")
+        .await
+        .map_err(|_| "file_export_failed".into())
 }
 
 fn uniform_qr_codes(contents: &[String]) -> Result<Vec<qrcode::QrCode>, String> {
@@ -345,6 +409,73 @@ fn uniform_qr_codes(contents: &[String]) -> Result<Vec<qrcode::QrCode>, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invitation_image_contains_the_full_link_not_an_animation_frame() {
+        for prefix in ["elo://space/v1#", "elo://exchange/v1#"] {
+            let link = format!("{prefix}{}", "aB7_-xyz9".repeat(290));
+            assert!(link.len() > 1800);
+            let png = super::invitation_png(&link).unwrap();
+            assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+            let image = image::load_from_memory(&png).unwrap().into_luma8();
+            let mut prepared = rqrr::PreparedImage::prepare(image);
+            let grids = prepared.detect_grids();
+            assert_eq!(grids.len(), 1);
+            assert_eq!(grids[0].decode().unwrap().1, link);
+        }
+    }
+
+    #[test]
+    fn short_space_invitation_qr_preserves_the_complete_local_fragment() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let mut payload = [7; 65];
+        payload[0] = 1;
+        let link = format!(
+            "{}{}",
+            elo_core::witness::link::PREFIX,
+            URL_SAFE_NO_PAD.encode(payload)
+        );
+        let png = super::invitation_png(&link).unwrap();
+        let image = image::load_from_memory(&png).unwrap().into_luma8();
+        let mut prepared = rqrr::PreparedImage::prepare(image);
+        let grids = prepared.detect_grids();
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].decode().unwrap().1, link);
+        for invalid in [
+            format!("{link}="),
+            link.replace("https://", "http://"),
+            link.replace("elo.now/", "elo.now.example/"),
+        ] {
+            assert!(super::invitation_png(&invalid).is_err());
+        }
+        payload[0] = 2;
+        assert!(
+            super::invitation_png(&format!(
+                "{}{}",
+                elo_core::witness::link::PREFIX,
+                URL_SAFE_NO_PAD.encode(payload)
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invitation_image_rejects_invalid_or_oversized_payloads() {
+        for link in [
+            "https://example.test/",
+            "data:image/svg+xml,<svg/>",
+            "elo://space/v1#é",
+        ] {
+            assert!(super::invitation_png(link).is_err());
+        }
+        for length in [3000, 4097] {
+            assert_eq!(
+                super::invitation_png(&format!("elo://space/v1#{}", "a".repeat(length)))
+                    .unwrap_err(),
+                "invitation_qr_image_too_large"
+            );
+        }
+    }
+
     #[test]
     fn attachment_preview_is_bounded_and_never_interprets_svg_as_active_content() {
         assert!(

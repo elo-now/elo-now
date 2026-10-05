@@ -9,7 +9,7 @@ use crate::{
         },
         team,
     },
-    authority::{Authority, CallAuthorityProof},
+    authority::{Authority, CallAuthorityProof, WitnessPin},
     crypto,
     identity::{DeviceCredential, VerifiedCredential},
     ids::{AttachmentId, AttachmentObjectId, IdentityId, RecordId, SpaceId, StreamId},
@@ -31,7 +31,10 @@ use std::{
 use zeroize::Zeroizing;
 mod attachments;
 mod calls;
+mod notes;
 pub(crate) mod roles;
+mod witnessed;
+mod witnessed_relay;
 use attachments::{AttachmentAccess, HostedAttachment, bytes_in_state};
 pub use attachments::{AttachmentCleanupTarget, AttachmentStorageUsage, AttachmentTransferGrant};
 use roles::Roles;
@@ -59,6 +62,7 @@ pub struct PublicSpaceService {
     credential: VerifiedCredential,
     authorities: Authorities,
     allow_loopback: bool,
+    trusted_witness: Option<WitnessPin>,
 }
 fn time() -> Result<u64> {
     Ok(std::time::SystemTime::now()
@@ -77,6 +81,25 @@ fn verify_credential(encoded: &str) -> Result<VerifiedCredential> {
     let signed = decode_record(encoded)?;
     let root = VerifyingKey::from_bytes(&record::hex(field(signed.body(), "root_public_key")?)?)?;
     Ok(VerifiedCredential::verify(signed.bytes(), &root)?)
+}
+
+fn verify_general_authority(
+    proof: &CallAuthorityProof,
+    trusted_witness: Option<&WitnessPin>,
+) -> Result<Authority> {
+    let genesis = decode_record(&proof.genesis)?;
+    let config = decode_record(
+        proof
+            .configs
+            .last()
+            .ok_or("Missing General configuration.")?,
+    )?;
+    let space = SpaceId::from_bytes(*genesis.id().as_bytes());
+    let stream = field(config.body(), "stream_id")?.parse()?;
+    Ok(match trusted_witness {
+        Some(pin) => proof.verify_witnessed(space, stream, pin)?,
+        None => proof.verify(space, stream)?,
+    })
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +189,10 @@ struct ServiceState {
     attachment_access: BTreeMap<String, AttachmentAccess>,
     #[serde(default)]
     call_heads: BTreeMap<String, calls::PublishedHead>,
+    #[serde(default)]
+    notes: BTreeMap<IdentityId, CallAuthorityProof>,
+    #[serde(default)]
+    witness_requests: BTreeMap<RecordId, witnessed_relay::Pending>,
 }
 
 impl ServiceState {
@@ -296,14 +323,22 @@ impl PublicSpaceService {
             "primary_identity":primary,"contact_email":state.roles.as_ref().and_then(|r|r.contact_email.as_ref())}),
         )
     }
-    /// Called only by the local hosting worker after authenticated self-deletion.
-    /// Minimal revocation/authority proofs remain to prevent old backups rejoining.
-    pub async fn erase_service_account(
-        &mut self,
+    /// Validate before the host persists an erasure job that blocks this Space.
+    pub fn validate_account_deletion(
+        &self,
         config: &ServiceConfig,
         identity: IdentityId,
         evidence: Option<&AdminEvidence>,
     ) -> Result<()> {
+        self.account_deletion_intent(config, identity, evidence)?;
+        Ok(())
+    }
+    fn account_deletion_intent(
+        &self,
+        config: &ServiceConfig,
+        identity: IdentityId,
+        evidence: Option<&AdminEvidence>,
+    ) -> Result<(ServiceState, bool)> {
         if self.account_membership(config, identity)?["primary"] == true {
             return Err("Transfer primary ownership before deleting your account.".into());
         }
@@ -312,6 +347,7 @@ impl PublicSpaceService {
         let credential = verify_credential(&evidence.credential)?;
         signed.verify_signature(credential.key())?;
         let command: crate::app::account_deletion::Command = signed.decode()?;
+        record::hex::<16>(&command.nonce)?;
         let mut endpoint = reqwest::Url::parse(&config.address.url)?;
         endpoint.set_path(crate::app::account_deletion::PATH);
         if command.v != 1
@@ -323,18 +359,49 @@ impl PublicSpaceService {
         {
             return Err("Invalid account deletion proof.".into());
         }
-        let mut state = self.service_state()?;
-        state.account_deletions.insert(identity, evidence.clone());
-        if !state
-            .journal
+        let state = self.service_state()?;
+        // Pending and already removed profiles have no General permission to
+        // change. Keep their erasure receipt outside the owner journal: an
+        // unadmitted signer cannot contribute an administration intent.
+        let enrolled = self.authorities.0[0].head()?.members.iter().any(|member| {
+            member.identity_id == identity && member.credential_ids.contains(&credential.id())
+        }) && !state.revoked.contains(&credential.id())
+            && !state.removal_blocks(identity)
+            && !state.erased_accounts.contains(&identity);
+        let current_member = self.authorities.0[0]
+            .head()?
+            .members
             .iter()
-            .any(|entry| entry.record == evidence.record)
-        {
-            if state.journal.len() >= 4096 {
-                return Err("Space administration history limit reached.".into());
-            }
+            .any(|member| member.identity_id == identity)
+            && !state.removal_blocks(identity)
+            && !state.erased_accounts.contains(&identity);
+        if current_member && !enrolled {
+            return Err("Delete this account from a device admitted to this Space.".into());
+        }
+        let append = enrolled
+            && !state
+                .journal
+                .iter()
+                .any(|entry| entry.record == evidence.record);
+        if append && state.journal.len() >= 4096 {
+            return Err("Space administration history limit reached.".into());
+        }
+        Ok((state, append))
+    }
+    /// Called only by the local hosting worker after authenticated self-deletion.
+    /// Minimal revocation/authority proofs remain to prevent old backups rejoining.
+    pub async fn erase_service_account(
+        &mut self,
+        config: &ServiceConfig,
+        identity: IdentityId,
+        evidence: Option<&AdminEvidence>,
+    ) -> Result<()> {
+        let (mut state, append) = self.account_deletion_intent(config, identity, evidence)?;
+        let evidence = evidence.ok_or("Missing signed account deletion request.")?;
+        if append {
             state.journal.push(evidence.clone());
         }
+        state.account_deletions.insert(identity, evidence.clone());
         if state.erased_accounts.insert(identity) {
             let epoch = state
                 .removals
@@ -348,6 +415,7 @@ impl PublicSpaceService {
         state
             .applicants
             .retain(|_, applicant| applicant.identity != identity);
+        state.notes.remove(&identity);
         if let Some(roles) = state.roles.as_mut() {
             roles.retire_member(identity);
         }
@@ -502,6 +570,9 @@ impl PublicSpaceService {
         address: &SpaceAddress,
         require_approval: bool,
     ) -> Result<String> {
+        if self.trusted_witness.is_some() {
+            return Err("Witnessed invitations are created by their owners.".into());
+        }
         address.validate(self.allow_loopback)?;
         let scope = self.team_scope()?;
         if serde_json::to_value(&scope)? != serde_json::to_value(&address.scope)? {
@@ -569,6 +640,9 @@ impl PublicSpaceService {
         config: &ServiceConfig,
         request: Request,
     ) -> Result<Response> {
+        if self.trusted_witness.is_some() {
+            return Err("An independent witness lease is required.".into());
+        }
         self.serve_space_inner(config, request, None).await
     }
     pub async fn serve_hosted_space(
@@ -577,6 +651,9 @@ impl PublicSpaceService {
         request: Request,
         replica: &crate::replica::ReplicaStore,
     ) -> Result<Response> {
+        if self.trusted_witness.is_some() {
+            return Err("An independent witness lease is required.".into());
+        }
         self.serve_space_inner(config, request, Some(replica)).await
     }
     async fn serve_space_inner(
@@ -711,12 +788,7 @@ impl PublicSpaceService {
                 };
                 let journaled = matches!(
                     command.action.as_str(),
-                    "invite"
-                        | "revoke"
-                        | "decide"
-                        | "role_change"
-                        | "role_decide"
-                        | "device_revoke"
+                    "invite" | "revoke" | "decide" | "role_change" | "role_decide"
                 );
                 let journal_len = state.journal.len();
                 let append_intent = journaled
@@ -851,6 +923,7 @@ impl PublicSpaceService {
             }
             "chat_head_check" => self.check_space_chat_head(state, credential, &command.body),
             "call_head_publish" => self.publish_space_call_head(state, credential, &command.body),
+            "notes" => self.notes_command(state, credential, &command.body),
             "contact"
                 if state
                     .applicants
@@ -910,6 +983,11 @@ impl PublicSpaceService {
                 let (identity, device, name) = self.space_applicant(&request)?;
                 if identity != credential.identity() || device != credential.id() {
                     return Err("This join request belongs to another profile.".into());
+                }
+                if !self.device_admitted(device)
+                    && let Some(replica) = replica
+                {
+                    replica.revocations().require_enrollment_budget(identity)?;
                 }
                 let key = credential.id().to_string();
                 let declined = state.device_was_declined(&key)?;
@@ -1237,8 +1315,19 @@ impl PublicSpaceService {
         let general = &self.authorities.0[0];
         let admitted = key.parse().ok().is_some_and(|id| self.device_admitted(id));
         if !admitted || matches!(applicant.status.as_str(), "removed" | "declined") {
+            let status = if applicant.status == "eligible" {
+                "pending"
+            } else {
+                applicant.status.as_str()
+            };
+            let pending_reason =
+                (status == "pending").then_some(if applicant.status == "eligible" {
+                    "owner_sync"
+                } else {
+                    "approval"
+                });
             return Ok(
-                json!({"name":config.name,"status":if applicant.status == "eligible" { "pending" } else { applicant.status.as_str() },"membership_epoch":state.removals.get(&applicant.identity).copied().unwrap_or(0)}),
+                json!({"name":config.name,"status":status,"pending_reason":pending_reason,"membership_epoch":state.removals.get(&applicant.identity).copied().unwrap_or(0)}),
             );
         }
         let epoch = state
@@ -1271,8 +1360,15 @@ impl PublicSpaceService {
             })
         };
         let roles = state.roles.as_ref().ok_or("Space roles unavailable.")?;
+        // This is only a scheduling hint. The owner's device still verifies the
+        // signed admission journal before it can publish a new General head.
+        let owner_sync_needed = self.trusted_witness.is_none()
+            && roles.is_owner(applicant.identity)
+            && key.parse().is_ok_and(|id| general.can_manage(id))
+            && (state.applicants.values().any(|a| a.status == "eligible")
+                || state.journal.len() != state.committed_journal.len());
         Ok(
-            json!({"name":config.name,"status":"approved","membership_epoch":epoch,"owner":roles.is_owner(applicant.identity),"role":roles.role(applicant.identity),"roles_revision":roles.revision,"role_requests":roles.requests_for(applicant.identity),"contact_email":roles.contact_email,"message_lifetime_seconds":config.address.message_lifetime_seconds,"peer":config.peer,"general_head":self.authorities.0[0].head_id(),"enrollment":packet}),
+            json!({"name":config.name,"status":"approved","membership_epoch":epoch,"owner":roles.is_owner(applicant.identity),"owner_sync_needed":owner_sync_needed,"role":roles.role(applicant.identity),"roles_revision":roles.revision,"role_requests":roles.requests_for(applicant.identity),"contact_email":roles.contact_email,"message_lifetime_seconds":config.address.message_lifetime_seconds,"peer":config.peer,"general_head":self.authorities.0[0].head_id(),"enrollment":packet}),
         )
     }
 
@@ -1325,6 +1421,27 @@ impl PublicSpaceService {
         allow_loopback: bool,
         creation: Option<AdminEvidence>,
     ) -> Result<Self> {
+        Self::create_with_witness(
+            directory,
+            proof,
+            owners,
+            contact_email,
+            allow_loopback,
+            creation,
+            None,
+        )
+    }
+
+    pub fn create_with_witness(
+        directory: impl AsRef<Path>,
+        proof: CallAuthorityProof,
+        owners: &[IdentityId],
+        contact_email: Option<String>,
+        allow_loopback: bool,
+        creation: Option<AdminEvidence>,
+        trusted_witness: Option<WitnessPin>,
+    ) -> Result<Self> {
+        verify_general_authority(&proof, trusted_witness.as_ref())?;
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory)?;
         #[cfg(unix)]
@@ -1368,15 +1485,25 @@ impl PublicSpaceService {
             attachments: BTreeMap::new(),
             attachment_access: BTreeMap::new(),
             call_heads: BTreeMap::new(),
+            notes: BTreeMap::new(),
+            witness_requests: BTreeMap::new(),
         };
         vault::write_private(
             &directory.join("state.json"),
             &serde_json::to_vec(&state)?,
             false,
         )?;
-        Self::open(directory, allow_loopback)
+        Self::open_with_witness(directory, allow_loopback, trusted_witness)
     }
     pub fn open(directory: impl AsRef<Path>, allow_loopback: bool) -> Result<Self> {
+        Self::open_with_witness(directory, allow_loopback, None)
+    }
+
+    pub fn open_with_witness(
+        directory: impl AsRef<Path>,
+        allow_loopback: bool,
+        trusted_witness: Option<WitnessPin>,
+    ) -> Result<Self> {
         let directory = directory.as_ref().to_path_buf();
         let signer: TransportSigner = serde_json::from_slice(&Zeroizing::new(
             vault::read_private(&directory.join("transport.json"))?,
@@ -1392,18 +1519,7 @@ impl PublicSpaceService {
             return Err("Space state is too large.".into());
         }
         let state: ServiceState = serde_json::from_slice(&bytes)?;
-        let genesis = decode_record(&state.proof.genesis)?;
-        let config = decode_record(
-            state
-                .proof
-                .configs
-                .last()
-                .ok_or("Missing General configuration.")?,
-        )?;
-        let authority = state.proof.verify(
-            SpaceId::from_bytes(*genesis.id().as_bytes()),
-            field(config.body(), "stream_id")?.parse()?,
-        )?;
+        let authority = verify_general_authority(&state.proof, trusted_witness.as_ref())?;
         if !authority.is_owner_managed()
             || authority
                 .head()?
@@ -1417,12 +1533,25 @@ impl PublicSpaceService {
             directory,
             signing_key,
             credential,
+            trusted_witness,
             authorities: Authorities(vec![authority]),
             allow_loopback,
         })
     }
     pub fn transport_credential(&self) -> String {
         STANDARD.encode(self.credential.record().bytes())
+    }
+    /// A host may use this verified snapshot only with its independently pinned
+    /// witness gate. Network callers cannot install a pin through this method.
+    pub fn witnessed_authority(&self) -> Result<Option<Authority>> {
+        let Some(pin) = self.trusted_witness.as_ref() else {
+            return Ok(None);
+        };
+        let authority = &self.authorities.0[0];
+        if authority.is_forked() || authority.witness_pin() != Some(pin) {
+            return Err("Witnessed General is unavailable.".into());
+        }
+        Ok(Some(authority.clone()))
     }
     pub fn team_scope(&self) -> Result<team::TeamScope> {
         let authority = &self.authorities.0[0];
@@ -1548,6 +1677,11 @@ impl PublicSpaceService {
         body: &Value,
         replica: Option<&crate::replica::ReplicaStore>,
     ) -> Result<Value> {
+        // Witnessed membership is serialized by the independent service. The
+        // legacy owner journal must never become an alternate update path.
+        if self.trusted_witness.is_some() {
+            return Err("Witnessed General requires an independently verified update.".into());
+        }
         self.authority_status(state, requester, replica)?;
         let previous = &self.authorities.0[0];
         if body["expected_head"] != json!(previous.head_id()) {
@@ -1575,9 +1709,66 @@ impl PublicSpaceService {
         {
             return Err("General authority proof does not extend its current head.".into());
         }
+        if next.head_id() != previous.head_id()
+            && (next.head()?.previous_config_id != previous.head_id()
+                || next.head()?.sequence != previous.head()?.sequence.saturating_add(1))
+        {
+            return Err("General permissions must extend the current head by one update.".into());
+        }
         let roles = state.roles.as_ref().ok_or("Space roles unavailable.")?;
+        let next_owners = next
+            .head()?
+            .members
+            .iter()
+            .filter(|member| {
+                member
+                    .capabilities
+                    .contains(&crate::authority::Capability::Manage)
+            })
+            .map(|member| member.identity_id)
+            .collect::<BTreeSet<_>>();
+        if next_owners != roles.owner_identities() {
+            return Err("General owners must match the approved Space roles.".into());
+        }
+        // A valid owner signature alone is not a removal decision. Preserve
+        // every admitted device until its own revocation or an accepted role /
+        // account-deletion intent explicitly removes it.
+        for member in &previous.head()?.members {
+            if state.erased_accounts.contains(&member.identity_id)
+                || state.removal_blocks(member.identity_id)
+            {
+                continue;
+            }
+            for id in &member.credential_ids {
+                if state.revoked.contains(id) {
+                    continue;
+                }
+                if !next.head()?.members.iter().any(|candidate| {
+                    candidate.identity_id == member.identity_id
+                        && candidate.credential_ids.contains(id)
+                }) {
+                    return Err(
+                        "Removing a General member requires a signed removal intent.".into(),
+                    );
+                }
+            }
+        }
         let mut expected_owners = Vec::new();
         for member in &next.head()?.members {
+            use crate::authority::Capability;
+            let expected_capabilities = if roles.is_owner(member.identity_id) {
+                &[
+                    Capability::Read,
+                    Capability::Post,
+                    Capability::ShareHistory,
+                    Capability::Manage,
+                ][..]
+            } else {
+                &[Capability::Read, Capability::Post][..]
+            };
+            if member.capabilities != expected_capabilities {
+                return Err("General permissions must match the approved Space roles.".into());
+            }
             if state.erased_accounts.contains(&member.identity_id)
                 || (state.removals.contains_key(&member.identity_id)
                     && !state.applicants.values().any(|a| {
@@ -1598,6 +1789,11 @@ impl PublicSpaceService {
                     previous.head()?.members.iter().any(|m| {
                         m.identity_id == member.identity_id && m.credential_ids.contains(id)
                     });
+                if !existing && let Some(replica) = replica {
+                    replica
+                        .revocations()
+                        .require_enrollment_budget(member.identity_id)?;
+                }
                 let candidate = next.credential(*id)?;
                 let companion = candidate.authorizing_device().is_some_and(|parent| {
                     !state.revoked.contains(&parent)
@@ -1712,6 +1908,14 @@ impl PublicSpaceService {
         if target.identity() != requester.identity() || target.id() == requester.id() {
             return Err("Choose another device belonging to this profile.".into());
         }
+        if !self.authorities.0[0].head()?.members.iter().any(|member| {
+            member.identity_id == target.identity() && member.credential_ids.contains(&target.id())
+        }) {
+            return Err("Choose a device currently admitted to this Space.".into());
+        }
+        if !state.revoked.contains(&target.id()) && state.journal.len() >= 4096 {
+            return Err("Space administration history limit reached.".into());
+        }
         replica.revocations().insert(&proof)?;
         self.apply_device_revocations(state, replica)?;
         Ok(json!({"revoked":target.id()}))
@@ -1729,6 +1933,8 @@ mod tests {
     use super::*;
     use crate::authority::{Capability, ConfigAction, Member, Owner, SpaceGenesis, StreamConfig};
     use crate::identity::generate_signing_key;
+    mod notes_tests;
+    mod security_tests;
 
     struct Device {
         key: SigningKey,
@@ -1775,6 +1981,7 @@ mod tests {
             .to_owned();
         let genesis = SignedRecord::sign(
             &serde_json::to_vec(&SpaceGenesis {
+                witness: None,
                 v: 2,
                 kind: "space.genesis".into(),
                 nonce: record::random_hex::<16>().unwrap(),
@@ -1800,6 +2007,7 @@ mod tests {
         )
         .unwrap();
         let config = StreamConfig {
+            witness_evidence: None,
             v: 2,
             kind: "stream.config".into(),
             nonce: record::random_hex::<16>().unwrap(),
@@ -2222,6 +2430,7 @@ mod tests {
         )
         .await;
         assert_eq!(restored["status"], "pending");
+        assert_eq!(restored["pending_reason"], "approval");
         let key = recovered.credential.id().to_string();
         assert_eq!(
             service.service_state().unwrap().applicants[&key].status,
@@ -2242,7 +2451,7 @@ mod tests {
         let mut state = service.service_state().unwrap();
         state.applicants.get_mut(&key).unwrap().status = "eligible".into();
         service.save_service_state(&state).unwrap();
-        command(
+        let waiting = command(
             &mut service,
             &config,
             &recovered,
@@ -2250,6 +2459,7 @@ mod tests {
             json!({"enrollment":enrollment(&recovered,&authority)}),
         )
         .await;
+        assert_eq!(waiting["pending_reason"], "approval");
         assert_eq!(
             service.service_state().unwrap().applicants[&key].status,
             "pending"
@@ -2271,7 +2481,7 @@ mod tests {
             !service.device_admitted(recovered.credential.id()),
             "Only an owner-signed General commit can grant membership"
         );
-        command(
+        let waiting = command(
             &mut service,
             &config,
             &recovered,
@@ -2279,6 +2489,8 @@ mod tests {
             json!({"enrollment":enrollment(&recovered,&authority)}),
         )
         .await;
+        assert_eq!(waiting["status"], "pending");
+        assert_eq!(waiting["pending_reason"], "owner_sync");
         assert_eq!(
             service.service_state().unwrap().applicants[&key].status,
             "eligible",
@@ -2557,8 +2769,8 @@ mod tests {
             &owner.credential,
         )
         .unwrap();
-        let nonce = record::random_hex::<16>().unwrap();
-        let command = Command {
+        let mut nonce = record::random_hex::<16>().unwrap();
+        let mut command = Command {
             v: 1,
             kind: "space.command".into(),
             space: admitted.space(),
@@ -2567,9 +2779,20 @@ mod tests {
             action: "device_revoke".into(),
             body: json!({"authority_head":admitted.head_id(),"proof":STANDARD.encode(proof.bytes())}),
         };
-        let signed =
-            SignedRecord::sign(&serde_json::to_vec(&command).unwrap(), &child.key).unwrap();
-        for _ in 0..2 {
+        for attempt in 0..3 {
+            if attempt == 2 {
+                nonce = record::random_hex::<16>().unwrap();
+                command.nonce = nonce.clone();
+                let repeated = crate::identity::DeviceRevocation::issue_from_device(
+                    &child.credential,
+                    &child.key,
+                    &owner.credential,
+                )
+                .unwrap();
+                command.body["proof"] = STANDARD.encode(repeated.bytes()).into();
+            }
+            let signed =
+                SignedRecord::sign(&serde_json::to_vec(&command).unwrap(), &child.key).unwrap();
             let reply = service
                 .serve_hosted_space(
                     &config,
@@ -2593,8 +2816,8 @@ mod tests {
         let state = service.service_state().unwrap();
         assert_eq!(
             state.journal.len(),
-            2,
-            "one signed command and one permanent proof"
+            1,
+            "one permanent proof, without a duplicate command for every retry"
         );
         let devices = service.space_device_list(&child.credential).unwrap();
         assert_eq!(devices["devices"].as_array().unwrap().len(), 1);

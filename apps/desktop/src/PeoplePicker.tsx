@@ -71,7 +71,7 @@ export function PeoplePicker({
                   {!hideAvatars && (
                     <span className="avatar">
                       {person.initials}
-                      <OnlineIndicator identity={person.id} />
+                      {!person.self && <OnlineIndicator identity={person.id} />}
                     </span>
                   )}
                   <span className="dm-person-copy">

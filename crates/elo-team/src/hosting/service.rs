@@ -21,6 +21,37 @@ macro_rules! read_method {
     };
 }
 impl HostedService {
+    pub fn witnessed_authority(&self) -> Result<Option<elo_core::authority::Authority>> {
+        match self {
+            Self::Public(service) => service.witnessed_authority(),
+            Self::Legacy(_) => Ok(None),
+        }
+    }
+    pub fn witnessed_request_authority(
+        &self,
+        request: &SpaceRequest,
+    ) -> Result<elo_core::authority::Authority> {
+        match self {
+            Self::Public(service) => service.witnessed_request_authority(request),
+            Self::Legacy(_) => Err("Witnessed Space required.".into()),
+        }
+    }
+    pub async fn serve_hosted_witnessed_space(
+        &mut self,
+        config: &ServiceConfig,
+        request: SpaceRequest,
+        replica: &ReplicaStore,
+        lease: &elo_core::witness::VerifiedFreshness,
+    ) -> Result<SpaceResponse> {
+        match self {
+            Self::Public(service) => {
+                service
+                    .serve_hosted_witnessed_space(config, request, replica, lease)
+                    .await
+            }
+            Self::Legacy(_) => Err("Witnessed Space required.".into()),
+        }
+    }
     read_method!(team_scope() -> elo_core::app::team::TeamScope);
     read_method!(set_attachment_storage_available(available: bool) -> ());
     read_method!(bootstrap_space_invitation(address: &SpaceAddress, approval: bool) -> String);
@@ -125,6 +156,22 @@ impl HostedService {
         match self {
             Self::Legacy(service) => service.serve_hosted_space(config, request, replica).await,
             Self::Public(service) => service.serve_hosted_space(config, request, replica).await,
+        }
+    }
+    pub fn validate_account_deletion(
+        &self,
+        config: &ServiceConfig,
+        identity: IdentityId,
+        evidence: Option<&elo_core::public_space::AdminEvidence>,
+    ) -> Result<()> {
+        match self {
+            Self::Legacy(service) => {
+                if service.account_membership(config, identity)?["primary"] == true {
+                    return Err("Transfer primary ownership before deleting your account.".into());
+                }
+                Ok(())
+            }
+            Self::Public(service) => service.validate_account_deletion(config, identity, evidence),
         }
     }
     pub async fn erase_service_account(

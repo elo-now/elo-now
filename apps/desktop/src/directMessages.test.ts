@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { directName, findPeople, knownPeople } from "./directMessages";
+import {
+  directName,
+  findPeople,
+  knownPeople,
+  toggleDirectPerson,
+} from "./directMessages";
 import type { Stream, View } from "./model";
 
 const member = (id: string, type = "HUMAN") => ({
@@ -40,6 +45,23 @@ const view = (streams: Stream[]): View => ({
 });
 
 describe("DM people", () => {
+  it("offers private Notes only in the DM picker and keeps self out of group selections", () => {
+    const data = view([chat("General", ["maya"])]);
+    const people = knownPeople(data, true);
+    expect(people[0]).toMatchObject({
+      id: "me",
+      name: "Alex (you)",
+      self: true,
+    });
+    expect(findPeople(people, "notes").map((person) => person.id)).toEqual([
+      "me",
+    ]);
+    expect(directName(data, [people[0]])).toBe("Notes");
+    expect(knownPeople(data).some((person) => person.id === "me")).toBe(false);
+    expect(toggleDirectPerson(["maya"], "me", "me")).toEqual(["me"]);
+    expect(toggleDirectPerson(["me"], "maya", "me")).toEqual(["maya"]);
+    expect(toggleDirectPerson(["me"], "me", "me")).toEqual([]);
+  });
   it("includes saved contacts without a shared chat and merges memberships by identity", () => {
     const data = {
       ...view([chat("Team", ["maya"], { member_names: { maya: "Maya" } })]),

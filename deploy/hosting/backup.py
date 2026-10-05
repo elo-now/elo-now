@@ -19,6 +19,7 @@ from attachment_snapshot import AttachmentSnapshot
 import urllib.parse
 import xml.etree.ElementTree as ET
 
+CONFIG = Path('/etc/elo-backup/config.json')
 STATE = Path('/run/elo-backup-resume.json')
 NAME = re.compile(r'elo-ops-(\d{8}T\d{6}Z)\.tar\.gz\.age\Z')
 
@@ -131,9 +132,26 @@ def snapshot(config, directory):
     return archive
 
 
+def load_config(path):
+    # A delegated encrypted-export command must never choose root's input files
+    # or redirect a privileged snapshot to an attacker-controlled recipient.
+    if os.geteuid() == 0 and Path(path) != CONFIG:
+        raise ValueError('Privileged backups require the fixed operator configuration')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_uid != os.geteuid()):
+            raise ValueError('Backup configuration must be private and owned by the operator')
+        data = source.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise ValueError('Backup configuration is too large')
+    return json.loads(data)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='/etc/elo-backup/config.json')
+    parser.add_argument('--config', default=str(CONFIG))
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--cleanup', action='store_true')
     export = parser.add_mutually_exclusive_group()
@@ -145,7 +163,7 @@ def main():
         resume()
         return
     if args.list_encrypted or args.read_encrypted:
-        config = json.loads(Path(args.config).read_text())
+        config = load_config(args.config)
         directory = Path(config['destination'])
         if args.list_encrypted:
             print(json.dumps(sorted(p.name for p in directory.iterdir()
@@ -162,7 +180,7 @@ def main():
     with open('/run/lock/elo-operational-backup.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         resume()
-        config = json.loads(Path(args.config).read_text())
+        config = load_config(args.config)
         days = config['retention_days']
         if not 1 <= days <= 7:
             raise ValueError('Operational retention must be between one and seven days')

@@ -2,5 +2,7 @@
   "desktop.tray.open": "Open elo.now",
   "desktop.tray.quit": "Quit elo.now",
   "desktop.tray.idle": "elo.now",
-  "desktop.tray.unread": "elo.now — {count} unread messages"
+  "desktop.tray.unread": "elo.now — {count} unread messages",
+  "desktop.notification.message": "New messages",
+  "desktop.notification.session": "A conversation session has started. Open elo.now to join."
 }

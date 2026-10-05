@@ -35,7 +35,7 @@ import WebRTC
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
         do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP, .defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: ChatSessionAudio.shared.categoryOptions)
         } catch { pc.close(); throw MediaError.unavailable }
         audio = Self.factory.audioTrack(with: Self.factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)), trackId: "microphone")
         audio?.isEnabled = false

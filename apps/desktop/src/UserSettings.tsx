@@ -33,7 +33,7 @@ import {
   type PaletteKey,
   type UserPreferences,
 } from "./preferences";
-import type { Theme } from "./theme";
+import type { Theme, ThemePreference } from "./theme";
 import type { ViewMode } from "./viewMode";
 import { useToast } from "./Toast";
 import {
@@ -73,12 +73,14 @@ export function UserSettings({
   notifications,
   invitations,
   theme,
+  themePreference = theme,
   mode,
   preferences,
   identity,
   credential,
   busy,
   mobile,
+  biometricSupported,
   demoProfile,
   onPage,
   onClose,
@@ -93,6 +95,7 @@ export function UserSettings({
   remindersDue,
   onCode,
   notificationSettings,
+  soundSettings,
   spaceContext,
   spacesPage,
   blockedUsersPage,
@@ -104,16 +107,18 @@ export function UserSettings({
   notifications: number;
   invitations: number;
   theme: Theme;
+  themePreference?: ThemePreference;
   mode: ViewMode;
   preferences: UserPreferences;
   identity: string;
   credential: string;
   busy: boolean;
   mobile: boolean;
+  biometricSupported: boolean;
   demoProfile?: string;
   onPage: (page: Exclude<SettingsPage, "actions">) => void;
   onClose: () => void;
-  onTheme: (theme: Theme) => void;
+  onTheme: (theme: ThemePreference) => void;
   onMode: (mode: ViewMode) => void;
   onPreferences: (preferences: UserPreferences) => void;
   onLock: () => void;
@@ -124,6 +129,7 @@ export function UserSettings({
   remindersDue: boolean;
   onCode: () => void;
   notificationSettings?: ReactNode;
+  soundSettings?: ReactNode;
   spaceContext?: ReactNode;
   spacesPage?: ReactNode;
   blockedUsersPage?: ReactNode;
@@ -280,7 +286,9 @@ export function UserSettings({
       )}
       {page === "appearance" && (
         <AppearanceSettings
+          soundSettings={soundSettings}
           theme={theme}
+          themePreference={themePreference}
           preferences={preferences}
           onTheme={onTheme}
           onChange={onPreferences}
@@ -297,6 +305,7 @@ export function UserSettings({
           }
         >
           <LicenseSettings
+            desktopRoot
             onBack={() => onPage("profile")}
             serviceRequests={serviceRequests}
           />
@@ -342,7 +351,7 @@ export function UserSettings({
               {notificationSettings}
             </section>
           )}
-          {mobile && (
+          {biometricSupported && (
             <section aria-labelledby="settings-security-title">
               <h3 id="settings-security-title">{t("settings.security")}</h3>
               <SecuritySettings
@@ -505,7 +514,9 @@ function SecuritySettings({
           ? t("biometric.demoHelp", { name })
           : biometric?.available
             ? t("biometric.help", { name })
-            : t("biometric.setupHelp")}
+            : biometric?.error === "keychainUnavailable"
+              ? t("biometric.buildUnavailable", { name })
+              : t("biometric.setupHelp")}
       </p>
       {notice && <p className="settings-notice">{notice}</p>}
       {biometric?.enabled ? (
@@ -598,14 +609,18 @@ function Segmented<T extends string>({
 }
 
 function AppearanceSettings({
+  soundSettings,
   theme,
+  themePreference,
   preferences,
   onTheme,
   onChange,
 }: {
+  soundSettings?: ReactNode;
   theme: Theme;
+  themePreference: ThemePreference;
   preferences: UserPreferences;
-  onTheme: (theme: Theme) => void;
+  onTheme: (theme: ThemePreference) => void;
   onChange: (preferences: UserPreferences) => void;
 }) {
   const index = scaleValues.indexOf(preferences.uiScale);
@@ -618,9 +633,9 @@ function AppearanceSettings({
     <div className="settings-page appearance-page">
       <h3>{t("theme.mode")}</h3>
       <Segmented
-        values={["light", "dark"]}
-        selected={theme}
-        labels={[t("theme.light"), t("theme.dark")]}
+        values={["dark", "auto", "light"]}
+        selected={themePreference}
+        labels={[t("theme.dark"), t("theme.auto"), t("theme.light")]}
         onSelect={onTheme}
       />
       <button
@@ -654,6 +669,7 @@ function AppearanceSettings({
           <span />
         </span>
       </button>
+      {soundSettings}
       <h3>{t("scale.label")}</h3>
       <input
         className="scale-slider"

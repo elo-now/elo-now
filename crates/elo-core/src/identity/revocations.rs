@@ -1,10 +1,64 @@
 //! Permanent, authenticated device tombstones. Hosting shares this directory across
 //! Spaces so deleting a Space cannot resurrect a retired device.
 use super::*;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const MAX_REVOKED_DEVICES: usize = 65_536;
+const MAX_REVOCATIONS_PER_HOUR: usize = 16;
+const MAX_REVOCATIONS_PER_DAY: usize = 32;
+
+#[derive(Default)]
+struct Budget {
+    identities: BTreeMap<IdentityId, BTreeMap<RecordId, u64>>,
+    total: usize,
+}
+impl Budget {
+    fn require_enrollment_budget(
+        &self,
+        identity: IdentityId,
+        current: u64,
+    ) -> crate::app::Result<()> {
+        if let Some(entries) = self.identities.get(&identity)
+            && (entries
+                .values()
+                .filter(|at| current.saturating_sub(**at) < 3_600)
+                .count()
+                >= MAX_REVOCATIONS_PER_HOUR
+                || entries
+                    .values()
+                    .filter(|at| current.saturating_sub(**at) < 86_400)
+                    .count()
+                    >= MAX_REVOCATIONS_PER_DAY)
+        {
+            return Err(
+                "Too many device changes for this profile. Try linking a device later.".into(),
+            );
+        }
+        Ok(())
+    }
+    fn record(&mut self, identity: IdentityId, id: RecordId, at: u64) {
+        if self
+            .identities
+            .entry(identity)
+            .or_default()
+            .insert(id, at)
+            .is_none()
+        {
+            self.total += 1;
+        }
+    }
+}
 
 #[derive(Clone)]
-pub struct Revocations(PathBuf);
+pub struct Revocations {
+    path: PathBuf,
+    budget: Arc<Mutex<Budget>>,
+}
 impl Revocations {
     pub fn open(path: impl AsRef<Path>) -> crate::app::Result<Self> {
         let path = path.as_ref();
@@ -28,10 +82,37 @@ impl Revocations {
                 return Err("Unsafe revocation registry.".into());
             }
         }
-        Ok(Self(path.to_path_buf()))
+        // Build the quota index once per host startup. Proofs remain the durable
+        // source of truth; no separate counter can be reset to bypass a quota.
+        let mut budget = Budget::default();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file = entry.path();
+            if file.extension().and_then(|extension| extension.to_str()) != Some("record") {
+                continue;
+            }
+            if budget.total >= MAX_REVOKED_DEVICES {
+                return Err("Device revocation registry is full.".into());
+            }
+            let record = SignedRecord::parse(&crate::vault::read_private(&file)?)?;
+            let credential = DeviceRevocation::verify(&record)?;
+            if file != path.join(format!("{}.record", credential.id())) {
+                return Err("Invalid device revocation path.".into());
+            }
+            let at = entry
+                .metadata()?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?
+                .as_secs();
+            budget.record(credential.identity(), credential.id(), at);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            budget: Arc::new(Mutex::new(budget)),
+        })
     }
     pub fn get(&self, id: RecordId) -> crate::app::Result<Option<SignedRecord>> {
-        let path = self.0.join(format!("{id}.record"));
+        let path = self.path.join(format!("{id}.record"));
         if !path.try_exists()? {
             return Ok(None);
         }
@@ -43,21 +124,36 @@ impl Revocations {
     }
     pub fn insert(&self, record: &SignedRecord) -> crate::app::Result<()> {
         let credential = DeviceRevocation::verify(record)?;
+        let mut budget = self
+            .budget
+            .lock()
+            .map_err(|_| "Device revocation registry unavailable.")?;
         if self.get(credential.id())?.is_some() {
             return Ok(());
         }
         // Only host-authorized requests may reach this method. Keep even
         // expired accounts' tombstones, never evict them to admit more entries.
-        if std::fs::read_dir(&self.0)?.take(65_536).count() >= 65_536 {
+        let current = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        if budget.total >= MAX_REVOKED_DEVICES {
             return Err("Device revocation registry is full.".into());
         }
-        let path = self.0.join(format!("{}.record", credential.id()));
+        let path = self.path.join(format!("{}.record", credential.id()));
         if let Err(error) = crate::vault::write_private(&path, record.bytes(), false)
             && self.get(credential.id())?.is_none()
         {
             return Err(error.into());
         }
+        budget.record(credential.identity(), credential.id(), current);
         Ok(())
+    }
+    /// Limit replacement-device churn, never retirement of already admitted
+    /// devices. A user must still be able to remove all compromised devices.
+    pub fn require_enrollment_budget(&self, identity: IdentityId) -> crate::app::Result<()> {
+        let current = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.budget
+            .lock()
+            .map_err(|_| "Device revocation registry unavailable.")?
+            .require_enrollment_budget(identity, current)
     }
 }
 
@@ -65,6 +161,63 @@ impl Revocations {
 mod tests {
     use super::*;
     use crate::vault::{self, Session};
+
+    #[test]
+    fn replacement_churn_limits_survive_restart_without_blocking_further_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("revocations");
+        let registry = Revocations::open(&path).unwrap();
+        let (session, card) = Session::create().unwrap();
+        let root = card.recover_root(session.identity_id()).unwrap();
+        for _ in 0..MAX_REVOCATIONS_PER_HOUR {
+            let device = Session::recover(&card, session.identity_id()).unwrap();
+            let proof = DeviceRevocation::issue(&root, device.credential()).unwrap();
+            registry.insert(&proof).unwrap();
+            registry.insert(&proof).unwrap();
+        }
+        assert!(
+            registry
+                .require_enrollment_budget(session.identity_id())
+                .is_err()
+        );
+        assert_eq!(
+            registry.budget.lock().unwrap().total,
+            MAX_REVOCATIONS_PER_HOUR
+        );
+        drop(registry);
+        let registry = Revocations::open(&path).unwrap();
+        assert!(
+            registry
+                .require_enrollment_budget(session.identity_id())
+                .is_err()
+        );
+        // Even at the churn limit, previously admitted compromised devices
+        // must remain removable. Only a new enrollment is rate limited.
+        let proof = DeviceRevocation::issue(&root, session.credential()).unwrap();
+        registry.insert(&proof).unwrap();
+        assert!(registry.get(session.credential().id()).unwrap().is_some());
+        let (another, _) = Session::create().unwrap();
+        registry
+            .require_enrollment_budget(another.identity_id())
+            .unwrap();
+    }
+
+    #[test]
+    fn replacement_budget_ages_out_without_deleting_tombstones() {
+        let identity = IdentityId::from_bytes([1; 32]);
+        let mut budget = Budget::default();
+        for index in 0..MAX_REVOCATIONS_PER_HOUR {
+            budget.record(identity, RecordId::from_bytes([index as u8; 32]), 1_000);
+        }
+        assert!(budget.require_enrollment_budget(identity, 1_001).is_err());
+        budget.require_enrollment_budget(identity, 4_600).unwrap();
+        for index in MAX_REVOCATIONS_PER_HOUR..MAX_REVOCATIONS_PER_DAY {
+            budget.record(identity, RecordId::from_bytes([index as u8; 32]), 4_600);
+        }
+        assert!(budget.require_enrollment_budget(identity, 8_200).is_err());
+        budget.require_enrollment_budget(identity, 91_000).unwrap();
+        assert_eq!(budget.total, MAX_REVOCATIONS_PER_DAY);
+    }
 
     #[test]
     fn root_proofs_reject_forgery_and_tombstones_survive_restart() {

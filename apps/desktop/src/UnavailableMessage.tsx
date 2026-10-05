@@ -45,15 +45,14 @@ export function UnavailableMessage({
       data-requesting={requesting || undefined}
     >
       {requesting ? (
-        <strong role="status" aria-live="polite">
+        <span role="status" aria-live="polite">
           {t("messageUnavailable.requesting")}
-        </strong>
+        </span>
       ) : (
         <>
-          <strong>{t("messageUnavailable.title")}</strong>
+          <span>{t("messageUnavailable.title")}</span>
           <button
             type="button"
-            className="secondary"
             disabled={disabled}
             onClick={() => void request()}
           >

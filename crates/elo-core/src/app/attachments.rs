@@ -1,4 +1,5 @@
 use super::*;
+use crate::attachments::broker::{Operation as StorageOperation, Response as StorageResponse};
 use crate::attachments::{AttachmentDescriptor, AttachmentEncryption, MAX_ATTACHMENT_FILE_SIZE};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
@@ -156,6 +157,7 @@ impl ClientApp {
             created_at_ms: 0,
             expires_at_ms: None,
             object_id: object,
+            external_storage: self.attachment_storage_endpoint.clone(),
             encryption: AttachmentEncryption {
                 algorithm: "xchacha20-poly1305-chunks-v1".into(),
                 key: STANDARD.encode(plan.key.as_slice()),
@@ -188,20 +190,41 @@ impl ClientApp {
             return Err("Unblock this user before contacting them.".into());
         }
         self.require_fresh_membership(authority).await?;
-        let reservation = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
-            result = self.call_space(
-                address,
-                "attachment_reserve",
-                json!({
-                    "attachment_id":attachment,
-                    "object_id":object,
-                    "plaintext_size":metadata.len(),
-                    "encrypted_size":encrypted.encrypted_size,
-                    "ciphertext_sha256":encrypted.ciphertext_sha256,
-                }),
-            ) => result?,
+        let external = self.attachment_storage_endpoint.is_some();
+        let (reservation, upload_endpoint) = if external {
+            let created_at_ms = now()?.as_millis() as u64;
+            let response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
+                response = self.external_storage_command(address, StorageOperation::Reserve {
+                    object_id: object,
+                    encrypted_size: encrypted.encrypted_size,
+                    ciphertext_sha256: encrypted.ciphertext_sha256.clone(),
+                }) => response?,
+            };
+            let (endpoint, token, expires_at_ms) =
+                self.external_storage_transfer(response, object)?;
+            (
+                json!({"upload_token":token,"created_at_ms":created_at_ms,"expires_at_ms":expires_at_ms}),
+                endpoint,
+            )
+        } else {
+            let reservation = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
+                result = self.call_space(
+                    address,
+                    "attachment_reserve",
+                    json!({
+                        "attachment_id":attachment,
+                        "object_id":object,
+                        "plaintext_size":metadata.len(),
+                        "encrypted_size":encrypted.encrypted_size,
+                        "ciphertext_sha256":encrypted.ciphertext_sha256,
+                    }),
+                ) => result?,
+            };
+            (reservation, self.attachment_endpoint(address, "upload")?)
         };
         descriptor.created_at_ms = reservation["created_at_ms"]
             .as_u64()
@@ -239,7 +262,7 @@ impl ClientApp {
             result
         });
         let upload = client
-            .put(self.attachment_endpoint(address, "upload")?)
+            .put(upload_endpoint)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_LENGTH, encrypted.encrypted_size)
             .body(reqwest::Body::wrap_stream(body))
@@ -256,8 +279,9 @@ impl ClientApp {
         // The storage provider may finish the PUT while the following control
         // request crosses a short mobile-network transition. Retry only this
         // idempotent finalization step; never repeat the encrypted body upload.
-        let mut committed = false;
+        let mut committed = external;
         for attempt in 0..2 {
+            if external { break; }
             let result = tokio::select! {
             biased;
                 _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
@@ -301,8 +325,16 @@ impl ClientApp {
         finalizing = true;
         let mut linked = false;
         for attempt in 0..2 {
-            let result = self.call_space(address, "attachment_link",
-                json!({"attachment_id":attachment,"message_id":message})).await;
+            let result = if external {
+                self.external_storage_command(address, StorageOperation::Complete { object_id: object }).await
+                    .and_then(|response| match response {
+                        StorageResponse::Complete { object_id } if object_id == object => Ok(json!({})),
+                        _ => Err("Invalid attachment storage response.".into()),
+                    })
+            } else {
+                self.call_space(address, "attachment_link",
+                    json!({"attachment_id":attachment,"message_id":message})).await
+            };
             match result {
                 Ok(_) => {
                     linked = true;
@@ -343,14 +375,23 @@ impl ClientApp {
             // The PUT may already have reached storage. Revoke its reservation
             // as well as dropping the socket; a bounded best-effort request lets
             // the server's normal cleanup reclaim any completed ciphertext.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.call_space(
-                    address,
-                    "attachment_cancel",
-                    json!({"attachment_id":attachment}),
-                ),
-            )
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                if external {
+                    self.external_storage_command(
+                        address,
+                        StorageOperation::Cancel { object_id: object },
+                    )
+                    .await
+                    .map(|_| json!({}))
+                } else {
+                    self.call_space(
+                        address,
+                        "attachment_cancel",
+                        json!({"attachment_id":attachment}),
+                    )
+                    .await
+                }
+            })
             .await;
         }
         result
@@ -425,54 +466,83 @@ impl ClientApp {
             return Err("Attachment transfer cancelled.".into());
         }
         let descriptor = self.attachment_descriptor(request).await?;
-        let authorization = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
-            result = self.call_space(
-                address,
-                "attachment_download",
-                json!({"attachment_id":descriptor.id}),
-            ) => result?,
-        };
-        if authorization["status"] != "available" {
-            return Err(match authorization["status"].as_str() {
-                Some("expired") => "This attachment has expired on the server.",
-                Some("deleted") => "This attachment was removed from the server.",
-                _ => "This attachment is no longer available on the server.",
-            }
-            .into());
+        let current = now()?.as_millis() as u64;
+        if descriptor
+            .expires_at_ms
+            .is_some_and(|expiry| expiry <= current)
+        {
+            return Err("This attachment has expired on the server.".into());
         }
-        let token = field(&authorization, "download_token")?;
-        let client = crate::attachments::download::client(reqwest::Client::builder().no_proxy())?;
-        let endpoint = self.attachment_endpoint(address, "download")?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
         progress(0, descriptor.encrypted_size);
-        let mut response = None;
-        for attempt in 0..2 {
-            let download = client.get(endpoint.clone()).bearer_auth(token).send();
-            let result = tokio::select! {
-            biased;
+        let response = if let Some(service) = &descriptor.external_storage {
+            if self.attachment_storage_endpoint.as_ref() != Some(service) {
+                return Err("Attachment storage is unavailable in this build.".into());
+            }
+            self.external_storage_download(
+                address,
+                descriptor.object_id,
+                descriptor
+                    .expires_at_ms
+                    .ok_or("Invalid attachment storage response.")?,
+                &cancellation,
+                deadline,
+            )
+            .await?
+        } else {
+            let authorization = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
-                result = download => result,
+                result = self.call_space(
+                    address,
+                    "attachment_download",
+                    json!({"attachment_id":descriptor.id}),
+                ) => result?,
             };
-            match result {
-                Ok(candidate) if candidate.status().is_success() => {
-                    response = Some(candidate);
-                    break;
+            if authorization["status"] != "available" {
+                return Err(match authorization["status"].as_str() {
+                    Some("expired") => "This attachment has expired on the server.",
+                    Some("deleted") => "This attachment was removed from the server.",
+                    _ => "This attachment is no longer available on the server.",
                 }
-                Ok(candidate) if attempt == 0 && candidate.status().is_server_error() => {}
-                Ok(_) => return Err("Could not download this attachment. Try again later.".into()),
-                Err(_) if attempt == 0 => {}
-                Err(_) => {
-                    return Err(
+                .into());
+            }
+            let endpoint = self.attachment_endpoint(address, "download")?;
+            let token = field(&authorization, "download_token")?;
+            let client =
+                crate::attachments::download::client(reqwest::Client::builder().no_proxy())?;
+            let mut response = None;
+            for attempt in 0..2 {
+                let download = client
+                    .get(endpoint.clone())
+                    .bearer_auth(token)
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .send();
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
+                    result = download => result,
+                };
+                match result {
+                    Ok(candidate) if candidate.status().is_success() => {
+                        response = Some(candidate);
+                        break;
+                    }
+                    Ok(candidate) if attempt == 0 && candidate.status().is_server_error() => {}
+                    Ok(_) => {
+                        return Err("Could not download this attachment. Try again later.".into());
+                    }
+                    Err(_) if attempt == 0 => {}
+                    Err(_) => return Err(
                         "Could not download this attachment. Check your connection and try again."
                             .into(),
-                    );
+                    ),
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-        let response = response
-            .ok_or("Could not download this attachment. Check your connection and try again.")?;
+            response
+                .ok_or("Could not download this attachment. Check your connection and try again.")?
+        };
         if !response.status().is_success()
             || response.content_length() != Some(descriptor.encrypted_size)
         {
@@ -487,7 +557,7 @@ impl ClientApp {
             let next = tokio::select! {
             biased;
                 _ = cancellation.cancelled() => return Err("Attachment transfer cancelled.".into()),
-                next = stream.next() => next,
+                next = tokio::time::timeout_at(deadline, stream.next()) => next.map_err(|_| "Could not download this attachment. Check your connection and try again.")?,
             };
             let Some(chunk) = next else { break };
             let chunk = chunk.map_err(

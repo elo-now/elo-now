@@ -1,4 +1,5 @@
 //! Provider-independent attachment metadata and bounded client-side encryption.
+pub mod broker;
 pub mod cache;
 pub mod crypto;
 pub mod download;

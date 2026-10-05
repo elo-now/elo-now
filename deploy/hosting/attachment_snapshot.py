@@ -1,6 +1,8 @@
 """Bounded ciphertext copies from the loopback-only hosting operator listener."""
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 import re
 import shutil
@@ -28,6 +30,15 @@ class AttachmentSnapshot:
         if (url.scheme != 'http' or url.hostname not in ('127.0.0.1', '::1')
                 or url.username or url.password or url.query or url.fragment or url.path):
             raise ValueError('Expected a loopback operator origin')
+        # A separate key scopes local access to backups rather than call admission.
+        fd = os.open(config['access_key_file'], os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+                raise ValueError('Backup access key must be a private regular file')
+            self.access_key = source.read(65).decode('ascii')
+        if not HEX64.fullmatch(self.access_key):
+            raise ValueError('Invalid backup access key')
         self.maximum = config.get('max_bytes', 1024 * 1024 * 1024)
         if type(self.maximum) is not int or not 1 <= self.maximum <= 8 * 1024**3:
             raise ValueError('Invalid attachment backup byte budget')
@@ -39,7 +50,9 @@ class AttachmentSnapshot:
         if remaining <= 0:
             raise TimeoutError('Attachment backup exceeded its time budget')
         try:
-            return self.http.open(self.base + path, timeout=min(30, remaining))
+            request = urllib.request.Request(self.base + path,
+                headers={'Authorization': 'Bearer ' + self.access_key})
+            return self.http.open(request, timeout=min(30, remaining))
         except urllib.error.HTTPError as error:
             if error.code in (404, 410, 503):
                 raise SourceChanged('Attachment source is busy or changed') from None

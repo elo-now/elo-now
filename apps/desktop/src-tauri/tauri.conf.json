@@ -16,6 +16,7 @@
         "title": "elo.now",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "dragDropEnabled": false,
         "width": 1180,
         "height": 800,
         "minWidth": 820,
@@ -73,6 +74,12 @@
       "entitlements": "macos/Entitlements.plist",
       "bundleVersion": "1114",
       "minimumSystemVersion": "11.0"
+    },
+    "resources": {
+      "../public/sounds/default.wav": "default.wav",
+      "../public/sounds/soft.wav": "soft.wav",
+      "../public/sounds/elo-male.wav": "elo-male.wav",
+      "../public/sounds/elo-female.wav": "elo-female.wav"
     }
   }
 }

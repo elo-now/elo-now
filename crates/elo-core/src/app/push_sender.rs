@@ -14,6 +14,8 @@ struct Proof {
     target_hash: String,
     #[serde(default = "message_category")]
     category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_expires: Option<u64>,
     expires: u64,
 }
 fn message_category() -> String {
@@ -70,8 +72,14 @@ pub fn verify_sender(route: &str, request: &Value, time: u64) -> Result<Sender> 
         || body.category != request["category"].as_str().unwrap_or("message")
         || !matches!(
             body.category.as_str(),
-            "message" | "invitation" | "membership"
+            "message" | "invitation" | "membership" | "session_start"
         )
+        || body.delivery_expires != request["expires"].as_u64()
+        || (body.category == "session_start"
+            && body
+                .delivery_expires
+                .is_none_or(|expires| expires <= time || expires > time.saturating_add(60)))
+        || (body.category != "session_start" && body.delivery_expires.is_some())
         || body.target_hash
             != record::encode_hex(&Sha256::digest(field(request, "target")?.as_bytes()))
         || body.expires < time
@@ -92,6 +100,7 @@ pub fn sign(session: &Session, route: &str, request: &mut Value) -> Result<()> {
         event: field(request, "event")?.into(),
         scope: field(request, "scope")?.into(),
         category: request["category"].as_str().unwrap_or("message").into(),
+        delivery_expires: request["expires"].as_u64(),
         target_hash: record::encode_hex(&Sha256::digest(field(request, "target")?.as_bytes())),
         expires: now()?.as_millis() as u64 / 1000 + 120,
     };

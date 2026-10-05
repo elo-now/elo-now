@@ -18,11 +18,13 @@ export function ComposerExpiry({
     >
       <span>{t("composer.deleteAfter")}</span>
       <div className="composer-expiry-options">
-        {([1, 12, 24] as const).map((hours) => (
+        {([undefined, 1, 24] as const).map((hours) => (
           <button
-            key={hours}
+            key={hours ?? "none"}
             type="button"
             aria-pressed={value === hours}
+            aria-label={hours === undefined ? t("composer.noExpiry") : undefined}
+            title={hours === undefined ? t("composer.noExpiry") : undefined}
             disabled={disabled}
             // Cover both pointer events and WebKit's compatibility mouse events.
             onPointerDown={(event) => event.preventDefault()}
@@ -37,7 +39,9 @@ export function ComposerExpiry({
               onChange(value === hours ? undefined : hours);
             }}
           >
-            {t("composer.expiryHours", { hours })}
+            {hours === undefined
+              ? t("composer.expiryNone")
+              : t("composer.expiryHours", { hours })}
           </button>
         ))}
       </div>
