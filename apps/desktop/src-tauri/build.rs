@@ -65,6 +65,7 @@ fn main() {
             "push_task",
             "desktop_notification_task",
             "native_call_media",
+            "native_call_incoming",
             "native_call_state",
             "native_call_audio",
             "choose_attachment",

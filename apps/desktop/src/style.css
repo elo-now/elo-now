@@ -976,11 +976,15 @@ h2 {
   font-size: var(--elo-type-display);
   font-weight: 750;
 }
-.profile-edit-form {
+.profile-edit-form,
+.change-password-form {
   display: flex;
   flex-direction: column;
   gap: 16px;
   padding-top: 16px;
+}
+.change-password-form > label {
+  margin: 0;
 }
 .profile-photo-preview {
   display: flex;
@@ -990,14 +994,6 @@ h2 {
 .profile-photo-preview .profile-avatar {
   width: 112px;
   height: 112px;
-}
-.profile-photo-actions {
-  display: flex;
-  justify-content: center;
-  gap: 8px;
-}
-.profile-photo-actions button {
-  flex: 1;
 }
 .profile-remove-photo {
   align-self: center;

@@ -206,7 +206,7 @@ export function InvitationFlow({
   };
   const refresh = async () => {
     setRequestsRefresh((value) => value + 1);
-    await call({ op: "invitation_sync", force: true });
+    await call({ op: "invitation_sync", force: true, foreground: true });
     if (page === "activity" || page === "notifications") await loadActivity();
     if (page === "requests" || page === "invitations") await load();
   };

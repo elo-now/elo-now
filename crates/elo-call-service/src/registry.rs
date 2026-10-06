@@ -53,8 +53,39 @@ pub struct Participant {
     pub credential_id: RecordId,
     pub media: MediaState,
     pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
     #[serde(skip)]
     last_seen: u64,
+    #[serde(skip)]
+    delegation_expires_at: Option<u64>,
+    #[serde(skip)]
+    accepted_invitation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Ringing,
+    Active,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Invitation {
+    pub invitation_id: String,
+    pub invited_by: IdentityId,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    Cancelled,
+    Declined,
+    Ended,
+    Unanswered,
+    Expired,
+    Unauthorized,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -65,6 +96,10 @@ pub struct ActiveCall {
     pub initial_media: InitialMedia,
     pub started_at: u64,
     pub started_by: IdentityId,
+    pub phase: Phase,
+    pub ring_expires_at: u64,
+    pub answered_at: Option<u64>,
+    pub invitations: BTreeMap<IdentityId, Invitation>,
     pub ready: bool,
     pub ready_at: Option<u64>,
     pub config_id: RecordId,
@@ -103,6 +138,7 @@ pub enum Event {
     Ended {
         scope: Scope,
         call_id: String,
+        reason: EndReason,
     },
     Signal {
         scope: Scope,
@@ -142,6 +178,80 @@ impl Registry {
         self.rooms.get(scope)
     }
 
+    /// The engine has verified this certificate and current device membership.
+    pub fn apply_with_delegation(
+        &mut self,
+        authority: &Authority,
+        command: &Command,
+        now: u64,
+        delegation: Option<&str>,
+    ) -> Result<Vec<Event>> {
+        let scope = Scope::from(command);
+        if let Some(participant) = self.rooms.get(&scope).and_then(|call| {
+            call.participants
+                .values()
+                .find(|participant| participant.credential_id == command.credential_id)
+        }) {
+            if participant.delegation.as_deref() != delegation
+                && !matches!(
+                    command.operation,
+                    Operation::Subscribe | Operation::Decline { .. }
+                )
+                // The original device may control its own capture and invitations
+                // after foreground adoption, without replacing the admitted
+                // delegate or gaining a second signaling/media transport.
+                && !(delegation.is_none()
+                    && matches!(
+                        command.operation,
+                        Operation::End { .. }
+                            | Operation::Cancel { .. }
+                            | Operation::Leave { .. }
+                            | Operation::Media { .. }
+                            | Operation::Invite { .. }
+                    ))
+            {
+                return Err(CallError::AlreadyJoined);
+            }
+        }
+        let delegation_expires_at = delegation
+            .map(|encoded| {
+                let signed = elo_core::calls::delegation::decode_certificate(encoded)
+                    .map_err(|_| CallError::Unauthorized)?;
+                let verified = elo_core::calls::delegation::verify(
+                    authority,
+                    &signed,
+                    command.hosting_space_id,
+                    &command.audience,
+                    now,
+                )
+                .map_err(|_| CallError::Unauthorized)?;
+                Ok::<_, CallError>(verified.body.expires_at)
+            })
+            .transpose()?;
+        let mut events = self.apply(authority, command, now)?;
+        if matches!(
+            command.operation,
+            Operation::Start { .. } | Operation::Join { .. }
+        ) {
+            if let Some(participant) = self.rooms.get_mut(&scope).and_then(|call| {
+                call.participants
+                    .values_mut()
+                    .find(|participant| participant.credential_id == command.credential_id)
+            }) {
+                participant.delegation = delegation.map(str::to_owned);
+                participant.delegation_expires_at = delegation_expires_at;
+            }
+            for event in &mut events {
+                if let Event::Presence { call } = event {
+                    if let Some(current) = self.rooms.get(&scope) {
+                        *call = current.clone();
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+
     pub fn apply(
         &mut self,
         authority: &Authority,
@@ -157,6 +267,16 @@ impl Registry {
         {
             return Err(CallError::Unauthorized);
         }
+        if self.rooms.get(&scope).is_some_and(|call| {
+            call.kind == CallKind::Direct
+                && call.phase == Phase::Ringing
+                && now >= call.ring_expires_at
+        }) {
+            return Ok(vec![
+                self.end_with_reason(scope, EndReason::Unanswered)
+                    .ok_or(CallError::Ended)?,
+            ]);
+        }
         match &command.operation {
             Operation::Subscribe => {
                 return Ok(self
@@ -171,19 +291,19 @@ impl Registry {
                 initial_media,
             } => {
                 let head = authority.head().map_err(|_| CallError::Unauthorized)?;
-                let expected =
-                    if head.chat_kind == Some(ChatKind::Direct) && head.members.len() == 2 {
-                        CallKind::Direct
-                    } else {
-                        CallKind::Group
-                    };
-                if *kind != expected {
+                let expected = if head.chat_kind == Some(ChatKind::Direct) {
+                    CallKind::Direct
+                } else {
+                    CallKind::Group
+                };
+                if *kind != expected || (expected == CallKind::Direct && head.members.len() != 2) {
                     return Err(CallError::Invalid);
                 }
                 if let Some(call) = self.rooms.get(&scope) {
                     let mut join = command.clone();
                     join.operation = Operation::Join {
                         call_id: call.call_id.clone(),
+                        invitation_id: None,
                     };
                     return self.apply(authority, &join, now);
                 }
@@ -200,6 +320,9 @@ impl Registry {
                         ..MediaState::default()
                     },
                     last_seen: now,
+                    delegation_expires_at: None,
+                    accepted_invitation_id: None,
+                    delegation: None,
                 };
                 self.rooms.insert(
                     scope,
@@ -210,6 +333,32 @@ impl Registry {
                         initial_media: *initial_media,
                         started_at: now,
                         started_by: identity,
+                        phase: if *kind == CallKind::Direct {
+                            Phase::Ringing
+                        } else {
+                            Phase::Active
+                        },
+                        ring_expires_at: now.saturating_add(elo_core::calls::RING_TTL),
+                        answered_at: None,
+                        invitations: if *kind == CallKind::Direct {
+                            let recipient = head
+                                .members
+                                .iter()
+                                .find(|member| member.identity_id != identity)
+                                .ok_or(CallError::Invalid)?
+                                .identity_id;
+                            BTreeMap::from([(
+                                recipient,
+                                Invitation {
+                                    invitation_id: record::random_hex::<16>()
+                                        .map_err(|_| CallError::Unavailable)?,
+                                    invited_by: identity,
+                                    expires_at: now.saturating_add(elo_core::calls::RING_TTL),
+                                },
+                            )])
+                        } else {
+                            BTreeMap::new()
+                        },
                         ready: false,
                         ready_at: None,
                         config_id: command.config_id,
@@ -231,7 +380,21 @@ impl Registry {
                     return Err(CallError::Unauthorized);
                 }
                 match &command.operation {
-                    Operation::Join { .. } => {
+                    Operation::Join { invitation_id, .. } => {
+                        if let Some(expected) = invitation_id {
+                            let pending = call.invitations.get(&identity).is_some_and(|invite| {
+                                invite.invitation_id == *expected && invite.expires_at > now
+                            });
+                            let joined =
+                                call.participants.get(&identity).is_some_and(|participant| {
+                                    participant.credential_id == command.credential_id
+                                        && participant.accepted_invitation_id.as_ref()
+                                            == Some(expected)
+                                });
+                            if !pending && !joined {
+                                return Err(CallError::Ended);
+                            }
+                        }
                         if let Some(joined) = call.participants.get_mut(&identity) {
                             if joined.credential_id != command.credential_id {
                                 return Err(CallError::AlreadyJoined);
@@ -252,18 +415,127 @@ impl Registry {
                                         ..MediaState::default()
                                     },
                                     last_seen: now,
+                                    delegation_expires_at: None,
+                                    accepted_invitation_id: None,
+                                    delegation: None,
                                 },
                             );
                             call.key_epoch += 1;
                         }
+                        if let Some(joined) = call.participants.get_mut(&identity) {
+                            if invitation_id.is_some() {
+                                joined.accepted_invitation_id.clone_from(invitation_id);
+                            }
+                        }
+                        call.invitations.remove(&identity);
+                        if call.kind == CallKind::Direct && identity != call.started_by {
+                            call.phase = Phase::Active;
+                            call.answered_at.get_or_insert(now);
+                            call.invitations.clear();
+                        }
                         call.empty_since = None;
+                    }
+                    Operation::Decline { invitation_id, .. } => {
+                        if call
+                            .invitations
+                            .get(&identity)
+                            .is_some_and(|invite| invite.invitation_id != *invitation_id)
+                        {
+                            return Err(CallError::Ended);
+                        }
+                        if call.kind == CallKind::Direct {
+                            if call.phase != Phase::Ringing
+                                || identity == call.started_by
+                                || call.participants.contains_key(&identity)
+                            {
+                                return Err(CallError::Invalid);
+                            }
+                            return Ok(vec![
+                                self.end_with_reason(scope, EndReason::Declined)
+                                    .ok_or(CallError::Ended)?,
+                            ]);
+                        }
+                        // Declining a group invitation never removes participants.
+                        call.invitations.remove(&identity);
+                    }
+                    Operation::Cancel { .. } => {
+                        if call.kind != CallKind::Direct
+                            || call.phase != Phase::Ringing
+                            || identity != call.started_by
+                        {
+                            return Err(CallError::Invalid);
+                        }
+                        Self::participant(call, identity, command.credential_id)?;
+                        return Ok(vec![
+                            self.end_with_reason(scope, EndReason::Cancelled)
+                                .ok_or(CallError::Ended)?,
+                        ]);
+                    }
+                    Operation::End { .. } => {
+                        if call.kind != CallKind::Direct {
+                            return Err(CallError::Invalid);
+                        }
+                        Self::participant(call, identity, command.credential_id)?;
+                        return Ok(vec![
+                            self.end_with_reason(scope, EndReason::Ended)
+                                .ok_or(CallError::Ended)?,
+                        ]);
+                    }
+                    Operation::Invite { to, .. } => {
+                        if call.kind != CallKind::Group
+                            || *to == identity
+                            || call.participants.contains_key(to)
+                        {
+                            return Err(CallError::Invalid);
+                        }
+                        Self::participant(call, identity, command.credential_id)?;
+                        let member = authority
+                            .head()
+                            .map_err(|_| CallError::Unauthorized)?
+                            .members
+                            .iter()
+                            .find(|member| member.identity_id == *to)
+                            .ok_or(CallError::Unauthorized)?;
+                        if !member
+                            .credential_ids
+                            .iter()
+                            .any(|credential| require_member(authority, *credential).is_ok())
+                        {
+                            return Err(CallError::Unauthorized);
+                        }
+                        // Retries cannot extend an existing ringing window or ring
+                        // the same recipient's other devices a second time.
+                        if !call
+                            .invitations
+                            .get(to)
+                            .is_some_and(|invite| invite.expires_at > now)
+                        {
+                            call.invitations.insert(
+                                *to,
+                                Invitation {
+                                    invitation_id: record::random_hex::<16>()
+                                        .map_err(|_| CallError::Unavailable)?,
+                                    invited_by: identity,
+                                    expires_at: now.saturating_add(elo_core::calls::RING_TTL),
+                                },
+                            );
+                        }
                     }
                     Operation::Leave { .. } => {
                         Self::participant(call, identity, command.credential_id)?;
+                        if call.kind == CallKind::Direct {
+                            return Ok(vec![
+                                self.end_with_reason(scope, EndReason::Ended)
+                                    .ok_or(CallError::Ended)?,
+                            ]);
+                        }
                         call.participants.remove(&identity);
                         call.key_epoch += 1;
                         if call.participants.is_empty() {
-                            return Ok(vec![self.end(scope).ok_or(CallError::Ended)?]);
+                            return Ok(vec![
+                                self.end_with_reason(scope, EndReason::Ended)
+                                    .ok_or(CallError::Ended)?,
+                            ]);
                         }
                     }
                     Operation::Heartbeat { .. } | Operation::ConnectMedia { .. } => {
@@ -358,9 +630,13 @@ impl Registry {
             .ok_or(CallError::Unauthorized)
     }
     pub(crate) fn end(&mut self, scope: Scope) -> Option<Event> {
+        self.end_with_reason(scope, EndReason::Unauthorized)
+    }
+    fn end_with_reason(&mut self, scope: Scope, reason: EndReason) -> Option<Event> {
         self.rooms.remove(&scope).map(|room| Event::Ended {
             scope,
             call_id: room.call_id,
+            reason,
         })
     }
 
@@ -407,9 +683,26 @@ impl Registry {
             let count = room.participants.len();
             room.participants.retain(|_, participant| {
                 now.saturating_sub(participant.last_seen) < self.limits.participant_ttl
+                    && participant
+                        .delegation_expires_at
+                        .is_none_or(|expires| now < expires)
             });
+            let invitations = room.invitations.len();
+            room.invitations
+                .retain(|_, invitation| invitation.expires_at > now);
             if room.participants.len() != count {
                 room.key_epoch += 1;
+            }
+            if room.kind == CallKind::Direct
+                && room.phase == Phase::Ringing
+                && now >= room.ring_expires_at
+            {
+                ended.push((*scope, EndReason::Unanswered));
+                continue;
+            }
+            if room.kind == CallKind::Direct && room.participants.len() != count {
+                ended.push((*scope, EndReason::Expired));
+                continue;
             }
             if room.participants.is_empty() {
                 room.empty_since.get_or_insert(now);
@@ -419,12 +712,16 @@ impl Registry {
                     .empty_since
                     .is_some_and(|since| now.saturating_sub(since) >= self.limits.empty_grace)
             {
-                ended.push(*scope);
-            } else if room.participants.len() != count {
+                ended.push((*scope, EndReason::Expired));
+            } else if room.participants.len() != count || invitations != room.invitations.len() {
                 events.push(Event::Presence { call: room.clone() });
             }
         }
-        events.extend(ended.into_iter().filter_map(|scope| self.end(scope)));
+        events.extend(
+            ended
+                .into_iter()
+                .filter_map(|(scope, reason)| self.end_with_reason(scope, reason)),
+        );
         events
     }
 }

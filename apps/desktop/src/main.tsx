@@ -3,15 +3,15 @@ import { UpdateGate } from "./UpdateGate";
 import { canReadVisibleMessages } from "./messageReadVisibility";
 import { PageSurface, useDesktopLayout } from "./PageSurface";
 import { ProfileEditor, type ProfilePresentation } from "./ProfileEditor";
+import { ChangePassword } from "./ChangePassword";
 import {
   useCalls,
   CallButton,
   CallSurface,
-  ActiveSessions,
-  ActiveSessionJoin,
   useSessionStarted,
 } from "./calls/CallUI";
 import { activeSessions } from "./calls/sessionPresence";
+import { isRingingFor } from "./calls/attention";
 import {
   useActivityNotifications,
   appHasAttention,
@@ -37,6 +37,7 @@ import {
   type ChatGroup,
 } from "./model";
 import { ChatGroupsBar, ChatList, ChatGroupField } from "./ChatOrganization";
+import { DeleteLocalChatDialog } from "./DeleteLocalChatDialog";
 import { isDirectChat } from "./chatGroups";
 import { NewChat } from "./NewChat";
 import { Contacts } from "./Contacts";
@@ -77,6 +78,7 @@ import {
   useConversationDraft,
   flushConversationDrafts,
   retryConversationDrafts,
+  deleteConversationDrafts,
 } from "./conversationDrafts";
 import {
   mentionCandidates,
@@ -101,6 +103,7 @@ import {
 } from "./AttachmentButton";
 import {
   clearAttachmentPreviews,
+  forgetConversationPreviews,
   loadAttachmentPreview,
 } from "./attachmentPreview";
 import {
@@ -484,6 +487,8 @@ function App() {
   });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [desktopProfileEditing, setDesktopProfileEditing] = useState(false);
+  const [desktopPasswordEditing, setDesktopPasswordEditing] = useState(false);
+  const [passwordChanging, setPasswordChanging] = useState(false);
   const [keyboardPanel, setKeyboardPanel] = useState<"switch" | "help" | null>(
     null,
   );
@@ -571,7 +576,10 @@ function App() {
         !desktopProfileEditing &&
         !document.querySelector("dialog[open]")
       ) {
-        if (!["actions", "profile"].includes(settingsPage)) {
+        if (passwordChanging) return;
+        if (settingsPage === "change-password") {
+          setSettingsPage("edit-profile");
+        } else if (!["actions", "profile"].includes(settingsPage)) {
           setSettingsPage("profile");
         } else {
           setSettingsOpen(false);
@@ -581,7 +589,7 @@ function App() {
     };
     document.addEventListener("keydown", key);
     return () => document.removeEventListener("keydown", key);
-  }, [settingsOpen, settingsPage, desktopProfileEditing]);
+  }, [settingsOpen, settingsPage, desktopProfileEditing, passwordChanging]);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [themePreference, setThemePreference] = useState<ThemePreference>(
     initialThemePreference,
@@ -632,6 +640,13 @@ function App() {
     [syncSummary, setSyncSummary] = useState(""),
     [action, setAction] = useState<Action | null>(null),
     [values, setValues] = useState<Record<string, string | boolean>>({});
+  const [deleteChat, setDeleteChat] = useState<{
+    identity: string;
+    credential: string;
+    context: string | null;
+    chat: Stream;
+  }>();
+  const deletingChat = useRef(false);
   const view = useExpiringView(storedView);
   const previousUnlockIdentity = useRef<string | undefined>(undefined);
   useEffect(() => {
@@ -666,9 +681,17 @@ function App() {
     );
   const currentView = useRef(view);
   currentView.current = view;
+  useEffect(
+    () => setDeleteChat(undefined),
+    [view?.identity, view?.active_space],
+  );
   useEffect(() => {
     setDesktopProfileEditing(false);
+    setDesktopPasswordEditing(false);
   }, [view?.identity, view?.active_space, desktopLayout]);
+  useEffect(() => {
+    if (!desktopProfileEditing) setDesktopPasswordEditing(false);
+  }, [desktopProfileEditing]);
   const saveProfile = async ({ name, avatar }: ProfilePresentation) => {
     setBusy(true);
     try {
@@ -800,6 +823,7 @@ function App() {
     view?.active_space,
     streamSummary?.space,
     streamSummary?.stream,
+    streamSummary?.history_generation ?? 0,
   ]);
   const currentConversationScope = useRef(conversationScope);
   currentConversationScope.current = conversationScope;
@@ -846,7 +870,7 @@ function App() {
       : undefined;
   const threadComposerDraft = useConversationDraft(
     view ? JSON.stringify([view.identity, view.credential]) : undefined,
-    JSON.stringify(threadDraftScope),
+    JSON.stringify([threadDraftScope, streamSummary?.history_generation ?? 0]),
     () => {},
     threadDraftScope,
     reportError,
@@ -880,6 +904,7 @@ function App() {
       }
     : streamSummary;
   const calls = useCalls(view);
+  const [callsTabRequest, setCallsTabRequest] = useState(0);
   const personalDM =
     stream?.chat_kind === "direct" && stream.members.length === 2;
   const awaitingDirect =
@@ -988,6 +1013,127 @@ function App() {
       requestSync(true);
     }
     return r;
+  };
+  const requestDeleteChat = (chat: Stream) => {
+    if (
+      !view ||
+      busy ||
+      attachmentTransfer ||
+      postingMessage.current ||
+      !chat.can_delete_local ||
+      chat.is_general
+    )
+      return;
+    setHeaderMenu(null);
+    setDeleteChat({
+      identity: view.identity,
+      credential: view.credential,
+      context: view.active_space ?? null,
+      chat,
+    });
+  };
+  const confirmDeleteChat = async () => {
+    const target = deleteChat;
+    if (
+      !target ||
+      deletingChat.current ||
+      busy ||
+      attachmentTransfer ||
+      postingMessage.current
+    )
+      return;
+    if (
+      currentView.current?.identity !== target.identity ||
+      (currentView.current?.active_space ?? null) !== target.context
+    )
+      return;
+    deletingChat.current = true;
+    await perform(async () => {
+      try {
+        const request = {
+          op: "delete_chat_local",
+          expected_identity: target.identity,
+          expected_space: target.context,
+          space: target.chat.space,
+          stream: target.chat.stream,
+        };
+        const result = await invoke<{
+          view?: View | null;
+          revision: number;
+          cleanup_pending?: boolean;
+          removed_reminders?: string[];
+        }>("operate", { request });
+        deleteConversationDrafts({
+          identity: target.identity,
+          credential: target.credential,
+          active_space: target.context,
+          space: target.chat.space,
+          stream: target.chat.stream,
+        });
+        forgetConversationPreviews({
+          ...request,
+          expected_space: target.context ?? "",
+        });
+        outgoing.forget(
+          JSON.stringify([
+            target.identity,
+            target.context ?? undefined,
+            target.chat.space,
+            target.chat.stream,
+            target.chat.history_generation ?? 0,
+          ]),
+        );
+        if (
+          currentView.current?.identity !== target.identity ||
+          (currentView.current?.active_space ?? null) !== target.context
+        )
+          return;
+        setPreparedHistory(undefined);
+        setThreadTarget(undefined);
+        setNewMessage(undefined);
+        setMessageStatus(null);
+        setAttachmentStates({});
+        setSessionUnread(new Set());
+        clearMessages();
+        if (result.view) setView(result.view);
+        else
+          setView((current) =>
+            current &&
+            current.identity === target.identity &&
+            (current.active_space ?? null) === target.context
+              ? {
+                  ...current,
+                  revision: result.revision,
+                  streams: current.streams.filter(
+                    (chat) =>
+                      chat.space !== target.chat.space ||
+                      chat.stream !== target.chat.stream,
+                  ),
+                  all_streams: current.all_streams?.filter(
+                    (chat) =>
+                      chat.space !== target.chat.space ||
+                      chat.stream !== target.chat.stream,
+                  ),
+                  reminders: current.reminders?.filter(
+                    (reminder) =>
+                      !result.removed_reminders?.includes(reminder.record),
+                  ),
+                  all_reminders: current.all_reminders?.filter(
+                    (reminder) =>
+                      !result.removed_reminders?.includes(reminder.record),
+                  ),
+                }
+              : current,
+          );
+        setDeleteChat(undefined);
+        if (selected === target.chat.stream) setSelected("");
+        openHome("chats");
+        if (result.cleanup_pending)
+          setError(t("chat.deleteLocalCleanupPending"));
+      } finally {
+        deletingChat.current = false;
+      }
+    });
   };
   const sendText = (
     value: string,
@@ -1261,7 +1407,11 @@ function App() {
   const closeThread = () => {
     setThreadRoot(undefined);
   };
-  const openStreamMessage = async (entry: StreamEntry) => {
+  const openStreamMessage = async (
+    entry: StreamEntry,
+    navigation?: { isCurrent: () => boolean; deadline: number; id: string },
+  ) => {
+    if (navigation && !navigation.isCurrent()) return false;
     const identity = view?.identity;
     if (
       entry.chat.space_context &&
@@ -1273,18 +1423,25 @@ function App() {
             op: "space_select",
             id: entry.chat.space_context,
             expected_identity: view?.identity,
+            ...(navigation
+              ? {
+                  nav_deadline_ms: navigation.deadline,
+                  nav_open_id: navigation.id,
+                }
+              : {}),
           },
         });
         if (
           currentView.current?.identity !== identity ||
-          result.view.identity !== identity
+          result.view.identity !== identity ||
+          (navigation && !navigation.isCurrent())
         )
           return false;
         setView(result.view);
         navigateToMessage(entry);
         return true;
       } catch (error) {
-        reportError(error);
+        if (!navigation || navigation.isCurrent()) reportError(error);
         return false;
       }
     }
@@ -1461,6 +1618,9 @@ function App() {
       ),
   });
   useSessionStarted(calls, (event) => {
+    // The incoming dialog owns foreground call attention and its sound.
+    if (appHasAttention() && view && isRingingFor(event.call, view.identity))
+      return;
     const sameChat =
       appHasAttention() &&
       (messagesActive || threadActive) &&
@@ -1655,16 +1815,33 @@ function App() {
     busy,
     requestSync,
     receiveSync,
-    async (entry, page, space, chat) => {
+    async (entry, page, space, chat, isCurrent, deadline, openId) => {
+      if (!isCurrent()) return false;
       if ((page || chat) && space && space !== view?.active_space) {
-        await call({ op: "space_select", id: space });
+        const result = await invoke<{ view: View }>("operate", {
+          request: {
+            op: "space_select",
+            id: space,
+            expected_identity: view?.identity,
+            nav_deadline_ms: deadline,
+            nav_open_id: openId,
+          },
+        });
+        if (
+          !isCurrent() ||
+          result.view.identity !== currentView.current?.identity
+        )
+          return false;
+        setView(result.view);
       }
+      if (!isCurrent()) return false;
       clearMessages();
       setCollection(null);
       setNewChat(null);
       setMembersOpen(false);
       setInvitationRoute(null);
-      if (entry) return openStreamMessage(entry);
+      if (entry)
+        return openStreamMessage(entry, { isCurrent, deadline, id: openId });
       else if (chat) {
         openHome("chats");
         setSelected(chat.stream);
@@ -1756,6 +1933,7 @@ function App() {
 
     setAction(null);
     setValues({});
+    setDeleteChat(undefined);
 
     setLogoutOpen(false);
     setActiveDemoProfile(undefined);
@@ -1778,6 +1956,15 @@ function App() {
         clearProfileSession();
       }
     });
+  const lockAfterPasswordFailure = () => {
+    // Native password recovery may already have detached the profile. Do not
+    // flush drafts or wait for another native operation to remove the UI.
+    void invoke("lock").catch(() => {});
+    clearProfileSession();
+    setSettingsOpen(false);
+    setSettingsPage("profile");
+    reportError("password_change_recovery_required");
+  };
   const dismissBiometricOffer = () => {
     if (biometricOfferCredential.current.profile)
       markBiometricOfferHandled(biometricOfferCredential.current.profile);
@@ -1813,6 +2000,7 @@ function App() {
       !view ||
       view.space_setup ||
       busy ||
+      passwordChanging ||
       biometricOfferPending ||
       biometricOfferName ||
       notificationOpening
@@ -2107,16 +2295,10 @@ function App() {
             onRefresh={refresh}
             onRead={readStreamMessage}
             onOpen={openStreamMessage}
-            activity={
-              mobile ? (
-                <ActiveSessions
-                  calls={calls}
-                  view={view}
-                  onOpen={(chat) =>
-                    void openSessionChat(chat).catch(reportError)
-                  }
-                />
-              ) : undefined
+            calls={calls}
+            callsTabRequest={callsTabRequest}
+            onSessionOpen={(chat) =>
+              void openSessionChat(chat).catch(reportError)
             }
           />
           {threadActive && stream && selectedThread && (
@@ -2199,6 +2381,7 @@ function App() {
                 {t("nav.stream")}
               </button>
               <ScreenHeader
+                callSlot="call-strip-messages"
                 title={t("nav.chats")}
                 actions={
                   <>
@@ -2304,20 +2487,15 @@ function App() {
                       </small>
                     </div>
                   )}
-                  {mobile && (
-                    <ActiveSessions
-                      calls={calls}
-                      view={view}
-                      onOpen={(chat) =>
-                        void openSessionChat(chat).catch(reportError)
-                      }
-                    />
-                  )}
+
                   <ChatList
                     view={view}
                     filter={chatFilter}
                     query={chatQuery}
                     selected={stream?.stream}
+                    onRequestDelete={
+                      busy || attachmentTransfer ? undefined : requestDeleteChat
+                    }
                     onOpen={(chat) => {
                       setSelected(chat.stream);
                       setHomeTab("chats");
@@ -2361,6 +2539,7 @@ function App() {
               selected={messagesActive ? stream?.stream : undefined}
               query={chatQuery}
               busy={busy}
+              navigationBlocked={passwordChanging}
               current={
                 settingsOpen
                   ? "settings"
@@ -2446,6 +2625,7 @@ function App() {
               </div>
             )}
             <ScreenHeader
+              callSlot="call-strip-conversation"
               title={stream?.name ?? t("channel.start")}
               search={
                 <SearchField
@@ -2512,9 +2692,6 @@ function App() {
                 </>
               }
             />
-            {stream && (
-              <ActiveSessionJoin calls={calls} view={view} chat={stream} />
-            )}
             {stream?.forked && <p className="error">{t("warning.forked")}</p>}
             {mode === "expert" && syncSummary && (
               <p className="notice" role="status">
@@ -3158,6 +3335,9 @@ function App() {
                 onMode={changeMode}
                 onPreferences={changePreferences}
                 onLock={() => setLogoutOpen(true)}
+                onLockRequired={lockAfterPasswordFailure}
+                passwordChanging={passwordChanging}
+                onPasswordBusyChange={setPasswordChanging}
                 onProfile={saveProfile}
                 onInvitations={() =>
                   setInvitationRoute({ page: "activity", unscoped: true })
@@ -3244,7 +3424,30 @@ function App() {
               }}
             />
           )}
-          <CallSurface calls={calls} view={view} />
+          <CallSurface
+            calls={calls}
+            view={view}
+            currentChat={messagesActive || threadActive ? stream : undefined}
+            stripTarget={
+              settingsOpen || invitationRoute || desktopProfileEditing
+                ? undefined
+                : threadActive
+                  ? "call-strip-thread"
+                  : contactsActive
+                    ? "call-strip-contacts"
+                    : streamActive
+                      ? "call-strip-buzz"
+                      : messagesActive
+                        ? "call-strip-conversation"
+                        : chatsActive && !desktopLayout
+                          ? "call-strip-messages"
+                          : undefined
+            }
+            onShowCalls={() => {
+              openHome("stream");
+              setCallsTabRequest((value) => value + 1);
+            }}
+          />
           <LogoutDialog
             open={logoutOpen}
             busy={busy}
@@ -3318,10 +3521,21 @@ function App() {
               settingsOpen && settingsPage !== "actions" ? "profile" : homeTab
             }
             onNavigate={(tab) => {
+              if (passwordChanging) return;
               if (tab === "profile") openSettings("profile");
               else openHome(tab);
             }}
           />
+          {deleteChat &&
+            deleteChat.identity === view.identity &&
+            deleteChat.context === (view.active_space ?? null) && (
+              <DeleteLocalChatDialog
+                chatName={deleteChat.chat.name}
+                busy={busy}
+                onClose={() => setDeleteChat(undefined)}
+                onConfirm={() => void confirmDeleteChat()}
+              />
+            )}
           {headerMenu && (
             <ActionDialog
               title={t("nav.actions")}
@@ -3403,6 +3617,20 @@ function App() {
                   </span>
                 </button>
               )}
+              {headerMenu.conversation &&
+                stream?.can_delete_local &&
+                !stream.is_general && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="chat-delete-menu-action"
+                    disabled={busy || !!attachmentTransfer}
+                    onClick={() => requestDeleteChat(stream)}
+                  >
+                    <Icon name="delete" />
+                    <span>{t("chat.deleteLocal")}</span>
+                  </button>
+                )}
               {headerMenu.conversation && stream && mode === "expert" && (
                 <button
                   type="button"
@@ -3534,28 +3762,51 @@ function App() {
           )}
           {desktopLayout && desktopProfileEditing && (
             <PageSurface
-              title={t("profile.edit")}
+              title={t(
+                desktopPasswordEditing ? "password.change" : "profile.edit",
+              )}
               className="desktop-profile-editor"
               onClose={() => {
-                if (!busy) setDesktopProfileEditing(false);
+                if (busy || passwordChanging) return;
+                if (desktopPasswordEditing) setDesktopPasswordEditing(false);
+                else setDesktopProfileEditing(false);
               }}
             >
               <ScreenHeader
-                title={t("profile.edit")}
+                title={t(
+                  desktopPasswordEditing ? "password.change" : "profile.edit",
+                )}
+                backLabel={
+                  desktopPasswordEditing
+                    ? t("password.backToProfile")
+                    : undefined
+                }
                 onBack={() => {
-                  if (!busy) setDesktopProfileEditing(false);
+                  if (busy || passwordChanging) return;
+                  if (desktopPasswordEditing) setDesktopPasswordEditing(false);
+                  else setDesktopProfileEditing(false);
                 }}
               />
-              <ProfileEditor
-                name={profileName(view)}
-                avatar={view.avatar ?? null}
-                mobile={false}
-                busy={busy}
-                onSave={async (profile) => {
-                  await saveProfile(profile);
-                  setDesktopProfileEditing(false);
-                }}
-              />
+              {desktopPasswordEditing ? (
+                <ChangePassword
+                  identity={view.identity}
+                  busy={busy}
+                  onBusyChange={setPasswordChanging}
+                  onDone={() => setDesktopPasswordEditing(false)}
+                  onLockRequired={lockAfterPasswordFailure}
+                />
+              ) : (
+                <ProfileEditor
+                  name={profileName(view)}
+                  avatar={view.avatar ?? null}
+                  busy={busy}
+                  onChangePassword={() => setDesktopPasswordEditing(true)}
+                  onSave={async (profile) => {
+                    await saveProfile(profile);
+                    setDesktopProfileEditing(false);
+                  }}
+                />
+              )}
             </PageSurface>
           )}
         </div>

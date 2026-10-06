@@ -21,6 +21,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 mod database;
+mod ringing;
 
 type Result<T> = std::result::Result<T, StatusCode>;
 pub trait Provider: Send + Sync {
@@ -311,6 +312,8 @@ impl Relay {
             COMMIT;",
         )
         .map_err(|_| "Cannot retire incoming-call delivery")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS incoming_bindings(route TEXT PRIMARY KEY REFERENCES routes(id) ON DELETE CASCADE, provider TEXT NOT NULL, token TEXT NOT NULL, expires INTEGER NOT NULL, next_send INTEGER NOT NULL);")
+            .map_err(|_| "Cannot initialize incoming-call delivery")?;
         Ok(Arc::new(Self {
             db: database::Database::new(db)?,
             provider,
@@ -328,6 +331,11 @@ impl Relay {
             .route("/v1/routes/{id}", post(register).delete(remove))
             .route("/v1/routes/{id}/confirm", post(confirm))
             .route("/v1/routes/{id}/wake", post(wake))
+            .route("/v1/routes/{id}/ring", post(ringing::ring))
+            .route(
+                "/v1/routes/{id}/ring-binding",
+                put(ringing::bind).delete(ringing::unbind),
+            )
             .route("/v1/routes/{id}/policy", put(policy))
             .route("/v1/routes/{id}/read", post(read))
             .route("/wake/health", get(|| async { StatusCode::NO_CONTENT }))

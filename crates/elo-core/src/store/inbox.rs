@@ -83,12 +83,14 @@ impl ClientStore {
         };
         self.call(move|c|{
    let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-   if let Some(bytes)=bytes {
+   let removed = local_deletion::deleted_object(&tx, entry.object_id)?;
+   let state = if removed { "REJECTED" } else { state };
+   if let Some(bytes)=bytes.filter(|_| !removed) {
     if bytes.is_empty()||bytes.len()>MAX_OBJECT_BYTES||bytes.len() as u64!=entry.size_bytes||ObjectId::of_ciphertext(&bytes)!=entry.object_id{return Err(StoreError::ObjectIntegrity);}
     if let Some(old)=get_object(&tx,entry.object_id)?{if old!=bytes{return Err(StoreError::ObjectIntegrity);}}else{tx.execute(INSERT_OBJECT,params![entry.object_id.to_string(),bytes,bytes.len() as i64,now.as_millis()])?;}
    }
    let epoch: i64 = tx.query_row("SELECT local_epoch FROM peer_cursors WHERE peer_id=?1 AND mailbox_id=?2",params![peer.to_string(),mailbox.to_string()],|r|r.get(0)).optional()?.unwrap_or(0);
-   super::repair::remember_copy(&tx, peer, mailbox, &entry)?;
+   if !removed { super::repair::remember_copy(&tx, peer, mailbox, &entry)?; }
    let old:Option<(String,String)>=tx.query_row("SELECT object_id,transfer_hint FROM inbox WHERE peer_id=?1 AND mailbox_id=?2 AND storage_generation=?3 AND arrival_seq=?4 AND local_epoch=?5",params![peer.to_string(),mailbox.to_string(),generation,entry.arrival_seq as i64,epoch],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
    if old.as_ref().is_some_and(|o|o!=&(entry.object_id.to_string(),entry.transfer_hint.as_str().into())) {return Err(StoreError::ObjectIntegrity);}
    tx.execute("INSERT INTO inbox VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",params![peer.to_string(),mailbox.to_string(),generation,entry.arrival_seq as i64,entry.object_id.to_string(),entry.transfer_hint.as_str(),state,epoch])?;
@@ -107,10 +109,19 @@ impl ClientStore {
         item: InboxItem,
         verified: Option<VerifiedChat>,
         now: LocalTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.call(move|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
    if let Some(v)=&verified {
     let chat=v.chat();let id=v.record().id();
+    if local_deletion::rejects(&tx, v.record())? {
+     tx.execute("INSERT OR IGNORE INTO local_deleted_records VALUES(?1)", [id.to_string()])?;
+     if let Some(locator) = &chat.locator {
+      tx.execute("INSERT OR IGNORE INTO local_deleted_targets VALUES(?1,?2,?3)", params![chat.space_id.to_string(),chat.stream_id.to_string(),locator.message_record_id.to_string()])?;
+     }
+     local_deletion::discard_object(&tx, item.object)?;
+     tx.commit()?; return Ok(false);
+    }
+    if matches!(chat.kind.as_str(), "chat.message" | "chat.locator") { local_deletion::reveal(&tx, chat.space_id, chat.stream_id)?; }
     tx.execute("INSERT INTO records VALUES(?1,?6,?2,?3,?4,'ACCEPTED',?5) ON CONFLICT(record_id) DO NOTHING",params![id.to_string(),chat.space_id.to_string(),chat.stream_id.to_string(),chat.config_id.to_string(),now.as_millis(),chat.kind])?;
     let inserted=tx.execute("INSERT INTO record_sources VALUES(?1,?2,-1) ON CONFLICT DO NOTHING",params![id.to_string(),item.object.to_string()])?;
     if inserted>0 { audit::append(&tx,id,now,&audit::Event::new("RECEIVED",Some(DeliveryTarget{peer_id:item.peer,mailbox_id:item.mailbox})))?; }
@@ -120,7 +131,7 @@ impl ClientStore {
     }
    }
    tx.execute("UPDATE inbox SET state=?1 WHERE peer_id=?2 AND mailbox_id=?3 AND storage_generation=?4 AND arrival_seq=?5 AND local_epoch=?6 AND state='PENDING'",params![if verified.is_some(){"ACCEPTED"}else{"REJECTED"},item.peer.to_string(),item.mailbox.to_string(),item.generation,item.seq as i64,item.epoch])?;
-   tx.commit()?;Ok(())}).await
+   tx.commit()?;Ok(verified.is_some())}).await
     }
 
     pub async fn remember_local_locator(
@@ -215,10 +226,14 @@ impl ClientStore {
         now: LocalTime,
     ) -> Result<()> {
         self.call(move|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;let object=bundle.object_id();
+   if local_deletion::deleted_object(&tx, object)? || bundle.originals().iter().map(|r| local_deletion::rejects(&tx, r)).collect::<Result<Vec<_>>>()?.into_iter().any(|removed| removed) {
+    local_deletion::discard_object(&tx, object)?; tx.commit()?; return Ok(());
+   }
    if let Some(old)=get_object(&tx,object)?{if old!=bundle.ciphertext(){return Err(StoreError::ObjectIntegrity);}}else{tx.execute(INSERT_OBJECT,params![object.to_string(),bundle.ciphertext(),bundle.ciphertext().len() as i64,now.as_millis()])?;}
    let grant=bundle.grant();tx.execute("INSERT INTO records VALUES(?1,'history.access.granted',?2,?3,?4,'ACCEPTED',?5) ON CONFLICT DO NOTHING",params![bundle.record().id().to_string(),grant.space_id.to_string(),grant.stream_id.to_string(),grant.config_id.to_string(),now.as_millis()])?;
    tx.execute("INSERT INTO record_sources VALUES(?1,?2,-1) ON CONFLICT DO NOTHING",params![bundle.record().id().to_string(),object.to_string()])?;
    for (index,original) in bundle.originals().iter().enumerate(){let chat=original.chat().map_err(|_|StoreError::InvalidInput("invalid history original"))?;
+    if matches!(chat.kind.as_str(), "chat.message" | "chat.locator") { local_deletion::reveal(&tx, chat.space_id, chat.stream_id)?; }
     tx.execute("INSERT INTO records VALUES(?1,?6,?2,?3,?4,'ACCEPTED',?5) ON CONFLICT DO NOTHING",params![original.id().to_string(),chat.space_id.to_string(),chat.stream_id.to_string(),chat.config_id.to_string(),now.as_millis(),chat.kind])?;
     let inserted=tx.execute("INSERT INTO record_sources VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",params![original.id().to_string(),object.to_string(),index as i64])?;
     if inserted>0 { audit::append(&tx,original.id(),now,&audit::Event::new("HISTORY_IMPORTED",None))?; }
@@ -299,7 +314,13 @@ impl ClientStore {
         verified: crate::files::VerifiedFileShare,
         now: LocalTime,
     ) -> Result<()> {
-        self.call(move|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;let b=verified.body();tx.execute("INSERT INTO records VALUES(?1,'file.shared',?2,?3,?4,'ACCEPTED',?5) ON CONFLICT DO NOTHING",params![verified.record().id().to_string(),b.space_id.to_string(),b.stream_id.to_string(),b.config_id.to_string(),now.as_millis()])?;tx.execute("INSERT INTO record_sources VALUES(?1,?2,-1) ON CONFLICT DO NOTHING",params![verified.record().id().to_string(),item.object.to_string()])?;tx.execute("UPDATE inbox SET state='ACCEPTED' WHERE peer_id=?1 AND mailbox_id=?2 AND storage_generation=?3 AND arrival_seq=?4 AND local_epoch=?5",params![item.peer.to_string(),item.mailbox.to_string(),item.generation,item.seq as i64,item.epoch])?;tx.commit()?;Ok(())}).await
+        self.call(move|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;let b=verified.body();
+        if local_deletion::rejects(&tx, verified.record())? {
+            tx.execute("INSERT OR IGNORE INTO local_deleted_records VALUES(?1)", [verified.record().id().to_string()])?;
+            local_deletion::discard_object(&tx, item.object)?; tx.commit()?; return Ok(());
+        }
+        local_deletion::reveal(&tx, b.space_id, b.stream_id)?;
+        tx.execute("INSERT INTO records VALUES(?1,'file.shared',?2,?3,?4,'ACCEPTED',?5) ON CONFLICT DO NOTHING",params![verified.record().id().to_string(),b.space_id.to_string(),b.stream_id.to_string(),b.config_id.to_string(),now.as_millis()])?;tx.execute("INSERT INTO record_sources VALUES(?1,?2,-1) ON CONFLICT DO NOTHING",params![verified.record().id().to_string(),item.object.to_string()])?;tx.execute("UPDATE inbox SET state='ACCEPTED' WHERE peer_id=?1 AND mailbox_id=?2 AND storage_generation=?3 AND arrival_seq=?4 AND local_epoch=?5",params![item.peer.to_string(),item.mailbox.to_string(),item.generation,item.seq as i64,item.epoch])?;tx.commit()?;Ok(())}).await
     }
 }
 

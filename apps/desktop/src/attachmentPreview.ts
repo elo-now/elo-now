@@ -9,6 +9,7 @@ export type AttachmentContext = {
 export type AttachmentRequest = AttachmentContext & { record: string };
 export type PreviewDimensions = { width: number; height: number };
 type Preview = {
+  request: AttachmentRequest;
   pending: Promise<string | null>;
   url?: string;
   dimensions?: PreviewDimensions;
@@ -48,6 +49,19 @@ export function clearAttachmentPreviews() {
   previews.clear();
 }
 
+export function forgetConversationPreviews(context: AttachmentContext) {
+  for (const [key, preview] of previews) {
+    const request = preview.request;
+    if (
+      request.expected_identity === context.expected_identity &&
+      request.expected_space === context.expected_space &&
+      request.space === context.space &&
+      request.stream === context.stream
+    )
+      previews.delete(key);
+  }
+}
+
 /** Reuse a resolved preview on the first render after returning to a chat. */
 export function cachedAttachmentPreview(request: AttachmentRequest) {
   return previews.get(JSON.stringify(request))?.url;
@@ -83,8 +97,9 @@ export function loadAttachmentPreview(
   let entry = previews.get(key);
   if (!entry) {
     const result: Preview = {
+      request: { ...request },
       pending: invoke<string | null>("attachment_preview", { request }).then(
-        (value) => value ?? null,
+        (value) => (previews.get(key) === result ? (value ?? null) : null),
       ),
     };
     entry = result;

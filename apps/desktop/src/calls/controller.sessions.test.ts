@@ -41,6 +41,8 @@ vi.mock("./nativePeer", () => ({
   usesNativePeer: () => runtime.native,
   nativeMediaPermission: runtime.permission,
   NativePeer: class {
+    detach = vi.fn();
+    setParticipantMuted = vi.fn(async () => {});
     update = vi.fn(async () => {});
     stop = vi.fn(async () => {});
     offer = vi.fn(async () => {});
@@ -241,7 +243,7 @@ afterEach(() => {
 it("releases capture immediately and locks within 400ms when signed Leave cannot reach the network", async () => {
   const f = setup();
   await f.calls.start(f.chat);
-  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connecting"));
   vi.useFakeTimers();
   let respond!: (result: unknown) => void;
   f.command.mockImplementationOnce(
@@ -284,10 +286,10 @@ it("discovers a session in its chat without joining or acquiring media", async (
   f.calls.dispose();
 });
 
-it("starts audio only and remains connected alone until explicitly leaving", async () => {
+it("starts audio only and waits for the recipient without claiming a connection", async () => {
   const f = setup();
   await f.calls.start(f.chat);
-  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connecting"));
   expect(f.getUserMedia).toHaveBeenCalledExactlyOnceWith({
     audio: { echoCancellation: true, noiseSuppression: true },
     video: false,
@@ -300,7 +302,7 @@ it("starts audio only and remains connected alone until explicitly leaving", asy
   expect(f.calls.localCapture()).toBe(f.capture);
   expect(runtime.peers).toHaveLength(0);
   await f.controller.tick();
-  expect(f.calls.snapshot.phase).toBe("connected");
+  expect(f.calls.snapshot.phase).toBe("connecting");
   expect(f.audio.stop).not.toHaveBeenCalled();
   await f.calls.leave();
   expect(f.calls.snapshot.available["host:space:chat"]).toBeUndefined();
@@ -323,6 +325,39 @@ it("starts audio only and remains connected alone until explicitly leaving", asy
   f.calls.dispose();
 });
 
+it("marks a direct call connected only after the remote media transport connects", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  expect(f.current().ready).toBe(true);
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  await f.presence({
+    me: f.current().participants.me,
+    peer: participant("peer", "b"),
+  });
+  await vi.waitFor(() => expect(runtime.peers).toHaveLength(1));
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  runtime.peers[0].args[5]();
+  expect(f.calls.snapshot.phase).toBe("connected");
+  await f.calls.leave();
+  f.calls.dispose();
+});
+
+it("releases a waiting direct call when the control service reports it unanswered", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  await f.controller.event({
+    type: "ended",
+    call_id: f.current().call_id,
+    scope: f.current().scope,
+    reason: "unanswered",
+  });
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("idle"));
+  expect(f.calls.snapshot.active).toBeUndefined();
+  expect(f.audio.stop).toHaveBeenCalled();
+  f.calls.dispose();
+});
+
 it("joins explicitly, keeps camera and capture when the peer leaves, and negotiates again on rejoin", async () => {
   const f = setup();
   await f.presence({ peer: participant("peer", "b") });
@@ -336,7 +371,7 @@ it("joins explicitly, keeps camera and capture when the peer leaves, and negotia
   await f.calls.toggle("video");
   expect(f.calls.snapshot.media.video_published).toBe(true);
   await f.presence({ me: f.current().participants.me });
-  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connecting"));
   expect(runtime.peers[0].stop).toHaveBeenCalledOnce();
   expect(f.calls.localCapture()).toBe(f.capture);
   expect(f.audio.stop).not.toHaveBeenCalled();
@@ -805,6 +840,48 @@ it("suppresses old snapshots, own starts, and muted sessions even after repeats"
   f.calls.dispose();
 });
 
+it("announces a recent session when a new empty DM is discovered during this unlock", async () => {
+  const f = setup();
+  const listener = vi.fn();
+  f.calls.subscribeSessionStarted(listener);
+  f.chat.created_at = Date.now();
+  f.current().ready_at = Math.floor(Date.now() / 1000);
+  f.current().started_by = "peer";
+  const original = f.command.getMockImplementation()!;
+  f.command.mockImplementation(async (chat, operation) => {
+    if (operation.type === "subscribe")
+      await f.controller.event({ type: "presence", call: f.current() });
+    return original(chat, operation);
+  });
+  await f.controller.subscribeChats();
+  await f.controller.event({ type: "presence", call: f.current() });
+  expect(listener).toHaveBeenCalledOnce();
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  expect(runtime.activity).not.toHaveBeenCalled();
+  expect(f.calls.snapshot.phase).toBe("idle");
+  f.calls.dispose();
+});
+
+it("keeps pre-existing DMs and stale session discoveries silent at first subscription", async () => {
+  for (const [created, ready] of [
+    [-1000, 0],
+    [0, -61_000],
+    [0, 1000],
+  ]) {
+    const f = setup();
+    const listener = vi.fn();
+    f.calls.subscribeSessionStarted(listener);
+    f.chat.created_at = f.controller.sessionDiscoverySince + created;
+    f.current().ready_at = Math.floor((Date.now() + ready) / 1000);
+    f.current().started_by = "peer";
+    await f.controller.subscribeChats();
+    await f.controller.event({ type: "presence", call: f.current() });
+    expect(listener).not.toHaveBeenCalled();
+    expect(Object.values(f.calls.snapshot.available)).toEqual([f.current()]);
+    f.calls.dispose();
+  }
+});
+
 it("cannot revive an ended or revoked session with a queued presence", async () => {
   const f = setup();
   f.controller.subscribed.set("host:space:chat", "head");
@@ -830,6 +907,7 @@ it("cannot revive an ended or revoked session with a queued presence", async () 
 
 it("notifies after microphone admission and keeps a session when push delivery fails", async () => {
   const f = setup();
+  const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => {});
   const original = f.command.getMockImplementation()!;
   f.command.mockImplementation(async (chat, operation) => {
     if (operation.type === "media")
@@ -838,7 +916,7 @@ it("notifies after microphone admission and keeps a session when push delivery f
   });
   runtime.operate.mockRejectedValue(new Error("unavailable"));
   await f.calls.start(f.chat);
-  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connecting"));
   expect(runtime.operate).toHaveBeenCalledExactlyOnceWith({
     expected_identity: "me",
     target_space: "host",
@@ -850,18 +928,397 @@ it("notifies after microphone admission and keeps a session when push delivery f
   });
   expect(f.calls.snapshot.error).toBeUndefined();
   expect(f.audio.stop).not.toHaveBeenCalled();
+  expect(diagnostic).toHaveBeenCalledWith(
+    "Session notification handoff failed.",
+    "unavailable",
+  );
   await f.calls.leave();
+  diagnostic.mockRestore();
+  f.calls.dispose();
+});
+
+it("retries a failed session notification without changing media and stops after success", async () => {
+  vi.useFakeTimers();
+  const f = setup();
+  const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => {});
+  runtime.operate
+    .mockRejectedValueOnce(new Error("unavailable"))
+    .mockResolvedValueOnce({ notified: true });
+  await f.calls.start(f.chat);
+  await vi.advanceTimersByTimeAsync(7999);
+  expect(runtime.operate).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(runtime.operate).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(2);
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  await f.calls.leave();
+  diagnostic.mockRestore();
+  f.calls.dispose();
+});
+
+it("retries opaque acknowledgements long enough for a newly discovered DM scope", async () => {
+  vi.useFakeTimers();
+  const f = setup();
+  runtime.operate.mockResolvedValue({ notified: true, retry: true });
+  await f.calls.start(f.chat);
+  await vi.advanceTimersByTimeAsync(35_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(5);
+  expect(
+    runtime.operate.mock.calls.every(
+      ([request]) =>
+        request.call_id === f.current().call_id &&
+        request.target_space === "host",
+    ),
+  ).toBe(true);
+  await vi.advanceTimersByTimeAsync(25_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(8);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(8);
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  await f.calls.leave();
+  f.calls.dispose();
+});
+
+it("bounds notification retries and cancels them when leaving or locking", async () => {
+  vi.useFakeTimers();
+  const f = setup();
+  const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => {});
+  runtime.operate.mockRejectedValue(new Error("unavailable"));
+  await f.calls.start(f.chat);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(8);
+  expect(f.calls.snapshot.phase).toBe("connecting");
+  await f.calls.leave();
+  runtime.operate.mockClear();
+  await f.calls.start(f.chat);
+  expect(runtime.operate).toHaveBeenCalledTimes(1);
+  f.calls.update(null);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(runtime.operate).toHaveBeenCalledTimes(1);
+  expect(f.calls.snapshot.active).toBeUndefined();
+  diagnostic.mockRestore();
   f.calls.dispose();
 });
 
 it("does not send a session start notification for an explicit Join", async () => {
   const f = setup();
   await f.calls.start(f.chat, f.current());
-  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+  await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connecting"));
   expect(
     runtime.operate.mock.calls.some(
       ([request]) => request.op === "call_notify_ready",
     ),
   ).toBe(false);
   f.calls.dispose();
+});
+
+function invited(f: ReturnType<typeof setup>, id = "attempt") {
+  return {
+    ...f.current(),
+    phase: "ringing" as const,
+    started_by: "peer",
+    participants: { peer: participant("peer", "b") },
+    invitations: {
+      me: {
+        invitation_id: id,
+        invited_by: "peer",
+        expires_at: Math.floor(Date.now() / 1000) + 60,
+      },
+    },
+  };
+}
+
+it("rings only a fresh targeted invitation and expires it without acquiring media", async () => {
+  vi.useFakeTimers();
+  const f = setup();
+  f.controller.subscribed.set("host:space:chat", "head");
+  const old = invited(f, "old");
+  await f.controller.presence(old, false);
+  expect(f.calls.snapshot.incoming).toEqual([]);
+  await f.controller.event({ type: "presence", call: old });
+  expect(f.calls.snapshot.incoming).toEqual([]);
+  const fresh = { ...invited(f, "fresh"), call_id: "new-call" };
+  await f.controller.event({ type: "presence", call: fresh });
+  expect(f.calls.snapshot.incoming).toEqual([fresh]);
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(60_001);
+  expect(f.calls.snapshot.incoming).toEqual([]);
+  f.calls.dispose();
+});
+
+it("does not ring a group start and accepts a new explicit invitation after dismissal", async () => {
+  const f = setup();
+  f.chat.chat_kind = "chat";
+  f.controller.subscribed.set("host:space:chat", "head");
+  const group = {
+    ...invited(f),
+    kind: "group" as const,
+    phase: "active" as const,
+    invitations: {},
+  };
+  await f.controller.event({ type: "presence", call: group });
+  expect(f.calls.snapshot.incoming).toEqual([]);
+  const ring = { ...group, invitations: invited(f).invitations };
+  await f.controller.event({ type: "presence", call: ring });
+  expect(f.calls.snapshot.incoming).toEqual([ring]);
+  await f.calls.decline(ring);
+  expect(f.command).toHaveBeenCalledWith(f.chat, {
+    type: "decline",
+    call_id: ring.call_id,
+    invitation_id: "attempt",
+  });
+  expect(f.calls.snapshot.dismissed).toContain(
+    `host:space:chat:${ring.call_id}`,
+  );
+  await f.controller.event({ type: "presence", call: ring });
+  expect(f.calls.snapshot.incoming).toEqual([]);
+  const again = { ...ring, invitations: invited(f, "attempt-2").invitations };
+  await f.controller.event({ type: "presence", call: again });
+  expect(f.calls.snapshot.incoming).toEqual([again]);
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  f.calls.dispose();
+});
+
+it("rejects a stale Answer before leaving the current session", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active;
+  const next = { ...invited(f, "first"), call_id: "another-call" };
+  f.command.mockResolvedValueOnce({
+    call: { ...next, invitations: invited(f, "second").invitations },
+  });
+  f.command.mockClear();
+  await f.calls.answer(f.chat, next, true, "first");
+  expect(f.calls.snapshot.active).toBe(original);
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  expect(f.command.mock.calls.map(([, operation]) => operation.type)).toEqual([
+    "subscribe",
+  ]);
+  f.calls.dispose();
+});
+
+it("requires explicit switching and validates a session before ending the current one", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active!;
+  const next = { ...invited(f), call_id: "another-call" };
+  f.calls.requestStart(f.chat, next);
+  expect(f.calls.snapshot.joinRequest?.call).toBe(next);
+  expect(f.calls.snapshot.active).toBe(original);
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  f.calls.cancelJoin();
+  f.calls.requestStart(f.chat, original);
+  expect(f.calls.snapshot.expanded).toBe(true);
+  const start = vi.spyOn(f.calls, "start").mockResolvedValueOnce();
+  f.command.mockResolvedValueOnce({ call: next });
+  await f.calls.answer(f.chat, next, true, "attempt");
+  expect(f.audio.stop).toHaveBeenCalled();
+  expect(start).toHaveBeenCalledWith(f.chat, next, "attempt");
+  f.calls.dispose();
+});
+
+it("declining an incoming call does not stop an unrelated active session", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active!;
+  const ring = { ...invited(f), call_id: "another-call" };
+  f.command.mockResolvedValueOnce({});
+  await f.calls.decline(ring);
+  expect(f.calls.snapshot.active).toBe(original);
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  expect(f.command).toHaveBeenLastCalledWith(f.chat, {
+    type: "decline",
+    call_id: ring.call_id,
+    invitation_id: "attempt",
+  });
+  f.calls.dispose();
+});
+
+it("adopts only a current native call for this profile without duplicate media admission", async () => {
+  const f = setup();
+  runtime.native = true;
+  const native = {
+    identity: "me",
+    call: f.current(),
+    session_id: "12345678-1234-1234-1234-123456789abc",
+    activation: "12345678-1234-1234-1234-123456789def",
+    media,
+  };
+  expect(await f.calls.adoptNative({ ...native, identity: "other" })).toBe(
+    false,
+  );
+  expect(
+    await f.calls.adoptNative({
+      ...native,
+      call: { ...native.call, config_id: "old-head" },
+    }),
+  ).toBe(false);
+  expect(await f.calls.adoptNative(native)).toBe(true);
+  expect(runtime.peers).toHaveLength(1);
+  expect(runtime.peers[0].args[8]).toEqual({ sessionId: native.session_id });
+  expect(f.calls.snapshot.active?.call_id).toBe(native.call.call_id);
+  expect(f.command).not.toHaveBeenCalled();
+  expect(runtime.permission).not.toHaveBeenCalled();
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  expect(
+    await f.calls.adoptNative({
+      ...native,
+      session_id: "12345678-1234-1234-1234-123456789aaa",
+    }),
+  ).toBe(false);
+  const stop = runtime.peers[0].stop;
+  const detach = runtime.peers[0].detach;
+  f.calls.update(null);
+  expect(detach).toHaveBeenCalledOnce();
+  expect(stop).not.toHaveBeenCalled();
+  expect(f.command).not.toHaveBeenCalled();
+  expect(f.calls.snapshot.active).toBeUndefined();
+  f.calls.dispose();
+});
+
+it("ignores native actions from an old invitation attempt or activation", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active;
+  const event = {
+    action: "answer" as const,
+    call_id: "another-call",
+    hosting_space_id: "host",
+    space: "space",
+    stream: "chat",
+    invitation_id: "old",
+  };
+  f.command.mockResolvedValueOnce({
+    call: { ...invited(f, "new"), call_id: event.call_id },
+  });
+  await f.calls.handleNativeAction(event);
+  expect(f.calls.snapshot.incoming ?? []).toEqual([]);
+  expect(f.calls.snapshot.active).toBe(original);
+  await f.calls.handleNativeAction({
+    ...event,
+    action: "end",
+    call_id: original!.call_id,
+    activation: "stale",
+  });
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  f.calls.dispose();
+});
+
+it("adopts a group on the native owner and routes participant mute without acquiring WebView media", async () => {
+  const f = setup();
+  runtime.native = true;
+  f.chat.chat_kind = "chat";
+  const call = {
+    ...f.current(),
+    kind: "group" as const,
+    participants: {
+      ...f.current().participants,
+      peer: participant("peer", "b"),
+    },
+  };
+  expect(
+    await f.calls.adoptNative({
+      identity: "me",
+      call,
+      session_id: "12345678-1234-1234-1234-123456789abc",
+      activation: "12345678-1234-1234-1234-123456789def",
+      media,
+    }),
+  ).toBe(true);
+  expect(await f.calls.setParticipantMuted("b", true)).toBe(true);
+  expect(runtime.peers[0].setParticipantMuted).toHaveBeenCalledExactlyOnceWith(
+    "b",
+    true,
+  );
+  expect(await f.calls.setParticipantMuted("removed-device", true)).toBe(false);
+  expect(runtime.groups).toHaveLength(0);
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  f.calls.dispose();
+});
+
+it("starts mobile groups on the native worker without WebView capture or a second LiveKit room", async () => {
+  runtime.native = true;
+  const f = setup();
+  f.chat.chat_kind = "chat";
+  f.current().kind = "group";
+  await f.calls.start(f.chat);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(f.calls.getSnapshot().active?.kind).toBe("group");
+  expect(runtime.permission).toHaveBeenCalledWith("me", false);
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  expect(runtime.groups).toHaveLength(0);
+  expect(runtime.peers).toHaveLength(1);
+  expect(runtime.peers[0].native).toBe(true);
+  expect(runtime.peers[0].args[7]).toMatchObject({
+    call_id: f.current().call_id,
+  });
+  expect(
+    f.command.mock.calls.some(
+      ([, operation]) => operation.type === "connect_media",
+    ),
+  ).toBe(false);
+  await f.presence({
+    me: participant("me", "a"),
+    peer: participant("peer", "b"),
+  });
+  expect(runtime.peers).toHaveLength(1);
+  await f.calls.leave();
+});
+
+it.each(["user", "native_end"])(
+  "dismisses a group after %s leave while keeping it available for explicit rejoin",
+  async (reason) => {
+    runtime.native = true;
+    const f = setup();
+    f.chat.chat_kind = "chat";
+    f.current().kind = "group";
+    await f.calls.start(f.chat);
+    await f.presence({
+      me: participant("me", "a"),
+      peer: participant("peer", "b"),
+    });
+    const id = f.current().call_id;
+    await f.calls.leave(reason);
+    expect(f.calls.snapshot.active).toBeUndefined();
+    expect(f.calls.snapshot.dismissed).toContain(`host:space:chat:${id}`);
+    expect(f.calls.snapshot.available["host:space:chat"].participants).toEqual({
+      peer: participant("peer", "b"),
+    });
+    // Later presence does not undo the local dismissal.
+    await f.presence({ peer: participant("peer", "b") });
+    expect(f.calls.snapshot.dismissed).toContain(`host:space:chat:${id}`);
+    f.command.mockClear();
+    f.calls.reveal(f.chat);
+    expect(f.calls.snapshot.dismissed).not.toContain(`host:space:chat:${id}`);
+    expect(f.calls.snapshot.active).toBeUndefined();
+    expect(f.command).not.toHaveBeenCalled();
+    const start = vi.spyOn(f.calls, "start").mockResolvedValueOnce();
+    f.calls.requestStart(f.chat);
+    await vi.waitFor(() =>
+      expect(start).toHaveBeenCalledExactlyOnceWith(
+        f.chat,
+        f.current(),
+        undefined,
+      ),
+    );
+    f.calls.dispose();
+  },
+);
+
+it("does not record a group dismissal for direct calls or transport failures", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  await f.calls.leave();
+  expect(f.calls.snapshot.dismissed ?? []).toEqual([]);
+  f.calls.dispose();
+  runtime.native = true;
+  const group = setup();
+  group.chat.chat_kind = "chat";
+  group.current().kind = "group";
+  await group.calls.start(group.chat);
+  await group.calls.leave("failure");
+  expect(group.calls.snapshot.dismissed ?? []).toEqual([]);
+  group.calls.dispose();
 });

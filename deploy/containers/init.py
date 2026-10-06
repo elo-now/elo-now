@@ -183,7 +183,7 @@ def proxy_config(role, public_origin, storage, wake=False, calls=False):
 \t}
 """
         if calls:
-            routes += """\t@calls path /calls/v1/connect /calls/v1/health
+            routes += """\t@calls path /calls/v1/connect /calls/v1/state /calls/v1/health
 \thandle @calls {
 \t\trequest_body {
 \t\t\tmax_size 1048576

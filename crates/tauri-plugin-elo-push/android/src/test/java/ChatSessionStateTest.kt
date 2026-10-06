@@ -73,4 +73,33 @@ class ChatSessionStateTest {
         }
         assertNull(restarted.active())
     }
+
+    @Test fun onlyAuthorizedSystemAnswerAllowsBackgroundAudioAndStillRequiresMicrophonePermission() {
+        val state = ChatSessionState()
+        assertThrows(IllegalStateException::class.java) {
+            state.begin(id, false, false, false, false, authorizedIncoming = true)
+        }
+        assertNull(state.active())
+        val answered = state.begin(id, false, false, true, false, authorizedIncoming = true)
+        assertEquals(answered, state.active())
+        assertThrows(IllegalStateException::class.java) {
+            state.begin(other, false, false, true, true, authorizedIncoming = true)
+        }
+        assertEquals(answered, state.active())
+    }
+
+    @Test fun authorizedBackgroundAnswerCannotEnableCameraButMayKeepPreviouslyEnabledCamera() {
+        val state = ChatSessionState()
+        val answered = state.begin(id, false, false, true, true, authorizedIncoming = true)
+        assertThrows(IllegalStateException::class.java) {
+            state.begin(id, true, false, true, true, authorizedIncoming = true)
+        }
+        assertEquals(answered, state.active())
+        state.begin(id, true, true, true, true, authorizedIncoming = true)
+        assertTrue(state.begin(id, true, false, true, true, authorizedIncoming = true).camera)
+        state.end(id)
+        assertThrows(IllegalStateException::class.java) {
+            state.begin(id, true, false, true, true, authorizedIncoming = true)
+        }
+    }
 }

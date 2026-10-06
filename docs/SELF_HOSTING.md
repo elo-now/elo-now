@@ -370,8 +370,12 @@ The `admission_key` must have exactly the same 64 characters as the host's `call
 Create your own Firebase project with Android and iOS apps matching the identifiers in **your** client build. Download the Android `google-services.json` and iOS `GoogleService-Info.plist` as private build inputs. Enable Cloud Messaging, associate APNs credentials with the iOS Firebase app for ordinary message notifications, and create a restricted Firebase service-account key for the VPS. The service account JSON belongs at `/etc/elo/wake/firebase.json`, readable only by `elo-wake`. See [Firebase's server-environment guide](https://firebase.google.com/docs/cloud-messaging/server-environment).
 
 iOS uses the APNs credentials associated with Firebase for ordinary notifications.
-Chat audio/video sessions are joined in the foreground and do not use CallKit,
-PushKit, a separate APNs VoIP key or VoIP-token App Attest enrollment.
+Incoming calls use CallKit/PushKit and additionally need an APNs signing key
+authorized for the app's VoIP topic. Supply `--apns /etc/elo/wake/apns.json` with
+private `team_id`, `key_id`, `bundle_id` and PEM `private_key` fields (mode0600,
+wake-service owner). The installation selects sandbox or production when it
+registers; this configuration does not override the binary's entitlements.
+See [Calls](CALLS.md) for protected background authorization and deployment checks.
 
 Start the wake service with the same public origin as the host:
 

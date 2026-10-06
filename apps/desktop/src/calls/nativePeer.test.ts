@@ -134,3 +134,37 @@ it("invalidates native render bindings after a reset preserves the same camera t
   expect(f.tiles).toHaveBeenCalledTimes(2);
   await f.peer.stop();
 });
+
+it("adopts an existing native capture without starting a second peer or signaling", async () => {
+  vi.useFakeTimers();
+  const transport = vi.fn<NativeRequest>(async (request) =>
+    request.op === "poll"
+      ? { native_owned: true, connection: "connected", tracks: [], signals: [] }
+      : {},
+  );
+  const connected = vi.fn();
+  const peer = new NativePeer(
+    "device",
+    "identity",
+    vi.fn(),
+    vi.fn(),
+    connected,
+    vi.fn(),
+    transport,
+    undefined,
+    { sessionId: "12345678-1234-1234-1234-123456789abc" },
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  expect(connected).toHaveBeenCalledOnce();
+  expect(transport.mock.calls.map(([request]) => request.op)).toEqual(["poll"]);
+  await peer.stop();
+  expect(
+    transport.mock.calls.every(
+      ([request]) => request.id === "12345678-1234-1234-1234-123456789abc",
+    ),
+  ).toBe(true);
+  expect(transport.mock.calls.map(([request]) => request.op)).toEqual([
+    "poll",
+    "stop",
+  ]);
+});

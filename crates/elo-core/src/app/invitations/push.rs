@@ -8,6 +8,12 @@ use std::time::Duration;
 
 pub use crate::invite::shared::WakeRoute as Route;
 
+#[derive(Default, Serialize)]
+pub(in crate::app) struct SessionNoticeAttempt {
+    pub notified: bool,
+    pub retry: bool,
+}
+
 /// Capability rotation is needed for revocation, not new members or mute toggles.
 pub fn policy_requires_rotation(previous: &Value, next: &Value) -> bool {
     let strings = |value: &Value| -> BTreeSet<String> {
@@ -71,6 +77,101 @@ fn valid_route(route: &Route, expected: &str, allow_loopback: bool) -> Result<()
     Ok(())
 }
 impl ClientApp {
+    pub(in crate::app) async fn notify_ringing_session(
+        &self,
+        authority: &Authority,
+        call: &Value,
+        only: Option<IdentityId>,
+    ) -> Result<SessionNoticeAttempt> {
+        let now_ms = now()?.as_millis() as u64;
+        let time = now_ms / 1000;
+        let hosting = self
+            .call_host
+            .as_ref()
+            .ok_or("Session unavailable.")?
+            .scope
+            .space;
+        let call_id = field(call, "call_id")?;
+        record::hex::<16>(call_id)?;
+        let mut state = self.invitation_state()?;
+        state.session_notices.retain(|_, until| *until > now_ms);
+        let routes = self.wake_candidates(&state, None)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(4))
+            .build()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut notified = false;
+        for (route, credential, _) in routes {
+            let recipient = credential.identity();
+            if recipient == self.identity_id()
+                || only.is_some_and(|id| id != recipient)
+                || self.blocked.contains(recipient)
+                || crate::calls::require_member(authority, credential.id()).is_err()
+            {
+                continue;
+            }
+            let invitation = &call["invitations"][recipient.to_string()];
+            let Some(invitation_id) = invitation["invitation_id"].as_str() else {
+                continue;
+            };
+            let Some(expires) = invitation["expires_at"]
+                .as_u64()
+                .filter(|until| *until > time && *until <= time + 60)
+            else {
+                continue;
+            };
+            if invitation["invited_by"] != json!(self.identity_id()) {
+                continue;
+            }
+            let event = format!("ring:{}:{invitation_id}", route.id);
+            if state.session_notices.contains_key(&event) || state.session_notices.len() >= 256 {
+                continue;
+            }
+            state.session_notices.insert(event.clone(), now_ms + 8_000);
+            let target = crate::calls::ring::RingTarget {
+                v: 1,
+                hosting_space_id: hosting,
+                scope: crate::calls::CallScope {
+                    space_id: authority.space(),
+                    stream_id: authority.stream(),
+                },
+                recipient,
+                call_id: call_id.into(),
+                invitation_id: invitation_id.into(),
+                expires,
+            };
+            let cipher = crate::calls::ring::seal(&route.scope_key, &route.id, &target, time)?;
+            let mut wake = json!({"event":keyed(&route,"elo.notification.event.v1",&event)?,
+                "scope":session_scope(&route,authority.space(),authority.stream())?,"target":cipher,
+                "category":"call_ring","expires":expires});
+            super::super::push_sender::sign(&self.session, &route.id, &mut wake)?;
+            let url = endpoint(&route.endpoint, self.push_allow_loopback)?
+                .join(&format!("v1/routes/{}/ring", route.id))?;
+            if let Ok(Ok(response)) = tokio::time::timeout_at(
+                deadline,
+                client
+                    .post(url)
+                    .bearer_auth(&route.notify_key)
+                    .json(&json!({"wake":wake,"call_id":call_id,"invitation_id":invitation_id}))
+                    .send(),
+            )
+            .await
+            {
+                notified |= response.status().is_success();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        self.save_invitations(&state)?;
+        Ok(SessionNoticeAttempt {
+            notified,
+            retry: true,
+        })
+    }
     pub fn configure_push(&mut self, value: &str, allow_loopback: bool) -> Result<()> {
         self.push_endpoint = Some(endpoint(value, allow_loopback)?.to_string());
         self.push_allow_loopback = allow_loopback;
@@ -903,7 +1004,7 @@ impl ClientApp {
         authority: &Authority,
         call_id: &str,
         expires: u64,
-    ) -> Result<bool> {
+    ) -> Result<SessionNoticeAttempt> {
         record::hex::<16>(call_id)?;
         crate::calls::require_member(authority, self.session.credential().id())?;
         let hosting = self
@@ -914,7 +1015,18 @@ impl ClientApp {
             .space;
         let time = now()?.as_millis() as u64;
         if expires <= time || expires > time + 60_000 {
-            return Ok(false);
+            return Ok(SessionNoticeAttempt::default());
+        }
+        let has_recipient = authority.head()?.members.iter().any(|member| {
+            member.identity_id != self.identity_id()
+                && !self.blocked.contains(member.identity_id)
+                && member
+                    .credential_ids
+                    .iter()
+                    .any(|id| crate::calls::require_member(authority, *id).is_ok())
+        });
+        if !has_recipient {
+            return Ok(SessionNoticeAttempt::default());
         }
         let mut state = self.invitation_state()?;
         state.session_notices.retain(|_, expires| *expires > time);
@@ -924,12 +1036,19 @@ impl ClientApp {
             authority.stream()
         );
         if state.session_notices.contains_key(&event) || state.session_notices.len() >= 128 {
-            return Ok(false);
+            return Ok(SessionNoticeAttempt {
+                notified: false,
+                retry: true,
+            });
         }
         let routes = self.wake_candidates(&state, None)?;
-        // Persist before sending: repeated callbacks and process restarts cannot
-        // notify twice. Relay delivery remains a bounded best-effort handoff.
-        state.session_notices.insert(event.clone(), expires);
+        // 202 also hides unknown/muted scopes, so it is not a delivery receipt.
+        // Throttle repeated callbacks durably, but retry the identical event
+        // while the original ready deadline remains valid. The relay deduplicates
+        // accepted events, including retries after a newly discovered DM is allowed.
+        state
+            .session_notices
+            .insert(event.clone(), expires.min(time + 8_000));
         self.save_invitations(&state)?;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -990,7 +1109,10 @@ impl ClientApp {
                 break;
             }
         }
-        Ok(notified)
+        Ok(SessionNoticeAttempt {
+            notified,
+            retry: true,
+        })
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -1153,19 +1275,20 @@ mod tests {
         );
         app.read.muted_streams.remove(&authority.stream());
         assert!(app.open_notification(encoded).is_ok());
-        // No recipient route exists in this fixture; the durable attempt is
-        // nevertheless recorded before any possible network handoff.
+        // This self-only fixture has nobody to notify and does not start retries.
         assert!(
             !app.notify_ready_session(&authority, &call_id, expires)
                 .await
                 .unwrap()
+                .retry
         );
         assert!(
             !app.notify_ready_session(&authority, &call_id, expires)
                 .await
                 .unwrap()
+                .retry
         );
-        assert_eq!(app.invitation_state().unwrap().session_notices.len(), 1);
+        assert!(app.invitation_state().unwrap().session_notices.is_empty());
         let expired = Target {
             expires: 1,
             ..target
@@ -1182,6 +1305,160 @@ mod tests {
             app.open_notification(body["target"].as_str().unwrap())
                 .is_err()
         );
+        app.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn session_handoff_retries_missing_routes_and_rejections_with_durable_throttle() {
+        use std::sync::{Arc, Mutex};
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/v1/routes/{id}/wake",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let mut requests = observed.lock().unwrap();
+                requests.push(body);
+                let status = if requests.len() == 1 {
+                    axum::http::StatusCode::FORBIDDEN
+                } else {
+                    axum::http::StatusCode::ACCEPTED
+                };
+                async move { status }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save(
+                dir.path().join("profile"),
+                "synthetic session retry password".into(),
+                "General",
+            )
+            .await
+            .unwrap();
+        app.configure_push(&url, true).unwrap();
+        app.call_host = Some(space_service::SpaceAddress {
+            service_credential: None,
+            url: "https://api.example.test/team/v1/spaces".into(),
+            scope: app.team_scope().unwrap(),
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
+        });
+        let peer = Session::create().unwrap().0;
+        let mut authority = app.authorities.0[0].clone();
+        authority.add_credential(peer.credential().clone());
+        let mut config = authority.head().unwrap().clone();
+        config.members.push(crate::authority::Member {
+            identity_id: peer.identity_id(),
+            identity_type: "HUMAN".into(),
+            root_public_key: field(peer.credential().record().body(), "root_public_key")
+                .unwrap()
+                .into(),
+            capabilities: vec![Capability::Read, Capability::Post],
+            credential_ids: vec![peer.credential().id()],
+            external: false,
+        });
+        config.members.sort_by_key(|m| m.identity_id);
+        config.sequence += 1;
+        config.previous_config_id = authority.head_id();
+        config.nonce = record::random_hex::<16>().unwrap();
+        config.action.operation = "replace".into();
+        authority
+            .apply_config(config.sign(app.session.signing_key()).unwrap())
+            .unwrap();
+        let call_id = "42".repeat(16);
+        let expires = now().unwrap().as_millis() as u64 + 60_000;
+        let first = app
+            .notify_ready_session(&authority, &call_id, expires)
+            .await
+            .unwrap();
+        assert!(!first.notified && first.retry);
+        assert!(requests.lock().unwrap().is_empty());
+        let state = app.invitation_state().unwrap();
+        assert_eq!(state.session_notices.len(), 1);
+        assert!(*state.session_notices.values().next().unwrap() < expires);
+        let route = Route {
+            endpoint: url,
+            id: "11".repeat(16),
+            notify_key: "22".repeat(32),
+            scope_key: "33".repeat(32),
+            since: 1,
+        };
+        let mut card = shared::contact(
+            peer.credential(),
+            peer.signing_key(),
+            "Synthetic peer",
+            expires + 1000,
+        )
+        .unwrap()
+        .body()
+        .clone();
+        card["wake"] = serde_json::to_value(route).unwrap();
+        let card =
+            SignedRecord::sign(&serde_json::to_vec(&card).unwrap(), peer.signing_key()).unwrap();
+        let mut state = app.invitation_state().unwrap();
+        state.contacts.insert(
+            peer.credential().id().to_string(),
+            Packet::Contact {
+                card: STANDARD.encode(card.bytes()),
+                credential: STANDARD.encode(peer.credential().record().bytes()),
+            },
+        );
+        app.save_invitations(&state).unwrap();
+        assert!(
+            app.notify_ready_session(&authority, &call_id, expires)
+                .await
+                .unwrap()
+                .retry
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "saved cooldown survives a new invocation"
+        );
+        let expire_throttle = || {
+            let mut state = app.invitation_state().unwrap();
+            for due in state.session_notices.values_mut() {
+                *due = 0;
+            }
+            app.save_invitations(&state).unwrap();
+        };
+        expire_throttle();
+        let rejected = app
+            .notify_ready_session(&authority, &call_id, expires)
+            .await
+            .unwrap();
+        assert!(!rejected.notified && rejected.retry);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        expire_throttle();
+        let accepted = app
+            .notify_ready_session(&authority, &call_id, expires)
+            .await
+            .unwrap();
+        assert!(
+            accepted.notified && accepted.retry,
+            "202 cannot reveal scope authorization or delivery"
+        );
+        assert!(
+            app.notify_ready_session(&authority, &call_id, expires)
+                .await
+                .unwrap()
+                .retry
+        );
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "repeated callbacks are throttled");
+            assert_eq!(requests[0]["event"], requests[1]["event"]);
+            assert_eq!(requests[0]["scope"], requests[1]["scope"]);
+            assert_eq!(requests[0]["expires"], requests[1]["expires"]);
+        }
+        assert!(
+            !app.notify_ready_session(&authority, &call_id, 1)
+                .await
+                .unwrap()
+                .retry
+        );
+        server.abort();
         app.close().await.unwrap();
     }
     #[tokio::test]

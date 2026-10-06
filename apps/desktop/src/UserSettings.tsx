@@ -1,4 +1,5 @@
 import { PasswordInput } from "./PasswordInput";
+import { ChangePassword } from "./ChangePassword";
 import {
   useEffect,
   useRef,
@@ -49,6 +50,7 @@ export type SettingsPage =
   | "actions"
   | "profile"
   | "edit-profile"
+  | "change-password"
   | "appearance"
   | "licenses"
   | "settings"
@@ -88,6 +90,9 @@ export function UserSettings({
   onMode,
   onPreferences,
   onLock,
+  onLockRequired,
+  passwordChanging,
+  onPasswordBusyChange,
   onProfile,
   onNotifications,
   onInvitations,
@@ -122,6 +127,9 @@ export function UserSettings({
   onMode: (mode: ViewMode) => void;
   onPreferences: (preferences: UserPreferences) => void;
   onLock: () => void;
+  onLockRequired: () => void;
+  passwordChanging: boolean;
+  onPasswordBusyChange: (busy: boolean) => void;
   onProfile: (profile: ProfilePresentation) => Promise<void>;
   onNotifications: () => void;
   onInvitations: () => void;
@@ -138,6 +146,7 @@ export function UserSettings({
   const title = {
     profile: t("nav.you"),
     "edit-profile": t("profile.edit"),
+    "change-password": t("password.change"),
     appearance: t("settings.appearance"),
     licenses: t("legal.title"),
     settings: t("settings.title"),
@@ -155,9 +164,16 @@ export function UserSettings({
         page !== "devices" && (
           <ScreenHeader
             title={title}
-            desktopRoot={page !== "edit-profile"}
-            onBack={() => onPage("profile")}
-            backLabel={t("settings.back")}
+            desktopRoot={page !== "edit-profile" && page !== "change-password"}
+            onBack={() => {
+              if (!passwordChanging)
+                onPage(page === "change-password" ? "edit-profile" : "profile");
+            }}
+            backLabel={t(
+              page === "change-password"
+                ? "password.backToProfile"
+                : "settings.back",
+            )}
           />
         )}
       {page === "profile" && (
@@ -276,12 +292,21 @@ export function UserSettings({
         <ProfileEditor
           name={name}
           avatar={avatar}
-          mobile={mobile}
           busy={busy}
+          onChangePassword={() => onPage("change-password")}
           onSave={async (value) => {
             await onProfile(value);
             onPage("profile");
           }}
+        />
+      )}
+      {page === "change-password" && (
+        <ChangePassword
+          identity={identity}
+          busy={busy}
+          onBusyChange={onPasswordBusyChange}
+          onDone={() => onPage("edit-profile")}
+          onLockRequired={onLockRequired}
         />
       )}
       {page === "appearance" && (

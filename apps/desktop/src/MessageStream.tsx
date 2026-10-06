@@ -7,11 +7,13 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
   type PointerEvent,
 } from "react";
 import { MessageContent } from "./MessageContent";
 import { EmptyState } from "./EmptyState";
+import { CallList } from "./calls/ActiveSessions";
+import type { Calls } from "./calls/controller";
+import type { Stream } from "./model";
 import { Icon } from "./Icon";
 import { ScreenHeader } from "./ScreenHeader";
 import { PullToRefresh } from "./PullToRefresh";
@@ -77,10 +79,14 @@ export function MessageStream({
   onRefresh,
   onRead,
   onOpen,
-  activity,
+  calls,
+  callsTabRequest = 0,
+  onSessionOpen,
 }: {
   view: View;
-  activity?: ReactNode;
+  calls?: Calls;
+  callsTabRequest?: number;
+  onSessionOpen?: (chat: Stream) => void;
   active: boolean;
   mobile: boolean;
   busy: boolean;
@@ -89,10 +95,16 @@ export function MessageStream({
   onRead: (entry: StreamEntry) => Promise<boolean>;
   onOpen: (entry: StreamEntry) => void;
 }) {
-  const [filter, setFilter] = useState<BuzzFilter>("all");
+  const [filter, setFilter] = useState<BuzzFilter | "calls">("all");
+  useEffect(() => {
+    if (callsTabRequest > 0) setFilter("calls");
+  }, [callsTabRequest]);
   const unreadEntries = useMemo(() => unreadStreamEntries(view), [view]);
   const entries = useMemo(
-    () => filterBuzzEntries(unreadEntries, filter, view.identity),
+    () =>
+      filter === "calls"
+        ? []
+        : filterBuzzEntries(unreadEntries, filter, view.identity),
     [unreadEntries, filter, view.identity],
   );
   const [limit, setLimit] = useState(60);
@@ -349,6 +361,7 @@ export function MessageStream({
       aria-label={t("nav.stream")}
     >
       <ScreenHeader
+        callSlot="call-strip-buzz"
         title={t("nav.stream")}
         actions={!mobile && <RefreshButton onRefresh={onRefresh} />}
       />
@@ -357,7 +370,7 @@ export function MessageStream({
         role="group"
         aria-label={t("stream.filters")}
       >
-        {(["all", "mentions", "threads"] as const).map((value) => (
+        {(["all", "mentions", "threads", "calls"] as const).map((value) => (
           <button
             key={value}
             type="button"
@@ -386,8 +399,10 @@ export function MessageStream({
             onRefresh={onRefresh}
             resetKey={view.identity}
           >
-            {activity}
-            {!entries.length && (
+            {filter === "calls" && calls && onSessionOpen && (
+              <CallList calls={calls} view={view} onOpen={onSessionOpen} />
+            )}
+            {filter !== "calls" && !entries.length && (
               <EmptyState
                 message={t(
                   filter === "mentions"

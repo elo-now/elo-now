@@ -57,6 +57,7 @@
     "allow-push-task",
     "allow-desktop-notification-task",
     "allow-native-call-media",
+    "allow-native-call-incoming",
     "allow-native-call-state",
     "allow-native-call-audio",
     "allow-choose-attachment",

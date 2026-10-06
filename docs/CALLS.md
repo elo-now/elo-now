@@ -38,32 +38,46 @@ media servers does not require a mobile release through the implemented discover
 Drain existing rooms before shutting down a node; moving an active room is not
 seamless live migration.
 
-All conversations use voluntary sessions. A participant explicitly starts or joins
-from the conversation; microphone starts after permission, camera remains off until
-enabled. There is no incoming Answer/Decline dialog, ringtone, system telephone UI
-or VoIP wake. The live chat action advertises a ready session. Session-start hints
-use the ordinary encrypted notification route and never join or start capture.
-The initiating participant must first acquire local media and receive acceptance
-of its signed Media command. This sets `ready` and the original `ready_at` time;
-Subscribe, Start, Join and ConnectMedia alone do not mark a session ready.
+Direct conversations support ringing calls with **Answer**, **Decline** and
+**Cancel call**. Group sessions remain joinable from the conversation or the
+**Calls** filter in Buzz. Starting a group does not ring every member: a joined
+participant explicitly selects a person with **Invite to call** to ring them.
+The signed conversation kind, not its current participant count or title,
+determines the behavior.
 
-Before sending a hint, the native client reads `/calls/v1/state` with a signed
-Subscribe command. The service applies the existing membership, hosting admission,
-configuration and replay checks; this endpoint cannot start or join a session.
-The client checks the exact active session and initiating device. The recipient's
-encrypted target contains the hosting Space, chat and session ID, with a
-60-second deadline. Opening it matches the hosting Space as well as the chat,
-so the same chat genesis in another Space cannot redirect the target.
-The wake service requires an explicitly authorized, unmuted recipient scope,
-deduplicates the session event, and applies the same deadline to its queue and
-provider delivery. Session hints use a separate opaque scope so they cannot replace
-queued message notifications, and they do not increase the unread-message badge.
-Opening a hint refreshes current session presence and offers an explicit Join.
-Session end can race with provider delivery; already delivered OS alerts cannot be
-recalled reliably. A stale or ended target must never join automatically.
-Deploy matching session-control, notification and client versions. Delivery to
-physical mobile devices remains a separate acceptance check; source support does
-not establish the state of a particular installed release.
+The interface presents one compact active-call strip across navigation. Other
+available sessions belong in Calls rather than additional persistent control bars.
+An incoming invitation names its conversation and Space. **End & answer** first
+validates the incoming invitation, ends the current local call and then answers;
+declining the incoming invitation leaves the current call running. Expanded video,
+participant controls and desktop screen sharing remain available.
+
+The initiating participant must acquire media permission and receive acceptance of
+its signed Media command before a new session is advertised as ready. This sets
+`ready` and the original `ready_at`; Subscribe, Start, Join and ConnectMedia alone
+do not mark a session ready. Camera capture remains an explicit action.
+
+Before notification, the sender checks `/calls/v1/state` with a signed Subscribe
+command. Existing membership, hosted-Space admission, configuration and replay
+checks apply; this endpoint cannot start or join a call. Ring targets bind the
+hosting Space, conversation, call, recipient and a specific invitation ID, with a
+60-second invitation deadline. The target is authenticated and encrypted with a
+key derived from the recipient's wake scope capability. The relay never receives
+that capability or a profile/media key.
+
+Ring delivery requires an authorized, unmuted recipient scope and a separately
+opted-in installation. The relay deduplicates each invitation, expires it, and
+never queues a ring for later playback. iOS uses the installation's registered
+APNs VoIP environment; ordinary notifications retain their own route. An accepted
+provider request is not an answer, read receipt or guarantee of device delivery.
+Session advertisements do not increase the unread-message badge. Cancellation,
+answer on another device and expiry are reconciled against signed live state;
+delayed push delivery must never revive a terminal invitation or start capture.
+
+Deploy matching call-control, wake and client versions. Native signaling,
+notification code and synthetic tests do not establish physical acceptance of an
+installed release. Real lock-screen, cold-start and multi-device tests remain
+separate gates.
 
 ## Media and privacy
 
@@ -100,13 +114,21 @@ PSTN, anonymous room or permanent media storage in this scope.
   client explains the conflict instead of suggesting a network failure. Leave on
   the first device before joining on the second; simultaneous two-person tests
   require separate identities.
-- All sessions advertise live presence and a Join action without ringing.
-- Presence counts identities. Heartbeat is 10 seconds and participant expiry is
-  30 seconds. An explicit Leave removes only that participant; the last participant ends the session
-  immediately; the configurable 15-second empty-room grace applies only after
-  unexpected expiry so a brief transport interruption can recover.
-- One device participates in one call at a time. Leaving and joining another
-  requires an explicit user action.
+- Direct Start creates a bounded ringing attempt. The recipient's Join answers
+  it; Decline ends that attempt for all devices, Cancel is restricted to its
+  initiator while ringing, and End or Leave terminates an active direct call.
+  A direct participant lease expiring also ends the call.
+- Group Start is active without a ring. Invite creates a recipient-specific
+  attempt; Decline consumes only that invitation and Leave removes only the
+  leaving participant. Dismissing an available session locally does not end its
+  room. A late Decline/Join carries the invitation ID and cannot act on a newer
+  invitation for the same room.
+- Presence counts identities. Client heartbeats run every 5–10 seconds;
+  participant expiry is 30 seconds. The last explicit group Leave ends its room.
+  The configurable 15-second empty-room grace applies to unexpected group expiry.
+  Ringing expires after 60 seconds even if the caller keeps sending heartbeats.
+- One device participates in one call at a time. Answering or joining another
+  requires an explicit switch; rejecting that switch preserves the current call.
 - Calls continue across navigation. A persistent compact control surface exposes
   microphone, speaker and leave; the full call view adds camera, participants and
   desktop screen share. Speaker mute silences all remote playback locally, remains
@@ -197,46 +219,62 @@ removal plus media-key rotation. Drain/restart must preserve authorization fence
 ## Platform integration and acceptance
 
 The shared controls preserve full-screen video, local preview, camera switching,
-microphone/speaker mute and desktop screen sharing. Mobile screen publication is
-not implemented. Entering a session is an explicit foreground action after the
-profile is unlocked; a push never starts capture or opens a locked profile.
+microphone mute, audio-output selection and desktop screen sharing. Mobile screen
+publication is not implemented. System Answer may use an already enrolled
+call-only delegation while the profile vault stays locked; a push alone never
+starts capture or unlocks the profile.
 
-An unlocked profile remains open when the phone is locked with Power or the app
-is backgrounded. A new process requires the ordinary password/biometric unlock.
-Logout stops capture and native background ownership. Ordinary notification opt-in
-is independent of maintaining an already joined session.
+After an authenticated profile refresh, eligible conversations receive a signed
+call-only credential scoped to the hosting Space, exact conversation, current
+configuration head, parent device credential and pinned call service. Protected
+native storage contains this limited signing/decryption key and the incoming
+ring target capability, not profile signing keys, history keys or the wake
+notification-send key. Delegations expire after at most 24 hours and refresh
+before expiry. Enrollment reevaluates membership, hidden conversations and
+blocked direct contacts on every pass; matching valid keys are reused. Live
+admission still checks the current hosted permissions. An expired or revoked
+binding cannot answer until a fresh authorized enrollment is available.
 
-Android uses a microphone foreground service, extended with the camera type only
-when needed. The service starts from the visible Activity after microphone/camera
-permission, has a quiet ongoing notification, and cannot restore itself from boot
-or a delayed intent after Leave. Telephone, full-screen intent and Core-Telecom
-integration are absent. The portrait orientation policy is unchanged.
+Logout and disabling incoming calls remove protected enrollment and stop its
+native ownership. Native callbacks and snapshots expose public state only. The
+background worker verifies the restored proof, encrypted target, exact live
+invitation and current participant state before signing Join or Decline. A
+bounded Android Decline worker can execute directly from the notification
+receiver without creating a WebView or opening the vault. Failed dispatch remains
+pending for later reconciliation; it is not reported as a successful decline.
 
-iOS direct media uses native WebRTC 153.0.0 for microphone, playback and camera,
-with an app-owned play-and-record audio session and the audio background mode.
-Native video renders below the transparent expanded view; frames do not cross IPC.
-The native controller owns authenticated signaling and roster changes independently
-of WebView timers. The interface reads a snapshot;
-it cannot drain the native SDP/ICE queue. An activation identifier isolates a new
-Join from delayed cleanup events for an earlier visit to the same session.
-Group media keeps LiveKit with E2EE. CallKit, PushKit, native ringing and the
-VoIP-token App Attest enrollment have been removed; ordinary Firebase/APNs
-message notifications remain.
+Android integrates a self-managed Telecom account, incoming-call notifications,
+an incoming Activity and a phone-call foreground service. Full-screen presentation
+depends on platform permission/settings and has a notification fallback. Explicit
+answer validates the target and permissions before capture. Microphone and camera
+foreground-service types are added only for the actual media use; boot and stale
+intents cannot resurrect a call. The portrait orientation policy is unchanged.
 
-Mobile session membership has a native signed lease independent of WebView timers.
-The lease is scoped to the unlocked profile, hosted Space, conversation, session
-and device credential. It survives media-adapter replacement, checks current
-admission and stops on logout, terminal errors or revocation. Native permission
-and compilation checks are not physical audio acceptance. The voluntary
-session lifecycle needs device acceptance; previous telephone-style test results
-describe earlier builds only.
+iOS uses CallKit/PushKit for real incoming invitations. Verified outgoing sessions
+also register with CallKit before media starts, so the system can offer End & answer
+when another invitation arrives. System end/mute actions bind the exact capture
+UUID and local activation; an old callback cannot stop a replacement call. Media
+epoch resets preserve that system call, while terminal cleanup ends it. CallKit
+owns audio-session activation for system calls; direct WebRTC and encrypted LiveKit group adapters
+respect that activation. Native signaling, participant state and encrypted group
+key exchange run independently of WebView timers. Media keys stay at the endpoints;
+frames and protected credentials do not cross WebView IPC. The admitted delegate
+remains pinned for signaling; the original device key may update its capture state
+or invite a group member without replacing that transport. A second device of
+the same identity cannot take over the admitted participant.
+
+The native group worker keeps the same key during a reconnect within the same
+epoch. Membership changes advance the epoch, dispose the old room/key, and require
+fresh recipient-encrypted key distribution. An unexpected same-epoch member or key
+change, revoked authorization or unavailable encryption stops capture. Native
+permission, compilation and local WebSocket tests are not physical audio acceptance.
+
 An active audio session alone does not prove indefinite background execution while
-waiting alone. If iOS suspends an idle solo session, its server lease expires and
-the user must join again after returning. No silent playback or extra recording
-is used solely to keep the app awake. This distinction follows Apple's
-[audio-session guidance](https://developer.apple.com/library/archive/documentation/Audio/Conceptual/AudioSessionProgrammingGuide/AudioGuidelinesByAppType/AudioGuidelinesByAppType.html);
-actual solo suspension still needs device measurement. The background acceptance test must cover
-both an ongoing conversation and the transition to waiting alone.
+waiting alone. If the OS suspends an idle session, its server lease may expire;
+no silent playback or extra recording is used solely to keep the app awake.
+Apple's [audio-session guidance](https://developer.apple.com/library/archive/documentation/Audio/Conceptual/AudioSessionProgrammingGuide/AudioGuidelinesByAppType/AudioGuidelinesByAppType.html)
+still applies. Acceptance must cover ongoing media, waiting alone, a locked vault,
+process restart, system audio activation and network handover for the exact build.
 
 Private hosting admission waits up to two seconds for the Space client instead
 of treating a momentary lock collision as lost membership. After acquiring it,
@@ -289,19 +327,18 @@ After an idle proof is evicted, a client must supply a fresh proof to subscribe.
 
 ## App and service integration
 
-The app discovers call control at `/calls/v1` on the trusted joined Space's hosting
-origin. The signed `connect_media` operation returns an expiring room-scoped
+The app obtains call control from the trusted joined hosting profile's pinned
+`call_url`; the built-in service defaults to `/calls/v1` on its hosting origin. The signed `connect_media` operation returns an expiring room-scoped
 provider token and temporary TURN credentials. These endpoints are configuration,
 not embedded IP addresses or a fallback to official infrastructure. A future
 multi-node deployment can change the provider endpoint behind the same API.
 
-The shared app includes a Start session/Join session action
-above conversation search and in the desktop chat header,
-a persistent control bar, microphone/camera
-controls and the expanded participant/video view with a live connection-status badge. Calls keep running when navigating
-inside the unlocked application. Direct calls authenticate SDP/ICE through elo's
-signed encrypted signals. Group calls use the lazily loaded LiveKit client with
-an encryption worker and a fresh 256-bit key per membership epoch. No plaintext
+The shared app includes conversation call actions, the Calls filter in Buzz,
+one persistent compact strip and an expanded participant/video view. Calls continue
+across navigation; answering another call uses the explicit switch flow. Direct
+calls authenticate SDP/ICE through elo's signed encrypted signals. Group calls use
+LiveKit with a fresh 256-bit key per membership epoch: the desktop adapter uses its
+encryption worker, while mobile adapters and signaling are native. No plaintext
 fallback is offered when the runtime lacks the required encryption API.
 
 The server provider uses short-lived join-only tokens, a private loopback admin
@@ -351,8 +388,10 @@ for the exact release being distributed; source compilation alone does not resol
 them:
 
 - Windows/Linux native calls, screen capture and installation acceptance.
-- Android voluntary-session controls, audio routing and interrupted direct
-  sessions; broader cross-device lifecycle coverage.
+- iOS CallKit/PushKit and Android Telecom incoming calls while locked,
+  backgrounded and cold-started, including provider environment and opt-in state.
+- Answer/reject during another call, cancellation on multiple devices, stale
+  invitation expiry, audio routing and interrupted direct/group sessions.
 - Long network outages, Wi-Fi/cellular handover and reconnect while the iOS
   WebView is suspended. Native lease renewal alone does not prove these paths.
 - Final store-installed notification/media smoke tests on supported runtimes.

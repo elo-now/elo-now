@@ -16,6 +16,7 @@ private struct PushRegisterArgs: Decodable { let registration: String; let backg
 private struct PushStatusArgs: Decodable { let registration: String? }
 private struct PushAckArgs: Decodable { let opened: String?; let wake: String? }
 private struct PushStatusListenerArgs: Decodable { let channel: Channel }
+private struct IncomingCallArgs: Decodable { let payload: String }
 private struct PushReconcileArgs: Decodable {
     let registration: String
     let unread: Bool
@@ -62,6 +63,34 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             })
         }
     }
+
+    @objc func incomingListener(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(PushStatusListenerArgs.self)
+        Task { @MainActor in IncomingCalls.shared.listen(args.channel); invoke.resolve() }
+    }
+    @objc func incomingStatus(_ invoke: Invoke) {
+        Task { @MainActor in invoke.resolve(IncomingCalls.shared.status()) }
+    }
+    @objc func callBindings(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(IncomingCallArgs.self)
+        guard args.payload.utf8.count <= 3 * 1024 * 1024,
+              let body = try JSONSerialization.jsonObject(with: Data(args.payload.utf8)) as? [String: Any] else {
+            invoke.reject("invalid"); return
+        }
+        do { invoke.resolve(try CallBindings.command(body)) }
+        catch { invoke.reject("unavailable") }
+    }
+    @objc func incomingCall(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(IncomingCallArgs.self)
+        guard args.payload.utf8.count <= 32768,
+              let body = try JSONSerialization.jsonObject(with: Data(args.payload.utf8)) as? [String: Any] else {
+            invoke.reject("invalid"); return
+        }
+        Task { @MainActor in
+            do { invoke.resolve(try IncomingCalls.shared.command(body)) }
+            catch { invoke.reject("unavailable") }
+        }
+    }
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
     override func load(webview: WKWebView) {
@@ -88,9 +117,11 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         let args = try invoke.parseArgs(CallStateArgs.self)
         Task { @MainActor in
             do {
-                try ChatSessionAudio.shared.set(active: args.active, id: args.sessionId, activation: args.activation) {
+                try ChatSessionAudio.shared.set(active: args.active, id: args.sessionId, activation: args.activation, changed: {
                     _ = try? args.routeChannel?.send(["sessionId": args.sessionId, "activation": args.activation])
-                }
+                }, systemAction: { event in
+                    _ = try? args.routeChannel?.send(event)
+                })
                 invoke.resolve()
             } catch { invoke.reject("unavailable") }
         }
@@ -107,7 +138,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
     // Tao 0.35 supplies the delegate methods but does not declare protocol
     // conformance. Firebase refuses to install its APNs callbacks without it.
     // Keep Tao's delegate and lifecycle methods; only supply the missing marker.
-    @discardableResult private func configure() -> Bool {
+    @MainActor @discardableResult private func configure() -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         // Anchor the gzip category used by Firebase heartbeat headers. A global
         // -ObjC flag loads duplicate Tauri/SwiftRs objects from plugin archives.
@@ -129,6 +160,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         if prefs.bool(forKey: "elo.push.enabled") {
             UIApplication.shared.registerForRemoteNotifications()
         }
+        IncomingCalls.shared.configure(enabled: prefs.bool(forKey: "elo.push.enabled"))
         return true
     }
 
@@ -179,6 +211,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
                 invoke.resolve(["token": token]); return
             }
             self.prefs.set(true, forKey: "elo.push.enabled")
+            IncomingCalls.shared.configure(enabled: true)
             self.waiting?.reject("Notification setup was restarted.")
             let attempt = UUID()
             self.registrationAttempt = attempt
@@ -287,6 +320,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         DispatchQueue.main.async { [self] in
             PushBadge.invalidate(prefs: prefs)
             PushRegistrations.remove(args.registration, prefs: prefs)
+            if PushRegistrations.all(prefs).isEmpty { IncomingCalls.shared.configure(enabled: false) }
             let center = UNUserNotificationCenter.current()
             if PushRegistrations.all(prefs).isEmpty { center.setBadgeCount(0) { _ in } }
             center.getDeliveredNotifications { notifications in
@@ -303,6 +337,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             waiting?.reject("Notification setup was cancelled.")
             waiting = nil
             registrationAttempt = nil
+            IncomingCalls.shared.configure(enabled: false)
             for key in prefs.dictionaryRepresentation().keys where key.hasPrefix("elo.push.") {
                 prefs.removeObject(forKey: key)
             }

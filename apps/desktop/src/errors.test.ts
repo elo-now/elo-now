@@ -37,6 +37,11 @@ describe("native error presentation", () => {
       ],
       ["profile_password_required", "devices.error.passwordRequired"],
       ["The password is incorrect", "error.passwordCheck"],
+      ["password_change_incorrect", "error.passwordCheck"],
+      ["password_change_unchanged", "password.unchanged"],
+      ["password_change_unavailable", "password.unavailable"],
+      ["password_change_recovery_required", "password.recoveryRequired"],
+      ["profile_changed_while_opening", "password.profileChanged"],
       ["recovery_code_required", "devices.error.recoveryRequired"],
     ] as const) {
       expect(presentError(reason)).toEqual({ message: en[key] });

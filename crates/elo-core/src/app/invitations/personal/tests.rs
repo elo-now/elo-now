@@ -551,3 +551,93 @@ async fn personal_block_suppresses_new_dms_history_reactions_and_survives_restar
     maya.close().await.unwrap();
     alex.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn concurrent_personal_dms_reopen_the_same_signed_scope_without_erasing_either_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut alex = profile(temp.path(), "Alex").await;
+    let mut maya = profile(temp.path(), "Maya").await;
+    for reverse in [false, true] {
+        let (source, receiver) = if reverse {
+            (&mut maya, &mut alex)
+        } else {
+            (&mut alex, &mut maya)
+        };
+        let card = source
+            .operate(json!({"op":"contact_create","name":"Shared display name"}))
+            .await
+            .unwrap();
+        let preview = receiver
+            .operate(json!({"op":"contact_preview","link":card["link"]}))
+            .await
+            .unwrap();
+        receiver.operate(json!({"op":"contact_add","link":card["link"],"trusted":true,"confirmed_contact":preview["id"]})).await.unwrap();
+    }
+    let alex_request =
+        json!({"op":"contact_open","identity":maya.identity_id(),"name":"Shared display name"});
+    let maya_request =
+        json!({"op":"contact_open","identity":alex.identity_id(),"name":"Shared display name"});
+    alex.operate(alex_request.clone()).await.unwrap();
+    maya.operate(maya_request.clone()).await.unwrap();
+    let alex_authority = alex.authorities.0.last().unwrap().clone();
+    let maya_authority = maya.authorities.0.last().unwrap().clone();
+    let alex_scope = (alex_authority.space(), alex_authority.stream());
+    let maya_scope = (maya_authority.space(), maya_authority.stream());
+    assert_ne!(
+        alex_scope, maya_scope,
+        "independent signed bootstraps precede discovery"
+    );
+    let to_maya = packet(
+        &alex.invitation_state().unwrap().personal[&maya.identity_id().to_string()],
+        &alex_authority,
+        maya.session.credential(),
+    );
+    let to_alex = packet(
+        &maya.invitation_state().unwrap().personal[&alex.identity_id().to_string()],
+        &maya_authority,
+        alex.session.credential(),
+    );
+    for (app, scope, text) in [
+        (&mut alex, alex_scope, "Alex's original history"),
+        (&mut maya, maya_scope, "Maya's original history"),
+    ] {
+        app.operate(json!({"op":"send","space":scope.0,"stream":scope.1,"text":text,"created_at":"2026-10-06T19:00:00Z"})).await.unwrap();
+    }
+    alex.import_personal(&to_alex).await.unwrap();
+    maya.import_personal(&to_maya).await.unwrap();
+    let pin_counts = (alex.pins.len(), maya.pins.len());
+    alex.import_personal(&to_alex).await.unwrap();
+    maya.import_personal(&to_maya).await.unwrap();
+    assert_eq!(
+        (alex.pins.len(), maya.pins.len()),
+        pin_counts,
+        "replayed invitation does not create another chat"
+    );
+    let selected = alex_scope.min(maya_scope);
+    for _ in 0..2 {
+        let opened_alex = alex.operate(alex_request.clone()).await.unwrap();
+        let opened_maya = maya.operate(maya_request.clone()).await.unwrap();
+        assert_eq!(opened_alex["stream"], json!(selected.1));
+        assert_eq!(opened_maya["stream"], json!(selected.1));
+        assert_eq!((alex.pins.len(), maya.pins.len()), pin_counts);
+        alex.pins.reverse();
+        alex.authorities.0.reverse();
+        maya.pins.reverse();
+        maya.authorities.0.reverse();
+    }
+    for (app, authority, text) in [
+        (&alex, &alex_authority, "Alex's original history"),
+        (&maya, &maya_authority, "Maya's original history"),
+    ] {
+        assert!(
+            app.originals(authority)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(record, _)| record.body()["payload"]["text"] == text),
+            "opening the canonical DM must retain history in every original scope"
+        );
+    }
+    alex.close().await.unwrap();
+    maya.close().await.unwrap();
+}

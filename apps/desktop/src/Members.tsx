@@ -93,7 +93,10 @@ export function Members({
                     {!hideAvatars && (
                       <span className="avatar">
                         {senderInitials(view, member.identity_id, stream)}
-                        <OnlineIndicator identity={member.identity_id} chat={stream} />
+                        <OnlineIndicator
+                          identity={member.identity_id}
+                          chat={stream}
+                        />
                       </span>
                     )}
                     <span className="member-copy">

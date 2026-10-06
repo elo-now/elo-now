@@ -178,7 +178,8 @@ export function PullToRefresh({
     };
     let touchY: number | undefined;
     const touchStart = (event: TouchEvent) => {
-      touchY = event.touches.length === 1 ? event.touches[0].clientY : undefined;
+      touchY =
+        event.touches.length === 1 ? event.touches[0].clientY : undefined;
     };
     const touchMove = (event: TouchEvent) => {
       if (touchY === undefined || event.touches.length !== 1) return;

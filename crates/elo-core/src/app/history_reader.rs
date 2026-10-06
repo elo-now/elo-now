@@ -240,8 +240,34 @@ impl HistoryView<'_> {
         a: &Authority,
         sources: Vec<crate::store::DisplaySource>,
     ) -> Result<Vec<(SignedRecord, String)>> {
+        self.open_verified_sources(a, sources, true).await
+    }
+    /// Cleanup must include records hidden by presentation limits and blocking.
+    pub(super) async fn local_file_shares(
+        &self,
+        a: &Authority,
+    ) -> Result<Vec<(SignedRecord, String)>> {
+        let sources = self
+            .store
+            .local_file_share_sources(a.space(), a.stream())
+            .await?;
+        self.open_verified_sources(a, sources, false).await
+    }
+    async fn open_verified_sources(
+        &self,
+        a: &Authority,
+        sources: Vec<crate::store::DisplaySource>,
+        apply_blocking: bool,
+    ) -> Result<Vec<(SignedRecord, String)>> {
+        let removed = self
+            .store
+            .local_deleted_records(sources.iter().map(|source| source.record).collect())
+            .await?;
         let mut unique = BTreeMap::new();
         for source in sources {
+            if removed.contains(&source.record) {
+                continue;
+            }
             if unique.contains_key(&source.record) {
                 continue;
             }
@@ -282,7 +308,7 @@ impl HistoryView<'_> {
         }
         let mut rows = unique
             .into_values()
-            .filter(|(record, _)| self.blocked.permits(record))
+            .filter(|(record, _)| !apply_blocking || self.blocked.permits(record))
             .collect::<Vec<_>>();
         rows.sort_by(|(left, _), (right, _)| {
             (
@@ -301,6 +327,14 @@ impl HistoryView<'_> {
     pub(super) async fn history_page(&self, v: &Value) -> Result<Value> {
         let index = self.authority_index(v)?;
         let a = &self.authorities.0[index];
+        let local_history = self.store.local_chat_state(a.space(), a.stream()).await?;
+        if local_history.hidden
+            || v["history_generation"]
+                .as_u64()
+                .is_some_and(|value| value != local_history.generation)
+        {
+            return Err("This conversation was removed from this device.".into());
+        }
         let mut before = v
             .get("before")
             .filter(|v| !v.is_null())
@@ -464,8 +498,11 @@ impl HistoryView<'_> {
             let locator = r.body()["kind"] == "chat.locator" || projection.is_deleted(&r);
             json!({"reply_count":reply_counts.get(message_id),"id":id,"body":body,"state":state,"unread":!locator && (marked || (!seen && r.body()["issuer_identity"]!=json!(self.identity_id()))),"marked_unread":!locator && marked,"pinned":!locator && projection.is_pinned(r.id()),"reactions":if locator { Vec::new() } else { projection.reactions(r.id(),self.identity_id()) }})
         };
+        if self.store.local_chat_state(a.space(), a.stream()).await? != local_history {
+            return Err("The local conversation history has changed.".into());
+        }
         Ok(
-            json!({"history":{"identity":self.identity_id(),"space":a.space(),"stream":a.stream(),"rows":rows.into_iter().map(project).collect::<Vec<_>>(),"context":context.into_iter().map(project).collect::<Vec<_>>(),"next":before,"newer":newer,"query":query,"thread":thread}}),
+            json!({"history":{"history_generation":local_history.generation,"identity":self.identity_id(),"space":a.space(),"stream":a.stream(),"rows":rows.into_iter().map(project).collect::<Vec<_>>(),"context":context.into_iter().map(project).collect::<Vec<_>>(),"next":before,"newer":newer,"query":query,"thread":thread}}),
         )
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 mod authorization;
+mod ringing;
 #[derive(Default)]
 struct Fake {
     sent: Mutex<Vec<Notice>>,
@@ -1314,4 +1315,51 @@ async fn session_wakes_require_exact_authorized_scope_deduplicate_and_expire() {
         "A chat session has started. Open elo.now to join."
     );
     assert!(!payload.to_string().contains("elo_call"));
+}
+
+#[tokio::test]
+async fn session_retry_after_new_dm_scope_is_authorized_keeps_opaque_ack_and_deduplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Fake::default());
+    let relay = Relay::open(&temp.path().join("db"), provider.clone()).unwrap();
+    let (id, owner, key, scope) = setup(&relay, &provider).await;
+    let expires = now().unwrap() as u64 + 60;
+    let input = || {
+        let mut body = json!({"event":format!("{:064x}",211),"scope":scope,
+            "target":URL_SAFE_NO_PAD.encode([7u8;100]),"category":"session_start","expires":expires});
+        elo_core::app::push_sender::sign(test_sender(), &id, &mut body).unwrap();
+        serde_json::from_value::<Wake>(body).unwrap()
+    };
+    let send = || {
+        wake(
+            State(relay.clone()),
+            Path(id.clone()),
+            headers(&key),
+            Json(input()),
+        )
+    };
+    assert_eq!(send().await.unwrap(), StatusCode::ACCEPTED);
+    for table in ["queue", "events"] {
+        assert_eq!(
+            relay
+                .database()
+                .unwrap()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "an opaque acknowledgement does not record delivery"
+        );
+    }
+    allow(&relay, &id, &owner, &scope, 1, true).await;
+    assert_eq!(send().await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(send().await.unwrap(), StatusCode::ACCEPTED);
+    due(&relay);
+    assert!(relay.deliver_due().await.unwrap());
+    assert_eq!(send().await.unwrap(), StatusCode::ACCEPTED);
+    due(&relay);
+    assert!(!relay.deliver_due().await.unwrap());
+    assert_eq!(provider.sent.lock().unwrap().iter().filter(|notice|
+        matches!(notice, Notice::Wake { category, .. } if category == "session_start")
+    ).count(), 1);
 }

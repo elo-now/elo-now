@@ -122,6 +122,12 @@ server {
         proxy_read_timeout 3600s;
         proxy_pass http://127.0.0.1:18920;
     }
+    location = /calls/v1/state {
+        limit_req zone=elo_call_connect burst=12 nodelay;
+        client_max_body_size 1m;
+        access_log off;
+        proxy_pass http://127.0.0.1:18920;
+    }
     location = /calls/v1/health { proxy_pass http://127.0.0.1:18920; }
 
     # The trailing slash strips exactly /media/ and preserves the remainder.

@@ -18,6 +18,8 @@ import android.content.pm.PackageManager
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
+import app.tauri.annotation.Permission
+import app.tauri.annotation.PermissionCallback
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Channel
 import app.tauri.plugin.JSObject
@@ -27,6 +29,7 @@ import com.google.firebase.messaging.FirebaseMessaging
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailabilityLight
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONObject
 
 @InvokeArg
 class RegisterArgs { var registration: String = ""; var background: Boolean = false }
@@ -49,8 +52,15 @@ class CallStateArgs { var active: Boolean = false; var sessionId: String = ""; v
 @InvokeArg
 class CallAudioArgs { var sessionId: String = ""; var activation: String = ""; var outputId: String? = null }
 
-@TauriPlugin
+@InvokeArg
+class IncomingCallArgs { var payload: String = "" }
+
+@TauriPlugin(permissions = [
+    Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"),
+    Permission(strings = [Manifest.permission.CAMERA], alias = "camera"),
+])
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
+    private val bindingsWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Command
     fun deviceModel(invoke: Invoke) {
         val result = JSObject()
@@ -70,6 +80,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         GoogleApiAvailabilityLight.getInstance().isGooglePlayServicesAvailable(activity) == ConnectionResult.SUCCESS
     override fun load(webView: WebView) {
         super.load(webView)
+        NativeMedia.attach(webView)
         prefs.registerOnSharedPreferenceChangeListener(statusChanged)
         if (Build.VERSION.SDK_INT >= 26) {
             val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -81,13 +92,14 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); onIntent(intent) }
     override fun onWebViewDestroyed() {
-        ChatSessions.stop(activity)
+        NativeMedia.attach(null)
+        ChatSessions.detach(activity)
         statusChannel = null
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         super.onWebViewDestroyed()
     }
     override fun onDestroy(activity: AppCompatActivity) {
-        ChatSessions.stop(activity)
+        ChatSessions.detach(activity)
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         statusChannel = null
         super.onDestroy(activity)
@@ -96,6 +108,58 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     fun statusListener(invoke: Invoke) {
         statusChannel = invoke.parseArgs(StatusListenerArgs::class.java).channel
         invoke.resolve()
+    }
+    @Command
+    fun incomingListener(invoke: Invoke) {
+        val channel = invoke.parseArgs(StatusListenerArgs::class.java).channel
+        activity.runOnUiThread { IncomingCalls.listen(activity) { channel.send(it) }; invoke.resolve() }
+    }
+    @Command
+    fun incomingStatus(invoke: Invoke) {
+        activity.runOnUiThread { invoke.resolve(IncomingCalls.status(activity)) }
+    }
+    @Command
+    fun incomingCall(invoke: Invoke) {
+        val payload = invoke.parseArgs(IncomingCallArgs::class.java).payload
+        activity.runOnUiThread {
+            try {
+                check(payload.length <= 8192) { "invalid_incoming_call_operation" }
+                invoke.resolve(IncomingCalls.command(activity, JSONObject(payload)))
+            } catch (_: Exception) { invoke.reject("incoming_call_unavailable") }
+        }
+    }
+    @Command
+    fun callBindings(invoke: Invoke) {
+        val args = invoke.parseArgs(IncomingCallArgs::class.java)
+        bindingsWorker.execute {
+            try {
+                require(args.payload.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024 + 1024)
+                val request = JSONObject(args.payload)
+                invoke.resolve(CallBindings.command(activity.applicationContext, request.getString("op"), request.optString("payload").takeIf { !request.isNull("payload") }))
+            }
+            catch (_: Exception) { invoke.reject("call_bindings_unavailable") }
+        }
+    }
+    @Command
+    fun nativeMedia(invoke: Invoke) {
+        val args = invoke.parseArgs(IncomingCallArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                require(args.payload.toByteArray(Charsets.UTF_8).size <= 196608)
+                val request = JSONObject(args.payload)
+                if (request.optString("op") == "permissions") {
+                    check(NativeMedia.foreground(activity)) { "NotAllowedError" }
+                    val video = request.optBoolean("video")
+                    if (NativeMedia.granted(activity, video)) invoke.resolve(JSObject())
+                    else requestPermissionForAliases(if (video) arrayOf("microphone", "camera") else arrayOf("microphone"), invoke, "nativeMediaPermissionResult")
+                } else NativeMedia.command(activity, request) { invoke.resolve(it) }
+            } catch (_: Exception) { invoke.resolve(JSObject().put("error", "NotAllowedError")) }
+        }
+    }
+    @PermissionCallback
+    fun nativeMediaPermissionResult(invoke: Invoke) {
+        val video = runCatching { JSONObject(invoke.parseArgs(IncomingCallArgs::class.java).payload).optBoolean("video") }.getOrDefault(false)
+        invoke.resolve(if (NativeMedia.granted(activity, video)) JSObject() else JSObject().put("error", "NotAllowedError"))
     }
     private fun onIntent(intent: Intent?) {
         val target = intent?.getStringExtra("elo_target") ?: return
@@ -179,7 +243,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
             try {
                 ChatSessions.update(activity, args.sessionId, args.activation, args.active, args.camera) { error ->
                     if (error == null) {
-                        ChatSessionAudio.listen(args.sessionId, args.activation, if (args.active) ({ args.routeChannel?.send(JSObject().put("sessionId", args.sessionId).put("activation", args.activation)); Unit }) else null)
+                        ChatSessionAudio.listen(args.sessionId, args.activation, if (args.active) ({ value -> args.routeChannel?.send(value.put("sessionId", args.sessionId).put("activation", args.activation)); Unit }) else null)
                         invoke.resolve()
                     } else invoke.reject(error)
                 }
@@ -192,13 +256,23 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     fun callAudio(invoke: Invoke) {
         val args = invoke.parseArgs(CallAudioArgs::class.java)
         activity.runOnUiThread {
-            try { invoke.resolve(ChatSessionAudio.route(args.sessionId, args.activation, args.outputId)) }
+            try {
+                if (IncomingCalls.ownsTelecom(args.sessionId) || OutgoingCalls.owns(args.sessionId)) {
+                    check(ChatSessionAudio.owns(args.sessionId, args.activation))
+                    val completed: (JSObject?, String?) -> Unit = { result, error ->
+                        if (error != null) invoke.reject(error) else invoke.resolve(result)
+                    }
+                    if (IncomingCalls.ownsTelecom(args.sessionId)) IncomingCalls.route(args.sessionId, args.outputId, completed)
+                    else OutgoingCalls.route(args.sessionId, args.outputId, completed)
+                } else invoke.resolve(ChatSessionAudio.route(args.sessionId, args.activation, args.outputId))
+            }
             catch (_: RuntimeException) { invoke.reject("unavailable") }
         }
     }
     @Command
     fun remove(invoke: Invoke) {
         val registration = invoke.parseArgs(RegisterArgs::class.java).registration
+        activity.runOnUiThread { IncomingCalls.remove(activity, registration) }
         PushRegistrations.remove(prefs, registration)
         val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.activeNotifications.filter { it.notification.extras.getString("elo_registration") == registration }.forEach { manager.cancel(it.tag, it.id) }
@@ -206,6 +280,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
     @Command
     fun disable(invoke: Invoke) {
+        activity.runOnUiThread { IncomingCalls.remove(activity) }
         prefs.edit().clear().commit()
         val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.activeNotifications.filter { it.tag?.startsWith("elo-wake:") == true }.forEach { manager.cancel(it.tag, it.id) }

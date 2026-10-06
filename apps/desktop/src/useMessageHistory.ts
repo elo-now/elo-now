@@ -26,6 +26,7 @@ export function useMessageHistory(
     view?.blocked_users?.map((p) => p.identity).join(","),
     chat?.space,
     chat?.stream,
+    chat?.history_generation ?? 0,
     query.trim(),
     thread,
     around,
@@ -63,6 +64,7 @@ export function useMessageHistory(
       around,
       thread,
       query,
+      chat.history_generation,
     )
       ? {
           key,
@@ -133,6 +135,8 @@ export function useMessageHistory(
       if (
         generation.current !== epoch ||
         latest.current.key !== current.key ||
+        (page.history_generation ?? 0) !==
+          (current.chat.history_generation ?? 0) ||
         !sameHistoryScope(
           page,
           current.view.identity,
@@ -186,6 +190,9 @@ export function useMessageHistory(
           });
           if (
             generation.current !== epoch ||
+            latest.current.key !== current.key ||
+            (fresh.history.history_generation ?? 0) !==
+              (current.chat.history_generation ?? 0) ||
             !sameHistoryScope(
               fresh.history,
               current.view.identity,

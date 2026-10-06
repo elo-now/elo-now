@@ -9,7 +9,7 @@ fn main() {
         let root = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
             .join("swift-rs/tauri-plugin-elo-push");
         globalize_xcode_27_bridge_symbols(&root);
-        link_webrtc(&root);
+        link_media_frameworks(&root);
         println!("cargo:ios_resource_root={}", root.display());
     }
 }
@@ -30,34 +30,45 @@ fn xcode_products_directory() -> String {
     format!("{configuration}-{platform}")
 }
 
-fn link_webrtc(root: &std::path::Path) {
+fn link_media_frameworks(root: &std::path::Path) {
     let simulator = std::env::var("TARGET")
         .is_ok_and(|target| target.ends_with("-sim") || target.starts_with("x86_64-"));
     let products = xcode_products_directory();
-    let directory = [
-        root.join("out/Products").join(&products),
-        root.join("Products").join(&products),
-    ]
-    .into_iter()
-    .find(|path| path.join("WebRTC.framework/WebRTC").is_file())
-    .or_else(|| {
-        let slice = if simulator {
-            "ios-x86_64_arm64-simulator"
-        } else {
-            "ios-arm64"
-        };
-        let path = root
-            .join("artifacts/webrtc/WebRTC/WebRTC.xcframework")
-            .join(slice);
-        path.join("WebRTC.framework/WebRTC")
-            .is_file()
-            .then_some(path)
-    })
-    .expect("the pinned WebRTC package did not produce the requested iOS framework");
-    // Rust also links a cdylib during the Tauri build; Xcode embeds/signs the
-    // same pinned SwiftPM framework in the final app bundle.
-    println!("cargo:rustc-link-search=framework={}", directory.display());
-    println!("cargo:rustc-link-lib=framework=WebRTC");
+    let slice = if simulator {
+        "ios-x86_64_arm64-simulator"
+    } else {
+        "ios-arm64"
+    };
+    for (name, artifact) in [
+        ("WebRTC", "webrtc/WebRTC"),
+        ("LiveKitWebRTC", "webrtc-xcframework/LiveKitWebRTC"),
+        (
+            "RustLiveKitUniFFI",
+            "livekit-uniffi-xcframework/RustLiveKitUniFFI",
+        ),
+    ] {
+        let binary = format!("{name}.framework/{name}");
+        let directory = [
+            root.join("out/Products").join(&products),
+            root.join("Products").join(&products),
+        ]
+        .into_iter()
+        .find(|path| path.join(&binary).is_file())
+        .or_else(|| {
+            let path = root
+                .join("artifacts")
+                .join(artifact)
+                .join(format!("{name}.xcframework"))
+                .join(slice);
+            path.join(&binary).is_file().then_some(path)
+        })
+        .unwrap_or_else(|| {
+            panic!("the pinned {name} package did not produce the requested iOS framework")
+        });
+        // Cargo links a cdylib too; Xcode embeds/signs these exact SwiftPM products.
+        println!("cargo:rustc-link-search=framework={}", directory.display());
+        println!("cargo:rustc-link-lib=framework={name}");
+    }
 }
 
 /// Xcode 27 internalizes the Swift package's `@_cdecl` bridge symbols when the

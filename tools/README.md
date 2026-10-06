@@ -131,7 +131,7 @@ rmdir "$ELO_COVER_BUILD"
 | Tool | Purpose and boundaries |
 | --- | --- |
 | `check_ios_startup.py APP_OR_ARCHIVE_OR_IPA` | Inspects the final scene manifest, single-window declaration, portrait orientation and iPhone target. Also accepts `Info.plist`. Physical cold/warm launch checks remain necessary. |
-| `check_ios_privacy.py APP_OR_ARCHIVE [--push]` | Validates embedded manifests in a built `.app` or `.xcarchive`; `--push` includes notification SDK/WebRTC manifests. Complements Xcode's final privacy report. |
+| `check_ios_privacy.py APP_OR_ARCHIVE [--push]` | Validates embedded manifests in a built `.app` or `.xcarchive`; `--push` includes notification SDK, LiveKit, SwiftProtobuf and native media framework manifests. Complements Xcode's final privacy report. |
 | `prepare_macos_signing.py --help` | Creates signing configuration in a new private output directory using an explicitly supplied development provisioning profile and installed signing identity. Keep inputs/outputs outside source control. |
 | `test_prepare_macos_signing.py` | Tests signing-profile validation with synthetic fixtures: `python3 -m unittest discover -s tools -p 'test_prepare_macos_signing.py'`. |
 | `stage_desktop_release.py BUNDLE_DIRECTORY NEW_OUTPUT_DIRECTORY` | Copies final desktop installers and writes SHA-256 checksums. Requires Python 3.11 or newer and a fresh output directory; does not publish. |

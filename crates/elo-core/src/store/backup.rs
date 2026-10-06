@@ -15,6 +15,10 @@ const REDUNDANT_PRIVATE_SETTINGS: &str = "kind='chat.private-settings'
     AND record_id NOT IN (SELECT record_id FROM outbox WHERE state!='STORED')";
 
 const TABLES: &[(&str, &str)] = &[
+    ("local_chat_deletions", "WHERE 0"),
+    ("local_deleted_records", "WHERE 0"),
+    ("local_deleted_targets", "WHERE 0"),
+    ("local_deleted_objects", "WHERE 0"),
     (
         "objects",
         "WHERE object_id IN (SELECT object_id FROM main.record_sources WHERE record_id IN (SELECT record_id FROM elo_selection.keep))",
@@ -76,6 +80,21 @@ impl ClientStore {
         records: Option<Vec<RecordId>>,
         private_settings_cursor: i64,
     ) -> Result<Vec<u8>> {
+        self.transfer_image(maximum, records, private_settings_cursor, false)
+            .await
+    }
+
+    pub(crate) async fn local_content_backup_image(&self, maximum: usize) -> Result<Vec<u8>> {
+        self.transfer_image(maximum, None, 0, true).await
+    }
+
+    async fn transfer_image(
+        &self,
+        maximum: usize,
+        records: Option<Vec<RecordId>>,
+        private_settings_cursor: i64,
+        include_files: bool,
+    ) -> Result<Vec<u8>> {
         self.call(move |connection| {
             let schema = read_schema(connection)?;
             let tables = schema
@@ -102,7 +121,7 @@ impl ClientStore {
                         }
                         transaction.commit()?;
                     }
-                    None => { connection.execute("INSERT INTO elo_selection.keep SELECT record_id FROM records WHERE kind != 'file.body'", [])?; }
+                    None => { connection.execute("INSERT INTO elo_selection.keep SELECT record_id FROM records WHERE ?1 OR kind != 'file.body'", [include_files])?; }
                 }
                 connection.execute(
                     &format!("DELETE FROM elo_selection.keep WHERE record_id IN (SELECT record_id FROM records WHERE {REDUNDANT_PRIVATE_SETTINGS})"),

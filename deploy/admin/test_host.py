@@ -87,7 +87,7 @@ def proxy_configuration(origin, hostname):
             header_up X-Real-IP {{remote_host}}
         }}
     }}
-    @calls path /calls/v1/connect /calls/v1/health
+    @calls path /calls/v1/connect /calls/v1/state /calls/v1/health
     handle @calls {{
         request_body {{
             max_size 1048576
@@ -151,8 +151,7 @@ def compose_configuration(root, certificate_directory, origin, version, uids):
             "logging": {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}},
         }
     services["api"]["command"] = ["elo-team", "host", "--config", "/etc/elo/api/config.json", "--bind", "127.0.0.1:19900"]
-    services["wake"]["command"] = ["elo-wake", "--service-account", "/etc/elo/wake/firebase.json",
-        "--database", "/var/lib/elo-wake/wake.sqlite", "--listen", "127.0.0.1:8878", "--public-url", origin]
+    services["wake"]["command"] = ["python3", "/opt/elo/wake.py", "--listen", "127.0.0.1:8878"]
     services["calls"]["command"] = ["elo-call-service", "--config", "/etc/elo/calls/config.json"]
     uid = uids["proxy"]
     services["proxy"] = {

@@ -142,6 +142,7 @@ export function ThreadView({
       aria-label={t("thread.title")}
     >
       <ScreenHeader
+        callSlot="call-strip-thread"
         title={t("thread.title")}
         onBack={onBack}
         backLabel={t("thread.back")}

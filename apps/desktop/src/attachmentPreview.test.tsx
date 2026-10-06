@@ -178,3 +178,22 @@ test("unknown or invalid headers do not invent image geometry", () => {
     height: 96,
   });
 });
+
+test("local chat deletion evicts only its previews and rejects a late decode result", async () => {
+  const { forgetConversationPreviews } = await import("./attachmentPreview");
+  const other = { ...request, stream: "another-chat" };
+  native.mockResolvedValueOnce("data:image/png;base64,keep");
+  await loadAttachmentPreview(other);
+  let resolve!: (value: string) => void;
+  native.mockReturnValueOnce(
+    new Promise<string>((done) => {
+      resolve = done;
+    }),
+  );
+  const pending = loadAttachmentPreview(request);
+  forgetConversationPreviews(context);
+  resolve("data:image/png;base64,deleted");
+  expect(await pending).toBeNull();
+  expect(cachedAttachmentPreview(request)).toBeUndefined();
+  expect(cachedAttachmentPreview(other)).toBe("data:image/png;base64,keep");
+});

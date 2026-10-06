@@ -84,22 +84,21 @@ export function ProfileEditor({
   name: initialName,
   avatar: initialAvatar,
   busy,
-  mobile,
   onSave,
+  onChangePassword,
 }: ProfilePresentation & {
   busy: boolean;
-  mobile: boolean;
   onSave: (profile: ProfilePresentation) => Promise<void>;
+  onChangePassword: () => void;
 }) {
   const [name, setName] = useState(initialName);
   const [avatar, setAvatar] = useState(initialAvatar);
   const [preparing, setPreparing] = useState(false);
   const selection = useRef(0);
   const gallery = useRef<HTMLInputElement>(null);
-  const camera = useRef<HTMLInputElement>(null);
   const { reportError, onInvalid } = useToast();
   useEffect(() => {
-    const inputs = [gallery.current, camera.current];
+    const inputs = [gallery.current];
     inputs.forEach((input) => input?.addEventListener("cancel", clearCapture));
     return () => {
       selection.current++;
@@ -143,7 +142,18 @@ export function ProfileEditor({
         }}
       >
         <div className="profile-photo-preview">
-          <ProfileAvatar name={name} avatar={avatar} />
+          <button
+            type="button"
+            className="profile-edit-button"
+            aria-label={t("profile.choosePhoto")}
+            disabled={busy || preparing}
+            onClick={() => gallery.current?.click()}
+          >
+            <ProfileAvatar name={name} avatar={avatar} />
+            <span className="profile-edit-badge" aria-hidden="true">
+              <Icon name="camera" />
+            </span>
+          </button>
         </div>
         <input
           ref={gallery}
@@ -153,37 +163,6 @@ export function ProfileEditor({
           aria-label={t("profile.choosePhoto")}
           onChange={(event) => void choose(event.currentTarget)}
         />
-        {mobile && (
-          <input
-            ref={camera}
-            type="file"
-            accept="image/*"
-            capture="user"
-            hidden
-            aria-label={t("profile.takePhoto")}
-            onChange={(event) => void choose(event.currentTarget)}
-          />
-        )}
-        <div className="profile-photo-actions">
-          <button
-            type="button"
-            className="ghost"
-            disabled={busy || preparing}
-            onClick={() => gallery.current?.click()}
-          >
-            {t("profile.choosePhoto")}
-          </button>
-          {mobile && (
-            <button
-              type="button"
-              className="ghost"
-              disabled={busy || preparing}
-              onClick={() => camera.current?.click()}
-            >
-              {t("profile.takePhoto")}
-            </button>
-          )}
-        </div>
         {avatar && (
           <button
             type="button"
@@ -197,6 +176,14 @@ export function ProfileEditor({
         <ProfileNameField value={name} onChange={setName} />
         <button disabled={busy || preparing}>
           {busy || preparing ? t("sync.busy") : t("profile.saveName")}
+        </button>
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy || preparing}
+          onClick={onChangePassword}
+        >
+          {t("password.change")}
         </button>
       </form>
     </div>

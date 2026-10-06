@@ -13,6 +13,7 @@ export type Participant = {
   credential_id: string;
   media: MediaState;
   ready?: boolean;
+  delegation?: string;
 };
 export type ActiveCall = {
   call_id: string;
@@ -27,6 +28,13 @@ export type ActiveCall = {
   /** The initiator has admitted media and can receive peers, not necessarily a connected peer. */
   ready?: boolean;
   ready_at?: number;
+  phase?: "ringing" | "active";
+  ring_expires_at?: number;
+  answered_at?: number;
+  invitations?: Record<
+    string,
+    { invitation_id: string; invited_by: string; expires_at: number }
+  >;
 };
 export type MediaAccess = {
   provider: "livekit" | "p2p";
@@ -71,6 +79,12 @@ export type Snapshot = {
   error?: string;
   changingMedia?: boolean;
   available: Record<string, ActiveCall>;
+  incoming?: ActiveCall[];
+  dismissed?: string[];
+  expanded?: boolean;
+  joinRequest?: { chat: Stream; call?: ActiveCall };
+  answering?: boolean;
+  nativePresented?: { call_id: string; invitation_id: string }[];
 };
 export const muted: MediaState = {
   audio_muted: true,

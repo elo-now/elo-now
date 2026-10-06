@@ -9,11 +9,20 @@ const sourceMessageKeys = new Map<string, MessageKey>(
 );
 
 const known: Record<string, MessageKey> = {
+  chat_deleted_locally: "error.chatDeletedLocally",
+  "This conversation cannot be removed from this device.":
+    "error.chatDeleteUnavailable",
+  notification_open_expired: "notifications.openingTimeout",
   attachment_retention_invalid: "error.attachmentRetention",
   message_expiry_invalid: "error.messageExpiry",
   message_expiry_author_only: "error.messageExpiryAuthor",
   message_expiry_unavailable: "error.messageExpiryUnavailable",
   profile_password_weak: "error.passwordWeak",
+  password_change_incorrect: "error.passwordCheck",
+  profile_changed_while_opening: "password.profileChanged",
+  password_change_unchanged: "password.unchanged",
+  password_change_unavailable: "password.unavailable",
+  password_change_recovery_required: "password.recoveryRequired",
   file_export_failed: "error.fileExport",
   invitation_qr_image_too_large: "invite.qrImageTooLarge",
   profile_logout_notifications_pending: "profile.logoutNotificationsPending",

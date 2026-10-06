@@ -375,10 +375,18 @@ app bundle, repository or a public installation page. Custom mobile builds
 should use the operator's own Firebase project. A separate trusted push gateway
 could provide another arrangement, but no such gateway is implemented here.
 Do not share the public elo project's service-account key with arbitrary
-operators; the QR never carries it. The relay uses Firebase's APNs
-integration on iOS and does not require CallKit, VoIP push or background access
-to a microphone. Startup smoke checks use a synthetic RSA key and do not prove
-FCM/APNs delivery; test both platforms with authorized real installations.
+operators; the QR never carries it. Ordinary iOS notifications use Firebase's
+APNs integration. Native incoming calls additionally require an Apple APNs
+signing key authorized for the application's VoIP topic. Place the private
+mode-0600 configuration at `wake/config/apns.json`, owned by the wake service's
+UID, with `team_id`, `key_id`, `bundle_id` and PEM `private_key` fields. The wake
+launcher loads it when present. Never put this key in a QR or public profile.
+Development and production installations register their own APNs environment;
+the relay selects the corresponding Apple endpoint for each installation.
+System answer uses a separately protected, short-lived call-only delegation;
+it does not unlock the profile or message history. Startup smoke checks use a
+synthetic RSA key and do not prove FCM/APNs delivery; test both platforms with
+authorized real installations.
 
 The wake container alone receives Firebase credentials. The call-control
 admission key is shared only with the API, LiveKit's key only with call control,

@@ -689,15 +689,17 @@ mod tests {
         let session = Session::create().unwrap().0;
         let first = profile(&session);
         let link = link(&first, &session);
-        let mut catalog = Catalog::default();
         // Invalid duplicate persisted identities are rejected independently of
         // the total limit, including entries hidden from the selector.
-        catalog.profiles = (0..=MAX_PROFILES)
-            .map(|_| StoredProfile {
-                link: link.clone(),
-                enabled: false,
-            })
-            .collect();
+        let mut catalog = Catalog {
+            profiles: (0..=MAX_PROFILES)
+                .map(|_| StoredProfile {
+                    link: link.clone(),
+                    enabled: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
         assert!(catalog.validate().is_err());
         catalog.profiles.pop();
         assert!(catalog.validate().is_err());

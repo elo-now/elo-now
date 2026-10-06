@@ -1,4 +1,4 @@
-//! Explicitly joined iOS direct sessions: one native signaling owner, no persisted keys.
+//! Direct mobile sessions share one native signaling owner per admitted call.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +16,7 @@ type Socket =
 type Result<T> = std::result::Result<T, &'static str>;
 const QUEUE_LIMIT: usize = 128;
 const QUEUE_BYTES: usize = 2 * 1024 * 1024;
+mod group;
 
 pub(crate) trait Driver: Send {
     fn operation(&mut self, op: &str, fields: Value) -> impl Future<Output = Result<Value>> + Send;
@@ -37,14 +38,15 @@ impl Target {
     fn validate(&self, call: &Value) -> Result<()> {
         if call["call_id"] != self.call_id
             || call["scope"] != self.scope()
-            || call["kind"] != "direct"
+            || call["kind"] != self.context.get("kind").unwrap_or(&json!("direct")).clone()
             || call["config_id"] != self.context["config_id"]
             || call["key_epoch"].as_u64().is_none_or(|epoch| epoch == 0)
         {
             return Err("unauthorized");
         }
         let people = call["participants"].as_object().ok_or("invalid")?;
-        if !(1..=2).contains(&people.len()) {
+        let maximum = if call["kind"] == "group" { 64 } else { 2 };
+        if !(1..=maximum).contains(&people.len()) {
             return Err("ended");
         }
         for (identity, participant) in people {
@@ -105,8 +107,8 @@ pub(crate) fn verified_context(context: &Value, signed: &Value) -> Result<Value>
         .map_err(|_| "invalid")?;
     let identity = calls::require_member(&authority, credential).map_err(|_| "unauthorized")?;
     let head = authority.head().map_err(|_| "unauthorized")?;
-    if head.chat_kind != Some(ChatKind::Direct)
-        || head.members.len() != 2
+    if !matches!(head.chat_kind, Some(ChatKind::Direct | ChatKind::Chat))
+        || (head.chat_kind == Some(ChatKind::Direct) && head.members.len() != 2)
         || context["expected_identity"] != json!(identity)
     {
         return Err("unauthorized");
@@ -121,6 +123,11 @@ pub(crate) fn verified_context(context: &Value, signed: &Value) -> Result<Value>
         .map_err(|_| "unauthorized")?;
     let mut result = context.clone();
     result["credential"] = json!(credential);
+    result["kind"] = json!(if head.chat_kind == Some(ChatKind::Direct) {
+        "direct"
+    } else {
+        "group"
+    });
     result["config_id"] = json!(authority.head_id().ok_or("unauthorized")?);
     result["members"] = json!({});
     for member in &head.members {
@@ -155,6 +162,14 @@ pub(crate) fn validate_command(context: &Value, signed: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn command_envelope(signed: &Value) -> Value {
+    let mut envelope = json!({"command":signed["command"],"proof":signed["proof"]});
+    if let Some(delegation) = signed.get("delegation") {
+        envelope["delegation"] = delegation.clone();
+    }
+    envelope
+}
+
 struct Control {
     socket: Socket,
     pending: VecDeque<Value>,
@@ -189,12 +204,8 @@ impl Control {
         Some(value)
     }
     async fn signed(&mut self, signed: Value) -> Result<Value> {
-        self.send(Message::Text(
-            json!({"command":signed["command"],"proof":signed["proof"]})
-                .to_string()
-                .into(),
-        ))
-        .await?;
+        self.send(Message::Text(command_envelope(&signed).to_string().into()))
+            .await?;
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 let event = self.receive().await?;
@@ -257,12 +268,13 @@ impl Control {
 /// automatically: the fresh heartbeat must still admit the exact same device.
 pub(crate) async fn run(driver: &mut impl Driver, target: &Target) -> Result<()> {
     let mut failures = 0;
+    let mut group_state = group::State::default();
     loop {
         if !driver.live() {
             return Ok(());
         }
         let started = tokio::time::Instant::now();
-        let result = connected(driver, target).await;
+        let result = connected(driver, target, &mut group_state).await;
         if result != Err("unavailable") || !driver.live() {
             return result;
         }
@@ -276,7 +288,11 @@ pub(crate) async fn run(driver: &mut impl Driver, target: &Target) -> Result<()>
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-async fn connected(driver: &mut impl Driver, target: &Target) -> Result<()> {
+async fn connected(
+    driver: &mut impl Driver,
+    target: &Target,
+    group_state: &mut group::State,
+) -> Result<()> {
     // A reconnect must complete before the server's 30-second participant
     // lease expires. Signing, TLS and first admission share one deadline.
     let (mut control, first) = tokio::time::timeout(Duration::from_secs(12), async {
@@ -303,7 +319,14 @@ async fn connected(driver: &mut impl Driver, target: &Target) -> Result<()> {
     })
     .await
     .map_err(|_| "unavailable")??;
-    let result = maintain(driver, target, &mut control, first["call"].clone()).await;
+    let result = maintain(
+        driver,
+        target,
+        &mut control,
+        first["call"].clone(),
+        group_state,
+    )
+    .await;
     // Best effort terminal cleanup; transport failure retains the short server
     // lease for reconnection, and never signs leave on behalf of a successor.
     if result != Err("unavailable") && driver.live() {
@@ -322,7 +345,11 @@ async fn maintain(
     target: &Target,
     control: &mut Control,
     initial: Value,
+    group_state: &mut group::State,
 ) -> Result<()> {
+    if initial["kind"] == "group" {
+        return group::maintain(driver, target, control, initial, group_state).await;
+    }
     target.validate(&initial)?;
     let mut call = initial;
     let mut epoch = 0;
@@ -374,7 +401,7 @@ async fn maintain(
             driver
                 .media(json!({"op":"reset","ice_servers":servers}))
                 .await?;
-            driver.changed(&call, remote.is_none()).await?;
+            driver.changed(&call, false).await?;
             if let Some(peer) = remote.as_deref() {
                 if target.leader(peer) {
                     driver.media(json!({"op":"offer"})).await?;
@@ -414,7 +441,7 @@ async fn maintain(
                         retry_at = Some(now);
                     }
                 }
-                driver.changed(&call, remote.is_none() || state["connection"] == "connected").await?;
+                driver.changed(&call, remote.is_some() && state["connection"] == "connected").await?;
                 if state["media"].is_object() && !state["media"].as_object().unwrap().is_empty() && state["media"] != last_media {
                     let result = control.command(driver, json!({"type":"media","call_id":target.call_id,"state":state["media"]})).await?;
                     last_media = state["media"].clone();
@@ -465,7 +492,7 @@ async fn maintain(
                     && event["epoch"] == epoch
                     && remote.as_deref().is_some_and(|peer| event["from"] == peer) =>
             {
-                let opened = driver.operation("call_open_signal", json!({"call_id":target.call_id,"epoch":epoch,"ciphertext":event["ciphertext"]})).await?;
+                let opened = driver.operation("call_open_signal", json!({"call_id":target.call_id,"epoch":epoch,"from":event["from"],"ciphertext":event["ciphertext"]})).await?;
                 if accept_signal(
                     target,
                     epoch,
@@ -681,7 +708,13 @@ mod tests {
                 json!({})
             })
         }
-        async fn changed(&mut self, call: &Value, _connected: bool) -> Result<()> {
+        async fn changed(&mut self, call: &Value, connected: bool) -> Result<()> {
+            if call["participants"].as_object().unwrap().len() == 1 {
+                assert!(
+                    !connected,
+                    "A direct call without its recipient is still waiting"
+                );
+            }
             let epoch = call["key_epoch"].as_u64().unwrap();
             if self.last_epoch != epoch {
                 self.last_epoch = epoch;
@@ -792,5 +825,23 @@ mod tests {
             1
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod delegation_transport_tests {
+    use super::*;
+    #[test]
+    fn retains_call_only_certificate_without_forwarding_unrelated_secrets() {
+        assert_eq!(
+            command_envelope(
+                &json!({"command":"signed","proof":null,"delegation":"certificate","secret":"never-forward"})
+            ),
+            json!({"command":"signed","proof":null,"delegation":"certificate"})
+        );
+        assert_eq!(
+            command_envelope(&json!({"command":"signed","proof":"proof"})),
+            json!({"command":"signed","proof":"proof"})
+        );
     }
 }

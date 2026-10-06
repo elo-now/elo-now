@@ -3,7 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { Stream, View } from "../model";
 import type { Calls } from "./controller";
 import { activeSessions } from "./sessionPresence";
-import { ActiveSessionJoin, ActiveSessions } from "./ActiveSessions";
+import { CallList } from "./ActiveSessions";
+import { CallButton } from "./CallUI";
 import { callKey, muted, type ActiveCall, type Snapshot } from "./types";
 
 vi.mock("react", async (importOriginal) => ({
@@ -71,11 +72,14 @@ function fixture() {
     subscribe: () => () => {},
     getSnapshot: () => state,
     start: vi.fn(),
+    requestStart: vi.fn(),
+    reveal: vi.fn(),
+    expand: vi.fn(),
   } as unknown as Calls;
   return { chat, call, view, state, calls };
 }
 
-it("shows ready participants and Space names from outside the selected Space without starting media", () => {
+it("lists verified ready calls across Spaces without acquiring media", () => {
   const f = fixture();
   const sessions = activeSessions(f.view, f.state.available);
   expect(sessions).toHaveLength(1);
@@ -83,21 +87,14 @@ it("shows ready participants and Space names from outside the selected Space wit
     spaceName: "Team",
     participantNames: ["Alex"],
   });
-  const onOpen = vi.fn();
-  const list = renderToStaticMarkup(
-    <ActiveSessions calls={f.calls} view={f.view} onOpen={onOpen} />,
+  const markup = renderToStaticMarkup(
+    <CallList calls={f.calls} view={f.view} onOpen={vi.fn()} />,
   );
-  expect(list).toContain("Planning");
-  expect(list).toContain("in Team space");
-  expect(list).toContain("Alex");
-  expect(list).not.toContain("Morgan");
-  expect(list).not.toContain(">Join<");
-  const join = renderToStaticMarkup(
-    <ActiveSessionJoin calls={f.calls} view={f.view} chat={f.chat} />,
-  );
-  expect(join).toContain(">Join</button>");
+  expect(markup).toContain("Planning");
+  expect(markup).toContain("in Team space");
+  expect(markup).toContain("Alex");
+  expect(markup).not.toContain("Morgan");
   expect(f.calls.start).not.toHaveBeenCalled();
-  expect(onOpen).not.toHaveBeenCalled();
 });
 
 it("hides unavailable, empty, stale, or inaccessible sessions", () => {
@@ -117,40 +114,83 @@ it("hides unavailable, empty, stale, or inaccessible sessions", () => {
   expect(activeSessions(f.view, f.state.available)).toEqual([]);
 });
 
-it("keeps Join disabled while another session is active", () => {
+it("keeps dismissed groups in Calls and opens their chat without joining", () => {
   const f = fixture();
-  f.state.active = { ...f.call, call_id: "other-call" };
-  const markup = renderToStaticMarkup(
-    <ActiveSessionJoin calls={f.calls} view={f.view} chat={f.chat} />,
-  );
-  expect(markup).toContain('disabled=""');
-  expect(f.calls.start).not.toHaveBeenCalled();
-});
-
-it("opens a session's chat on list click and joins only through the explicit Join action", () => {
-  const f = fixture();
+  f.state.dismissed = [`${callKey(f.call)}:${f.call.call_id}`];
   const onOpen = vi.fn();
-  const list = ActiveSessions({ calls: f.calls, view: f.view, onOpen })!;
-  const row = list.props.children[1][0];
-  row.props.onClick();
-  expect(onOpen).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({
-      space_context: "other",
-      stream: "chat",
-    }),
+  const list = CallList({ calls: f.calls, view: f.view, onOpen });
+  const row = list.props.children[0];
+  row.props.children[0].props.onClick();
+  expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ space_context: "other", stream: "chat" }),
   );
-  expect(f.calls.start).not.toHaveBeenCalled();
-  const banner = ActiveSessionJoin({
-    calls: f.calls,
-    view: f.view,
-    chat: f.chat,
-  })!;
-  banner.props.children.at(-1).props.onClick();
-  expect(f.calls.start).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({
-      space_context: "other",
-      stream: "chat",
-    }),
+  expect(onOpen).toHaveBeenCalledOnce();
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
+  row.props.children[1].props.onClick();
+  expect(f.calls.requestStart).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ space_context: "other", stream: "chat" }),
     f.call,
   );
+});
+
+it("opens this device's call instead of offering a redundant Join", () => {
+  const f = fixture();
+  f.state.active = f.call;
+  const list = CallList({ calls: f.calls, view: f.view, onOpen: vi.fn() });
+  expect(renderToStaticMarkup(list)).toContain("Open call");
+  list.props.children[0].props.children[1].props.onClick();
+  expect(f.calls.expand).toHaveBeenCalledOnce();
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
+});
+
+it("does not confuse identical call IDs from separate hostings", () => {
+  const f = fixture();
+  f.state.active = {
+    ...f.call,
+    scope: { ...f.call.scope, hosting_space_id: "current" },
+  };
+  const list = CallList({ calls: f.calls, view: f.view, onOpen: vi.fn() });
+  list.props.children[0].props.children[1].props.onClick();
+  expect(f.calls.expand).not.toHaveBeenCalled();
+  expect(f.calls.requestStart).toHaveBeenCalledOnce();
+});
+
+it("reveals a dismissed group from the phone action and waits for an explicit Join", () => {
+  const f = fixture();
+  f.state.dismissed = [`${callKey(f.call)}:${f.call.call_id}`];
+  const phone = CallButton({ calls: f.calls, chat: f.chat });
+  expect(phone.props["aria-label"]).toBe("Open call");
+  phone.props.onClick();
+  expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(f.chat);
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
+  // The distinct Join control remains the admission action.
+  const list = CallList({ calls: f.calls, view: f.view, onOpen: vi.fn() });
+  list.props.children[0].props.children[1].props.onClick();
+  expect(f.calls.requestStart).toHaveBeenCalledExactlyOnceWith(f.chat, f.call);
+});
+
+it("keeps the phone admission action for direct calls and new sessions", () => {
+  const f = fixture();
+  f.call.kind = "direct";
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.requestStart).toHaveBeenLastCalledWith(f.chat, f.call);
+  expect(f.calls.reveal).not.toHaveBeenCalled();
+  f.state.available = {};
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.requestStart).toHaveBeenLastCalledWith(f.chat, undefined);
+});
+
+it("opens an already joined group but never confuses its ID with another hosting", () => {
+  const f = fixture();
+  f.state.active = f.call;
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.requestStart).toHaveBeenCalledExactlyOnceWith(f.chat, f.call);
+  vi.mocked(f.calls.requestStart).mockClear();
+  f.state.active = {
+    ...f.call,
+    scope: { ...f.call.scope, hosting_space_id: "different-hosting" },
+  };
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(f.chat);
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
 });

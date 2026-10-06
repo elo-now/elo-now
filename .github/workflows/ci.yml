@@ -85,6 +85,20 @@ jobs:
         run: |
           cargo test --locked -p elo-desktop --lib hosting::tests
           cargo test --locked -p elo-desktop --lib push::
+      - name: Native call lifecycle and protected admission
+        run: |
+          cargo test --locked -p elo-desktop --lib native_session::
+          cargo test --locked -p elo-desktop --lib incoming_calls::
+          cargo test --locked -p elo-desktop --lib native_media::
+      - name: iOS call and media policy
+        if: runner.os == 'macOS'
+        run: |
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/IncomingCallState.swift crates/tauri-plugin-elo-push/ios/Sources/OutgoingCallState.swift crates/tauri-plugin-elo-push/ios/Tests/IncomingCallStateTests.swift -o "$RUNNER_TEMP/elo-call-policy-tests"
+          "$RUNNER_TEMP/elo-call-policy-tests"
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/NativeGroupPolicy.swift crates/tauri-plugin-elo-push/ios/Tests/NativeGroupPolicyTests.swift -o "$RUNNER_TEMP/elo-group-policy-tests"
+          "$RUNNER_TEMP/elo-group-policy-tests"
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/APNsEnvironment.swift crates/tauri-plugin-elo-push/ios/Tests/APNsEnvironmentTests.swift -o "$RUNNER_TEMP/elo-apns-environment-tests"
+          "$RUNNER_TEMP/elo-apns-environment-tests"
       - name: iOS notification inbox logic
         if: runner.os == 'macOS'
         run: |

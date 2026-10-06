@@ -146,6 +146,7 @@ impl Fixture {
         proof: bool,
     ) -> Request {
         Request {
+            delegation: None,
             command: STANDARD.encode(
                 calls::sign_command(
                     &self.authority,

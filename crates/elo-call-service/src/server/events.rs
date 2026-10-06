@@ -98,11 +98,13 @@ mod tests {
             bus.send(Event::Ended {
                 scope: scope("2"),
                 call_id: "a".repeat(32),
+                reason: crate::registry::EndReason::Ended,
             });
         }
         bus.send(Event::Ended {
             scope: scope("1"),
             call_id: "b".repeat(32),
+            reason: crate::registry::EndReason::Ended,
         });
         assert!(
             matches!(quiet.recv().await, Some(Event::Ended { call_id, .. }) if call_id == "b".repeat(32))

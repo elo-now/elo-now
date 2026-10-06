@@ -18,6 +18,7 @@ import {
   clearLegacyBiometricUnlock,
   shouldOfferBiometricUnlock,
   markBiometricOfferHandled,
+  changeProfilePassword,
 } from "./biometric";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const first = { id: "profile", identity: "identity-one" };
@@ -108,6 +109,15 @@ vi.mock("@choochmeque/tauri-plugin-biometry-api", async (original) => ({
 }));
 
 describe("mobile biometric bridge", () => {
+  it("does not offer an OS key whose local envelope was invalidated", async () => {
+    keychain.set(`vault-key-v3:${first.identity}:${first.id}`, "stale key");
+    vi.mocked(invoke).mockResolvedValue({
+      mobile,
+      saved_profiles: [{ ...first, active: true, biometric_enrolled: false }],
+    });
+    expect((await readBiometricState(first.identity)).enabled).toBe(false);
+    expect(hasData).not.toHaveBeenCalled();
+  });
   it.each([
     [1, "Touch ID", BiometryType.TouchID],
     [2, "Face ID", BiometryType.FaceID],
@@ -144,6 +154,139 @@ describe("mobile biometric bridge", () => {
       type: BiometryType.None,
     });
     expect(hasData).not.toHaveBeenCalled();
+  });
+});
+
+describe("password changes and biometric enrollment", () => {
+  const entry = `vault-key-v3:${first.identity}:${first.id}`;
+  const oldPassword = "old synthetic profile password";
+  const newPassword = "new synthetic profile password";
+  function passwordReply(reply: () => unknown) {
+    const previous = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (
+        command === "profile_task" &&
+        (args as { request: { op: string } }).request.op === "change_password"
+      )
+        return reply();
+      return previous(command, args);
+    });
+  }
+  it("changes a password without enabling biometrics that were off", async () => {
+    passwordReply(() => ({ biometric_refresh_required: false }));
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).resolves.toEqual({ biometricNeedsSetup: false });
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: {
+        op: "change_password",
+        ...first,
+        current_password: oldPassword,
+        new_password: newPassword,
+      },
+    });
+    expect(setData).not.toHaveBeenCalled();
+    expect(getData).not.toHaveBeenCalled();
+  });
+  it("renews an existing enrollment with the new password after commit", async () => {
+    keychain.set(entry, "old encrypted enrollment");
+    passwordReply(() => ({ biometric_refresh_required: true }));
+    const previous = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (
+        command === "profile_task" &&
+        (args as { request: { op: string } }).request.op === "biometric_enroll"
+      )
+        expect(keychain.has(entry)).toBe(false);
+      return previous(command, args);
+    });
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).resolves.toEqual({ biometricNeedsSetup: false });
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: {
+        op: "biometric_enroll",
+        ...first,
+        password: newPassword,
+      },
+    });
+    expect(keychain.get(entry)).toContain("elo-biometry:v3:");
+    expect(getData).not.toHaveBeenCalled();
+  });
+  it("does not create a new envelope if the previous OS key cannot be removed", async () => {
+    keychain.set(entry, "old encrypted enrollment");
+    passwordReply(() => ({ biometric_refresh_required: true }));
+    vi.mocked(removeData).mockRejectedValue(new Error("keychainUnavailable"));
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).resolves.toEqual({ biometricNeedsSetup: true });
+    expect(invoke).not.toHaveBeenCalledWith("profile_task", {
+      request: {
+        op: "biometric_enroll",
+        ...first,
+        password: newPassword,
+      },
+    });
+    expect(setData).not.toHaveBeenCalled();
+  });
+  it("leaves biometric storage unchanged when the current password is rejected", async () => {
+    keychain.set(entry, "keep this enrollment");
+    passwordReply(() => {
+      throw new Error("password_change_incorrect");
+    });
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).rejects.toThrow("password_change_incorrect");
+    expect(keychain.get(entry)).toBe("keep this enrollment");
+    expect(setData).not.toHaveBeenCalled();
+    expect(removeData).not.toHaveBeenCalled();
+  });
+  it("reports a committed change separately from failed OS enrollment", async () => {
+    keychain.set(entry, "old encrypted enrollment");
+    passwordReply(() => ({ biometric_refresh_required: true }));
+    vi.mocked(setData).mockRejectedValue(new Error("keychainUnavailable"));
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).resolves.toEqual({ biometricNeedsSetup: true });
+    expect(keychain.has(entry)).toBe(false);
+    const changes = vi
+      .mocked(invoke)
+      .mock.calls.filter(
+        ([command, args]) =>
+          command === "profile_task" &&
+          (args as { request: { op: string } }).request.op ===
+            "change_password",
+      );
+    expect(changes).toHaveLength(1);
+    expect(invoke).toHaveBeenCalledWith("profile_task", {
+      request: {
+        op: "biometric_forget",
+        ...first,
+      },
+    });
+  });
+  it("does not change a different selected identity", async () => {
+    selected = second;
+    passwordReply(() => ({ biometric_refresh_required: true }));
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).rejects.toThrow("dataNeedsReenrollment");
+    expect(invoke).not.toHaveBeenCalledWith("profile_task", expect.anything());
+  });
+  it("does not enroll or remove another profile after a concurrent switch", async () => {
+    keychain.set(entry, "old encrypted enrollment");
+    const otherEntry = `vault-key-v3:${second.identity}:${second.id}`;
+    keychain.set(otherEntry, "keep other enrollment");
+    passwordReply(() => {
+      selected = second;
+      return { biometric_refresh_required: true };
+    });
+    await expect(
+      changeProfilePassword(oldPassword, newPassword, first.identity),
+    ).resolves.toEqual({ biometricNeedsSetup: true });
+    expect(setData).not.toHaveBeenCalled();
+    expect(keychain.get(otherEntry)).toBe("keep other enrollment");
+    expect(keychain.has(entry)).toBe(false);
   });
 });
 

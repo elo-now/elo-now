@@ -12,7 +12,6 @@ import {
 } from "./model";
 import type { SettingsPage } from "./UserSettings";
 import type { Calls } from "./calls/controller";
-import { ActiveSessions } from "./calls/ActiveSessions";
 import { t } from "./i18n";
 import { ProfileAvatar } from "./ProfileEditor";
 import { DirectOnlineIndicator } from "./useRealtime";
@@ -24,6 +23,7 @@ type Props = {
   selected?: string;
   query: string;
   busy: boolean;
+  navigationBlocked?: boolean;
   current: "stream" | "contacts" | "chats" | "settings";
   onQuery: (value: string) => void;
   onOpen: (chat: Stream) => void;
@@ -123,6 +123,7 @@ export function DesktopSidebar({
   selected,
   query,
   busy,
+  navigationBlocked = false,
   current,
   onQuery,
   onOpen,
@@ -218,6 +219,7 @@ export function DesktopSidebar({
   }, [menuOpen]);
 
   const navigate = (action: () => void) => {
+    if (navigationBlocked) return;
     onNavigate();
     action();
   };
@@ -298,7 +300,7 @@ export function DesktopSidebar({
                 className="icon desktop-menu-context-action"
                 aria-label={t("profile.edit")}
                 title={t("profile.edit")}
-                disabled={busy}
+                disabled={busy || navigationBlocked}
                 onClick={() => {
                   setMenuOpen(false);
                   onEditProfile();
@@ -365,7 +367,12 @@ export function DesktopSidebar({
               icon="power"
               label={t("profile.lock")}
               danger
-              onClick={() => act(onLock)}
+              onClick={() => {
+                if (navigationBlocked) {
+                  setMenuOpen(false);
+                  onLock();
+                } else act(onLock);
+              }}
             />
           </div>
         )}
@@ -405,13 +412,6 @@ export function DesktopSidebar({
             <span className="desktop-nav-label">{t("nav.contacts")}</span>
           </button>
         </nav>
-
-        <ActiveSessions
-          calls={calls}
-          view={view}
-          compact
-          onOpen={(chat) => navigate(() => onOpen(chat))}
-        />
 
         {
           <section className="desktop-nav-section desktop-chats-heading">

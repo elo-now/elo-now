@@ -84,6 +84,10 @@ pub async fn attachment_preview(
         .map_err(|_| "file_export_failed")?;
     let guard = state.lock().await;
     let client = guard.client.as_ref().ok_or("The profile is locked")?;
+    let generation = client
+        .local_chat_generation(&request)
+        .await
+        .map_err(|error| error.to_string())?;
     let file = StagedAttachment(new_path(&app, "bin")?);
     if client
         .cached_attachment(&request, &file.0)
@@ -96,9 +100,19 @@ pub async fn attachment_preview(
     let bytes = Zeroizing::new(std::fs::read(&file.0).map_err(|e| e.to_string())?);
     drop(file);
     drop(guard);
-    tauri::async_runtime::spawn_blocking(move || image_preview(&bytes))
+    let preview = tauri::async_runtime::spawn_blocking(move || image_preview(&bytes))
         .await
-        .map_err(|_| "file_export_failed".to_owned())
+        .map_err(|_| "file_export_failed".to_owned())?;
+    // Decoding does not hold the runtime: a local deletion or profile change
+    // in the meantime must not return the old plaintext image to the renderer.
+    let guard = state.lock().await;
+    let Some(client) = guard.client.as_ref() else {
+        return Ok(None);
+    };
+    match client.local_chat_generation(&request).await {
+        Ok(current) if current == generation => Ok(preview),
+        _ => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -815,20 +829,23 @@ pub async fn discard_exchange(
     if state.lock().await.client.is_none() {
         return Err("The profile is locked".into());
     }
-    let Some((path, _)) = app
-        .state::<ExchangeFiles>()
-        .0
-        .lock()
-        .map_err(|_| "Exchange is unavailable")?
-        .remove(&path)
-    else {
+    discard_handle(&app, &path)
+}
+
+/// The caller already owns and validates the profile runtime lock.
+pub(crate) fn discard_handle(app: &tauri::AppHandle, handle: &str) -> Result<(), String> {
+    let exchange = app.state::<ExchangeFiles>();
+    let mut files = exchange.0.lock().map_err(|_| "Exchange is unavailable")?;
+    let Some((path, _)) = files.get(handle) else {
         return Ok(());
     };
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
-    }
+    }?;
+    files.remove(handle);
+    Ok(())
 }
 #[tauri::command]
 pub async fn prepare_export(

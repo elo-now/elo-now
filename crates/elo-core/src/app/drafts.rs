@@ -39,16 +39,21 @@ pub struct StoredAttachment {
     digest: String,
     name: String,
     size_bytes: usize,
+    #[serde(default)]
+    history_generation: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDraft {
     v: u8,
     scope: DraftScope,
+    #[serde(default)]
+    history_generation: u64,
     content: DraftContent,
     attachment: Option<StoredAttachment>,
 }
 pub struct LoadedDraft {
+    pub history_generation: u64,
     pub content: DraftContent,
     pub attachment: Option<(String, Zeroizing<Vec<u8>>)>,
 }
@@ -99,6 +104,24 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 impl ClientApp {
+    pub fn conversation_draft_scope(&self, request: &Value) -> Result<DraftScope> {
+        if request["expected_identity"] != json!(self.identity_id())
+            || request["expected_space"] != json!(self.active_space_id())
+        {
+            return Err("The selected Space has changed. Try again.".into());
+        }
+        let client = self.draft_space_client(self.active_space_id())?;
+        let scope = DraftScope {
+            identity: self.identity_id(),
+            credential: client.session.credential().id(),
+            active_space: self.active_space_id().map(str::to_owned),
+            space: field(request, "space")?.parse()?,
+            stream: field(request, "stream")?.parse()?,
+            thread: None,
+        };
+        self.draft_client(&scope)?;
+        Ok(scope)
+    }
     fn draft_client(&self, scope: &DraftScope) -> Result<&Self> {
         let client = self.draft_space_client(scope.active_space.as_deref())?;
         if scope.identity != self.session.identity_id()
@@ -140,12 +163,78 @@ impl ClientApp {
         draft.content.validate()?;
         Ok(Some(draft))
     }
-    pub fn load_conversation_draft(&self, scope: &DraftScope) -> Result<LoadedDraft> {
+    async fn active_draft_client(&self, scope: &DraftScope) -> Result<(&Self, u64)> {
         let client = self.draft_client(scope)?;
+        let state = client
+            .store
+            .local_chat_state(scope.space, scope.stream)
+            .await?;
+        if state.hidden {
+            return Err("chat_deleted_locally".into());
+        }
+        Ok((client, state.generation))
+    }
+    pub async fn conversation_draft_generation(&self, scope: &DraftScope) -> Result<u64> {
+        Ok(self.active_draft_client(scope).await?.1)
+    }
+    /// Remove every thread draft in one conversation without touching other chats.
+    /// This also accepts an already deleted chat so interrupted cleanup can retry.
+    pub fn delete_conversation_drafts(&self, scope: &DraftScope) -> Result<()> {
+        let client = self.draft_client(scope)?;
+        client.delete_chat_drafts(scope.space, scope.stream)
+    }
+    pub(super) fn delete_chat_drafts(&self, space: SpaceId, stream: StreamId) -> Result<()> {
+        let directory = self.directory.join("drafts");
+        if !directory.exists() {
+            return Ok(());
+        }
+        let files = removable_files(&directory)?;
+        let mut remove = Vec::new();
+        for path in files {
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("file-"))
+            {
+                continue;
+            }
+            let cipher = read_exchange(&path, MAX_DRAFT + 1024)?;
+            let clear = Zeroizing::new(crypto::open_bytes(
+                &cipher,
+                self.session.age_identity(),
+                MAX_DRAFT,
+            )?);
+            let draft: StoredDraft = serde_json::from_slice(&clear)?;
+            if draft.v != 1 || Self::draft_path(&directory, &draft.scope)? != path {
+                return Err("Invalid conversation draft scope.".into());
+            }
+            draft.content.validate()?;
+            if draft.scope.identity == self.identity_id()
+                && draft.scope.credential == self.session.credential().id()
+                && draft.scope.space == space
+                && draft.scope.stream == stream
+            {
+                remove.push(path);
+            }
+        }
+        for path in remove {
+            std::fs::remove_file(path)?;
+        }
+        // Retry orphan cleanup even when a prior attempt already removed metadata.
+        self.collect_draft_files(&directory)?;
+        #[cfg(unix)]
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    }
+    pub async fn load_conversation_draft(&self, scope: &DraftScope) -> Result<LoadedDraft> {
+        let (client, generation) = self.active_draft_client(scope).await?;
         let directory = client.draft_directory()?;
         let path = Self::draft_path(&directory, scope)?;
-        let Some(draft) = client.read_draft(scope, &path)? else {
+        let Some(draft) = client
+            .read_draft(scope, &path)?
+            .filter(|draft| draft.history_generation == generation)
+        else {
             return Ok(LoadedDraft {
+                history_generation: generation,
                 content: DraftContent::default(),
                 attachment: None,
             });
@@ -175,22 +264,24 @@ impl ClientApp {
             })
             .transpose()?;
         Ok(LoadedDraft {
+            history_generation: generation,
             content: draft.content,
             attachment,
         })
     }
-    pub fn save_conversation_draft(
+    pub async fn save_conversation_draft(
         &self,
         scope: &DraftScope,
         content: DraftContent,
         attachment: Option<(&Path, &str)>,
     ) -> Result<()> {
         self.save_conversation_draft_cached(scope, content, attachment, None)
+            .await
             .map(|_| ())
     }
     /// The native caller may reuse only its own session-bound attachment cache.
     /// This cached value is never accepted from a renderer or network request.
-    pub fn save_conversation_draft_cached(
+    pub async fn save_conversation_draft_cached(
         &self,
         scope: &DraftScope,
         content: DraftContent,
@@ -198,11 +289,12 @@ impl ClientApp {
         cached_attachment: Option<StoredAttachment>,
     ) -> Result<Option<StoredAttachment>> {
         content.validate()?;
-        let client = self.draft_client(scope)?;
+        let (client, generation) = self.active_draft_client(scope).await?;
         let directory = client.draft_directory()?;
         let path = Self::draft_path(&directory, scope)?;
         let previous_attachment = client
             .read_draft(scope, &path)?
+            .filter(|draft| draft.history_generation == generation)
             .and_then(|draft| draft.attachment);
         let attachment = attachment
             .map(|(path, name)| -> Result<_> {
@@ -212,7 +304,10 @@ impl ClientApp {
                 if let Some(cached) = cached_attachment {
                     record::hex::<32>(&cached.id)?;
                     let target = directory.join(format!("file-{}.age", cached.id));
-                    if cached.name == name && target.is_file() {
+                    if cached.history_generation == generation
+                        && cached.name == name
+                        && target.is_file()
+                    {
                         return Ok(cached);
                     }
                 }
@@ -238,6 +333,7 @@ impl ClientApp {
                     digest,
                     name: name.into(),
                     size_bytes: clear.len(),
+                    history_generation: generation,
                 })
             })
             .transpose()?;
@@ -253,6 +349,7 @@ impl ClientApp {
             let clear = Zeroizing::new(serde_json::to_vec(&StoredDraft {
                 v: 1,
                 scope: scope.clone(),
+                history_generation: generation,
                 content,
                 attachment: attachment.clone(),
             })?);

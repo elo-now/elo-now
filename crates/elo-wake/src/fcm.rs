@@ -1,4 +1,4 @@
-//! FCM is the only provider. Neither endpoint nor message contents are caller-controlled.
+//! Native push providers. Neither endpoint nor message contents are caller-controlled.
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -48,10 +48,20 @@ pub struct Fcm {
     key_id: String,
     key: RsaKeyPair,
     token: Mutex<Option<(Zeroizing<String>, Instant)>>,
+    apns: Option<crate::apns::Apns>,
 }
 
 #[derive(Clone, Debug)]
 pub enum Notice {
+    Ring {
+        registration: String,
+        call_id: String,
+        invitation_id: String,
+        target: String,
+        expires: u64,
+        voip: bool,
+        apns_sandbox: bool,
+    },
     Challenge {
         registration: String,
         challenge: String,
@@ -70,6 +80,23 @@ pub enum Notice {
 /// The provider never receives chat text, account IDs, mailbox capabilities or record IDs.
 pub fn payload(installation_id: &str, notice: &Notice) -> Value {
     let message = match notice {
+        Notice::Ring {
+            registration,
+            call_id,
+            invitation_id,
+            target,
+            expires,
+            ..
+        } => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            json!({"fid":installation_id,
+                "data":{"elo_ring":"1","elo_registration":registration,"elo_call_id":call_id,
+                    "elo_invitation_id":invitation_id,"elo_target":target,"elo_expires":expires.to_string()},
+                "android":{"priority":"HIGH","ttl":format!("{}s",expires.saturating_sub(now).min(60))}})
+        }
         Notice::Challenge {
             registration,
             challenge,
@@ -132,6 +159,10 @@ pub fn payload(installation_id: &str, notice: &Notice) -> Value {
 }
 
 impl Fcm {
+    pub fn with_apns(mut self, apns: crate::apns::Apns) -> Self {
+        self.apns = Some(apns);
+        self
+    }
     pub fn load(path: &Path) -> Result<Self, Error> {
         let meta = std::fs::symlink_metadata(path).map_err(|_| Error::Configuration)?;
         if !meta.is_file() || meta.len() > 32 * 1024 {
@@ -189,6 +220,7 @@ impl Fcm {
             key_id: account.private_key_id,
             key,
             token: Mutex::new(None),
+            apns: None,
         })
     }
 
@@ -262,6 +294,34 @@ impl Fcm {
     }
 
     pub async fn send(&self, installation_id: &str, notice: &Notice) -> Result<(), Error> {
+        if let Notice::Ring {
+            registration,
+            call_id,
+            invitation_id,
+            target,
+            expires,
+            voip: true,
+            apns_sandbox,
+        } = notice
+        {
+            return self
+                .apns
+                .as_ref()
+                .ok_or(Error::Configuration)?
+                .send(
+                    installation_id,
+                    crate::apns::ring_payload(
+                        registration,
+                        call_id,
+                        invitation_id,
+                        target,
+                        *expires,
+                    ),
+                    *expires,
+                    *apns_sandbox,
+                )
+                .await;
+        }
         if expired_session(notice) {
             return Ok(());
         }
@@ -305,7 +365,8 @@ fn expired_session(notice: &Notice) -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    matches!(notice,Notice::Wake{category,expires,..}
+    matches!(notice, Notice::Ring{expires,..} if *expires <= time)
+        || matches!(notice,Notice::Wake{category,expires,..}
         if category == "session_start" && expires.is_none_or(|until| until <= time))
 }
 

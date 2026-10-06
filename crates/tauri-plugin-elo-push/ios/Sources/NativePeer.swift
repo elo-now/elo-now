@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import UIKit
 import WebRTC
 
 /// Native media has no profile keys. SDP/ICE is supplied only after elo's signed
@@ -30,8 +31,9 @@ import WebRTC
         super.init()
         pc = try makeConnection(servers)
         let session = RTCAudioSession.sharedInstance()
-        session.useManualAudio = false
-        session.isAudioEnabled = true
+        // An answered system call is activated by CallKit, not a WebView timer.
+        session.useManualAudio = IncomingCalls.shared.systemAudioOwned
+        session.isAudioEnabled = !session.useManualAudio || IncomingCalls.shared.audioActivated
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
         do {
@@ -70,9 +72,18 @@ import WebRTC
     }
     enum MediaError: Error { case invalid, unavailable, ended, permission }
     static func permission(video: Bool) async throws {
-        guard await AVCaptureDevice.requestAccess(for: .audio) else { throw MediaError.permission }
-        if video {
-            guard await AVCaptureDevice.requestAccess(for: .video) else { throw MediaError.permission }
+        try await permission(for: .audio)
+        if video { try await permission(for: .video) }
+    }
+    private static func permission(for media: AVMediaType) async throws {
+        switch AVCaptureDevice.authorizationStatus(for: media) {
+        case .authorized: return
+        case .notDetermined:
+            // A background CallKit answer must not start a permission prompt
+            // behind the lock screen. The user can grant it in the foreground.
+            guard UIApplication.shared.applicationState == .active,
+                await AVCaptureDevice.requestAccess(for: media) else { throw MediaError.permission }
+        default: throw MediaError.permission
         }
     }
     private func live() throws { if stopped || pc == nil { throw MediaError.ended } }
@@ -85,13 +96,15 @@ import WebRTC
         guard signals.count < 256 else { stop(); connection = "failed"; return }
         signals.append(signal)
     }
-    func update(_ next: [String: Bool], speakerMuted: Bool) async throws {
+    func update(_ next: [String: Bool], speakerMuted: Bool, systemMuteRevision: UInt64? = nil) async throws {
         try live()
         guard next["screen_published"] != true else { throw MediaError.invalid }
         let video = next["video_published"] == true
-        if video && camera == nil {
-            try await Self.permission(video: true)
+        if next["audio_muted"] != true || video {
+            try await Self.permission(video: video)
             try live()
+        }
+        if video && camera == nil {
             guard let device = RTCCameraVideoCapturer.captureDevices().first(where: { $0.position == .front }) ?? RTCCameraVideoCapturer.captureDevices().first else { throw MediaError.unavailable }
             let formats = RTCCameraVideoCapturer.supportedFormats(for: device)
             guard let format = formats.filter({ CMVideoFormatDescriptionGetDimensions($0.formatDescription).width <= 1280 }).max(by: {
@@ -115,7 +128,8 @@ import WebRTC
             try live()
         }
         state = next
-        audio?.isEnabled = next["audio_muted"] != true
+        state["audio_muted"] = NativeMedia.shared.systemMuted(id: id, requested: next["audio_muted"] == true, revision: systemMuteRevision)
+        audio?.isEnabled = state["audio_muted"] != true
         self.speakerMuted = speakerMuted
         try applyTracks()
     }

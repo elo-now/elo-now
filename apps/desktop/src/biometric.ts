@@ -20,7 +20,10 @@ const offerKey = "elo.biometricOffer.v3:";
 export type BiometricProfile = { id: string; identity: string };
 type BiometricEnvironment = {
   mobile: boolean;
-  saved_profiles: (BiometricProfile & { active: boolean })[];
+  saved_profiles: (BiometricProfile & {
+    active: boolean;
+    biometric_enrolled?: boolean;
+  })[];
 };
 
 const profileKey = (profile: BiometricProfile) =>
@@ -91,7 +94,14 @@ export async function readBiometricState(
   let error = status.error;
   if (available && profile) {
     try {
-      enabled = await hasData(secret(profile));
+      const saved = environment.saved_profiles.find(
+        (entry) =>
+          entry.id === profile.id && entry.identity === profile.identity,
+      );
+      // A password change invalidates the local envelope before replacing the
+      // OS entry. A terminated app must not offer that stale biometric key.
+      enabled =
+        saved?.biometric_enrolled !== false && (await hasData(secret(profile)));
     } catch (reason) {
       if (environment.mobile || !String(reason).includes("keychainUnavailable"))
         throw reason;
@@ -186,6 +196,54 @@ export async function disableBiometricUnlock(
   });
   await removeData(secret(target));
   localStorage.removeItem(offerKey + profileKey(target));
+}
+
+/** Commit the local password once, then renew an existing biometric enrollment.
+ * An OS storage failure after commit must never be reported as a failed password
+ * change: the new password is already authoritative at that point. */
+export async function changeProfilePassword(
+  currentPassword: string,
+  newPassword: string,
+  expectedIdentity: string,
+): Promise<{ biometricNeedsSetup: boolean }> {
+  const profile = await activeProfile(expectedIdentity);
+  if (!profile) throw new Error("dataNeedsReenrollment");
+  let wasEnabled = false;
+  try {
+    wasEnabled = (await readBiometricState(expectedIdentity)).enabled;
+  } catch {
+    // OS keychain availability does not prevent a password-authenticated change.
+  }
+  const result = await invoke<{ biometric_refresh_required: boolean }>(
+    "profile_task",
+    {
+      request: {
+        op: "change_password",
+        ...profile,
+        current_password: currentPassword,
+        new_password: newPassword,
+      },
+    },
+  );
+  if (!result.biometric_refresh_required) return { biometricNeedsSetup: false };
+  if (wasEnabled) {
+    try {
+      // A crash between native enrollment and saving its new OS key must
+      // leave biometrics disabled, never pair a new envelope with an old key.
+      await removeData(secret(profile));
+      await enableBiometricUnlock(newPassword, undefined, profile);
+      return { biometricNeedsSetup: false };
+    } catch {
+      // Enrollment removes its new envelope on failure. Remove only this
+      // profile's old OS key, even if the user has since switched profiles.
+    }
+  }
+  await removeData(secret(profile)).catch(() => {});
+  await removeData({
+    domain: "now.elo.profile",
+    name: `vault-password-v2:${profileKey(profile)}`,
+  }).catch(() => {});
+  return { biometricNeedsSetup: true };
 }
 
 export async function readBiometricCredential(

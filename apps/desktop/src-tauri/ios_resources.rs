@@ -23,7 +23,7 @@ pub fn stage() -> io::Result<()> {
         return Ok(());
     }
     let root = env::var_os("DEP_TAURI_PLUGIN_ELO_PUSH_IOS_RESOURCE_ROOT")
-        .ok_or_else(|| io::Error::other("Missing Firebase Swift resource build path"))?;
+        .ok_or_else(|| io::Error::other("Missing push/media Swift resource build path"))?;
     let mut product_directories = Vec::new();
     // SwiftPM before Xcode 27 places resource bundles under
     // <triple>/<configuration>. Do not traverse checkouts, caches or symlinks
@@ -96,6 +96,8 @@ pub fn stage() -> io::Result<()> {
         "GoogleUtilities_GoogleUtilities-UserDefaults",
         "Promises_FBLPromises",
         "nanopb_nanopb",
+        "LiveKit_LiveKit",
+        "SwiftProtobuf_SwiftProtobuf",
     ] {
         if !destination
             .join(format!("{name}.bundle/PrivacyInfo.xcprivacy"))

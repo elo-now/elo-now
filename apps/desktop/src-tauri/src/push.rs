@@ -161,6 +161,8 @@ pub async fn changed(app: &tauri::AppHandle, client: &ClientApp) -> bool {
     }
 }
 pub async fn suspend(app: &tauri::AppHandle, client: Option<&ClientApp>) -> Result<(), String> {
+    #[cfg(all(mobile, feature = "mobile-push"))]
+    crate::incoming_calls::shutdown(app).await;
     let media = crate::native_media::shutdown(app).await;
     #[cfg(all(mobile, feature = "mobile-push"))]
     {
@@ -246,6 +248,10 @@ mod mobile {
         route: Route,
         owner: String,
         token: String,
+        #[serde(default)]
+        incoming_token: String,
+        #[serde(default)]
+        incoming_renew: u64,
         #[serde(default)]
         next_registration_attempt: u64,
         next_attempt: u64,
@@ -484,6 +490,28 @@ mod mobile {
         }
         Ok(())
     }
+    fn enrollment_routes(
+        app: &tauri::AppHandle,
+        client: &ClientApp,
+        current: Option<&Device>,
+    ) -> Result<Vec<elo_core::app::push::Route>, String> {
+        let identity = client.identity_id().to_string();
+        let mut routes = Vec::new();
+        for url in client.notification_endpoints() {
+            let saved = load(app, &url)?;
+            let device = current
+                .filter(|device| device.route.endpoint == url)
+                .or(saved.as_ref());
+            if let Some(device) = device
+                .filter(|device| device.enabled && device.active && device.identity == identity)
+            {
+                routes.push(device.route.clone());
+            }
+        }
+        routes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(routes)
+    }
+
     async fn policy(
         app: &tauri::AppHandle,
         client: &ClientApp,
@@ -492,6 +520,13 @@ mod mobile {
         prepare_policy(app, client, device)?;
         // Persist the revision before sending. An interrupted call retries the identical policy.
         if device.active && device.acknowledged != device.revision {
+            // Publishing a new ring scope may deliver a push immediately. Its
+            // matching call-only keys and receive route must already be durable.
+            // Enrollment reuses unchanged delegates, including across hosts.
+            let routes = enrollment_routes(app, client, Some(device))?;
+            crate::incoming_calls::enroll(app, client, routes)
+                .await
+                .map_err(|_| "Could not update notification settings")?;
             let mut body = device.policy.clone();
             body["revision"] = json!(device.revision);
             body["notify_key"] = json!(device.route.notify_key);
@@ -850,6 +885,7 @@ mod mobile {
             let mut prefs = choices(client, None)?;
             prefs.enabled = false;
             prefs.save(client.profile_path())?;
+            crate::incoming_calls::shutdown(&app).await;
             suspend(&app).await?;
             client
                 .advertise_wake_route(None)
@@ -935,7 +971,74 @@ mod mobile {
                 round.accept(operate_route(&app, client, &url, &op).await);
             }
         }
+        if maintenance && choices(client, None)?.enabled {
+            match enrollment_routes(&app, client, None) {
+                Ok(routes) => {
+                    if crate::incoming_calls::enroll(&app, client, routes)
+                        .await
+                        .is_err()
+                    {
+                        round.defer();
+                    }
+                }
+                Err(_) => round.defer(),
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            for url in client.notification_endpoints() {
+                if !matches!(
+                    super::round::until(deadline, incoming_binding(&app, &url)).await,
+                    Some(Ok(()))
+                ) {
+                    round.defer();
+                }
+            }
+        }
         round.finish()
+    }
+
+    async fn incoming_binding(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+        let Some(mut saved) = load(app, url)? else {
+            return Ok(());
+        };
+        if !saved.enabled || !saved.active {
+            return Ok(());
+        }
+        let native = app
+            .state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+            .call("incomingStatus", json!({}))?;
+        let (provider, token) = if cfg!(target_os = "ios") {
+            (
+                "apns",
+                native["voipToken"].as_str().unwrap_or_default().to_string(),
+            )
+        } else {
+            ("fcm", saved.token.clone())
+        };
+        if token.is_empty() {
+            return Ok(());
+        }
+        let sandbox = provider == "apns" && native["apnsSandbox"].as_bool().unwrap_or(false);
+        // A differently signed installation must renew even if a token remains unchanged.
+        let binding = format!("{provider}:{sandbox}:{token}");
+        if binding == saved.incoming_token && saved.incoming_renew > time() {
+            return Ok(());
+        }
+        let mut payload = json!({"provider":provider});
+        if provider == "apns" {
+            payload["token"] = token.into();
+            payload["sandbox"] = sandbox.into();
+        }
+        request(
+            app,
+            &saved,
+            "/ring-binding",
+            Some(payload),
+            reqwest::Method::PUT,
+        )
+        .await?;
+        saved.incoming_token = binding;
+        saved.incoming_renew = time() + 12 * 3600;
+        save(app, &saved)
     }
 
     async fn operate_route(
@@ -1009,6 +1112,8 @@ mod mobile {
                     },
                     owner: random::<32>()?,
                     token: String::new(),
+                    incoming_token: String::new(),
+                    incoming_renew: 0,
                     next_registration_attempt: 0,
                     next_attempt: 0,
                     policy: Value::Null,
@@ -1063,6 +1168,8 @@ mod mobile {
                 saved.revision = 0;
                 saved.acknowledged = 0;
                 saved.token = token.into();
+                saved.incoming_token.clear();
+                saved.incoming_renew = 0;
                 saved.generation = client.notification_generation();
                 saved.reads.clear();
                 save(app, saved)?;
@@ -1077,6 +1184,8 @@ mod mobile {
                 && let Some(token) = native["token"].as_str()
             {
                 saved.token = token.into();
+                saved.incoming_token.clear();
+                saved.incoming_renew = 0;
                 saved.generation = client.notification_generation();
             }
             // A lost policy acknowledgement may leave the server on the new

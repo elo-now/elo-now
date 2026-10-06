@@ -1,0 +1,49 @@
+.swipe-chat-row {
+  position: relative;
+  overflow: hidden;
+  touch-action: pan-y pinch-zoom;
+}
+.swipe-chat-action {
+  position: absolute;
+  inset-block: 0;
+  right: 0;
+  overflow: hidden;
+}
+.channel-list .swipe-chat-delete {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 10px;
+  background: #b43b36;
+  color: #fff;
+}
+.channel-list .swipe-chat-delete .ui-icon {
+  width: 22px;
+  height: 22px;
+}
+.swipe-chat-open {
+  position: relative;
+}
+.swipe-chat-open:focus-visible {
+  outline-offset: -3px;
+}
+.message-action-menu .chat-delete-menu-action {
+  color: var(--status-error-text);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .swipe-chat-row:not([data-dragging]) .swipe-chat-open {
+    transition: transform 140ms ease-out;
+  }
+  .swipe-chat-row:not([data-dragging]) .swipe-chat-action {
+    transition: width 140ms ease-out;
+  }
+}

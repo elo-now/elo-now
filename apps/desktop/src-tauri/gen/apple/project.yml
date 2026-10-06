@@ -8,6 +8,12 @@ packages:
   WebRTC:
     url: https://github.com/stasel/WebRTC.git
     exactVersion: 153.0.0
+  LiveKitWebRTC:
+    url: https://github.com/livekit/webrtc-xcframework.git
+    exactVersion: 144.7559.11
+  LiveKitUniFFI:
+    url: https://github.com/livekit/livekit-uniffi-xcframework.git
+    exactVersion: 0.0.6
 configs:
   debug: debug
   release: release
@@ -49,7 +55,7 @@ targets:
         FirebaseMessagingAutoInitEnabled: false
         FirebaseMessagingInstallationIdEnabled: true
         FirebaseAnalyticsCollectionEnabled: false
-        UIBackgroundModes: [remote-notification, audio]
+        UIBackgroundModes: [remote-notification, audio, voip]
         NSFaceIDUsageDescription: Use Face ID to unlock your encrypted elo profile on this device.
         NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.
         NSPhotoLibraryAddUsageDescription: Save images from your conversations or your password-protected recovery QR image to Photos.
@@ -96,6 +102,8 @@ targets:
       groups: [app]
     dependencies:
       - package: WebRTC
+      - package: LiveKitWebRTC
+      - package: LiveKitUniFFI
       - framework: libapp.a
         embed: false
       - sdk: CoreGraphics.framework
@@ -132,8 +140,8 @@ targets:
           resources="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
           /bin/mkdir -p "$resources"
           /bin/cp "$SRCROOT/../../PrivacyInfo.xcprivacy" "$resources/PrivacyInfo.xcprivacy"
-          # These resource-only bundles belong to elo's optional push plugin.
-          for bundle in "$resources"/Firebase_*.bundle "$resources"/GoogleUtilities_*.bundle "$resources"/GoogleDataTransport_*.bundle "$resources"/Promises_*.bundle "$resources"/nanopb_*.bundle; do
+          # These resource-only bundles belong to elo's push/media plugin.
+          for bundle in "$resources"/Firebase_*.bundle "$resources"/GoogleUtilities_*.bundle "$resources"/GoogleDataTransport_*.bundle "$resources"/Promises_*.bundle "$resources"/nanopb_*.bundle "$resources"/LiveKit_*.bundle "$resources"/SwiftProtobuf_*.bundle; do
             [ ! -d "$bundle" ] || /bin/rm -r "$bundle"
           done
           test -d "$SRCROOT/PrivacyResources"

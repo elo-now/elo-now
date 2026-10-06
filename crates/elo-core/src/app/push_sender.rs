@@ -72,14 +72,15 @@ pub fn verify_sender(route: &str, request: &Value, time: u64) -> Result<Sender> 
         || body.category != request["category"].as_str().unwrap_or("message")
         || !matches!(
             body.category.as_str(),
-            "message" | "invitation" | "membership" | "session_start"
+            "message" | "invitation" | "membership" | "session_start" | "call_ring"
         )
         || body.delivery_expires != request["expires"].as_u64()
-        || (body.category == "session_start"
+        || (matches!(body.category.as_str(), "session_start" | "call_ring")
             && body
                 .delivery_expires
                 .is_none_or(|expires| expires <= time || expires > time.saturating_add(60)))
-        || (body.category != "session_start" && body.delivery_expires.is_some())
+        || (!matches!(body.category.as_str(), "session_start" | "call_ring")
+            && body.delivery_expires.is_some())
         || body.target_hash
             != record::encode_hex(&Sha256::digest(field(request, "target")?.as_bytes()))
         || body.expires < time

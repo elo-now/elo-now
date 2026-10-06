@@ -2,13 +2,15 @@ import AVFoundation
 import UIKit
 
 /// Audio belongs to an explicitly joined chat session, independent of push opt-in.
-/// No system incoming-call UI or VoIP wake can activate capture.
+/// Incoming audio is admitted separately by the call-only native runtime.
 @MainActor final class ChatSessionAudio {
     static let shared = ChatSessionAudio()
     private var sessionId: String?
     private var activation: String?
+    private var systemManaged = false
     private var observer: NSObjectProtocol?
     private var changed: (() -> Void)?
+    private var systemAction: (([String: Any]) -> Void)?
     private(set) var categoryOptions: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .defaultToSpeaker]
 
     private init() {
@@ -20,7 +22,7 @@ import UIKit
         }
     }
 
-    func set(active: Bool, id: String, activation: String, changed: (() -> Void)? = nil) throws {
+    func set(active: Bool, id: String, activation: String, changed: (() -> Void)? = nil, systemAction: (([String: Any]) -> Void)? = nil) throws {
         guard id.range(of: "^[a-f0-9]{32}$", options: .regularExpression) != nil else {
             throw NativePeer.MediaError.invalid
         }
@@ -28,26 +30,43 @@ import UIKit
         if active {
             guard sessionId == nil || (sessionId == id && self.activation == activation) else { throw NativePeer.MediaError.invalid }
             if sessionId == nil {
-                guard UIApplication.shared.applicationState == .active,
+                guard (UIApplication.shared.applicationState == .active || IncomingCalls.shared.permitsBackgroundAudio(id)),
                     AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
                     throw NativePeer.MediaError.permission
                 }
                 categoryOptions = [.allowBluetoothHFP, .defaultToSpeaker]
                 try audio.setCategory(.playAndRecord, mode: .voiceChat, options: categoryOptions)
-                try audio.setActive(true)
+                if !IncomingCalls.shared.permitsBackgroundAudio(id) { try audio.setActive(true) }
+                systemManaged = IncomingCalls.shared.permitsBackgroundAudio(id)
                 sessionId = id
                 self.activation = activation
             }
             self.changed = changed
+            self.systemAction = systemAction
         } else if sessionId == id && self.activation == activation {
             sessionId = nil
             self.activation = nil
             self.changed = nil
+            self.systemAction = nil
             // Capture is stopped by the media owner before releasing this session.
             try? audio.overrideOutputAudioPort(.none)
             try? audio.setPreferredInput(nil)
-            try audio.setActive(false, options: .notifyOthersOnDeactivation)
+            if !systemManaged && !IncomingCalls.shared.systemAudioOwned { try audio.setActive(false, options: .notifyOthersOnDeactivation) }
+            systemManaged = false
         }
+    }
+
+    func manageWithSystem(_ call: OutgoingSystemCall) -> Bool {
+        guard sessionId == call.callId, activation == call.activation, systemAction != nil else { return false }
+        systemManaged = true
+        return true
+    }
+
+    func systemEvent(_ call: OutgoingSystemCall, action: String, muted: Bool? = nil, systemMuteRevision: UInt64? = nil) {
+        guard sessionId == call.callId, activation == call.activation else { return }
+        var event = call.event(action, muted: muted)
+        if let systemMuteRevision { event["systemMuteRevision"] = systemMuteRevision }
+        systemAction?(event)
     }
 
     private func externalKind(_ port: AVAudioSession.Port) -> String? {

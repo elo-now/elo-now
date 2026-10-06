@@ -267,6 +267,7 @@ impl ProfileDraft {
             password.clone(),
             self.allow_loopback,
             session,
+            encrypted,
         )
         .await?;
         let initialized: Result<()> = async {
@@ -278,9 +279,11 @@ impl ProfileDraft {
         .await;
         // Complete the database checkpoint before publishing initialization.
         // Retain only the authenticated session; reopen all persisted UI/data state.
+        let authenticated_vault = vault::read_private(&directory.join("vault.age"));
         let closed = app.store.close().await;
         initialized?;
         closed?;
+        let authenticated_vault = authenticated_vault?;
         let session = app.session;
         std::fs::remove_file(directory.join(".initializing"))?;
         #[cfg(unix)]
@@ -292,6 +295,13 @@ impl ProfileDraft {
         }
         // An interrupted initialization stays marked and cannot be opened as a
         // completed profile. Preserve it for diagnosis, never delete user data.
-        ClientApp::open_session(directory, password, self.allow_loopback, session).await
+        ClientApp::open_session(
+            directory,
+            password,
+            self.allow_loopback,
+            session,
+            authenticated_vault,
+        )
+        .await
     }
 }

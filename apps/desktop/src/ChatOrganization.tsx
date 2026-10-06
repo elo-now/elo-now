@@ -5,6 +5,7 @@ import { EmptyState } from "./EmptyState";
 import { t } from "./i18n";
 import { chatSections, chatIconName } from "./chatGroups";
 import type { ChatGroup, Stream, View } from "./model";
+import { SwipeChatRow } from "./SwipeChatRow";
 
 export function ChatGroupsBar({
   view,
@@ -54,13 +55,20 @@ export function ChatList({
   query = "",
   selected,
   onOpen,
+  onRequestDelete,
 }: {
   view: View;
   filter: string;
   query?: string;
   selected?: string;
   onOpen: (chat: Stream) => void;
+  onRequestDelete?: (chat: Stream) => void;
 }) {
+  const [revealed, setRevealed] = useState<string | null>(null);
+  useEffect(
+    () => setRevealed(null),
+    [view.identity, view.active_space, filter, query],
+  );
   const sections = chatSections(view, filter, query);
   const empty = sections.every((section) => section.chats.length === 0);
   return (
@@ -78,50 +86,67 @@ export function ChatList({
             className="channel-list"
             aria-label={section.title ? t(section.title) : t("channel.heading")}
           >
-            {section.chats.map((chat) => (
-              <button
-                key={chat.stream}
-                className={selected === chat.stream ? "active" : ""}
-                onClick={() => onOpen(chat)}
-              >
-                <ChatGlyph chat={chat} identity={view.identity} />
-                <span className="channel-list-copy">
-                  <strong>
-                    {chat.name}
-                    {chat.forked ? " !" : ""}
-                  </strong>
-                  <small className="mobile-only">
-                    {chat.rows.length
-                      ? chat.rows.at(-1)?.body.kind === "chat.message"
-                        ? chat.rows.at(-1)?.body.payload?.text
-                        : t("channel.attachment")
-                      : t("channel.noMessages")}
-                  </small>
-                </span>
-                {chat.muted && (
-                  <span
-                    className="channel-muted"
-                    role="img"
-                    aria-label={t("channel.muted")}
-                  >
-                    <Icon name="muted" />
+            {section.chats.map((chat) => {
+              const row = (
+                <button
+                  key={chat.stream}
+                  className={selected === chat.stream ? "active" : ""}
+                  onClick={() => onOpen(chat)}
+                >
+                  <ChatGlyph chat={chat} identity={view.identity} />
+                  <span className="channel-list-copy">
+                    <strong>
+                      {chat.name}
+                      {chat.forked ? " !" : ""}
+                    </strong>
+                    <small className="mobile-only">
+                      {chat.rows.length
+                        ? chat.rows.at(-1)?.body.kind === "chat.message"
+                          ? chat.rows.at(-1)?.body.payload?.text
+                          : t("channel.attachment")
+                        : t("channel.noMessages")}
+                    </small>
                   </span>
-                )}
-                {(chat.unread_count ?? 0) > 0 && (
-                  <span
-                    className="mobile-only unread-count"
-                    aria-label={t("unread.count", {
-                      count: chat.unread_count ?? 0,
-                    })}
-                  >
-                    {chat.unread_count}
+                  {chat.muted && (
+                    <span
+                      className="channel-muted"
+                      role="img"
+                      aria-label={t("channel.muted")}
+                    >
+                      <Icon name="muted" />
+                    </span>
+                  )}
+                  {(chat.unread_count ?? 0) > 0 && (
+                    <span
+                      className="mobile-only unread-count"
+                      aria-label={t("unread.count", {
+                        count: chat.unread_count ?? 0,
+                      })}
+                    >
+                      {chat.unread_count}
+                    </span>
+                  )}
+                  <span className="mobile-only channel-next">
+                    <Icon name="next" />
                   </span>
-                )}
-                <span className="mobile-only channel-next">
-                  <Icon name="next" />
-                </span>
-              </button>
-            ))}
+                </button>
+              );
+              return onRequestDelete &&
+                chat.can_delete_local === true &&
+                !chat.is_general ? (
+                <SwipeChatRow
+                  key={chat.stream}
+                  chatName={chat.name}
+                  revealed={revealed === chat.stream}
+                  onReveal={(open) => setRevealed(open ? chat.stream : null)}
+                  onRequestDelete={() => onRequestDelete(chat)}
+                >
+                  {row}
+                </SwipeChatRow>
+              ) : (
+                row
+              );
+            })}
           </nav>
         </section>
       ))}

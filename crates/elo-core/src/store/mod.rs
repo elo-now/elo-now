@@ -13,7 +13,10 @@ mod audit;
 mod backup;
 pub(crate) use backup::MessageBackupPlan;
 mod inbox;
+mod local_deletion;
 pub use audit::TransportFailure;
+#[cfg(test)]
+pub(crate) use local_deletion::LocalChatState;
 mod erasure;
 mod model;
 mod notifications;
@@ -58,7 +61,9 @@ const LOCATOR_MIGRATION: &str =
     include_str!("../../../../migrations/008_client_message_locators.sql");
 const PRIVATE_SETTINGS_MIGRATION: &str =
     include_str!("../../../../migrations/009_client_private_settings.sql");
-const SCHEMA_VERSION: i64 = 9;
+const LOCAL_DELETION_MIGRATION: &str =
+    include_str!("../../../../migrations/010_client_local_deletion.sql");
+const SCHEMA_VERSION: i64 = 10;
 const INSERT_OBJECT: &str = include_str!("sql/insert_object.sql");
 const INSERT_RECORD: &str = include_str!("sql/insert_record.sql");
 const INSERT_SOURCE: &str = include_str!("sql/insert_source.sql");
@@ -97,7 +102,7 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("client directory is already open by another worker/process")]
     AlreadyOpen,
-    #[error("unsupported schema version {found}; expected 9")]
+    #[error("unsupported schema version {found}; expected 10")]
     UnsupportedSchema { found: i64 },
     #[error("database is not an unmodified elo.now client schema; refusing to adopt it")]
     UnrecognizedSchema,
@@ -150,15 +155,23 @@ impl ClientStore {
     /// Creates/opens `client.sqlite` in an explicit local directory.
     /// No SQL or filesystem work occurs on the caller's Tokio thread.
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_lock(data_dir, None).await
+    }
+
+    pub(crate) async fn open_locked(data_dir: impl AsRef<Path>, lock: File) -> Result<Self> {
+        Self::open_with_lock(data_dir, Some(lock)).await
+    }
+
+    async fn open_with_lock(data_dir: impl AsRef<Path>, lock: Option<File>) -> Result<Self> {
         let path = data_dir.as_ref().to_path_buf();
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
         if let Some(pool) = shared::pool() {
-            tokio::spawn(shared::run(path, receiver, ready_sender, pool));
+            tokio::spawn(shared::run(path, receiver, ready_sender, pool, lock));
         } else {
             thread::Builder::new()
                 .name("elo-sqlite".into())
-                .spawn(move || run_worker(path, receiver, ready_sender))?;
+                .spawn(move || run_worker(path, receiver, ready_sender, lock))?;
         }
         ready_receiver
             .await
@@ -348,8 +361,9 @@ fn run_worker(
     data_dir: PathBuf,
     mut receiver: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<()>>,
+    lock: Option<File>,
 ) {
-    let (mut connection, lock) = match open_connection(&data_dir) {
+    let (mut connection, lock) = match open_connection(&data_dir, lock) {
         Ok(opened) => opened,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -410,7 +424,22 @@ fn private_file(path: &Path) -> Result<File> {
     Ok(options.open(path)?)
 }
 
-fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
+/// Shares the store's exclusive profile lock with authenticated vault maintenance.
+pub(crate) fn lock_profile(directory: &Path) -> Result<File> {
+    let lock = private_file(&directory.join(".elo-client.lock"))?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(lock),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Err(StoreError::AlreadyOpen)
+        }
+        Err(error) => Err(StoreError::Io(error)),
+    }
+}
+
+fn open_connection(data_dir: &Path, lock: Option<File>) -> Result<(Connection, File)> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -420,17 +449,10 @@ fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
     }
     builder.create(data_dir)?;
     let directory = data_dir.canonicalize()?;
-    let lock = private_file(&directory.join(".elo-client.lock"))?;
-    match FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => {}
-        Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
-        {
-            return Err(StoreError::AlreadyOpen);
-        }
-        Err(error) => return Err(StoreError::Io(error)),
-    }
+    let lock = match lock {
+        Some(lock) => lock,
+        None => lock_profile(&directory)?,
+    };
     let path = directory.join("client.sqlite");
     drop(private_file(&path)?);
     let connection = Connection::open(path)?;
@@ -441,7 +463,7 @@ fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
     let schema = read_schema(&connection)?;
     match version {
         0 if schema.is_empty() => {}
-        1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | SCHEMA_VERSION => validate_schema(&connection)?,
+        1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | SCHEMA_VERSION => validate_schema(&connection)?,
         0 => return Err(StoreError::UnrecognizedSchema),
         found => return Err(StoreError::UnsupportedSchema { found }),
     }
@@ -482,6 +504,9 @@ fn open_connection(data_dir: &Path) -> Result<(Connection, File)> {
     }
     if version < 9 {
         connection.execute_batch(PRIVATE_SETTINGS_MIGRATION)?;
+    }
+    if version < 10 {
+        connection.execute_batch(LOCAL_DELETION_MIGRATION)?;
     }
     validate_schema(&connection)?;
     let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
@@ -574,6 +599,9 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     if version >= 9 {
         expected.execute_batch(PRIVATE_SETTINGS_MIGRATION)?;
     }
+    if version >= 10 {
+        expected.execute_batch(LOCAL_DELETION_MIGRATION)?;
+    }
     if read_schema(connection)? != read_schema(&expected)? {
         return Err(StoreError::UnrecognizedSchema);
     }
@@ -620,6 +648,20 @@ fn write_local_rows(
     connection: &Connection,
     input: &PreparedLocalRecord,
 ) -> Result<CommitDisposition> {
+    let removed_target = match (input.metadata.space_id(), input.metadata.stream_id()) {
+        (Some(space), Some(stream)) => local_deletion::deleted_target(
+            connection,
+            &space.to_string(),
+            &stream.to_string(),
+            input.record_id,
+        )?,
+        _ => false,
+    };
+    if local_deletion::deleted_record(connection, input.record_id)? || removed_target {
+        return Err(StoreError::InvalidInput(
+            "message was removed from this device",
+        ));
+    }
     let existing: Option<IndexedMetadata> = connection
         .query_row(GET_RECORD, [input.record_id.to_string()], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -704,6 +746,14 @@ fn write_local_rows(
             input.created,
             &audit::Event::new("QUEUED", Some(*target)),
         )?;
+    }
+    if matches!(
+        input.metadata.kind(),
+        "chat.message" | "chat.locator" | "file.shared"
+    ) && let (Some(space), Some(stream)) =
+        (input.metadata.space_id(), input.metadata.stream_id())
+    {
+        local_deletion::reveal(connection, space, stream)?;
     }
     Ok(CommitDisposition::Inserted)
 }

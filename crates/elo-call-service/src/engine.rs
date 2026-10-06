@@ -23,6 +23,8 @@ pub const MAX_FRAME: usize = 9 * 1024 * 1024;
 pub struct Request {
     pub command: String,
     pub proof: Option<CallAuthorityProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
 }
 
 pub struct Preparation {
@@ -45,9 +47,20 @@ impl Preparation {
                 .cloned(),
         }
         .map_err(|_| CallError::Unauthorized)?;
-        let command =
-            calls::verify_command_authorship(&credential, &self.signed, &self.audience, now)
+        let command = if let Some(encoded) = &self.request.delegation {
+            let certificate = calls::delegation::decode_certificate(encoded)
                 .map_err(|_| CallError::Unauthorized)?;
+            calls::delegation::verify_command_authorship(
+                &credential,
+                &self.signed,
+                &certificate,
+                &self.audience,
+                now,
+            )
+        } else {
+            calls::verify_command_authorship(&credential, &self.signed, &self.audience, now)
+        }
+        .map_err(|_| CallError::Unauthorized)?;
         Ok((command, credential.identity()))
     }
     /// CPU-bound proof verification runs without the shared engine lock.
@@ -63,8 +76,33 @@ impl Preparation {
             ),
             None => self.cached.ok_or(CallError::Unauthorized)?,
         };
-        let command = calls::verify_command(&authority, &self.signed, &self.audience, now)
+        let mut delegation_lease = None;
+        let command = if let Some(encoded) = &self.request.delegation {
+            let certificate = calls::delegation::decode_certificate(encoded)
+                .map_err(|_| CallError::Unauthorized)?;
+            let verified = calls::delegation::verify(
+                &authority,
+                &certificate,
+                self.scope.hosting_space_id,
+                &self.audience,
+                now,
+            )
             .map_err(|_| CallError::Unauthorized)?;
+            delegation_lease = Some(DelegationLease {
+                config_id: verified.body.config_id,
+                expires_at: verified.body.expires_at,
+            });
+            calls::delegation::verify_command(
+                &authority,
+                &self.signed,
+                &certificate,
+                &self.audience,
+                now,
+            )
+        } else {
+            calls::verify_command(&authority, &self.signed, &self.audience, now)
+        }
+        .map_err(|_| CallError::Unauthorized)?;
         let identity = calls::require_member(&authority, command.credential_id)
             .map_err(|_| CallError::Unauthorized)?;
         Ok(Prepared {
@@ -73,6 +111,8 @@ impl Preparation {
             request_id: self.signed.id(),
             authority,
             proof: self.request.proof,
+            delegation: self.request.delegation,
+            delegation_lease,
         })
     }
 }
@@ -83,7 +123,21 @@ pub struct Prepared {
     pub request_id: RecordId,
     authority: Arc<Authority>,
     proof: Option<CallAuthorityProof>,
+    delegation: Option<String>,
+    pub delegation_lease: Option<DelegationLease>,
 }
+
+#[derive(Clone, Copy)]
+pub struct DelegationLease {
+    pub config_id: RecordId,
+    pub expires_at: u64,
+}
+impl DelegationLease {
+    pub fn permits(self, head: RecordId, now: u64) -> bool {
+        self.config_id == head && now < self.expires_at
+    }
+}
+
 pub struct Applied {
     pub request_id: RecordId,
     pub scope: Scope,
@@ -240,6 +294,8 @@ impl Engine {
             request_id,
             authority,
             proof,
+            delegation,
+            delegation_lease: _,
         } = prepared;
         if command.expires_at <= now {
             return Err(CallError::Unauthorized);
@@ -389,7 +445,8 @@ impl Engine {
             );
         }
         let mut next = self.registry.clone();
-        let outcome = next.apply(&authority, &command, now)?;
+        let outcome =
+            next.apply_with_delegation(&authority, &command, now, delegation.as_deref())?;
         let transaction = self.db.transaction().map_err(|_| CallError::Unavailable)?;
         transaction
             .execute(

@@ -4,7 +4,7 @@ import { locale, t } from "../i18n";
 import type { Stream, View } from "../model";
 import type { Calls } from "./controller";
 import { activeSessions, type ActiveSession } from "./sessionPresence";
-import { scopeKey } from "./types";
+import { callKey, scopeKey } from "./types";
 import "./calls.css";
 
 function SessionDetails({ session }: { session: ActiveSession }) {
@@ -23,16 +23,14 @@ function SessionDetails({ session }: { session: ActiveSession }) {
   );
 }
 
-export function ActiveSessions({
+export function CallList({
   calls,
   view,
   onOpen,
-  compact = false,
 }: {
   calls: Calls;
   view: View;
   onOpen: (chat: Stream) => void;
-  compact?: boolean;
 }) {
   const state = useSyncExternalStore(
     calls.subscribe,
@@ -40,73 +38,45 @@ export function ActiveSessions({
     calls.getSnapshot,
   );
   const sessions = activeSessions(view, state.available);
-  if (!sessions.length) return null;
+  if (!sessions.length)
+    return <p className="call-list-empty">{t("calls.none")}</p>;
   return (
-    <section
-      className={
-        compact ? "desktop-nav-section active-sessions" : "active-sessions"
-      }
-      aria-label={t("calls.activeSessions")}
-    >
-      <h2>{t("calls.activeSessions")}</h2>
-      {sessions.map((session) => (
-        <button
-          type="button"
-          className={
-            compact
-              ? "desktop-nav-item active-session-row"
-              : "active-session-row"
-          }
-          key={`${scopeKey(session.chat)}:${session.call.call_id}`}
-          aria-label={t("calls.openSession", {
-            chat: session.chat.name,
-            space: session.spaceName,
-          })}
-          onClick={() => onOpen(session.chat)}
-        >
-          <Phone size={18} aria-hidden="true" />
-          <SessionDetails session={session} />
-          <span className="active-session-dot" aria-hidden="true" />
-        </button>
-      ))}
+    <section className="call-list" aria-label={t("calls.activeSessions")}>
+      {sessions.map((session) => {
+        const joined =
+          state.active?.call_id === session.call.call_id &&
+          callKey(state.active) === callKey(session.call);
+        return (
+          <article
+            className="call-list-row"
+            key={`${scopeKey(session.chat)}:${session.call.call_id}`}
+          >
+            <button
+              type="button"
+              className="call-list-chat"
+              onClick={() => {
+                calls.reveal(session.chat);
+                onOpen(session.chat);
+              }}
+            >
+              <Phone size={20} aria-hidden="true" />
+              <SessionDetails session={session} />
+            </button>
+            <button
+              type="button"
+              className="quiet"
+              disabled={state.answering}
+              onClick={() =>
+                joined
+                  ? calls.expand()
+                  : calls.requestStart(session.chat, session.call)
+              }
+            >
+              {t(joined ? "calls.open" : "calls.joinSession")}
+            </button>
+          </article>
+        );
+      })}
     </section>
-  );
-}
-
-export function ActiveSessionJoin({
-  calls,
-  view,
-  chat,
-}: {
-  calls: Calls;
-  view: View;
-  chat: Stream;
-}) {
-  const state = useSyncExternalStore(
-    calls.subscribe,
-    calls.getSnapshot,
-    calls.getSnapshot,
-  );
-  const key = scopeKey({
-    ...chat,
-    space_context: chat.space_context ?? view.active_space ?? undefined,
-  });
-  const session = activeSessions(view, state.available).find(
-    (entry) => scopeKey(entry.chat) === key,
-  );
-  if (!session) return null;
-  return (
-    <div className="active-session-join">
-      <Phone size={18} aria-hidden="true" />
-      <SessionDetails session={session} />
-      <button
-        type="button"
-        className="secondary"
-        disabled={!!state.active || state.phase !== "idle"}
-        onClick={() => void calls.start(session.chat, session.call)}
-      >
-        {t("calls.joinSession")}
-      </button>
-    </div>
   );
 }

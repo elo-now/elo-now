@@ -830,6 +830,14 @@ impl SyncClient<'_> {
             let opened = crypto::open_object(&bytes, self.identity);
             let mut new_message = None;
             let decision = if let Ok(record) = opened {
+                if self
+                    .store
+                    .discard_known_removed_inbox(&item, record.id())
+                    .await?
+                {
+                    report.rejected += 1;
+                    continue;
+                }
                 let known = self.store.previously_accepted(record.id()).await?;
                 if !known && record.body()["kind"] == "chat.message" {
                     new_message = Some(record.id());
@@ -858,8 +866,13 @@ impl SyncClient<'_> {
                                 secret,
                             )
                         });
+                    if !self.store.finish_inbox(item, Some(*verified), now).await? {
+                        // Local deletion must not send a server-body acceptance
+                        // receipt or announce discarded content as a new message.
+                        report.rejected += 1;
+                        continue;
+                    }
                     report.accepted += 1;
-                    self.store.finish_inbox(item, Some(*verified), now).await?;
                     if let Some((peer_id, mailbox, object, record, secret)) = acceptance
                         && let Some(peer) = self
                             .peers

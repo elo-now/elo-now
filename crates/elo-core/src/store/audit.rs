@@ -136,7 +136,7 @@ mod tests {
             .unwrap();
         store.close().await.unwrap();
         let old = Connection::open(dir.path().join("client.sqlite")).unwrap();
-        old.execute_batch("DROP TRIGGER private_settings_received; DROP TRIGGER private_settings_admitted; DROP TABLE private_settings_inbox; DROP TABLE message_locators; ALTER TABLE replica_copies DROP COLUMN retention_expired; ALTER TABLE replica_copies DROP COLUMN pruned_record; DROP TABLE notification_outbox; DROP TABLE message_audit; DROP TABLE message_audit_meta; PRAGMA user_version=4; UPDATE outbox SET attempts=7,last_error_code='REMOTE_UNAVAILABLE'").unwrap();
+        old.execute_batch("DROP TABLE local_deleted_targets; DROP TABLE local_deleted_records; DROP TABLE local_deleted_objects; DROP TABLE local_chat_deletions; DROP TRIGGER private_settings_received; DROP TRIGGER private_settings_admitted; DROP TABLE private_settings_inbox; DROP TABLE message_locators; ALTER TABLE replica_copies DROP COLUMN retention_expired; ALTER TABLE replica_copies DROP COLUMN pruned_record; DROP TABLE notification_outbox; DROP TABLE message_audit; DROP TABLE message_audit_meta; PRAGMA user_version=4; UPDATE outbox SET attempts=7,last_error_code='REMOTE_UNAVAILABLE'").unwrap();
         drop(old);
         let store = ClientStore::open(dir.path()).await.unwrap();
         assert_eq!(

@@ -626,9 +626,14 @@ impl ClientApp {
         } else {
             None
         };
-        let mut child =
-            ClientApp::open_session(path, self.password.clone(), self.allow_loopback, session)
-                .await?;
+        let mut child = ClientApp::open_session(
+            path,
+            self.password.clone(),
+            self.allow_loopback,
+            session,
+            vault,
+        )
+        .await?;
         let inherited = match child.inherit_owner_grant_eligibility(&self.session) {
             Ok(inherited) => inherited,
             Err(error) => {
@@ -1373,9 +1378,10 @@ impl Spaces {
                     {
                         session.activate_new_space_controller(authority.space())?;
                     }
+                    let authenticated_vault = session.seal(root.password.clone())?;
                     vault::write_private(
                         &directory.join("vault.age"),
-                        &session.seal(root.password.clone())?,
+                        &authenticated_vault,
                         false,
                     )?;
                     vault::write_private(
@@ -1383,18 +1389,19 @@ impl Spaces {
                         &vault::read_private(&root.directory.join("profile.json"))?,
                         false,
                     )?;
-                    Some(session)
+                    Some((session, authenticated_vault))
                 } else {
                     check_directory(&directory)?;
                     None
                 };
 
-                let mut child = if let Some(session) = new_session {
+                let mut child = if let Some((session, authenticated_vault)) = new_session {
                     ClientApp::open_session(
                         directory.clone(),
                         root.password.clone(),
                         root.allow_loopback,
                         session,
+                        authenticated_vault,
                     )
                     .await?
                 } else {
@@ -2163,6 +2170,12 @@ impl Spaces {
                     | "Space server is busy."
                     | "Space server unavailable."
             )
+    }
+    pub(super) fn call_profile_for_space(
+        &self,
+        id: &str,
+    ) -> Option<&crate::hosting_profile::HostingProfile> {
+        self.catalog.hosting_bindings.get(id)
     }
     pub(super) fn history_clients<'a>(
         &'a self,
@@ -3117,7 +3130,19 @@ impl Spaces {
             result["view"]["all_streams"] = result["view"]["streams"].clone();
             return Ok(result);
         }
-        result["view"] = self.view(root).await?;
+        if result.get("deleted_chat").is_some() {
+            // Local removal is already committed. Preserve its cleanup receipt
+            // even if an unrelated Space prevents rebuilding the complete view.
+            match self.view(root).await {
+                Ok(view) => result["view"] = view,
+                Err(_) => {
+                    result["view"] = Value::Null;
+                    result["cleanup_pending"] = json!(true);
+                }
+            }
+        } else {
+            result["view"] = self.view(root).await?;
+        }
         Ok(result)
     }
 }
@@ -4380,21 +4405,23 @@ mod tests {
         async fn container(child: ClientApp, parent: PathBuf, id: &str) -> ClientApp {
             make_directory(&parent).unwrap();
             let session = child.session.isolated_space();
-            vault::write_private(
-                &parent.join("vault.age"),
-                &session.seal(child.password.clone()).unwrap(),
-                false,
-            )
-            .unwrap();
+            let authenticated_vault = session.seal(child.password.clone()).unwrap();
+            vault::write_private(&parent.join("vault.age"), &authenticated_vault, false).unwrap();
             vault::write_private(
                 &parent.join("profile.json"),
                 &vault::read_private(&child.directory.join("profile.json")).unwrap(),
                 false,
             )
             .unwrap();
-            let mut root = ClientApp::open_session(parent, child.password.clone(), true, session)
-                .await
-                .unwrap();
+            let mut root = ClientApp::open_session(
+                parent,
+                child.password.clone(),
+                true,
+                session,
+                authenticated_vault,
+            )
+            .await
+            .unwrap();
             root.enable_spaces().await.unwrap();
             let spaces = root.spaces.as_mut().unwrap();
             let mut entry = spaces.catalog.entries[0].clone();
@@ -4549,9 +4576,15 @@ mod tests {
             false,
         )
         .unwrap();
-        let mut child = ClientApp::open_session(path.clone(), PASSWORD.into(), true, session)
-            .await
-            .unwrap();
+        let mut child = ClientApp::open_session(
+            path.clone(),
+            PASSWORD.into(),
+            true,
+            session,
+            initial.clone(),
+        )
+        .await
+        .unwrap();
         child.seed_personal_chat(&encoded).await.unwrap();
         assert_eq!(vault::read_private(&vault_path).unwrap(), initial);
         child.close().await.unwrap();
@@ -4620,6 +4653,7 @@ mod tests {
                 PASSWORD.into(),
                 true,
                 second.session.isolated_space(),
+                bytes.clone(),
             )
             .await
             .is_err()

@@ -168,3 +168,18 @@ test("an explicit native deadline cancellation wins over the optimistic reply de
   );
   expect(store.snapshot()[0].row.body.payload?.expires_at_ms).toBeNull();
 });
+
+test("deleting a conversation removes its echoes even when an older write completes later", async () => {
+  const store = new OutgoingMessages();
+  const write = deferred();
+  const send = store.send(draft, () => write.promise);
+  await store.send({ ...draft, scope: "another-chat" }, async () => ({
+    id: "keep",
+    logical_time: 11,
+  }));
+  store.forget(draft.scope);
+  write.resolve({ id: "deleted", logical_time: 12 });
+  await send;
+  expect(withOutgoingMessages([], store.snapshot(), draft.scope)).toEqual([]);
+  expect(store.snapshot().map((echo) => echo.row.id)).toEqual(["keep"]);
+});

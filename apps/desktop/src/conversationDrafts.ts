@@ -23,6 +23,16 @@ export type DraftScope = {
   stream: string;
   thread: string | null;
 };
+export type ConversationDraftScope = Omit<DraftScope, "thread">;
+function sameConversation(a: DraftScope, b: ConversationDraftScope) {
+  return (
+    a.identity === b.identity &&
+    a.credential === b.credential &&
+    a.active_space === b.active_space &&
+    a.space === b.space &&
+    a.stream === b.stream
+  );
+}
 export interface DraftPersistence {
   load(scope: DraftScope): Promise<{ session: string; draft: Draft }>;
   save(scope: DraftScope, session: string, draft: Draft): Promise<void>;
@@ -64,6 +74,10 @@ const activeStores = new Set<ConversationDrafts>();
 export function retryConversationDrafts() {
   activeStores.forEach((store) => store.retryFailures());
 }
+/** Call after native deletion has revoked the conversation's save sessions. */
+export function deleteConversationDrafts(scope: ConversationDraftScope) {
+  activeStores.forEach((store) => store.deleteConversation(scope));
+}
 async function settleDraftWrites() {
   while (pendingWrites.size) await Promise.allSettled([...pendingWrites]);
 }
@@ -77,6 +91,7 @@ export async function flushConversationDrafts() {
   if (failedWrites.size) throw failedWrites.values().next().value;
 }
 type Entry = {
+  cancelled: boolean;
   scope: DraftScope;
   draft: Draft;
   ready: boolean;
@@ -110,6 +125,28 @@ export class ConversationDrafts {
   private notify() {
     this.listeners.forEach((listener) => listener());
   }
+  deleteConversation(scope: ConversationDraftScope) {
+    let changed = false;
+    for (const [key, entry] of this.drafts) {
+      if (!sameConversation(entry.scope, scope)) continue;
+      entry.cancelled = true;
+      failedWrites.delete(entry);
+      pendingWrites.delete(entry.saving);
+      this.drafts.delete(key);
+      const attachments = new Map(
+        [entry.draft.attachment, entry.savedAttachment]
+          .filter((file): file is DraftAttachment => !!file)
+          .map((file) => [file.path, file]),
+      );
+      entry.draft = empty;
+      entry.savedAttachment = null;
+      entry.session = undefined;
+      entry.edited.clear();
+      attachments.forEach((file) => this.discard(file));
+      changed = true;
+    }
+    if (changed) this.notify();
+  }
   reset(profile?: string) {
     if (this.profile === profile) return;
     const attachments = [...this.drafts.values()]
@@ -141,6 +178,7 @@ export class ConversationDrafts {
       return;
     }
     const entry: Entry = {
+      cancelled: false,
       scope,
       draft: empty,
       ready: false,
@@ -171,7 +209,11 @@ export class ConversationDrafts {
     entry.loaded = this.persistence
       .load(entry.scope)
       .then(({ session, draft }) => {
-        if (this.generation !== generation || this.profile !== profile) {
+        if (
+          entry.cancelled ||
+          this.generation !== generation ||
+          this.profile !== profile
+        ) {
           if (draft.attachment) this.discard(draft.attachment);
           return;
         }
@@ -192,7 +234,7 @@ export class ConversationDrafts {
         this.notify();
       })
       .catch((error) => {
-        if (this.generation === generation) {
+        if (!entry.cancelled && this.generation === generation) {
           entry.loadError = error;
           this.report(entry, error);
         }
@@ -223,22 +265,24 @@ export class ConversationDrafts {
     );
   }
   private persist(entry: Entry) {
-    if (entry.running) return;
+    if (entry.cancelled || entry.running) return;
     if (entry.loadError) this.load(entry);
     entry.running = true;
     const generation = this.generation;
     const save = (async () => {
       await entry.loaded;
-      if (generation !== this.generation) return;
+      if (entry.cancelled || generation !== this.generation) return;
       if (!entry.session)
         throw entry.loadError ?? new Error("The draft could not be loaded.");
       let recoveredAttachment = false;
       while (entry.savedRevision !== entry.revision) {
+        if (entry.cancelled || generation !== this.generation) return;
         const revision = entry.revision;
         const draft = entry.draft;
         try {
           await this.persistence.save(entry.scope, entry.session, draft);
         } catch (error) {
+          if (entry.cancelled || generation !== this.generation) return;
           // An older failing selection must not stall a newer removal/edit that
           // was queued while that native save was in flight.
           if (revision !== entry.revision) continue;
@@ -252,6 +296,7 @@ export class ConversationDrafts {
           }
           throw error;
         }
+        if (entry.cancelled || generation !== this.generation) return;
         entry.savedRevision = revision;
         entry.savedAttachment = draft.attachment;
         entry.reportedError = undefined;
@@ -261,7 +306,7 @@ export class ConversationDrafts {
     pendingWrites.add(save);
     entry.saving = save;
     void save.catch((error) => {
-      if (generation === this.generation) {
+      if (!entry.cancelled && generation === this.generation) {
         failedWrites.set(entry, error);
         this.report(entry, error);
       }
@@ -270,6 +315,7 @@ export class ConversationDrafts {
       .finally(() => {
         entry.running = false;
         if (
+          !entry.cancelled &&
           generation === this.generation &&
           entry.session &&
           !failedWrites.has(entry) &&
@@ -288,6 +334,7 @@ export class ConversationDrafts {
     const restored = await this.persistence.load(entry.scope);
     const attachment = restored.draft.attachment;
     if (
+      entry.cancelled ||
       generation !== this.generation ||
       entry.session !== restored.session ||
       entry.draft.attachment?.path !== previous.path ||

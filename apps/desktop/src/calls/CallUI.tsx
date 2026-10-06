@@ -4,7 +4,9 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  useLayoutEffect,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   Phone,
   PhoneOff,
@@ -15,11 +17,12 @@ import {
   ScreenShare,
   ScreenShareOff,
   ChevronDown,
-  ChevronUp,
   Pin,
   PinOff,
   Volume2,
   VolumeOff,
+  X,
+  UserPlus,
 } from "lucide-react";
 import { useDesktopLayout } from "../PageSurface";
 import { ActionDialog } from "../ActionDialog";
@@ -27,13 +30,21 @@ import { t } from "../i18n";
 import type { Stream, View } from "../model";
 import { Calls } from "./controller";
 import { callErrorCopy } from "./errors";
-import { scopeKey, type MediaTile } from "./types";
+import { callKey, scopeKey, type MediaTile } from "./types";
 import "./calls.css";
 import { NativeVideo } from "./NativeVideo";
 import { listenNativeSessionEnd } from "./sessionActivity";
 import { useAudioOutput } from "./audioOutput";
-import type { SessionStarted } from "./sessionPresence";
-export { ActiveSessions, ActiveSessionJoin } from "./ActiveSessions";
+import { activeSessions, type SessionStarted } from "./sessionPresence";
+import { sessionKey, isRingingFor, invitationKey } from "./attention";
+import { appHasAttention } from "../useActivityNotifications";
+import {
+  readNotificationSound,
+  playNotificationSound,
+  stopNotificationSound,
+} from "../notificationSounds";
+import { SessionDialogs } from "./SessionDialogs";
+import { incomingStatus, listenIncomingCalls } from "./incomingNative";
 import {
   AudioOutputIcon,
   AudioOutputMenu,
@@ -46,6 +57,46 @@ export function useCalls(view: View | null | undefined) {
     return () => calls.dispose();
   }, [calls]);
   useEffect(() => calls.update(view), [calls, view]);
+  useEffect(() => {
+    if (!view?.identity) return;
+    const identity = view.identity;
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    let revision = 0;
+    const refresh = async () => {
+      const current = ++revision;
+      const status = await incomingStatus(identity);
+      if (disposed || current !== revision) return false;
+      calls.setNativePresented(status.presented);
+      return status.active ? calls.adoptNative(status.active) : false;
+    };
+    void listenIncomingCalls(
+      (event) => {
+        if (event.action !== "answer") {
+          void calls.handleNativeAction(event);
+          return;
+        }
+        void refresh()
+          .then((adopted) => {
+            if (!disposed && !adopted) return calls.handleNativeAction(event);
+          })
+          .catch(() => {});
+      },
+      () => {
+        void refresh().catch(() => {});
+      },
+    )
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stop = unlisten;
+      })
+      .catch(() => {});
+    void refresh().catch(() => {});
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, [calls, view?.identity]);
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -78,13 +129,23 @@ export function useSessionStarted(
 export function CallButton({ calls, chat }: { calls: Calls; chat: Stream }) {
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
   const existing = state.available[scopeKey(chat)];
+  const availableGroup =
+    existing?.kind === "group" &&
+    !(
+      state.active?.call_id === existing.call_id &&
+      callKey(state.active) === callKey(existing)
+    );
   return (
     <button
       type="button"
       className="icon call-trigger"
-      aria-label={t(existing ? "calls.join" : "calls.start")}
-      disabled={!chat.can_post || !!state.active || state.phase !== "idle"}
-      onClick={() => void calls.start(chat, existing)}
+      aria-label={t(
+        availableGroup ? "calls.open" : existing ? "calls.join" : "calls.start",
+      )}
+      disabled={!chat.can_post || state.answering}
+      onClick={() =>
+        availableGroup ? calls.reveal(chat) : calls.requestStart(chat, existing)
+      }
     >
       <Phone size={22} />
       {existing && <span className="call-indicator" />}
@@ -100,6 +161,8 @@ function Tile({
   name: string;
   muted?: boolean;
 }) {
+  // Native audio already plays in the SDK; only video needs a render surface.
+  if (tile.native && tile.source === "audio") return null;
   if (tile.native) return <NativeVideo tile={tile} name={name} />;
   return <WebTile tile={tile} name={name} muted={muted} />;
 }
@@ -229,10 +292,62 @@ function ParticipantVisual({
   );
 }
 
-export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
+export function CallSurface({
+  calls,
+  view,
+  stripTarget,
+  currentChat,
+  onShowCalls,
+}: {
+  calls: Calls;
+  view: View;
+  stripTarget?: string;
+  currentChat?: Stream;
+  onShowCalls: () => void;
+}) {
   const desktop = useDesktopLayout();
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
-  const [expanded, setExpanded] = useState(false);
+  const incoming = state.incoming?.find((call) =>
+    isRingingFor(call, view.identity),
+  );
+  const ringKey = incoming ? invitationKey(incoming, view.identity) : undefined;
+  const nativePresented =
+    incoming &&
+    state.nativePresented?.some(
+      (item) =>
+        item.call_id === incoming.call_id &&
+        item.invitation_id ===
+          incoming.invitations?.[view.identity]?.invitation_id,
+    );
+  useEffect(() => {
+    if (
+      !ringKey ||
+      nativePresented ||
+      state.answering ||
+      /Android|iPhone|iPad|iPod/.test(navigator.userAgent)
+    )
+      return;
+    const play = () => {
+      if (appHasAttention())
+        void playNotificationSound(readNotificationSound()).catch(() => {});
+    };
+    play();
+    const timer = setInterval(play, 8000);
+    return () => {
+      clearInterval(timer);
+      stopNotificationSound();
+    };
+  }, [ringKey, nativePresented, state.answering]);
+
+  const expanded = state.expanded === true;
+  const setExpanded = (value: boolean) =>
+    value ? calls.expand() : calls.collapse();
+  const [stripHost, setStripHost] = useState<HTMLElement | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviting, setInviting] = useState(false);
+  useLayoutEffect(() => {
+    setStripHost(stripTarget ? document.getElementById(stripTarget) : null);
+  }, [stripTarget]);
   const [selected, setSelected] = useState<string>();
   const [pinned, setPinned] = useState<string>();
   const [mutedPeople, setMutedPeople] = useState<Set<string>>(() => new Set());
@@ -365,7 +480,7 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
       );
       const localCamera =
         local &&
-        !calls.isNativeDirect() &&
+        !calls.isNativeMedia() &&
         capture &&
         state.media.video_published
           ? {
@@ -415,6 +530,7 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
     setSpeakerMuted(false);
     appliedPlayback.current = { speaker: false, people: new Set() };
     setOutputOpen(false);
+    setInviteOpen(false);
   }, [active?.call_id]);
   useEffect(() => {
     if (!people.length) return;
@@ -473,20 +589,152 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
     setSelected(credential);
     if (pinned) setPinned(credential);
   };
-  const toggleSelectedMute = () => {
+  const toggleSelectedMute = async () => {
     if (!selectedPerson) return;
-    if (selectedPerson.local) void calls.toggle("audio");
-    else
-      setMutedPeople((current) => {
-        const next = new Set(current);
-        if (next.has(selectedPerson.credential))
-          next.delete(selectedPerson.credential);
-        else next.add(selectedPerson.credential);
-        return next;
-      });
+    if (selectedPerson.local) {
+      void calls.toggle("audio");
+      return;
+    }
+    const credential = selectedPerson.credential;
+    const mute = !mutedPeople.has(credential);
+    if (!(await calls.setParticipantMuted(credential, mute))) return;
+    setMutedPeople((current) => {
+      const next = new Set(current);
+      if (mute) next.add(credential);
+      else next.delete(credential);
+      return next;
+    });
   };
+  const sessions = activeSessions(view, state.available);
+  const visibleSessions = sessions.filter(
+    (entry) => !(state.dismissed ?? []).includes(sessionKey(entry.call)),
+  );
+  const selectedSession =
+    visibleSessions.find(
+      (entry) =>
+        currentChat &&
+        scopeKey(entry.chat) ===
+          scopeKey({
+            ...currentChat,
+            space_context:
+              currentChat.space_context ?? view.active_space ?? undefined,
+          }),
+    ) ?? visibleSessions[0];
+  const otherCount = sessions.filter(
+    (entry) =>
+      entry.call.call_id !== (active?.call_id ?? selectedSession?.call.call_id),
+  ).length;
+  const activeSpace = view.spaces?.find(
+    (space) => space.id === active?.scope.hosting_space_id,
+  );
+  const strip =
+    active || state.phase === "connecting" ? (
+      <section
+        className="call-strip"
+        aria-label={t("calls.active")}
+        key={active?.call_id ?? "connecting"}
+      >
+        <button
+          type="button"
+          className="call-strip-title"
+          disabled={!active}
+          onClick={calls.expand}
+        >
+          <Phone size={18} aria-hidden="true" />
+          <span>
+            <strong>{state.chat?.name ?? t("calls.establishing")}</strong>
+            <small>
+              {!active
+                ? t("calls.establishing")
+                : state.phase === "reconnecting"
+                  ? t("calls.reconnecting")
+                  : active.phase === "ringing"
+                    ? t("calls.ringing")
+                    : t("calls.inSpace", { name: activeSpace?.name ?? "" })}
+            </small>
+          </span>
+        </button>
+        {otherCount > 0 && (
+          <button
+            className="quiet call-strip-more"
+            onClick={onShowCalls}
+            aria-label={t("calls.otherSessions", { count: otherCount })}
+          >
+            +{otherCount}
+          </button>
+        )}
+        {active ? (
+          controls(false)
+        ) : (
+          <button
+            type="button"
+            className="icon call-leave"
+            aria-label={t("calls.cancelCall")}
+            onClick={() => void calls.leave()}
+          >
+            <PhoneOff />
+          </button>
+        )}
+      </section>
+    ) : selectedSession ? (
+      <section
+        className="call-strip"
+        aria-label={t("calls.activeSessions")}
+        key={selectedSession.call.call_id}
+      >
+        <button
+          type="button"
+          className="call-strip-title"
+          onClick={onShowCalls}
+        >
+          <Phone size={18} aria-hidden="true" />
+          <span>
+            <strong>{selectedSession.chat.name}</strong>
+            <small>
+              {t("calls.inSpace", { name: selectedSession.spaceName })}
+            </small>
+          </span>
+        </button>
+        {otherCount > 0 && (
+          <button
+            className="quiet call-strip-more"
+            onClick={onShowCalls}
+            aria-label={t("calls.otherSessions", { count: otherCount })}
+          >
+            +{otherCount}
+          </button>
+        )}
+        <button
+          type="button"
+          className="quiet call-strip-join"
+          disabled={state.answering}
+          onClick={() =>
+            calls.requestStart(selectedSession.chat, selectedSession.call)
+          }
+        >
+          {t(
+            selectedSession.call.kind === "direct" &&
+              selectedSession.call.phase === "ringing"
+              ? "calls.answer"
+              : "calls.joinSession",
+          )}
+        </button>
+        {selectedSession.call.kind === "group" && (
+          <button
+            type="button"
+            className="icon"
+            aria-label={t("calls.dismissSession")}
+            onClick={() => calls.dismiss(selectedSession.call)}
+          >
+            <X size={18} />
+          </button>
+        )}
+      </section>
+    ) : null;
   return (
     <>
+      {stripHost && strip && createPortal(strip, stripHost)}
+      <SessionDialogs calls={calls} view={view} />
       {active && outputOpen && (
         <AudioOutputMenu
           audio={audio}
@@ -494,41 +742,6 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
           onMute={() => setSpeakerMuted((value) => !value)}
           onClose={() => setOutputOpen(false)}
         />
-      )}
-      {!active && state.phase === "connecting" && (
-        <section className="call-dock" aria-label={t("calls.active")}>
-          <div className="call-dock-title" role="status" aria-live="polite">
-            <span>{t("calls.establishing")}</span>
-          </div>
-          <button
-            type="button"
-            className="icon call-leave"
-            aria-label={t("calls.leave")}
-            onClick={() => void calls.leave()}
-          >
-            <PhoneOff />
-          </button>
-        </section>
-      )}
-      {active && (
-        <section className="call-dock" aria-label={t("calls.active")}>
-          <button className="call-dock-title" onClick={() => setExpanded(true)}>
-            <ChevronUp size={18} />
-            <span>
-              {state.chat?.name}
-              <small>
-                {t(
-                  state.phase === "connected"
-                    ? "calls.active"
-                    : state.phase === "reconnecting"
-                      ? "calls.reconnecting"
-                      : "calls.connecting",
-                )}
-              </small>
-            </span>
-          </button>
-          {controls(false)}
-        </section>
       )}
       <div className="call-media call-media-collapsed">
         {state.tiles
@@ -653,7 +866,68 @@ export function CallSurface({ calls, view }: { calls: Calls; view: View }) {
               </div>
             )}
           </div>
-          <div className="call-controls">{controls(true)}</div>
+          <div className="call-controls">
+            {controls(true)}
+            {active.kind === "group" && (
+              <button
+                type="button"
+                className="icon"
+                aria-label={t("calls.invitePeople")}
+                onClick={() => setInviteOpen(true)}
+              >
+                <UserPlus />
+              </button>
+            )}
+          </div>
+        </ActionDialog>
+      )}
+      {inviteOpen && active?.kind === "group" && (
+        <ActionDialog
+          title={t("calls.invitePeople")}
+          onClose={() => {
+            if (!inviting) setInviteOpen(false);
+          }}
+        >
+          <p>{t("calls.inviteHelp")}</p>
+          <div className="call-choice">
+            {state.chat?.members
+              .filter(
+                (member) =>
+                  member.identity_id !== view.identity &&
+                  member.capabilities.includes("POST") &&
+                  member.capabilities.includes("READ") &&
+                  !active.participants[member.identity_id],
+              )
+              .map((member) => (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={
+                    inviting ||
+                    (active.invitations?.[member.identity_id]?.expires_at ??
+                      0) *
+                      1000 >
+                      Date.now()
+                  }
+                  key={member.identity_id}
+                  onClick={async () => {
+                    setInviting(true);
+                    try {
+                      await calls.invite(member.identity_id);
+                    } finally {
+                      setInviting(false);
+                      setInviteOpen(false);
+                    }
+                  }}
+                >
+                  {state.chat?.member_names?.[member.identity_id] ??
+                    view.contacts?.find(
+                      (person) => person.id === member.identity_id,
+                    )?.name ??
+                    t("calls.participant")}
+                </button>
+              ))}
+          </div>
         </ActionDialog>
       )}
       {state.error && (

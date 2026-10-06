@@ -48,8 +48,13 @@ describe("Signed record timestamps", () => {
 });
 describe("Sender names", () => {
   it("keeps the locally saved contact name ahead of sender-controlled names", () => {
-    const view = { identity: "me", contacts: [{ id: "peer", name: "Trusted contact" }] } as unknown as View;
-    const stream = { member_names: { peer: "Administrator" } } as unknown as Stream;
+    const view = {
+      identity: "me",
+      contacts: [{ id: "peer", name: "Trusted contact" }],
+    } as unknown as View;
+    const stream = {
+      member_names: { peer: "Administrator" },
+    } as unknown as Stream;
     expect(senderName(view, "peer", stream)).toBe("Trusted contact");
   });
   it("uses your current name and verified names scoped to the current chat", () => {
@@ -206,8 +211,9 @@ describe("Member search", () => {
       owner_managed: true,
       controller: stream.members[0].credential_ids[0],
     };
-    expect(visibleMembers(view, general, "").map((member) => member.identity_id))
-      .toEqual(["me", "bea", "zoe"]);
+    expect(
+      visibleMembers(view, general, "").map((member) => member.identity_id),
+    ).toEqual(["me", "bea", "zoe"]);
   });
 });
 

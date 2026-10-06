@@ -102,6 +102,9 @@ export class OutgoingMessages {
     );
     if (remaining.length !== this.echoes.length) this.update(remaining);
   }
+  forget(scope: string) {
+    this.update(this.echoes.filter((echo) => echo.scope !== scope));
+  }
 }
 
 export function withOutgoingMessages(

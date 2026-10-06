@@ -1,6 +1,7 @@
 import { expect, test, vi } from "vitest";
 import {
   ConversationDrafts,
+  deleteConversationDrafts,
   flushConversationDrafts,
   type Draft,
   type DraftPersistence,
@@ -415,5 +416,90 @@ test("attachment recovery completing after lock cannot leak into a new profile",
   await flushConversationDrafts();
   expect(store.read("other", "chat")).toEqual(initial);
   expect(discard).toHaveBeenCalledWith(restored);
+  store.reset();
+});
+
+test("deleting a conversation clears every thread and staged attachment while retaining other drafts", async () => {
+  const { adapter } = persistent();
+  const discard = vi.fn();
+  const store = new ConversationDrafts(discard, adapter);
+  await open(store);
+  await open(store, "thread", { ...scope, thread: "reply" });
+  await open(store, "other", { ...scope, stream: "other" });
+  const attachment = { path: "selected", name: "photo.jpg", size_bytes: 4 };
+  store.update("profile", "chat", "attachment", attachment);
+  store.update("profile", "thread", "text", "Reply draft");
+  store.update("profile", "other", "text", "Keep this draft");
+  await flushConversationDrafts();
+  deleteConversationDrafts(scope);
+  expect(store.read("profile", "chat")).toEqual(initial);
+  expect(store.read("profile", "thread")).toEqual(initial);
+  expect(store.read("profile", "other").text).toBe("Keep this draft");
+  expect(discard).toHaveBeenCalledWith(attachment);
+  store.reset();
+});
+
+test("a load finishing after deletion cannot hydrate or save a removed draft", async () => {
+  let finish!: (value: { session: string; draft: Draft }) => void;
+  const adapter: DraftPersistence = {
+    load: () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    save: vi.fn(async () => {}),
+  };
+  const discard = vi.fn(),
+    report = vi.fn();
+  const store = new ConversationDrafts(discard, adapter, report);
+  store.reset("profile");
+  store.open("profile", "chat", scope);
+  store.update("profile", "chat", "text", "Queued old input");
+  store.deleteConversation(scope);
+  await flushConversationDrafts();
+  const attachment = { path: "late", name: "photo.jpg", size_bytes: 4 };
+  finish({
+    session: "old",
+    draft: { ...initial, text: "Deleted", attachment },
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(store.read("profile", "chat")).toEqual(initial);
+  expect(adapter.save).not.toHaveBeenCalled();
+  expect(discard).toHaveBeenCalledWith(attachment);
+  expect(report).not.toHaveBeenCalled();
+  store.reset();
+});
+
+test("revoked in-flight writes neither retry nor corrupt a fresh draft after deletion", async () => {
+  let reject!: (error: Error) => void;
+  const save = vi.fn(
+    (_scope: DraftScope, _session: string, _draft: Draft) =>
+      new Promise<void>((_resolve, fail) => {
+        reject = fail;
+      }),
+  );
+  const adapter: DraftPersistence = {
+    load: async () => ({ session: "session", draft: initial }),
+    save,
+  };
+  const report = vi.fn();
+  const store = new ConversationDrafts(vi.fn(), adapter, report);
+  await open(store);
+  store.update("profile", "chat", "text", "First save");
+  await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+  store.update("profile", "chat", "text", "Queued second save");
+  store.deleteConversation(scope);
+  await flushConversationDrafts();
+  save.mockImplementation(async () => {});
+  await open(store);
+  store.update("profile", "chat", "text", "Fresh draft");
+  await flushConversationDrafts();
+  reject(new Error("The draft session is no longer active."));
+  await Promise.resolve();
+  await Promise.resolve();
+  await flushConversationDrafts();
+  expect(save).toHaveBeenCalledTimes(2);
+  expect(store.read("profile", "chat").text).toBe("Fresh draft");
+  expect(report).not.toHaveBeenCalled();
   store.reset();
 });

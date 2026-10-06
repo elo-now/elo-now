@@ -326,6 +326,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
     let mut scopes = BTreeSet::<Scope>::new();
     let mut admission_cursor = None;
     let mut grants = subscriptions::Grants::new();
+    let mut delegations = subscriptions::Delegations::default();
     let authentication = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(authentication);
     let mut admission_tick = tokio::time::interval(Duration::from_secs(5));
@@ -392,6 +393,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                     if !send(&mut socket, json!({"type":"error","request_id":request_id,"code":CallError::Unavailable})).await { break; }
                     continue;
                 }
+                let delegated_lease = prepared.delegation_lease;
                 let bound_device = prepared.command.credential_id;
                 let bound_identity = prepared.identity;
                 let mut engine = service.engine.lock().await;
@@ -402,6 +404,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 match applied {
                     Ok(result) => {
                         device = Some(bound_device); identity = Some(bound_identity); scopes.insert(scope);
+                        delegations.update(scope, delegated_lease);
                         receiver.update(bound_device, &scopes);
                         if service.publish_media(result.events).await.is_err() {
                             let ended=service.engine.lock().await.registry.revoke_member(scope,bound_identity);
@@ -439,6 +442,17 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                     });
                     if !current { continue; }
                 }
+                let current_head = service.engine.lock().await.authorized_head(scope, credential, now());
+                if current_head.is_some_and(|head| !delegations.permits(scope, head, now())) {
+                    // Expiration of one call-only key is not revocation of the
+                    // parent device or another device's participation.
+                    scopes.remove(&scope);
+                    grants.remove(&scope);
+                    delegations.update(scope, None);
+                    receiver.update(credential, &scopes);
+                    if !send(&mut socket, json!({"type":"access_revoked","scope":scope})).await { break; }
+                    continue;
+                }
                 if !service.engine.lock().await.authorized(scope, credential) {
                     scopes.remove(&scope);
                     receiver.update(credential, &scopes);
@@ -466,6 +480,20 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 if !send(&mut socket, serde_json::to_value(&event).unwrap()).await { break; }
             }
             _ = admission_tick.tick(), if device.is_some() => {
+                let expired = {
+                    let mut engine = service.engine.lock().await;
+                    scopes.iter().copied().filter(|scope| {
+                        engine.authorized_head(*scope, device.unwrap(), now())
+                            .is_some_and(|head| !delegations.permits(*scope, head, now()))
+                    }).collect::<Vec<_>>()
+                };
+                for scope in expired {
+                    scopes.remove(&scope);
+                    grants.remove(&scope);
+                    delegations.update(scope, None);
+                    receiver.update(device.unwrap(), &scopes);
+                    if !send(&mut socket, json!({"type":"access_revoked","scope":scope})).await { return; }
+                }
                 let mut urgent = BTreeSet::new();
                 {
                     let mut engine = service.engine.lock().await;

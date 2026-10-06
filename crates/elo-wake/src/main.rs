@@ -6,6 +6,9 @@ use std::path::PathBuf;
 struct Args {
     #[arg(long)]
     service_account: PathBuf,
+    /// Private APNs signing configuration for native incoming calls on iOS.
+    #[arg(long)]
+    apns: Option<PathBuf>,
     /// Validate OAuth authentication without sending a notification.
     #[arg(long)]
     check_authentication: bool,
@@ -22,7 +25,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let fcm = elo_wake::fcm::Fcm::load(&args.service_account)?;
+    let mut fcm = elo_wake::fcm::Fcm::load(&args.service_account)?;
+    if let Some(path) = &args.apns {
+        fcm = fcm.with_apns(elo_wake::apns::Apns::load(path)?);
+    }
     if args.check_authentication {
         fcm.check_authentication().await?;
         println!("Firebase authentication succeeded. No notification was sent.");

@@ -29,6 +29,7 @@ internal object ChatSessions {
     private val pending = mutableMapOf<Long, (String?) -> Unit>()
 
     fun update(activity: Activity, id: String, activation: String, active: Boolean, camera: Boolean, completed: (String?) -> Unit) {
+        require(java.util.UUID.fromString(activation).toString() == activation)
         if (!active) {
             if (ChatSessionAudio.owns(id, activation)) stop(activity, id)
             completed(null)
@@ -36,11 +37,27 @@ internal object ChatSessions {
         }
         val foreground = !activity.isFinishing && !activity.isDestroyed &&
             (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
+        val incomingMedia = IncomingCalls.authorizedCallMedia(id)
+        check(IncomingCalls.active() == null || incomingMedia != null || OutgoingCalls.owns(id)) { "Incoming call authorization is required." }
         val session = state.begin(
             id, camera, foreground,
             ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
             ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
+            authorizedIncoming = incomingMedia != null,
         )
+        if (incomingMedia != null) {
+            // The answered Telecom call already owns its foreground service and
+            // audio routes. Do not start a second service from a locked Activity.
+            try {
+                IncomingCallService.authorizeCapture(activity, incomingMedia, camera)
+                ChatSessionAudio.begin(activity, session.id, activation)
+                completed(null)
+            } catch (_: RuntimeException) {
+                stop(activity, session.id)
+                completed("Could not keep the chat session active.")
+            }
+            return
+        }
         pending.values.toList().also { pending.clear() }.forEach { it("Chat session update was replaced.") }
         pending[session.revision] = completed
         handler.postDelayed({
@@ -73,13 +90,19 @@ internal object ChatSessions {
         context.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
     }
 
+    fun detach(context: Context) {
+        val id = state.active()?.id
+        if (id != null && (IncomingCalls.authorizedCallMedia(id) != null || OutgoingCalls.owns(id))) ChatSessionAudio.detach()
+        else stop(context)
+    }
+
     fun clearLegacy(context: Context) {
         val prefs = context.getSharedPreferences("elo-push", Context.MODE_PRIVATE)
         val edit = prefs.edit()
         prefs.all.keys.filter { it.startsWith("call-") || it == "call" || it == "calls-enabled" }.forEach { edit.remove(it) }
         edit.apply()
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.notificationChannels.filter { it.id.startsWith("elo_calls_") }.forEach { manager.deleteNotificationChannel(it.id) }
+        manager.notificationChannels.filter { it.id.startsWith("elo_calls_") && it.id != "elo_calls_v1" }.forEach { manager.deleteNotificationChannel(it.id) }
         if (state.active() == null) manager.cancel(NOTIFICATION_ID)
     }
 }

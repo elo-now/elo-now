@@ -23,6 +23,7 @@ export function useOutgoingMessages(
   );
   return {
     send: store.send.bind(store),
+    forget: store.forget.bind(store),
     rows: useExpiringRows(withOutgoingMessages(rows, echoes, scope)),
     replies: useExpiringRows(withOutgoingMessages(replies, echoes, scope)),
   };

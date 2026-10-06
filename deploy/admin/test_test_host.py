@@ -39,7 +39,7 @@ class TestHostingIsolation(unittest.TestCase):
                     self.assertTrue(Path(volume["source"]).is_relative_to(state))
         self.assertIn("127.0.0.1:19900", config["services"]["api"]["command"])
         self.assertIn("127.0.0.1:8878", config["services"]["wake"]["command"])
-        self.assertIn("https://api.example.test:9443", config["services"]["wake"]["command"])
+        self.assertIn("/opt/elo/wake.py", config["services"]["wake"]["command"])
 
     def test_proxy_does_not_bind_public_ports_or_request_new_certificates(self):
         value = host.proxy_configuration("https://api.example.test:9443", "api.example.test").decode()
@@ -50,6 +50,10 @@ class TestHostingIsolation(unittest.TestCase):
         self.assertIn("127.0.0.1:19900", value)
         self.assertIn("127.0.0.1:8878", value)
         self.assertIn("127.0.0.1:19920", value)
+        self.assertIn("@calls path /calls/v1/connect /calls/v1/state /calls/v1/health\n", value)
+        self.assertNotIn("/calls/*", value)
+        self.assertNotIn("/calls/v1/*", value)
+        self.assertNotIn("/internal/calls", value)
         for public_listener in ("127.0.0.1:18900", "127.0.0.1:18901", "127.0.0.1:18920", "127.0.0.1:8788", "127.0.0.1:7880"):
             self.assertNotIn(public_listener, value)
 

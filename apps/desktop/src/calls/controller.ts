@@ -26,6 +26,14 @@ import {
 } from "./nativePeer";
 import { nativeCallState } from "./sessionActivity";
 import {
+  invitationKey,
+  isRingingFor,
+  readDismissed,
+  saveDismissed,
+  sessionKey,
+} from "./attention";
+import type { NativeActiveCall, NativeCallAction } from "./incomingNative";
+import {
   activeSessions,
   sessionAvailable,
   type SessionStarted,
@@ -43,15 +51,21 @@ export class Calls {
   private subscribed = new Map<string, string>();
   private subscriptionCursor = 0;
   private subscriptionRetry?: ReturnType<typeof setTimeout>;
+  private notificationRetry?: ReturnType<typeof setTimeout>;
+  private invitationRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  private incomingExpiry?: ReturnType<typeof setTimeout>;
   private subscriptionBackoff = new Map<string, number>();
   private listeners = new Set<() => void>();
   private sessionListeners = new Set<(event: SessionStarted) => void>();
   private seenSessions = new Set<string>();
+  private adoptedNative = false;
+  private seenInvitations = new Set<string>();
+  private sessionDiscoverySince = Date.now();
   private endedSessions = new Set<string>();
   private initializingSubscriptions = new Set<string>();
   private revokedScopes = new Set<string>();
   private capture?: MediaStream;
-  private nativeDirect = false;
+  private nativeOwned = false;
   private nativeActivity?: {
     identity: string;
     sessionId: string;
@@ -126,18 +140,372 @@ export class Calls {
     if (set.size > 2048) set.delete(set.values().next().value!);
   }
   dismissError = () => this.change({ error: undefined });
+  expand = () => this.change({ expanded: true });
+  collapse = () => this.change({ expanded: false });
+  cancelJoin = () => this.change({ joinRequest: undefined });
+  setNativePresented = (presented: Snapshot["nativePresented"]) =>
+    this.change({ nativePresented: presented ?? [] });
+  async handleNativeAction(event: NativeCallAction) {
+    const chat = this.chats().find(
+      (candidate) =>
+        candidate.space_context === event.hosting_space_id &&
+        candidate.space === event.space &&
+        candidate.stream === event.stream,
+    );
+    if (!chat || !this.view) return;
+    const active = this.snapshot.active;
+    if (event.action === "end") {
+      if (
+        active?.call_id === event.call_id &&
+        callKey(active) === scopeKey(chat) &&
+        event.activation &&
+        this.nativeActivity?.activation === event.activation
+      )
+        await this.leave("native_end");
+      return;
+    }
+    if (!event.invitation_id) return;
+    const identity = this.view.identity;
+    try {
+      const result = await this.command(chat, { type: "subscribe" });
+      if (this.view?.identity !== identity || this.disposed) return;
+      const call = result.call;
+      if (
+        !call ||
+        call.call_id !== event.call_id ||
+        callKey(call) !== scopeKey(chat) ||
+        !this.validate(call) ||
+        call.invitations?.[identity]?.invitation_id !== event.invitation_id ||
+        !isRingingFor(call, identity)
+      )
+        return;
+      if (event.action === "decline") await this.decline(call);
+      else if (event.action === "answer") {
+        // Another call requires an explicit in-app End & answer as well; an
+        // incoming notification alone never has authority to stop capture.
+        this.updateIncoming([
+          call,
+          ...(this.snapshot.incoming ?? []).filter(
+            (entry) => sessionKey(entry) !== sessionKey(call),
+          ),
+        ]);
+        if (!active && this.snapshot.phase === "idle")
+          await this.answer(chat, call, false, event.invitation_id);
+      }
+    } catch (error) {
+      if (this.view?.identity === identity)
+        this.change({ error: callErrorCode(error) });
+    }
+  }
+  async adoptNative(value: NativeActiveCall) {
+    if (
+      !usesNativePeer() ||
+      !this.view ||
+      value.identity !== this.view.identity ||
+      !["direct", "group"].includes(value.call.kind) ||
+      value.call.participants[value.identity]?.credential_id !==
+        this.view.credential ||
+      !/^[a-f\d-]{36}$/i.test(value.session_id) ||
+      !/^[a-f\d-]{36}$/i.test(value.activation)
+    )
+      return false;
+    const chat = this.validate(value.call);
+    if (!chat) return false;
+    if (
+      this.adapter instanceof NativePeer &&
+      this.adapter.id === value.session_id
+    )
+      return true;
+    if (this.snapshot.active || this.snapshot.phase !== "idle") return false;
+    const generation = ++this.generation;
+    await this.mediaStopping.catch(() => {});
+    if (
+      this.disposed ||
+      this.view?.identity !== value.identity ||
+      generation !== this.generation
+    )
+      return false;
+    this.nativeOwned = true;
+    this.adoptedNative = true;
+    this.capture = new MediaStream();
+    this.nativeActivity = {
+      identity: value.identity,
+      sessionId: value.call.call_id,
+      activation: value.activation,
+      context: requestContext(chat, value.identity),
+    };
+    this.audioActivationReady = value.activation;
+    this.epoch = value.call.key_epoch;
+    this.change({
+      active: value.call,
+      chat,
+      media: value.media,
+      phase: "connecting",
+      error: undefined,
+      joinRequest: undefined,
+      incoming: (this.snapshot.incoming ?? []).filter(
+        (call) => sessionKey(call) !== sessionKey(value.call),
+      ),
+    });
+    const mediaGeneration = this.mediaGeneration;
+    this.adapter = new NativePeer(
+      this.view.credential,
+      value.identity,
+      (tiles) => {
+        if (generation === this.generation) this.change({ tiles });
+      },
+      (error = "unavailable") => {
+        if (generation === this.generation) this.fail(error);
+      },
+      () => {
+        if (generation === this.generation) this.mediaConnected();
+      },
+      (call) => {
+        if (
+          generation === this.generation &&
+          mediaGeneration === this.mediaGeneration
+        )
+          void this.presence(call);
+      },
+      undefined,
+      {
+        ...requestContext(chat, value.identity),
+        call_id: value.call.call_id,
+        activation: value.activation,
+      },
+      { sessionId: value.session_id },
+    );
+    return true;
+  }
+  reveal(chat: Stream) {
+    if (!this.view) return;
+    const call = this.snapshot.available[scopeKey(chat)];
+    if (!call) return;
+    this.change({
+      dismissed: saveDismissed(
+        this.view.identity,
+        (this.snapshot.dismissed ?? []).filter(
+          (key) => key !== sessionKey(call),
+        ),
+      ),
+    });
+  }
+  dismiss(call: ActiveCall) {
+    if (!this.view) return;
+    this.change({
+      dismissed: saveDismissed(this.view.identity, [
+        ...(this.snapshot.dismissed ?? []),
+        sessionKey(call),
+      ]),
+      incoming: (this.snapshot.incoming ?? []).filter(
+        (value) => sessionKey(value) !== sessionKey(call),
+      ),
+    });
+  }
+  requestStart(chat: Stream, call = this.snapshot.available[scopeKey(chat)]) {
+    this.reveal(chat);
+    if (
+      call &&
+      this.snapshot.active?.call_id === call.call_id &&
+      callKey(this.snapshot.active) === callKey(call)
+    ) {
+      this.expand();
+      return;
+    }
+    if (this.snapshot.active || this.snapshot.phase !== "idle") {
+      this.change({ joinRequest: { chat, call } });
+      return;
+    }
+    void this.answer(chat, call);
+  }
+  async answer(
+    chat: Stream,
+    call?: ActiveCall,
+    replace = false,
+    invitationId?: string,
+  ) {
+    if (!this.view || this.snapshot.answering) return;
+    const identity = this.view.identity;
+    this.change({ answering: true });
+    try {
+      if (call) {
+        // A tap is intent only. Refresh membership/session before acquiring media
+        // or ending the current session, even for a verified native action.
+        const result = await this.command(chat, { type: "subscribe" });
+        if (this.view?.identity !== identity || this.disposed) return;
+        if (
+          !result.call ||
+          result.call.call_id !== call.call_id ||
+          callKey(result.call) !== callKey(call) ||
+          !this.validate(result.call) ||
+          !sessionAvailable(result.call) ||
+          this.endedSessions.has(call.call_id) ||
+          (invitationId &&
+            (result.call.invitations?.[identity]?.invitation_id !==
+              invitationId ||
+              !isRingingFor(result.call, identity)))
+        )
+          throw new Error("ended");
+        call = result.call;
+      }
+      if (this.snapshot.active || this.snapshot.phase !== "idle") {
+        if (!replace) {
+          this.change({ joinRequest: { chat, call } });
+          return;
+        }
+        await this.leave();
+        if (this.view?.identity !== identity || this.disposed) return;
+      }
+      this.change({
+        joinRequest: undefined,
+        incoming: (this.snapshot.incoming ?? []).filter(
+          (value) => !call || sessionKey(value) !== sessionKey(call),
+        ),
+      });
+      await this.start(chat, call, invitationId);
+    } catch (error) {
+      if (this.view?.identity === identity)
+        this.change({ error: callErrorCode(error), joinRequest: undefined });
+    } finally {
+      if (this.view?.identity === identity) this.change({ answering: false });
+    }
+  }
+  async decline(call: ActiveCall) {
+    const chat = this.validate(call);
+    const identity = this.view?.identity;
+    this.dismiss(call);
+    const invitationId =
+      identity && call.invitations?.[identity]?.invitation_id;
+    if (!chat || !identity || !invitationId) return;
+    try {
+      const result = await this.command(chat, {
+        type: "decline",
+        call_id: call.call_id,
+        invitation_id: invitationId,
+      });
+      if (this.view?.identity === identity && result.call)
+        await this.presence(result.call);
+    } catch (error) {
+      if (this.view?.identity === identity && callErrorCode(error) !== "ended")
+        this.change({ error: callErrorCode(error) });
+    }
+  }
+  async invite(identity: string) {
+    const { active, chat } = this.snapshot;
+    if (!active || !chat || active.kind !== "group") return;
+    const generation = this.generation;
+    try {
+      const result = await this.command(chat, {
+        type: "invite",
+        call_id: active.call_id,
+        to: identity,
+      });
+      if (generation === this.generation && result.call) {
+        await this.presence(result.call);
+        const invitation = result.call.invitations?.[identity];
+        if (invitation && this.view?.identity === invitation.invited_by)
+          void this.notifyInvitation(
+            chat,
+            result.call,
+            identity,
+            invitation.invitation_id,
+            generation,
+            invitation.expires_at * 1000,
+          );
+      }
+    } catch (error) {
+      if (generation === this.generation)
+        this.change({ error: callErrorCode(error) });
+    }
+  }
+  private async notifyInvitation(
+    chat: Stream,
+    call: ActiveCall,
+    to: string,
+    invitationId: string,
+    generation: number,
+    deadline: number,
+  ) {
+    const identity = this.view?.identity;
+    const current = () =>
+      identity &&
+      this.view?.identity === identity &&
+      !this.disposed &&
+      generation === this.generation &&
+      this.snapshot.active?.call_id === call.call_id &&
+      callKey(this.snapshot.active) === callKey(call) &&
+      this.snapshot.active.invitations?.[to]?.invitation_id === invitationId &&
+      Date.now() < deadline;
+    if (!current()) return;
+    try {
+      const result = await operate({
+        ...requestContext(chat, identity!),
+        op: "call_notify_ready",
+        call_id: call.call_id,
+        invitation_id: invitationId,
+        to,
+      });
+      if (result.retry !== true) return;
+    } catch (error) {
+      if (["ended", "unauthorized", "invalid"].includes(callErrorCode(error)))
+        return;
+    }
+    if (current()) {
+      clearTimeout(this.invitationRetries.get(to));
+      this.invitationRetries.set(
+        to,
+        setTimeout(
+          () => {
+            this.invitationRetries.delete(to);
+            void this.notifyInvitation(
+              chat,
+              call,
+              to,
+              invitationId,
+              generation,
+              deadline,
+            );
+          },
+          Math.min(8000, deadline - Date.now()),
+        ),
+      );
+    }
+  }
+  private updateIncoming(values: ActiveCall[]) {
+    clearTimeout(this.incomingExpiry);
+    const identity = this.view?.identity;
+    const incoming = identity
+      ? values.filter((call) => isRingingFor(call, identity)).slice(0, 8)
+      : [];
+    this.change({ incoming });
+    if (identity && incoming.length) {
+      const expires = Math.min(
+        ...incoming.map(
+          (call) => call.invitations![identity].expires_at * 1000,
+        ),
+      );
+      this.incomingExpiry = setTimeout(
+        () => this.updateIncoming(this.snapshot.incoming ?? []),
+        Math.max(1, expires - Date.now()),
+      );
+    }
+  }
   private change(update: Partial<Snapshot>) {
     this.snapshot = { ...this.snapshot, ...update };
     this.listeners.forEach((fn) => fn());
   }
   update(view: View | null | undefined) {
     if (this.view?.identity !== view?.identity) {
-      void this.leave("view_changed");
+      if (!view && this.adoptedNative) this.detachAdopted();
+      else void this.leave("view_changed");
       this.connections.forEach((c) => c.close());
       this.connections.clear();
       this.subscribed.clear();
       this.subscriptionBackoff.clear();
       this.seenSessions.clear();
+      this.seenInvitations.clear();
+      clearTimeout(this.incomingExpiry);
+      this.sessionDiscoverySince = Date.now();
       this.endedSessions.clear();
       this.initializingSubscriptions.clear();
       this.revokedScopes.clear();
@@ -145,7 +513,15 @@ export class Calls {
       clearTimeout(this.subscriptionRetry);
       this.subscriptionRetry = undefined;
       this.endpoints.clear();
-      this.change({ available: {}, error: undefined });
+      this.change({
+        available: {},
+        error: undefined,
+        incoming: [],
+        joinRequest: undefined,
+        expanded: false,
+        nativePresented: [],
+        dismissed: view ? readDismissed(view.identity) : [],
+      });
     }
     this.view = view ?? undefined;
     if (!view) return;
@@ -159,6 +535,9 @@ export class Calls {
       Object.keys(this.snapshot.available).length
     )
       this.change({ available });
+    this.updateIncoming(
+      (this.snapshot.incoming ?? []).filter((call) => this.validate(call)),
+    );
     if (this.snapshot.active && !this.chatFor(this.snapshot.active))
       void this.leave("chat_unavailable");
     const active = this.snapshot.active;
@@ -236,7 +615,7 @@ export class Calls {
               this.subscribed.delete(scopeKey(chat));
           // A connection to an unrelated deployment must not interrupt this call.
           if (
-            !this.nativeDirect &&
+            !this.nativeOwned &&
             this.snapshot.chat &&
             this.endpoints.get(this.snapshot.chat.space_context!) === endpoint
           )
@@ -293,7 +672,11 @@ export class Calls {
           this.subscribed.set(key, chat.head);
           this.revokedScopes.delete(key);
           this.subscriptionBackoff.delete(key);
-          if (result.call) await this.presence(result.call);
+          if (result.call)
+            await this.presence(
+              result.call,
+              this.newlyDiscoveredSession(result.call),
+            );
           else if (previous && this.snapshot.available[key] === previous) {
             const available = { ...this.snapshot.available };
             delete available[key];
@@ -356,12 +739,26 @@ export class Calls {
     }
     return chat;
   }
+  private newlyDiscoveredSession(call: ActiveCall) {
+    const chat = this.chatFor(call);
+    const now = Date.now();
+    const ready = (call.ready_at ?? 0) * 1000;
+    return (
+      chat?.chat_kind === "direct" &&
+      (chat.created_at ?? 0) >= this.sessionDiscoverySince &&
+      (chat.created_at ?? 0) <= now &&
+      ready > 0 &&
+      ready <= now &&
+      now < ready + 60_000
+    );
+  }
   private async event(event: Result) {
     if (event.type === "presence" && event.call)
       await this.presence(
         event.call,
-        this.subscribed.has(callKey(event.call)) &&
-          !this.initializingSubscriptions.has(callKey(event.call)),
+        (this.subscribed.has(callKey(event.call)) &&
+          !this.initializingSubscriptions.has(callKey(event.call))) ||
+          this.newlyDiscoveredSession(event.call),
       );
     else if (event.type === "ended" || event.type === "access_revoked") {
       if (event.type === "ended" && typeof event.call_id === "string")
@@ -392,6 +789,9 @@ export class Calls {
       for (const [key, call] of Object.entries(available))
         if (matches(call)) delete available[key];
       this.change({ available });
+      this.updateIncoming(
+        (this.snapshot.incoming ?? []).filter((call) => !matches(call)),
+      );
       if (this.snapshot.active && matches(this.snapshot.active))
         await this.leave(event.type);
     } else if (event.type === "signal") await this.signal(event);
@@ -459,6 +859,25 @@ export class Calls {
     if (sessionAvailable(call)) available[callKey(call)] = call;
     else if (known?.call_id === call.call_id) delete available[callKey(call)];
     this.change({ available });
+    const pending = (this.snapshot.incoming ?? []).filter(
+      (entry) => sessionKey(entry) !== sessionKey(call),
+    );
+    const ring = isRingingFor(call, this.view.identity);
+    const alreadyIncoming = this.snapshot.incoming?.some(
+      (entry) =>
+        invitationKey(entry, this.view!.identity) ===
+        invitationKey(call, this.view!.identity),
+    );
+    const invitation = invitationKey(call, this.view.identity);
+    const firstInvitation = !this.seenInvitations.has(invitation);
+    if (ring) this.rememberSession(this.seenInvitations, invitation);
+    if (
+      ring &&
+      (alreadyIncoming || (announce && !chat.muted && firstInvitation))
+    ) {
+      pending.push(call);
+    }
+    this.updateIncoming(pending);
     if (sessionAvailable(call) && !this.seenSessions.has(call.call_id)) {
       this.rememberSession(this.seenSessions, call.call_id);
       if (announce && call.started_by !== this.view.identity && !chat.muted) {
@@ -482,7 +901,7 @@ export class Calls {
     // Start presence can arrive before native activation and the signed media
     // grant. Do not request a provider token with the initial muted permissions.
     if (this.pendingMediaAdmission === this.generation) return;
-    if (this.nativeDirect && this.adapter instanceof NativePeer) {
+    if (this.nativeOwned && this.adapter instanceof NativePeer) {
       // Native signaling owns membership changes and preserves capture in the background.
       this.epoch = call.key_epoch;
       return;
@@ -508,43 +927,44 @@ export class Calls {
   ) {
     await stopping;
     if (generation !== this.mediaGeneration || !this.view) return;
+    const tiles = (tiles: import("./types").MediaTile[]) => {
+      if (generation === this.mediaGeneration) this.change({ tiles });
+    };
+    const connected = () => {
+      if (generation === this.mediaGeneration) this.mediaConnected();
+    };
+    if (this.nativeOwned) {
+      const peer = new NativePeer(
+        this.view.credential,
+        this.view.identity,
+        tiles,
+        (reason = "unavailable") => {
+          if (generation === this.mediaGeneration) this.fail(reason);
+        },
+        connected,
+        (current) => {
+          if (generation === this.mediaGeneration) void this.presence(current);
+        },
+        undefined,
+        {
+          ...requestContext(chat, this.view.identity),
+          call_id: call.call_id,
+          activation: this.nativeActivity?.activation,
+          display_name: chat.name,
+        },
+      );
+      this.adapter = peer;
+      await peer.setSpeakerMuted(this.speakerMuted);
+      await peer.update(this.snapshot.media);
+      return;
+    }
     if (call.kind === "direct") {
-      const tiles = (tiles: import("./types").MediaTile[]) => {
-        if (generation === this.mediaGeneration) this.change({ tiles });
-      };
-      const connected = () => {
-        if (generation === this.mediaGeneration) this.mediaConnected();
-      };
-      if (this.nativeDirect) {
-        const peer = new NativePeer(
-          this.view.credential,
-          this.view.identity,
-          tiles,
-          (reason = "unavailable") => {
-            if (generation === this.mediaGeneration) this.fail(reason);
-          },
-          connected,
-          (current) => {
-            if (generation === this.mediaGeneration)
-              void this.presence(current);
-          },
-          undefined,
-          {
-            ...requestContext(chat, this.view.identity),
-            call_id: call.call_id,
-            activation: this.nativeActivity?.activation,
-          },
-        );
-        this.adapter = peer;
-        await peer.setSpeakerMuted(this.speakerMuted);
-        await peer.update(this.snapshot.media);
-        return;
-      }
       const remote = Object.values(call.participants).find(
         (p) => p.credential_id !== this.view!.credential,
       );
       if (!remote) {
-        this.mediaConnected();
+        // Admission prepares this device to call; only a remote media transport
+        // establishes a direct conversation.
         return;
       }
       const access = (
@@ -627,6 +1047,9 @@ export class Calls {
       epoch: active.key_epoch,
       to,
       payload,
+      recipient_delegation: Object.values(active.participants).find(
+        (participant) => participant.credential_id === to,
+      )?.delegation,
     });
     if (generation !== this.mediaGeneration) return;
     await this.command(chat, {
@@ -638,7 +1061,7 @@ export class Calls {
     });
   }
   private async signal(event: Result) {
-    if (this.nativeDirect) return;
+    if (this.nativeOwned) return;
     const generation = this.mediaGeneration;
     const { active, chat } = this.snapshot;
     if (
@@ -658,6 +1081,9 @@ export class Calls {
       call_id: active.call_id,
       epoch: active.key_epoch,
       ciphertext: event.ciphertext,
+      sender_delegation: Object.values(active.participants).find(
+        (participant) => participant.credential_id === event.from,
+      )?.delegation,
     });
     if (generation !== this.mediaGeneration || !this.view) return;
     if (
@@ -792,7 +1218,7 @@ export class Calls {
         throw error;
     }
   }
-  async start(chat: Stream, existing?: ActiveCall) {
+  async start(chat: Stream, existing?: ActiveCall, invitationId?: string) {
     if (this.snapshot.active || this.snapshot.phase !== "idle" || !this.view)
       return;
     if (updateRequired()) {
@@ -846,12 +1272,12 @@ export class Calls {
       const direct = existing
         ? existing.kind === "direct"
         : chat.chat_kind === "direct" && chat.members.length === 2;
-      if (!direct) {
+      this.nativeOwned = usesNativePeer();
+      if (!direct && !this.nativeOwned) {
         const sdk = await import("livekit-client");
         if (!sdk.isE2EESupported()) throw new Error("encryption_unavailable");
       }
-      this.nativeDirect = usesNativePeer() && direct;
-      if (this.nativeDirect) {
+      if (this.nativeOwned) {
         await nativeMediaPermission(identity, false);
         capture = new MediaStream();
       } else
@@ -868,7 +1294,11 @@ export class Calls {
       const result = await this.command(
         chat,
         existing
-          ? { type: "join", call_id: existing.call_id }
+          ? {
+              type: "join",
+              call_id: existing.call_id,
+              ...(invitationId ? { invitation_id: invitationId } : {}),
+            }
           : {
               type: "start",
               kind: direct ? "direct" : "group",
@@ -929,11 +1359,7 @@ export class Calls {
         admitted.started_by === identity &&
         !existing
       ) {
-        void operate({
-          ...requestContext(chat, identity),
-          op: "call_notify_ready",
-          call_id: admitted.call_id,
-        }).catch(() => {});
+        void this.notifyReady(chat, admitted, generation, Date.now() + 60_000);
       }
     } catch (error) {
       capture?.getTracks().forEach((t) => t.stop());
@@ -962,6 +1388,43 @@ export class Calls {
       finishAdmission?.();
     }
   }
+  private async notifyReady(
+    chat: Stream,
+    call: ActiveCall,
+    generation: number,
+    deadline: number,
+    attempt = 0,
+  ) {
+    const current = () =>
+      !this.disposed &&
+      this.generation === generation &&
+      this.snapshot.active?.call_id === call.call_id &&
+      callKey(this.snapshot.active) === callKey(call) &&
+      this.view?.identity === call.started_by &&
+      Date.now() < deadline;
+    if (!current()) return;
+    try {
+      const result = await operate({
+        ...requestContext(chat, call.started_by),
+        op: "call_notify_ready",
+        call_id: call.call_id,
+      });
+      if (result.retry !== true) return;
+    } catch (error) {
+      if (!current()) return;
+      // Fixed diagnostic codes only; native failures may contain private data.
+      const code = callErrorCode(error);
+      console.warn("Session notification handoff failed.", code);
+      if (["ended", "unauthorized", "invalid"].includes(code)) return;
+    }
+    // A relay acknowledgement can also conceal a not-yet-authorized DM scope.
+    // Keep its original event/TTL and let the relay deduplicate actual delivery.
+    if (!current() || attempt >= 7) return;
+    this.notificationRetry = setTimeout(() => {
+      this.notificationRetry = undefined;
+      void this.notifyReady(chat, call, generation, deadline, attempt + 1);
+    }, 8000);
+  }
   async toggle(kind: "audio" | "video" | "screen") {
     const { active, chat } = this.snapshot;
     if (!active || !chat || !this.capture || this.mediaChanging) return;
@@ -977,7 +1440,7 @@ export class Calls {
         state.video_published = !state.video_published;
         if (
           state.video_published &&
-          !this.nativeDirect &&
+          !this.nativeOwned &&
           !this.capture.getVideoTracks().some((t) => t.readyState === "live")
         ) {
           const video = await navigator.mediaDevices.getUserMedia({
@@ -1123,8 +1586,8 @@ export class Calls {
       }
     }
   }
-  isNativeDirect() {
-    return this.nativeDirect;
+  isNativeMedia() {
+    return this.nativeOwned;
   }
   audioOutputContext() {
     const context = this.nativeActivity;
@@ -1154,6 +1617,28 @@ export class Calls {
         return true;
       this.speakerMuted = previous;
       if (this.snapshot.active) this.change({ error: "audio_unavailable" });
+      return false;
+    }
+  }
+  async setParticipantMuted(
+    credential: string,
+    muted: boolean,
+  ): Promise<boolean> {
+    const adapter = this.adapter;
+    const generation = this.generation;
+    if (!(adapter instanceof NativePeer)) return true;
+    if (
+      !Object.values(this.snapshot.active?.participants ?? {}).some(
+        (person) => person.credential_id === credential,
+      )
+    )
+      return false;
+    try {
+      await adapter.setParticipantMuted(credential, muted);
+      return true;
+    } catch {
+      if (generation === this.generation)
+        this.change({ error: "audio_unavailable" });
       return false;
     }
   }
@@ -1220,11 +1705,46 @@ export class Calls {
     )
       await this.leave("native_end");
   }
+  private detachAdopted() {
+    if (!this.adoptedNative || !(this.adapter instanceof NativePeer)) return;
+    ++this.generation;
+    ++this.mediaGeneration;
+    this.adapter.detach();
+    this.adapter = undefined;
+    this.adoptedNative = false;
+    this.nativeOwned = false;
+    this.nativeActivity = undefined;
+    this.audioActivationReady = undefined;
+    this.capture = undefined;
+    this.screen = undefined;
+    this.key = undefined;
+    this.epoch = 0;
+    this.clearReconnect();
+    this.change({
+      active: undefined,
+      chat: undefined,
+      phase: "idle",
+      media: { ...muted },
+      tiles: [],
+      expanded: false,
+      changingMedia: false,
+    });
+  }
   async leave(reason = "user") {
+    this.adoptedNative = false;
     const { active, chat } = this.snapshot;
     const identity = this.view?.identity;
+    if (
+      active?.kind === "group" &&
+      (reason === "user" || reason === "native_end")
+    )
+      this.dismiss(active);
     if (active || this.sessionWork.size) this.refreshBeforeStart = true;
     ++this.generation;
+    clearTimeout(this.notificationRetry);
+    this.invitationRetries.forEach(clearTimeout);
+    this.invitationRetries.clear();
+    this.notificationRetry = undefined;
     this.pendingMediaAdmission = undefined;
     this.clearReconnect();
     this.capture?.getTracks().forEach((t) => t.stop());
@@ -1233,13 +1753,14 @@ export class Calls {
     this.screen = undefined;
     this.key = undefined;
     this.speakerMuted = false;
-    this.nativeDirect = false;
+    this.nativeOwned = false;
     this.nonces.clear();
     this.change({
       active: undefined,
       chat: undefined,
       phase: "idle",
       changingMedia: false,
+      expanded: false,
       media: { ...muted },
       tiles: [],
     });
@@ -1286,7 +1807,7 @@ export class Calls {
     this.change({ phase: "connected" });
   }
   private beginReconnect() {
-    if (!this.snapshot.active || this.disposed || this.nativeDirect) return;
+    if (!this.snapshot.active || this.disposed || this.nativeOwned) return;
     if (!this.reconnectExpiry) {
       const generation = this.generation;
       // Stop media until fresh signed admission is confirmed. Keep capture only
@@ -1311,7 +1832,7 @@ export class Calls {
     const generation = this.generation;
     try {
       const { active, chat } = this.snapshot;
-      if (active && chat && !this.nativeDirect) {
+      if (active && chat && !this.nativeOwned) {
         try {
           const result = await this.command(chat, {
             type: "heartbeat",
@@ -1332,6 +1853,7 @@ export class Calls {
     }
   }
   dispose() {
+    clearTimeout(this.incomingExpiry);
     this.unsubscribePolicy?.();
     this.unsubscribePolicy = undefined;
     this.disposed = true;
@@ -1340,7 +1862,8 @@ export class Calls {
     clearTimeout(this.subscriptionRetry);
     this.subscriptionRetry = undefined;
     this.subscriptionBackoff.clear();
-    void this.leave("disposed");
+    if (this.adoptedNative) this.detachAdopted();
+    else void this.leave("disposed");
     this.connections.forEach((c) => c.close());
     this.connections.clear();
     this.subscribed.clear();

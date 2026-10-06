@@ -166,6 +166,11 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
         require(self.status(namespace, "http://127.0.0.1:18080/hosting") == "308", "Hosting directory redirect failed.")
         require(self.status(namespace, "http://127.0.0.1:18080/spaces/v1/health") == "200", "API reverse proxy failed.")
         require(self.status(namespace, "http://127.0.0.1:18080/calls/v1/health") == "204", "Call reverse proxy failed.")
+        state_status = run(["exec", keeper, "curl", "--silent", "--max-time", "3",
+                            "--output", "/dev/null", "--write-out", "%{http_code}",
+                            "--header", "Content-Type: application/json", "--data", "{}",
+                            "http://127.0.0.1:18080/calls/v1/state"], timeout=10).stdout
+        require(state_status == "400", "Call state route did not reach the authenticated call service.")
         require(self.status(namespace, "http://127.0.0.1:18080/wake/health") == "204", "Wake reverse proxy failed.")
         for path in ("/internal/calls/admission", "/internal/calls/event", "/media/twirp", "/media/twirp/livekit.RoomService/CreateRoom"):
             require(self.status(namespace, "http://127.0.0.1:18080" + path) == "404", "Proxy exposed a private media route.")

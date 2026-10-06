@@ -13,6 +13,7 @@ SDK_BUNDLES = (
     "GoogleUtilities_GoogleUtilities-NSData", "GoogleUtilities_GoogleUtilities-Network",
     "GoogleUtilities_GoogleUtilities-Reachability", "GoogleUtilities_GoogleUtilities-UserDefaults",
     "Promises_FBLPromises", "nanopb_nanopb",
+    "LiveKit_LiveKit", "SwiftProtobuf_SwiftProtobuf",
 )
 
 
@@ -25,13 +26,14 @@ def check(path, push=False):
     expected = [app / "PrivacyInfo.xcprivacy"]
     if push:
         expected += [app / (name + ".bundle") / "PrivacyInfo.xcprivacy" for name in SDK_BUNDLES]
-        expected.append(app / "Frameworks/WebRTC.framework/PrivacyInfo.xcprivacy")
+        expected += [app / "Frameworks" / (name + ".framework") / "PrivacyInfo.xcprivacy"
+                     for name in ("WebRTC", "LiveKitWebRTC", "RustLiveKitUniFFI")]
     collected, reasons = set(), set()
     for file in expected:
         assert file.is_file(), f"Missing embedded manifest: {file.relative_to(app)}"
         data = plistlib.loads(file.read_bytes())
-        assert data.get("NSPrivacyTracking") is False, f"Unexpected tracking: {file.name}"
-        assert data.get("NSPrivacyTrackingDomains") == [], "Review tracking domains"
+        assert data.get("NSPrivacyTracking", False) is False, f"Unexpected tracking: {file.name}"
+        assert data.get("NSPrivacyTrackingDomains", []) == [], "Review tracking domains"
         for item in data.get("NSPrivacyAccessedAPITypes", []):
             assert item["NSPrivacyAccessedAPITypeReasons"], "Empty API reasons"
             reasons.add(item["NSPrivacyAccessedAPIType"])

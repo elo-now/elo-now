@@ -8,9 +8,10 @@ internal class ChatSessionState {
     private var current: Session? = null
 
     @Synchronized
-    fun begin(id: String, camera: Boolean, foreground: Boolean, microphoneAllowed: Boolean, cameraAllowed: Boolean): Session {
+    fun begin(id: String, camera: Boolean, foreground: Boolean, microphoneAllowed: Boolean, cameraAllowed: Boolean, authorizedIncoming: Boolean = false): Session {
         require(id.matches(Regex("[a-f0-9]{32}"))) { "Invalid chat session." }
-        check(foreground) { "Open the app to join a chat session." }
+        check(foreground || authorizedIncoming) { "Open the app to join a chat session." }
+        check(!camera || foreground || (authorizedIncoming && current?.id == id && current?.camera == true)) { "Open the app to enable the camera." }
         check(microphoneAllowed && (!camera || cameraAllowed)) { "Allow microphone or camera access before joining." }
         check(current == null || current?.id == id) { "Leave the current chat session first." }
         return Session(id, camera, ++revision).also { current = it }

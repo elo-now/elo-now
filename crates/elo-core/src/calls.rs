@@ -10,7 +10,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+pub mod delegation;
+pub mod ring;
+
 pub const COMMAND_TTL: u64 = 60;
+pub const RING_TTL: u64 = 60;
 pub const MAX_SIGNAL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,9 +56,25 @@ pub enum Operation {
     },
     Join {
         call_id: String,
+        #[serde(default)]
+        invitation_id: Option<String>,
     },
     Leave {
         call_id: String,
+    },
+    Decline {
+        call_id: String,
+        invitation_id: String,
+    },
+    Cancel {
+        call_id: String,
+    },
+    End {
+        call_id: String,
+    },
+    Invite {
+        call_id: String,
+        to: IdentityId,
     },
     Heartbeat {
         call_id: String,
@@ -78,8 +98,12 @@ impl Operation {
     pub fn call_id(&self) -> Option<&str> {
         match self {
             Self::Subscribe | Self::Start { .. } => None,
-            Self::Join { call_id }
+            Self::Join { call_id, .. }
             | Self::Leave { call_id }
+            | Self::Decline { call_id, .. }
+            | Self::Cancel { call_id }
+            | Self::End { call_id }
+            | Self::Invite { call_id, .. }
             | Self::Heartbeat { call_id }
             | Self::ConnectMedia { call_id }
             | Self::Media { call_id, .. }
@@ -89,6 +113,16 @@ impl Operation {
     fn validate(&self) -> Result<()> {
         if let Some(id) = self.call_id() {
             record::hex::<16>(id)?;
+        }
+        match self {
+            Self::Decline { invitation_id, .. }
+            | Self::Join {
+                invitation_id: Some(invitation_id),
+                ..
+            } => {
+                record::hex::<16>(invitation_id)?;
+            }
+            _ => {}
         }
         if let Self::Signal {
             epoch, ciphertext, ..

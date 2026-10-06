@@ -305,12 +305,27 @@ class SourceAndComposeTests(unittest.TestCase):
     def test_optional_proxy_routes_are_explicit_and_media_admin_stays_private(self):
         minimal = provision.proxy_config("api", "https://api.example.test", False).decode()
         full = provision.proxy_config("api", "https://api.example.test", False, True, True).decode()
-        for path in ("/v1/routes/*", "/v1/wake", "/wake/v1/account-deletion", "/calls/v1/connect", "/media/*"):
+        for path in ("/v1/routes/*", "/v1/wake", "/wake/v1/account-deletion", "/calls/v1/connect", "/calls/v1/state", "/media/*"):
             self.assertNotIn(path, minimal)
             self.assertIn(path, full)
         self.assertIn("@media_private path /media/twirp /media/twirp/*", full)
         self.assertIn("handle @media_private {\n\t\trespond 404\n\t}", full)
         self.assertNotIn("18901", full)
+        self.assertIn("@calls path /calls/v1/connect /calls/v1/state /calls/v1/health\n", full)
+        self.assertNotIn("/calls/*", full)
+        self.assertNotIn("/calls/v1/*", full)
+        self.assertNotIn("/internal/calls", full)
+
+    def test_nginx_call_state_route_is_exact_and_bounded(self):
+        config = (HERE.parent / "self-host/nginx.conf.example").read_text()
+        route = config.split("location = /calls/v1/state {", 1)[1].split("}", 1)[0]
+        self.assertIn("proxy_pass http://127.0.0.1:18920;", route)
+        self.assertIn("client_max_body_size 1m;", route)
+        self.assertIn("limit_req zone=elo_call_connect", route)
+        self.assertIn("access_log off;", route)
+        self.assertNotIn("location /calls", config)
+        self.assertNotIn("location ^~ /calls", config)
+        self.assertNotIn("location /internal/calls", config)
 
     def test_lock_normalization_cannot_change_dependency_versions_or_checksums(self):
         with tempfile.TemporaryDirectory() as temporary:

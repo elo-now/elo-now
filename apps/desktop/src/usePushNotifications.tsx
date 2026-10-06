@@ -82,6 +82,129 @@ const unavailable: Status = {
   pending: false,
 };
 
+export const NOTIFICATION_OPEN_TIMEOUT_MS = 8000;
+const handledOpenKey = "elo.notificationOpening.handled.v1";
+type HandledOpen = { identity: string; id: string };
+function handledOpens(): HandledOpen[] {
+  try {
+    const value: unknown = JSON.parse(
+      localStorage.getItem(handledOpenKey) ?? "[]",
+    );
+    return Array.isArray(value)
+      ? value
+          .filter(
+            (item): item is HandledOpen =>
+              typeof item?.identity === "string" &&
+              item.identity.length <= 512 &&
+              typeof item?.id === "string" &&
+              item.id.length <= 512,
+          )
+          .slice(-32)
+      : [];
+  } catch {
+    return [];
+  }
+}
+function rememberOpen(identity: string, id: string) {
+  try {
+    const previous = handledOpens().filter(
+      (item) => item.identity !== identity || item.id !== id,
+    );
+    localStorage.setItem(
+      handledOpenKey,
+      JSON.stringify([...previous, { identity, id }].slice(-32)),
+    );
+  } catch {
+    /* Storage availability must never control the UI deadline. */
+  }
+}
+function openWasHandled(identity: string, id: string) {
+  return handledOpens().some(
+    (item) => item.identity === identity && item.id === id,
+  );
+}
+
+/** A wall-clock UI budget independent of any pending native/network promise.
+ * Only opaque local tap IDs are retained; this never marks content as read. */
+export class NotificationOpeningAttempt {
+  private active?: { identity: string; id?: string; deadline: number };
+  private timer?: ReturnType<typeof setTimeout>;
+  constructor(
+    private readonly change: (active: boolean, visible: boolean) => void,
+    private readonly timedOut: (identity: string, id?: string) => void,
+  ) {}
+  begin(identity: string, id?: string): boolean {
+    if (id && openWasHandled(identity, id)) {
+      this.clearMatching(identity, id);
+      return false;
+    }
+    const previous = this.active;
+    if (
+      previous?.identity === identity &&
+      (!id || !previous.id || previous.id === id)
+    ) {
+      if (id) previous.id = id;
+      if (!this.current(identity, id)) return false;
+      this.change(true, !!previous.id);
+      return true;
+    }
+    this.reset();
+    const attempt = {
+      identity,
+      id,
+      deadline: Date.now() + NOTIFICATION_OPEN_TIMEOUT_MS,
+    };
+    this.active = attempt;
+    this.change(true, !!id);
+    this.timer = setTimeout(
+      () => this.expire(attempt),
+      NOTIFICATION_OPEN_TIMEOUT_MS,
+    );
+    return true;
+  }
+  current(identity: string, id?: string): boolean {
+    const attempt = this.active;
+    if (!attempt || attempt.identity !== identity || (id && attempt.id !== id))
+      return false;
+    if (Date.now() >= attempt.deadline) {
+      this.expire(attempt);
+      return false;
+    }
+    return true;
+  }
+  complete(identity: string, id: string) {
+    if (!this.current(identity, id)) return;
+    rememberOpen(identity, id);
+    this.reset();
+  }
+  deadline() {
+    return this.active?.deadline ?? 0;
+  }
+  ignore(identity: string, id: string) {
+    rememberOpen(identity, id);
+    this.clearMatching(identity, id);
+  }
+  private clearMatching(identity: string, id: string) {
+    if (
+      this.active?.identity === identity &&
+      (!this.active.id || this.active.id === id)
+    )
+      this.reset();
+  }
+  reset() {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.active = undefined;
+    this.change(false, false);
+  }
+  private expire(attempt: { identity: string; id?: string; deadline: number }) {
+    if (this.active !== attempt) return;
+    if (attempt.id) rememberOpen(attempt.identity, attempt.id);
+    this.reset();
+    this.timedOut(attempt.identity, attempt.id);
+  }
+}
+
 /** Only navigate through verified local rows, never directly through push data. */
 export function notificationEntry(
   view: View,
@@ -235,6 +358,9 @@ export function usePushNotifications(
     page: "activity" | "notifications" | undefined,
     space: string | undefined,
     chat: Stream | undefined,
+    isCurrent: () => boolean,
+    deadline: number,
+    openId: string,
   ) => boolean | Promise<boolean>,
   onError: (error: unknown) => void,
   offerReady = false,
@@ -252,9 +378,7 @@ export function usePushNotifications(
     // An existing opt-in (including pending registration) is already a decision.
     if (status.enabled && !offerHandled) dismissOffer();
   }, [status.enabled, offerHandled]);
-  const [opened, setOpened] = useState<(Opened & { received: number }) | null>(
-    null,
-  );
+  const [opened, setOpened] = useState<Opened | null>(null);
   const latest = useRef({
     status,
     deferMaintenance,
@@ -286,7 +410,43 @@ export function usePushNotifications(
   const catchingUp = useRef(false);
   const needsProof = useRef(false);
   const hintSerial = useRef(0);
-  const receive = (result: Status, identity: string) => {
+  const hintEpoch = useRef(0);
+  const acknowledging = useRef(new Set<string>());
+  const acknowledgeTap = (identity: string, id: string) => {
+    const key = `${identity}:${id}`;
+    if (acknowledging.current.has(key)) return;
+    acknowledging.current.add(key);
+    void invoke("push_task", { op: `ack:${id}`, expectedIdentity: identity })
+      .catch(() => {})
+      .finally(() => acknowledging.current.delete(key));
+  };
+  const attempt = useRef<NotificationOpeningAttempt | null>(null);
+  attempt.current ??= new NotificationOpeningAttempt(
+    (active, visible) => {
+      opening.current = active;
+      setShowOpening(visible);
+    },
+    (identity, id) => {
+      if (latest.current.view?.identity !== identity) return;
+      const verified = activeOpened.current;
+      activeOpened.current = null;
+      hintSerial.current++;
+      setOpened(null);
+      if (id) {
+        if (
+          verified?.id === id &&
+          (!verified.target || verified.target.identity === identity)
+        )
+          acknowledgeTap(identity, id);
+        latest.current.onError(t("notifications.openingTimeout"));
+      }
+    },
+  );
+  const receive = (
+    result: Status,
+    identity: string,
+    requestDeadline: number,
+  ) => {
     if (latest.current.view?.identity !== identity) return;
     hintSerial.current++;
     latest.current.status = result;
@@ -297,20 +457,31 @@ export function usePushNotifications(
     }
     if (result.opened && result.opened.id !== acknowledged.current) {
       const incoming = result.opened;
+      if (
+        !attempt.current!.current(identity, incoming.id) &&
+        Date.now() >= requestDeadline
+      ) {
+        const handled = openWasHandled(identity, incoming.id);
+        attempt.current!.ignore(identity, incoming.id);
+        if (!incoming.target || incoming.target.identity === identity)
+          acknowledgeTap(identity, incoming.id);
+        if (!handled) latest.current.onError(t("notifications.openingTimeout"));
+        return;
+      }
+      if (!attempt.current!.begin(identity, incoming.id)) {
+        if (!incoming.target || incoming.target.identity === identity)
+          acknowledgeTap(identity, incoming.id);
+        return;
+      }
       const fresh = activeOpened.current?.id !== incoming.id;
       activeOpened.current = incoming;
-      opening.current = true;
-      setShowOpening(true);
-      setOpened((old) =>
-        old?.id === incoming.id ? old : { ...incoming, received: Date.now() },
-      );
+      setOpened((old) => (old?.id === incoming.id ? old : incoming));
       if (fresh) {
         nextCatchUp.current = 0;
         needsProof.current = false;
       }
     } else if (!activeOpened.current) {
-      opening.current = false;
-      setShowOpening(false);
+      attempt.current!.reset();
     }
   };
   useEffect(() => {
@@ -320,7 +491,7 @@ export function usePushNotifications(
     hintSerial.current++;
     acknowledged.current = undefined;
     activeOpened.current = null;
-    opening.current = !!view;
+    attempt.current!.reset();
     if (!view) return;
     const identity = view.identity;
     let active = true;
@@ -339,7 +510,14 @@ export function usePushNotifications(
         running = true;
         refreshQueued = false;
         const revision = settingsRevision.current;
-        const current = () => active && revision === settingsRevision.current;
+        const requestDeadline =
+          attempt.current!.deadline() ||
+          Date.now() + NOTIFICATION_OPEN_TIMEOUT_MS;
+        const requestEpoch = hintEpoch.current;
+        const current = () =>
+          active &&
+          revision === settingsRevision.current &&
+          requestEpoch === hintEpoch.current;
         try {
           // Keep the switch usable even if the following network maintenance fails.
           // A tap must be consumed before network maintenance, including on resume.
@@ -347,7 +525,7 @@ export function usePushNotifications(
             op: "status",
             expectedIdentity: identity,
           });
-          if (current()) receive(snapshot, identity);
+          if (current()) receive(snapshot, identity, requestDeadline);
           if (
             current() &&
             !latest.current.changing &&
@@ -358,12 +536,11 @@ export function usePushNotifications(
               op: "maintain",
               expectedIdentity: identity,
             });
-            if (current()) receive(result, identity);
+            if (current()) receive(result, identity, requestDeadline);
           }
         } catch {
           if (current() && !activeOpened.current) {
-            opening.current = false;
-            setShowOpening(false);
+            attempt.current!.reset();
           }
           // Delivery and chat sync are independent; retry settings when connectivity returns.
           if (current())
@@ -388,6 +565,9 @@ export function usePushNotifications(
     };
     const hint = async () => {
       if (updateRequired() || document.visibilityState !== "visible") return;
+      // A snapshot already waiting for native state belongs to the previous tap.
+      // Neither its target, an empty result nor its error may reset the new one.
+      hintEpoch.current++;
       const serial = ++hintSerial.current;
       try {
         const pending = await invoke<{ opened?: string | null }>("push_task", {
@@ -400,8 +580,7 @@ export function usePushNotifications(
           pending.opened &&
           pending.opened !== acknowledged.current
         ) {
-          opening.current = true;
-          setShowOpening(true);
+          attempt.current!.begin(identity, pending.opened);
         }
       } catch {
         // This optional hint never controls navigation or message verification.
@@ -410,7 +589,7 @@ export function usePushNotifications(
     const wake = () => {
       refreshQueued = true;
       if (!updateRequired() && document.visibilityState === "visible")
-        opening.current = true;
+        attempt.current!.begin(identity);
       void hint();
       void tick();
     };
@@ -429,6 +608,7 @@ export function usePushNotifications(
       active = false;
       unsubscribePolicy();
       hintSerial.current++;
+      attempt.current!.reset();
       clearTimeout(timer);
       void listener.then((unlisten) => unlisten?.());
       document.removeEventListener("visibilitychange", wake);
@@ -453,34 +633,43 @@ export function usePushNotifications(
         cancelled ||
         activeOpened.current?.id !== opened.id ||
         acknowledged.current === opened.id ||
+        !attempt.current!.current(view.identity, opened.id) ||
         latest.current.view?.identity !== view.identity
       )
         return;
       const current = latest.current.view;
       acknowledged.current = opened.id;
       let navigated = false;
+      const isCurrent = () =>
+        latest.current.view?.identity === current.identity &&
+        activeOpened.current?.id === opened.id &&
+        attempt.current!.current(current.identity, opened.id);
       try {
         navigated = await latest.current.onOpen(
           entry,
           notificationPage(current, opened.target),
           notificationSpace(current, opened.target),
           notificationChat(current, opened.target),
+          isCurrent,
+          attempt.current!.deadline(),
+          opened.id,
         );
       } catch (error) {
         acknowledged.current = undefined;
-        latest.current.onError(error);
+        if (isCurrent()) latest.current.onError(error);
         return;
       }
       if (
         latest.current.view?.identity !== current.identity ||
-        activeOpened.current?.id !== opened.id
+        activeOpened.current?.id !== opened.id ||
+        !isCurrent()
       )
         return;
       if (!navigated) {
         acknowledged.current = undefined;
         return;
       }
-      opening.current = false;
+      attempt.current!.complete(current.identity, opened.id);
       hintSerial.current++;
       setShowOpening(false);
       activeOpened.current = null;
@@ -495,12 +684,7 @@ export function usePushNotifications(
           },
         }).catch(latest.current.onError);
       }
-      void invoke("push_task", {
-        op: `ack:${opened.id}`,
-        expectedIdentity: view.identity,
-      }).catch(() => {
-        acknowledged.current = undefined;
-      });
+      acknowledgeTap(view.identity, opened.id);
     };
     const resolve = async () => {
       let entry: StreamEntry | undefined;
@@ -511,15 +695,15 @@ export function usePushNotifications(
       } catch {
         // Catch-up may still be importing the chat, or the profile/Space changed.
       }
-      if (cancelled) return;
+      if (cancelled || !attempt.current!.current(view.identity, opened.id))
+        return;
       if (
         entry ||
         notificationChat(view, opened.target) ||
         notificationPage(view, opened.target) ||
         !opened.target ||
         (opened.target.category === "session_start" &&
-          (!opened.target.expires || opened.target.expires <= Date.now())) ||
-        Date.now() - opened.received >= 60000
+          (!opened.target.expires || opened.target.expires <= Date.now()))
       ) {
         void finish(entry);
       } else {
@@ -537,6 +721,7 @@ export function usePushNotifications(
               const result = await invoke<SyncResult>("operate", { request });
               if (
                 activeOpened.current?.id === opened.id &&
+                attempt.current!.current(view.identity, opened.id) &&
                 latest.current.view?.identity === view.identity
               ) {
                 needsProof.current =
@@ -575,12 +760,13 @@ export function usePushNotifications(
     settingsRevision.current++;
     latest.current.changing = true;
     setChanging(true);
+    const requestDeadline = Date.now() + NOTIFICATION_OPEN_TIMEOUT_MS;
     try {
       const updated = await invoke<Status>("push_task", {
         op: enable ? "enable" : "disable",
         expectedIdentity: identity,
       });
-      receive(updated, identity);
+      receive(updated, identity, requestDeadline);
       if (updated.enabled) dismissOffer();
       if (latest.current.view?.identity === identity)
         latest.current.requestSync(true);

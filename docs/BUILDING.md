@@ -92,10 +92,14 @@ Target API 37 is a separate behavior migration: it changes background audio and
 local-network permissions and removes the large-screen orientation opt-out.
 Do not raise it solely to hide the `OldTargetApi` suggestion while preserving
 the current behavior is a release requirement.
-The iOS minimum is 16.0. Audio/video sessions are explicitly joined in a chat.
-Android uses an ongoing microphone/camera service; iOS uses an active audio
-session. CallKit, PushKit, Android Telecom and full-screen incoming-call
-notifications are not used. The existing portrait layout is preserved.
+The iOS minimum is 16.0. Android uses a self-managed Telecom connection and a
+CallStyle notification for explicit incoming invitations. Its call-only lock-screen
+surface is separate from the locked profile. Microphone capture starts only after
+Answer and verification of the signed invitation using a limited call delegation;
+ordinary chat-session notifications cannot start capture. Telecom owns audio routes
+and the existing phone-call service for these calls. Sessions joined inside the app
+use the ongoing microphone/camera service. No boot receiver starts either service.
+The existing portrait layout is preserved.
 Android-only copies of Tauri modules under [vendor/android](../vendor/android/README.md)
 migrate the removed `kotlinOptions.jvmTarget` DSL to `compilerOptions`. Java and
 Kotlin target JVM 11 for current AndroidX.
@@ -125,6 +129,26 @@ the `ExecOperations` build task when regenerating: the settings overrides check 
 The Android TLS verifier shim is versioned from `Cargo.lock`. Its Maven repository
 is pinned to a reviewed upstream commit in `app/build.gradle.kts`; update that
 commit together with the Rust verifier when a new shim version is needed.
+
+The Android call adapter pins these media dependencies:
+
+| Artifact | Version | Purpose |
+| --- | --- | --- |
+| `io.github.webrtc-sdk:android` | `150.7871.01` | Native direct-call media |
+| `io.livekit:livekit-android` | `2.29.0` | Native group media with frame E2EE |
+| `io.github.webrtc-sdk:android-prefixed` | `144.7559.14` | LiveKit's isolated WebRTC runtime |
+| `io.livekit:livekit-uniffi-android` | `0.1.12` | LiveKit's native support library |
+| `com.google.protobuf:protobuf-javalite` | `3.25.9` | LiveKit protocol types exposed to the adapter |
+| `com.github.davidliu:audioswitch` | `039a35aefab7747c557242fa216c9ea11743b604` | LiveKit's transitive Android audio helper |
+
+The plugin and root Android Gradle repositories restrict JitPack to the exact
+AudioSwitch module; retain both repository declarations when regenerating the
+project. All other artifacts above come from Maven Central. Direct and group
+WebRTC use separate Java packages and native library names. Their ARM64 and x86_64
+ELF load segments, including LiveKit UniFFI, have 16 KB alignment; the final APK's
+ZIP alignment still needs the normal release check. Runtime JNI classes have
+explicit consumer R8 keep rules. License notices are included in
+[Call media](../apps/desktop/public/licenses/calls.txt).
 
 Review the resulting diff before building: retain the checked-in camera/biometry permissions, notification integration, TLS verifier integration, launch resources and native source customizations. The iOS `project.yml` is the source for the Xcode project. Its app target uses `TARGETED_DEVICE_FAMILY: "1"` (iPhone only); preserve this setting when regenerating the Xcode project. Set your own Apple development team locally; use your own identifiers if distributing a fork. Android release signing is supplied separately.
 

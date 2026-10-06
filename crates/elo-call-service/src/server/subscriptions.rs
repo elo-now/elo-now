@@ -5,6 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub(super) type Grants = BTreeMap<Scope, (RecordId, Instant)>;
+#[derive(Default)]
+pub(super) struct Delegations(BTreeMap<Scope, crate::engine::DelegationLease>);
+impl Delegations {
+    pub(super) fn update(&mut self, scope: Scope, lease: Option<crate::engine::DelegationLease>) {
+        if let Some(lease) = lease {
+            self.0.insert(scope, lease);
+        } else {
+            self.0.remove(&scope);
+        }
+    }
+    pub(super) fn permits(&self, scope: Scope, head: RecordId, now: u64) -> bool {
+        self.0
+            .get(&scope)
+            .is_none_or(|lease| lease.permits(head, now))
+    }
+}
 pub(super) fn next_batch(
     scopes: &BTreeSet<Scope>,
     active: &BTreeSet<Scope>,
@@ -76,6 +92,25 @@ mod tests {
                 stream_id: elo_core::ids::StreamId::from_bytes([n; 16]),
             },
         }
+    }
+    #[test]
+    fn delegated_subscription_expires_without_a_new_command_and_cannot_follow_a_new_head() {
+        let head = RecordId::from_bytes([1; 32]);
+        let next = RecordId::from_bytes([2; 32]);
+        let mut bindings = Delegations::default();
+        bindings.update(
+            scope(1),
+            Some(crate::engine::DelegationLease {
+                config_id: head,
+                expires_at: 100,
+            }),
+        );
+        assert!(bindings.permits(scope(1), head, 99));
+        assert!(!bindings.permits(scope(1), head, 100));
+        assert!(!bindings.permits(scope(1), next, 99));
+        assert!(bindings.permits(scope(2), next, 100));
+        bindings.update(scope(1), None);
+        assert!(bindings.permits(scope(1), next, 100));
     }
     #[test]
     fn idle_checks_rotate_without_starving_an_active_call_or_later_chats() {

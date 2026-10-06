@@ -38,6 +38,7 @@ fn session_becomes_ready_only_after_the_initiators_first_media_and_stays_ready_w
                 &f.peer,
                 Operation::Join {
                     call_id: id.clone(),
+                    invitation_id: None,
                 },
                 NOW,
             ),
@@ -116,7 +117,14 @@ fn concurrent_start_intents_share_one_call_and_identity_uses_only_one_device() {
         assert_eq!(registry.presence(&scope).unwrap().call_id, id);
         assert_eq!(registry.presence(&scope).unwrap().participants.len(), 2);
         registry.apply(&f.authority, &peer_start, NOW + 1).unwrap();
-        let other_device = f.command(&f.peer_device, Operation::Join { call_id: id }, NOW);
+        let other_device = f.command(
+            &f.peer_device,
+            Operation::Join {
+                call_id: id,
+                invitation_id: None,
+            },
+            NOW,
+        );
         assert!(matches!(
             registry.apply(&f.authority, &other_device, NOW),
             Err(CallError::AlreadyJoined)
@@ -145,6 +153,7 @@ fn media_leases_participant_limits_and_timeouts_are_enforced() {
                 &f.peer,
                 Operation::Join {
                     call_id: id.clone(),
+                    invitation_id: None,
                 },
                 NOW,
             ),
@@ -157,7 +166,8 @@ fn media_leases_participant_limits_and_timeouts_are_enforced() {
             &f.command(
                 &f.third,
                 Operation::Join {
-                    call_id: id.clone()
+                    call_id: id.clone(),
+                    invitation_id: None
                 },
                 NOW
             ),
@@ -204,14 +214,18 @@ fn media_leases_participant_limits_and_timeouts_are_enforced() {
 }
 
 #[test]
-fn direct_session_waits_for_a_deliberate_join_without_a_ring_deadline() {
+fn direct_ring_deadline_is_bounded_even_while_caller_heartbeats() {
     let f = Fixture::new(true);
     let mut registry = Registry::new(Limits::default()).unwrap();
     let command = f.command(&f.owner, start(CallKind::Direct), NOW);
     registry.apply(&f.authority, &command, NOW).unwrap();
     let scope = Scope::from(&command);
-    let id = registry.presence(&scope).unwrap().call_id.clone();
-    for elapsed in (15..=180).step_by(15) {
+    let call = registry.presence(&scope).unwrap();
+    let id = call.call_id.clone();
+    assert_eq!(call.phase, elo_call_service::registry::Phase::Ringing);
+    assert_eq!(call.ring_expires_at, NOW + 60);
+    assert_eq!(call.invitations.len(), 1);
+    for elapsed in [15, 30, 45, 59] {
         registry
             .apply(
                 &f.authority,
@@ -226,40 +240,37 @@ fn direct_session_waits_for_a_deliberate_join_without_a_ring_deadline() {
             )
             .unwrap();
         assert!(registry.tick(NOW + elapsed).is_empty());
-        assert_eq!(registry.presence(&scope).unwrap().participants.len(), 1);
     }
-    let state = serde_json::to_value(registry.presence(&scope).unwrap()).unwrap();
-    assert!(state.get("ringing").is_none());
-    assert!(
-        serde_json::from_value::<Operation>(serde_json::json!({
-            "type":"decline", "call_id":id,
-        }))
-        .is_err()
-    );
-    registry
-        .apply(
+    assert!(matches!(
+        registry.tick(NOW + 60).as_slice(),
+        [Event::Ended {
+            reason: elo_call_service::registry::EndReason::Unanswered,
+            ..
+        }]
+    ));
+    assert!(registry.presence(&scope).is_none());
+    assert!(matches!(
+        registry.apply(
             &f.authority,
             &f.command(
                 &f.peer,
                 Operation::Join {
-                    call_id: id.clone(),
+                    call_id: id,
+                    invitation_id: None
                 },
-                NOW + 181,
+                NOW + 61
             ),
-            NOW + 181,
-        )
-        .unwrap();
-    let session = registry.presence(&scope).unwrap();
-    assert_eq!(session.call_id, id);
-    assert_eq!(session.participants.len(), 2);
-    assert_eq!(session.key_epoch, 2);
+            NOW + 61
+        ),
+        Err(CallError::Ended)
+    ));
 }
 
 #[test]
-fn direct_leave_keeps_the_other_participant_and_allows_rejoining() {
-    let f = Fixture::new(true);
+fn group_leave_keeps_the_other_participant_and_allows_rejoining() {
+    let f = Fixture::new(false);
     let mut registry = Registry::new(Limits::default()).unwrap();
-    let command = f.command(&f.owner, start(CallKind::Direct), NOW);
+    let command = f.command(&f.owner, start(CallKind::Group), NOW);
     registry.apply(&f.authority, &command, NOW).unwrap();
     let scope = Scope::from(&command);
     let id = registry.presence(&scope).unwrap().call_id.clone();
@@ -270,6 +281,7 @@ fn direct_leave_keeps_the_other_participant_and_allows_rejoining() {
                 &f.peer,
                 Operation::Join {
                     call_id: id.clone(),
+                    invitation_id: None,
                 },
                 NOW,
             ),
@@ -301,6 +313,7 @@ fn direct_leave_keeps_the_other_participant_and_allows_rejoining() {
                 &f.owner,
                 Operation::Join {
                     call_id: id.clone(),
+                    invitation_id: None,
                 },
                 NOW + 2,
             ),
@@ -357,13 +370,100 @@ fn direct_leave_keeps_the_other_participant_and_allows_rejoining() {
 }
 
 #[test]
-fn direct_network_loss_keeps_the_room_until_every_participant_expires_and_grace_passes() {
+fn direct_hangup_and_peer_expiry_end_the_complete_attempt() {
+    for explicit in [true, false] {
+        let f = Fixture::new(true);
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        let command = f.command(&f.owner, start(CallKind::Direct), NOW);
+        let scope = Scope::from(&command);
+        registry.apply(&f.authority, &command, NOW).unwrap();
+        let call = registry.presence(&scope).unwrap();
+        let id = call.call_id.clone();
+        let invitation_id = call.invitations[&f.peer.identity_id()]
+            .invitation_id
+            .clone();
+        registry
+            .apply(
+                &f.authority,
+                &f.command(
+                    &f.peer,
+                    Operation::Join {
+                        call_id: id.clone(),
+                        invitation_id: Some(invitation_id),
+                    },
+                    NOW + 1,
+                ),
+                NOW + 1,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.presence(&scope).unwrap().phase,
+            elo_call_service::registry::Phase::Active
+        );
+        let events = if explicit {
+            registry
+                .apply(
+                    &f.authority,
+                    &f.command(&f.peer, Operation::Leave { call_id: id }, NOW + 2),
+                    NOW + 2,
+                )
+                .unwrap()
+        } else {
+            registry
+                .apply(
+                    &f.authority,
+                    &f.command(&f.owner, Operation::Heartbeat { call_id: id }, NOW + 20),
+                    NOW + 20,
+                )
+                .unwrap();
+            registry.tick(NOW + 31)
+        };
+        assert!(matches!(events.as_slice(), [Event::Ended { .. }]));
+        assert!(registry.presence(&scope).is_none());
+    }
+}
+
+#[test]
+fn direct_decline_cancel_and_answer_are_identity_and_attempt_bound() {
     let f = Fixture::new(true);
     let mut registry = Registry::new(Limits::default()).unwrap();
     let command = f.command(&f.owner, start(CallKind::Direct), NOW);
-    registry.apply(&f.authority, &command, NOW).unwrap();
     let scope = Scope::from(&command);
-    let id = registry.presence(&scope).unwrap().call_id.clone();
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let call = registry.presence(&scope).unwrap();
+    let id = call.call_id.clone();
+    let invitation_id = call.invitations[&f.peer.identity_id()]
+        .invitation_id
+        .clone();
+    let decline = Operation::Decline {
+        call_id: id.clone(),
+        invitation_id: invitation_id.clone(),
+    };
+    assert!(
+        registry
+            .apply(
+                &f.authority,
+                &f.command(&f.owner, decline.clone(), NOW),
+                NOW
+            )
+            .is_err()
+    );
+    assert!(
+        registry
+            .apply(
+                &f.authority,
+                &f.command(
+                    &f.peer,
+                    Operation::Cancel {
+                        call_id: id.clone()
+                    },
+                    NOW
+                ),
+                NOW
+            )
+            .is_err()
+    );
+    // Answer on one device consumes the attempt; the other cannot reject it.
     registry
         .apply(
             &f.authority,
@@ -371,53 +471,140 @@ fn direct_network_loss_keeps_the_room_until_every_participant_expires_and_grace_
                 &f.peer,
                 Operation::Join {
                     call_id: id.clone(),
+                    invitation_id: Some(invitation_id),
                 },
-                NOW,
+                NOW + 1,
             ),
-            NOW,
+            NOW + 1,
         )
         .unwrap();
+    assert!(
+        registry
+            .apply(
+                &f.authority,
+                &f.command(&f.peer_device, decline, NOW + 2),
+                NOW + 2
+            )
+            .is_err()
+    );
+    assert_eq!(registry.presence(&scope).unwrap().participants.len(), 2);
     registry
         .apply(
             &f.authority,
-            &f.command(
-                &f.owner,
-                Operation::Heartbeat {
-                    call_id: id.clone(),
-                },
-                NOW + 20,
-            ),
-            NOW + 20,
+            &f.command(&f.owner, Operation::End { call_id: id }, NOW + 3),
+            NOW + 3,
         )
         .unwrap();
-    assert!(matches!(
-        registry.tick(NOW + 30).as_slice(),
-        [Event::Presence { .. }]
-    ));
-    let session = registry.presence(&scope).unwrap();
-    assert_eq!(session.participants.len(), 1);
-    assert!(session.participants.contains_key(&f.owner.identity_id()));
-    assert_eq!(session.key_epoch, 3);
-    registry.tick(NOW + 50);
-    assert!(registry.presence(&scope).unwrap().participants.is_empty());
-    // A new deliberate join can recover a temporarily empty session.
+    for declined in [true, false] {
+        registry
+            .apply(
+                &f.authority,
+                &f.command(&f.owner, start(CallKind::Direct), NOW + 4),
+                NOW + 4,
+            )
+            .unwrap();
+        let call = registry.presence(&scope).unwrap();
+        let operation = if declined {
+            Operation::Decline {
+                call_id: call.call_id.clone(),
+                invitation_id: call.invitations[&f.peer.identity_id()]
+                    .invitation_id
+                    .clone(),
+            }
+        } else {
+            Operation::Cancel {
+                call_id: call.call_id.clone(),
+            }
+        };
+        let sender = if declined { &f.peer_device } else { &f.owner };
+        let events = registry
+            .apply(
+                &f.authority,
+                &f.command(sender, operation, NOW + 5),
+                NOW + 5,
+            )
+            .unwrap();
+        assert!(matches!(events.as_slice(), [Event::Ended { .. }]));
+        assert!(registry.presence(&scope).is_none());
+    }
+}
+
+#[test]
+fn group_invitations_are_explicit_dismissible_and_old_declines_cannot_clear_new_attempts() {
+    let f = Fixture::new(false);
+    let mut registry = Registry::new(Limits::default()).unwrap();
+    let command = f.command(&f.owner, start(CallKind::Group), NOW);
+    let scope = Scope::from(&command);
+    registry.apply(&f.authority, &command, NOW).unwrap();
+    let id = registry.presence(&scope).unwrap().call_id.clone();
+    assert!(registry.presence(&scope).unwrap().invitations.is_empty());
+    let invite = Operation::Invite {
+        call_id: id.clone(),
+        to: f.peer.identity_id(),
+    };
+    assert!(
+        registry
+            .apply(&f.authority, &f.command(&f.third, invite.clone(), NOW), NOW)
+            .is_err()
+    );
+    registry
+        .apply(&f.authority, &f.command(&f.owner, invite.clone(), NOW), NOW)
+        .unwrap();
+    let first = registry.presence(&scope).unwrap().invitations[&f.peer.identity_id()]
+        .invitation_id
+        .clone();
     registry
         .apply(
             &f.authority,
-            &f.command(&f.peer, Operation::Join { call_id: id }, NOW + 60),
-            NOW + 60,
+            &f.command(&f.owner, invite.clone(), NOW + 1),
+            NOW + 1,
         )
         .unwrap();
-    assert!(registry.tick(NOW + 65).is_empty());
+    assert_eq!(
+        registry.presence(&scope).unwrap().invitations[&f.peer.identity_id()].invitation_id,
+        first
+    );
+    let decline = Operation::Decline {
+        call_id: id.clone(),
+        invitation_id: first.clone(),
+    };
+    registry
+        .apply(
+            &f.authority,
+            &f.command(&f.peer, decline.clone(), NOW + 2),
+            NOW + 2,
+        )
+        .unwrap();
     assert_eq!(registry.presence(&scope).unwrap().participants.len(), 1);
-    registry.tick(NOW + 90);
-    assert!(registry.presence(&scope).unwrap().participants.is_empty());
-    assert!(registry.tick(NOW + 104).is_empty());
-    assert!(matches!(
-        registry.tick(NOW + 105).as_slice(),
-        [Event::Ended { .. }]
-    ));
-    assert!(registry.presence(&scope).is_none());
+    registry
+        .apply(&f.authority, &f.command(&f.owner, invite, NOW + 3), NOW + 3)
+        .unwrap();
+    assert!(
+        registry
+            .apply(
+                &f.authority,
+                &f.command(&f.peer_device, decline, NOW + 4),
+                NOW + 4
+            )
+            .is_err()
+    );
+    assert!(
+        registry
+            .apply(
+                &f.authority,
+                &f.command(
+                    &f.peer,
+                    Operation::Join {
+                        call_id: id,
+                        invitation_id: Some(first)
+                    },
+                    NOW + 4
+                ),
+                NOW + 4
+            )
+            .is_err()
+    );
+    assert_eq!(registry.presence(&scope).unwrap().invitations.len(), 1);
 }
 
 #[test]
@@ -459,6 +646,7 @@ fn hosted_space_contexts_do_not_share_presence_or_signals() {
     );
     other.operation = Operation::Join {
         call_id: id.clone(),
+        invitation_id: None,
     };
     assert!(matches!(
         registry.apply(&f.authority, &other, NOW),
@@ -634,6 +822,7 @@ fn configuration_forks_remain_blocked_after_service_restart() {
         .apply_config(configuration.sign(f.owner.signing_key()).unwrap())
         .unwrap();
     let request = Request {
+        delegation: None,
         command: STANDARD.encode(
             calls::sign_command(
                 &branch,
@@ -757,20 +946,9 @@ fn an_idle_live_subscription_retains_authority_until_the_subscriber_disconnects(
     assert_eq!(started.call.unwrap().participants.len(), 1);
     assert!(engine.authorized(scope, f.peer.credential().id()));
     engine.maintain(NOW + 400).unwrap();
-    // Detecting the last expired participant starts the empty-session grace.
-    // Its public authority remains available until that grace finishes.
-    assert!(
-        engine
-            .registry
-            .presence(&scope)
-            .unwrap()
-            .participants
-            .is_empty()
-    );
-    assert!(engine.authorized(scope, f.peer.credential().id()));
-    engine
-        .maintain(NOW + 400 + Limits::default().empty_grace)
-        .unwrap();
+    // A direct ringing attempt terminates immediately at its deadline;
+    // unlike a group, it has no empty-room grace to retain the proof.
+    assert!(engine.registry.presence(&scope).is_none());
     assert!(!engine.authorized(scope, f.peer.credential().id()));
 }
 
@@ -837,6 +1015,7 @@ fn compact_checkpoints_keep_rollback_and_fork_floors_after_restart() {
     let prepared = engine
         .prepare(
             elo_call_service::engine::Request {
+                delegation: None,
                 command: old.command.clone(),
                 proof: old.proof.clone(),
             },
@@ -856,6 +1035,7 @@ fn compact_checkpoints_keep_rollback_and_fork_floors_after_restart() {
     let prepared = engine
         .prepare(
             elo_call_service::engine::Request {
+                delegation: None,
                 command: current.command.clone(),
                 proof: current.proof.clone(),
             },
@@ -975,6 +1155,7 @@ fn an_old_controller_cannot_invent_checkpoint_ancestry_to_undo_recovery() {
     let prepared = engine
         .prepare(
             elo_call_service::engine::Request {
+                delegation: None,
                 command: STANDARD.encode(command.bytes()),
                 proof: Some(proof),
             },
@@ -986,4 +1167,326 @@ fn an_old_controller_cannot_invent_checkpoint_ancestry_to_undo_recovery() {
         engine.execute(prepared, NOW),
         Err(CallError::Unauthorized)
     ));
+}
+
+#[test]
+fn delegated_answer_uses_parent_admission_and_cannot_swap_an_active_media_key() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_call_service::engine::Request;
+    use elo_core::calls::delegation::CallDelegate;
+    let f = Fixture::new(true);
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(
+        &temp.path().join("calls.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let started = engine
+        .prepare(
+            f.request(&f.owner, start(CallKind::Direct), NOW, true),
+            None,
+            NOW,
+        )
+        .unwrap();
+    let call = engine.execute(started, NOW).unwrap().call.unwrap();
+    let first =
+        CallDelegate::create(&f.authority, &f.peer, f.authority.space(), AUDIENCE, NOW).unwrap();
+    let second =
+        CallDelegate::create(&f.authority, &f.peer, f.authority.space(), AUDIENCE, NOW).unwrap();
+    let request = |delegate: &CallDelegate, operation: Operation, time| Request {
+        command: STANDARD.encode(
+            delegate
+                .sign_command(&f.authority, operation, time)
+                .unwrap()
+                .bytes(),
+        ),
+        proof: Some(f.authority.call_proof().unwrap()),
+        delegation: Some(STANDARD.encode(delegate.certificate().bytes())),
+    };
+    let join = Operation::Join {
+        call_id: call.call_id.clone(),
+        invitation_id: Some(
+            call.invitations[&f.peer.identity_id()]
+                .invitation_id
+                .clone(),
+        ),
+    };
+    let prepared = engine
+        .prepare(request(&first, join.clone(), NOW + 1), None, NOW + 1)
+        .unwrap();
+    let joined = engine.execute(prepared, NOW + 1).unwrap().call.unwrap();
+    assert_eq!(
+        joined.participants[&f.peer.identity_id()]
+            .delegation
+            .as_deref(),
+        Some(STANDARD.encode(first.certificate().bytes()).as_str())
+    );
+    let heartbeat = Operation::Heartbeat {
+        call_id: call.call_id.clone(),
+    };
+    let prepared = engine
+        .prepare(request(&second, heartbeat.clone(), NOW + 2), None, NOW + 2)
+        .unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW + 2),
+        Err(CallError::AlreadyJoined)
+    ));
+    let prepared = engine
+        .prepare(request(&second, join, NOW + 2), None, NOW + 2)
+        .unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW + 2),
+        Err(CallError::AlreadyJoined)
+    ));
+    let prepared = engine
+        .prepare(
+            request(
+                &second,
+                Operation::End {
+                    call_id: call.call_id.clone(),
+                },
+                NOW + 3,
+            ),
+            None,
+            NOW + 3,
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW + 3),
+        Err(CallError::AlreadyJoined)
+    ));
+    let prepared = engine
+        .prepare(request(&first, heartbeat, NOW + 3), None, NOW + 3)
+        .unwrap();
+    assert!(engine.execute(prepared, NOW + 3).is_ok());
+    let prepared = engine
+        .prepare(
+            request(
+                &first,
+                Operation::End {
+                    call_id: call.call_id,
+                },
+                NOW + 4,
+            ),
+            None,
+            NOW + 4,
+        )
+        .unwrap();
+    assert!(engine.execute(prepared, NOW + 4).unwrap().call.is_none());
+}
+
+#[test]
+fn original_device_can_control_its_delegate_without_replacing_the_media_transport() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_call_service::engine::Request;
+    use elo_core::calls::delegation::CallDelegate;
+    let f = Fixture::new(false);
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(
+        &temp.path().join("calls.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let prepared = engine
+        .prepare(
+            f.request(&f.owner, start(CallKind::Group), NOW, true),
+            None,
+            NOW,
+        )
+        .unwrap();
+    let initial = engine.execute(prepared, NOW).unwrap().call.unwrap();
+    let delegate =
+        CallDelegate::create(&f.authority, &f.peer, f.authority.space(), AUDIENCE, NOW).unwrap();
+    let other =
+        CallDelegate::create(&f.authority, &f.peer, f.authority.space(), AUDIENCE, NOW).unwrap();
+    let delegated = |delegate: &CallDelegate, operation| Request {
+        command: STANDARD.encode(
+            delegate
+                .sign_command(&f.authority, operation, NOW + 1)
+                .unwrap()
+                .bytes(),
+        ),
+        proof: Some(f.authority.call_proof().unwrap()),
+        delegation: Some(STANDARD.encode(delegate.certificate().bytes())),
+    };
+    let prepared = engine
+        .prepare(
+            delegated(
+                &delegate,
+                Operation::Join {
+                    call_id: initial.call_id.clone(),
+                    invitation_id: None,
+                },
+            ),
+            None,
+            NOW + 1,
+        )
+        .unwrap();
+    engine.execute(prepared, NOW + 1).unwrap();
+    let media = Operation::Media {
+        call_id: initial.call_id.clone(),
+        state: MediaState {
+            audio_muted: false,
+            video_published: true,
+            screen_published: false,
+        },
+    };
+    let prepared = engine
+        .prepare(delegated(&other, media.clone()), None, NOW + 1)
+        .unwrap();
+    assert!(matches!(
+        engine.execute(prepared, NOW + 1),
+        Err(CallError::AlreadyJoined)
+    ));
+    for operation in [
+        media,
+        Operation::Invite {
+            call_id: initial.call_id.clone(),
+            to: f.third.identity_id(),
+        },
+    ] {
+        // A paired device of the same identity is not the admitted device.
+        let prepared = engine
+            .prepare(
+                f.request(&f.peer_device, operation.clone(), NOW + 2, true),
+                None,
+                NOW + 2,
+            )
+            .unwrap();
+        assert!(engine.execute(prepared, NOW + 2).is_err());
+        let prepared = engine
+            .prepare(f.request(&f.peer, operation, NOW + 2, true), None, NOW + 2)
+            .unwrap();
+        let call = engine.execute(prepared, NOW + 2).unwrap().call.unwrap();
+        assert_eq!(
+            call.participants[&f.peer.identity_id()]
+                .delegation
+                .as_deref(),
+            Some(STANDARD.encode(delegate.certificate().bytes()).as_str())
+        );
+        assert_eq!(call.key_epoch, 2);
+        assert!(
+            call.participants[&f.peer.identity_id()]
+                .media
+                .video_published
+        );
+    }
+    for operation in [
+        Operation::Heartbeat {
+            call_id: initial.call_id.clone(),
+        },
+        Operation::ConnectMedia {
+            call_id: initial.call_id.clone(),
+        },
+        Operation::Join {
+            call_id: initial.call_id.clone(),
+            invitation_id: None,
+        },
+        Operation::Signal {
+            call_id: initial.call_id.clone(),
+            epoch: 2,
+            to: f.owner.credential().id(),
+            ciphertext: STANDARD.encode(b"synthetic"),
+        },
+    ] {
+        let prepared = engine
+            .prepare(f.request(&f.peer, operation, NOW + 3, true), None, NOW + 3)
+            .unwrap();
+        assert!(matches!(
+            engine.execute(prepared, NOW + 3),
+            Err(CallError::AlreadyJoined)
+        ));
+    }
+    let prepared = engine
+        .prepare(
+            delegated(
+                &delegate,
+                Operation::Heartbeat {
+                    call_id: initial.call_id,
+                },
+            ),
+            None,
+            NOW + 3,
+        )
+        .unwrap();
+    let call = engine.execute(prepared, NOW + 3).unwrap().call.unwrap();
+    assert!(call.invitations.contains_key(&f.third.identity_id()));
+}
+
+#[test]
+fn delegated_participant_lease_expires_even_with_a_recent_heartbeat() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_call_service::engine::Request;
+    use elo_core::calls::delegation::{CallDelegate, MAX_DELEGATION_TTL};
+    let f = Fixture::new(true);
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(
+        &temp.path().join("calls.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let prepared = engine
+        .prepare(
+            f.request(&f.owner, start(CallKind::Direct), NOW, true),
+            None,
+            NOW,
+        )
+        .unwrap();
+    let call = engine.execute(prepared, NOW).unwrap().call.unwrap();
+    let delegate = CallDelegate::create(
+        &f.authority,
+        &f.peer,
+        f.authority.space(),
+        AUDIENCE,
+        NOW - MAX_DELEGATION_TTL + 5,
+    )
+    .unwrap();
+    let request = |operation, time| Request {
+        command: STANDARD.encode(
+            delegate
+                .sign_command(&f.authority, operation, time)
+                .unwrap()
+                .bytes(),
+        ),
+        proof: Some(f.authority.call_proof().unwrap()),
+        delegation: Some(STANDARD.encode(delegate.certificate().bytes())),
+    };
+    let prepared = engine
+        .prepare(
+            request(
+                Operation::Join {
+                    call_id: call.call_id.clone(),
+                    invitation_id: None,
+                },
+                NOW + 1,
+            ),
+            None,
+            NOW + 1,
+        )
+        .unwrap();
+    engine.execute(prepared, NOW + 1).unwrap();
+    let prepared = engine
+        .prepare(
+            request(
+                Operation::Heartbeat {
+                    call_id: call.call_id.clone(),
+                },
+                NOW + 4,
+            ),
+            None,
+            NOW + 4,
+        )
+        .unwrap();
+    engine.execute(prepared, NOW + 4).unwrap();
+    assert!(matches!(
+        &engine.maintain(NOW + 5).unwrap()[..],
+        [Event::Ended {
+            reason: elo_call_service::registry::EndReason::Expired,
+            ..
+        }]
+    ));
+    assert!(engine.registry.presence(&call.scope).is_none());
 }

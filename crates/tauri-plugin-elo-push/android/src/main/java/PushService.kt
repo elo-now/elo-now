@@ -23,6 +23,10 @@ class PushService : FirebaseMessagingService() {
     }
     override fun onMessageReceived(message: RemoteMessage) {
         if (!prefs.getBoolean("enabled", false) || !PushRegistrations.contains(prefs, message.data["elo_registration"])) return
+        if (message.data["elo_ring"] == "1") {
+            IncomingCalls.receive(this, message.data)
+            return
+        }
         // Legacy call pushes cannot start capture or interrupt the user.
         if (message.data["elo_call"] == "1") return
         val challenge = message.data["elo_challenge"]

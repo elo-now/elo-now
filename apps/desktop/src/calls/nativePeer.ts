@@ -2,7 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { ActiveCall, MediaAdapter, MediaState, MediaTile } from "./types";
 
 export const usesNativePeer = () =>
-  isTauri() && /iPhone|iPad|iPod/.test(navigator.userAgent);
+  isTauri() && /Android|iPhone|iPad|iPod/.test(navigator.userAgent);
 export type NativeRequest = (request: Record<string, unknown>) => Promise<any>;
 const request =
   (identity: string): NativeRequest =>
@@ -38,15 +38,20 @@ export class NativePeer implements MediaAdapter {
     private presence: (call: ActiveCall) => void,
     transport?: NativeRequest,
     context?: Record<string, unknown>,
+    adoption?: { sessionId: string },
   ) {
-    this.id = crypto.randomUUID();
+    this.id = adoption?.sessionId ?? crypto.randomUUID();
     this.invoke = transport ?? request(identity);
-    this.ready = this.invoke({
-      op: "start",
-      id: this.id,
-      ice_servers: [],
-      context,
-    }).then(async () => {
+    this.ready = (
+      adoption
+        ? Promise.resolve()
+        : this.invoke({
+            op: "start",
+            id: this.id,
+            ice_servers: [],
+            context,
+          })
+    ).then(async () => {
       if (!this.stopped) void this.poll();
     });
   }
@@ -82,7 +87,8 @@ export class NativePeer implements MediaAdapter {
             (track: {
               id: string;
               local: boolean;
-              source: "camera" | "screen";
+              source: "camera" | "screen" | "audio";
+              credential?: string;
             }) => {
               live.add(track.id);
               let stream = this.streams.get(track.id);
@@ -93,7 +99,8 @@ export class NativePeer implements MediaAdapter {
               return {
                 ...track,
                 stream,
-                credential: track.local ? this.local : this.remote,
+                credential:
+                  track.credential ?? (track.local ? this.local : this.remote),
                 native: {
                   session: this.id,
                   revision: state.revision,
@@ -141,11 +148,17 @@ export class NativePeer implements MediaAdapter {
     this.speakerMuted = muted;
     await this.command({ op: "speaker", muted });
   }
-  async stop() {
+  async setParticipantMuted(credential: string, muted: boolean) {
+    await this.command({ op: "speaker", credential, muted });
+  }
+  detach() {
     this.stopped = true;
     clearTimeout(this.timer);
-    this.tiles([]);
     this.streams.clear();
+  }
+  async stop() {
+    this.detach();
+    this.tiles([]);
     // A pending start must finish before its matching stop; never close a successor.
     await this.ready.catch(() => {});
     await this.invoke({ op: "stop", id: this.id }).catch(() => {});

@@ -1,24 +1,31 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { expect, it } from "vitest";
-import { BlockingProvider, BlockUserAction, BlockedUsers } from "./BlockedUsers";
+import {
+  BlockingProvider,
+  BlockUserAction,
+  BlockedUsers,
+} from "./BlockedUsers";
 import { t } from "./i18n";
 import type { View } from "./model";
 
 const view = {
   identity: "me",
-  streams: [{
-    is_general: true,
-    controller: "service-key",
-    members: [{ identity_id: "service", credential_ids: ["service-key"] }],
-  }],
+  streams: [
+    {
+      is_general: true,
+      controller: "service-key",
+      members: [{ identity_id: "service", credential_ids: ["service-key"] }],
+    },
+  ],
 } as unknown as View;
 
 it("hides service blocking actions while allowing an ordinary person with the same name", () => {
-  const render = (identity: string) => renderToStaticMarkup(
-    <BlockingProvider view={view} onChange={async () => {}}>
-      <BlockUserAction identity={identity} name="elo.now" />
-    </BlockingProvider>,
-  );
+  const render = (identity: string) =>
+    renderToStaticMarkup(
+      <BlockingProvider view={view} onChange={async () => {}}>
+        <BlockUserAction identity={identity} name="elo.now" />
+      </BlockingProvider>,
+    );
   expect(render("service")).toBe("");
   expect(render("person")).toContain(t("blocking.block"));
 });

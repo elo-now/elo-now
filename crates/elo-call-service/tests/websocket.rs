@@ -123,6 +123,7 @@ async fn native_state_read_requires_signed_subscribe_and_current_admission_witho
         &f.peer,
         Operation::Join {
             call_id: call_id.clone(),
+            invitation_id: None,
         },
         now(),
         true,
@@ -437,4 +438,177 @@ async fn later_subscriptions_receive_calls_but_staggering_never_bypasses_admissi
     .unwrap();
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn direct_ring_answer_and_decline_reach_every_signed_device_subscription() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_core::calls::delegation::CallDelegate;
+    let f = Fixture::new(true);
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let service = Service::new(engine, Arc::new(Gate(AtomicBool::new(true))), 8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
+    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let (mut owner, _) = connect_async(&url).await.unwrap();
+    let (mut peer, _) = connect_async(&url).await.unwrap();
+    let (mut sibling, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut peer,
+        f.request(&f.peer, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut peer, "result").await;
+    submit(
+        &mut sibling,
+        f.request(&f.peer_device, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut sibling, "result").await;
+    submit(
+        &mut owner,
+        f.request(
+            &f.owner,
+            Operation::Start {
+                kind: CallKind::Direct,
+                initial_media: InitialMedia::Audio,
+            },
+            now(),
+            true,
+        ),
+    )
+    .await;
+    let first = receive(&mut owner, "result").await;
+    let id = first["call"]["call_id"].as_str().unwrap().to_owned();
+    let invitation =
+        first["call"]["invitations"][f.peer.identity_id().to_string()]["invitation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    for socket in [&mut peer, &mut sibling] {
+        let event = receive(socket, "presence").await;
+        assert_eq!(event["call"]["phase"], "ringing");
+        assert_eq!(event["call"]["call_id"], id);
+    }
+    submit(
+        &mut sibling,
+        f.request(
+            &f.peer_device,
+            Operation::Decline {
+                call_id: id.clone(),
+                invitation_id: invitation,
+            },
+            now(),
+            false,
+        ),
+    )
+    .await;
+    receive(&mut sibling, "result").await;
+    for socket in [&mut owner, &mut peer, &mut sibling] {
+        let event = receive(socket, "ended").await;
+        assert_eq!(event["call_id"], id);
+        assert_eq!(event["reason"], "declined");
+    }
+    submit(
+        &mut owner,
+        f.request(
+            &f.owner,
+            Operation::Start {
+                kind: CallKind::Direct,
+                initial_media: InitialMedia::Video,
+            },
+            now(),
+            false,
+        ),
+    )
+    .await;
+    let second = receive(&mut owner, "result").await;
+    receive(&mut owner, "presence").await;
+    let id = second["call"]["call_id"].as_str().unwrap().to_owned();
+    let invitation =
+        second["call"]["invitations"][f.peer.identity_id().to_string()]["invitation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    receive(&mut peer, "presence").await;
+    receive(&mut sibling, "presence").await;
+    let delegate =
+        CallDelegate::create(&f.authority, &f.peer, f.authority.space(), AUDIENCE, now()).unwrap();
+    submit(
+        &mut peer,
+        elo_call_service::engine::Request {
+            command: STANDARD.encode(
+                delegate
+                    .sign_command(
+                        &f.authority,
+                        Operation::Join {
+                            call_id: id.clone(),
+                            invitation_id: Some(invitation.clone()),
+                        },
+                        now(),
+                    )
+                    .unwrap()
+                    .bytes(),
+            ),
+            delegation: Some(STANDARD.encode(delegate.certificate().bytes())),
+            proof: None,
+        },
+    )
+    .await;
+    let answered = receive(&mut peer, "result").await;
+    assert_eq!(answered["call"]["phase"], "active");
+    assert!(
+        answered["call"]["invitations"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        answered["call"]["participants"][f.peer.identity_id().to_string()]["delegation"],
+        STANDARD.encode(delegate.certificate().bytes())
+    );
+    for socket in [&mut owner, &mut sibling] {
+        let event = receive(socket, "presence").await;
+        assert_eq!(event["call"]["phase"], "active");
+    }
+    // Another device's late decline must not terminate the answered attempt.
+    submit(
+        &mut sibling,
+        f.request(
+            &f.peer_device,
+            Operation::Decline {
+                call_id: id.clone(),
+                invitation_id: invitation,
+            },
+            now(),
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(receive(&mut sibling, "error").await["code"], "invalid");
+    submit(
+        &mut owner,
+        f.request(
+            &f.owner,
+            Operation::End {
+                call_id: id.clone(),
+            },
+            now(),
+            false,
+        ),
+    )
+    .await;
+    receive(&mut owner, "result").await;
+    for socket in [&mut owner, &mut peer, &mut sibling] {
+        let event = receive(socket, "ended").await;
+        assert_eq!(event["call_id"], id);
+        assert_eq!(event["reason"], "ended");
+    }
+    task.abort();
 }

@@ -70,10 +70,12 @@ mod groups;
 mod history_reader;
 mod hosting_services;
 mod invitations;
+mod local_deletion;
 mod membership;
 mod message_actions;
 mod message_audit;
 pub mod pairing;
+mod password;
 #[cfg(test)]
 mod performance;
 mod presentation;
@@ -310,15 +312,15 @@ impl ClientApp {
         password: SecretString,
         allow_loopback: bool,
     ) -> Result<Self> {
+        // Vault recovery must not race a live client's password transaction.
+        let profile_lock = crate::store::lock_profile(&directory)?;
         let public: Value =
             serde_json::from_slice(&vault::read_private(&directory.join("profile.json"))?)?;
         let expected: IdentityId = serde_json::from_value(public["identity_id"].clone())?;
-        let session = Session::open(
-            &vault::read_private(&directory.join("vault.age"))?,
-            password.clone(),
-            expected,
-        )?;
-        Self::open_session(directory, password, allow_loopback, session).await
+        let encrypted = vault::read_private(&directory.join("vault.age"))?;
+        let session = Session::open(&encrypted, password.clone(), expected)?;
+        password::recover_interrupted_change(&directory, &session, &password)?;
+        Self::open_locked_session(directory, password, allow_loopback, session, profile_lock).await
     }
     // A newly written Space can keep its authenticated session in memory. All
     // ordinary opens still decrypt the persisted vault in open_initialized.
@@ -327,6 +329,20 @@ impl ClientApp {
         password: SecretString,
         allow_loopback: bool,
         session: Session,
+        authenticated_vault: Vec<u8>,
+    ) -> Result<Self> {
+        let profile_lock = crate::store::lock_profile(&directory)?;
+        if vault::read_private(&directory.join("vault.age"))? != authenticated_vault {
+            return Err("profile_changed_while_opening".into());
+        }
+        Self::open_locked_session(directory, password, allow_loopback, session, profile_lock).await
+    }
+    async fn open_locked_session(
+        directory: PathBuf,
+        password: SecretString,
+        allow_loopback: bool,
+        session: Session,
+        profile_lock: std::fs::File,
     ) -> Result<Self> {
         let public: Value =
             serde_json::from_slice(&vault::read_private(&directory.join("profile.json"))?)?;
@@ -382,7 +398,7 @@ impl ClientApp {
             }
         };
         let profile_details = profile::ProfileDetails::load(&directory, &session)?;
-        let store = ClientStore::open(&directory).await?;
+        let store = ClientStore::open_locked(&directory, profile_lock).await?;
         let loaded: Result<Vec<_>> = async {
             let mut all = Vec::new();
             for (index, p) in pins.iter_mut().enumerate() {
@@ -587,8 +603,12 @@ impl ClientApp {
     async fn view_local_scope(&self, only: Option<StreamId>) -> Result<Value> {
         let mut streams = Vec::new();
         let direct = self.direct_summaries()?;
-        for (p, a) in self.pins.iter().zip(&self.authorities.0) {
+        for (index, (p, a)) in self.pins.iter().zip(&self.authorities.0).enumerate() {
             if only.is_some_and(|id| id != p.stream) {
+                continue;
+            }
+            let local_history = self.store.local_chat_state(p.space, p.stream).await?;
+            if local_history.hidden {
                 continue;
             }
             let seen = self.read.seen.get(&p.stream.to_string());
@@ -654,7 +674,7 @@ impl ClientApp {
                     && team.scope.stream == p.stream
                     && team.scope.root == p.root
             });
-            streams.push(json!({"name":p.name.clone(),"is_general":is_general,"owner_managed":a.is_owner_managed(),"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":if a.is_owner_managed() { json!(a.head()?.members.iter().filter(|member| member.capabilities.contains(&Capability::Manage)).map(|member| Owner { identity_id: member.identity_id, root_public_key: member.root_public_key.clone() }).collect::<Vec<_>>()) } else { a.genesis().body()["owners"].clone() },"rows":rows,"unread_count":unread_count,"followed_threads":self.private_thread_follows(p.stream,true),"unfollowed_threads":self.private_thread_follows(p.stream,false),"participating_threads":self.private_thread_participation(p.stream),"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":!is_general && !self.is_notes_authority(a) && self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
+            streams.push(json!({"can_delete_local":self.can_delete_chat_local(index)?,"history_generation":local_history.generation,"name":p.name.clone(),"is_general":is_general,"owner_managed":a.is_owner_managed(),"chat_kind":a.head()?.chat_kind.or(p.chat_kind),"direct_invitation":direct.get(&p.stream),"group":p.group,"created_at":p.created_at,"space":p.space,"stream":p.stream,"head":a.head_id(),"controller":a.controller().id(),"recovery":a.recovery_id(),"forked":!self.authorities.space_ready(a),"members":a.head()?.members,"member_names":member_names,"owners":if a.is_owner_managed() { json!(a.head()?.members.iter().filter(|member| member.capabilities.contains(&Capability::Manage)).map(|member| Owner { identity_id: member.identity_id, root_public_key: member.root_public_key.clone() }).collect::<Vec<_>>()) } else { a.genesis().body()["owners"].clone() },"rows":rows,"unread_count":unread_count,"followed_threads":self.private_thread_follows(p.stream,true),"unfollowed_threads":self.private_thread_follows(p.stream,false),"participating_threads":self.private_thread_participation(p.stream),"muted":self.read.muted_streams.contains(&p.stream),"can_manage_members":!is_general && !self.is_notes_authority(a) && self.require_controller(a).is_ok(),"can_post":!(a.head()?.chat_kind.or(p.chat_kind)==Some(ChatKind::Direct) && a.head()?.members.len()==2 && a.head()?.members.iter().any(|m|self.blocked.contains(m.identity_id))) && self.authorities.space_ready(a) && a.has(a.head_id().ok_or("head")?,self.session.identity_id(),Capability::Post) && a.head()?.members.iter().any(|m|m.credential_ids.contains(&self.session.credential().id()))}));
         }
         // A one-to-one title belongs to the other participant. Derive it from
         // verified names without rewriting historical signed chat records.
@@ -724,8 +744,24 @@ impl ClientApp {
             }
         }
         let s = self.store.stats().await?;
+        let removed_reminders = self
+            .store
+            .local_deleted_records(
+                self.read
+                    .reminders
+                    .iter()
+                    .map(|reminder| reminder.record)
+                    .collect(),
+            )
+            .await?;
+        let reminders = self
+            .read
+            .reminders
+            .iter()
+            .filter(|reminder| !removed_reminders.contains(&reminder.record))
+            .collect::<Vec<_>>();
         Ok(
-            json!({"blocked_users":self.blocked_view()?,"paged":self.presentation.enabled(),"contacts":self.contact_summary()?,"reminders":self.read.reminders,"identity":self.session.identity_id(),"name":self.profile_details.as_ref().map(|p| &p.name),"avatar":self.profile_details.as_ref().and_then(|p| p.avatar.as_ref()),"credential":self.session.credential().id(),"invitations":self.invitation_summary()?,"groups":self.groups,"streams":streams,"replicas":self.peers.iter().map(|p|json!({"id":p.id(),"mailbox":p.mailbox()})).collect::<Vec<_>>(),"counts":{"pending":s.pending,"stored":s.stored,"held":s.held,"rejected":s.rejected,"repair_pending":self.store.missing_copies().await?},"inbox":self.store.inbox_states().await?,"history_warning_code":"history_may_be_incomplete","history_warning":"History may be incomplete; the local head does not prove that other participants are up to date.","alpha_ready":false}),
+            json!({"blocked_users":self.blocked_view()?,"paged":self.presentation.enabled(),"contacts":self.contact_summary()?,"reminders":reminders,"identity":self.session.identity_id(),"name":self.profile_details.as_ref().map(|p| &p.name),"avatar":self.profile_details.as_ref().and_then(|p| p.avatar.as_ref()),"credential":self.session.credential().id(),"invitations":self.invitation_summary()?,"groups":self.groups,"streams":streams,"replicas":self.peers.iter().map(|p|json!({"id":p.id(),"mailbox":p.mailbox()})).collect::<Vec<_>>(),"counts":{"pending":s.pending,"stored":s.stored,"held":s.held,"rejected":s.rejected,"repair_pending":self.store.missing_copies().await?},"inbox":self.store.inbox_states().await?,"history_warning_code":"history_may_be_incomplete","history_warning":"History may be incomplete; the local head does not prove that other participants are up to date.","alpha_ready":false}),
         )
     }
     fn initial_genesis(session: &Session, card: &RecoveryCard) -> Result<SignedRecord> {
@@ -822,6 +858,23 @@ impl ClientApp {
         Ok(())
     }
     pub async fn operate(&mut self, v: Value) -> Result<Value> {
+        if v["op"] == "delete_chat_local" {
+            // Resolve the owning compartment before it is temporarily taken out
+            // for dispatch. Draft cleanup must finish before history commits.
+            let mut draft_request = v.clone();
+            if draft_request.get("expected_identity").is_none() {
+                draft_request["expected_identity"] = json!(self.identity_id());
+            }
+            if draft_request.get("expected_space").is_none() {
+                draft_request["expected_space"] = json!(self.active_space_id());
+            }
+            let scope = self.conversation_draft_scope(&draft_request)?;
+            let client = self.selected_space_client()?;
+            if !client.can_delete_chat_local(client.authority_index(&v)?)? {
+                return Err("This conversation cannot be removed from this device.".into());
+            }
+            self.delete_conversation_drafts(&scope)?;
+        }
         if matches!(v["op"].as_str(), Some("sync" | "sync_live")) {
             Box::pin(self.retry_device_revocations(false)).await?;
         }
@@ -877,6 +930,9 @@ impl ClientApp {
         result
     }
     async fn operate_local(&mut self, v: Value) -> Result<Value> {
+        if v["op"] == "delete_chat_local" {
+            return self.delete_local_chat(&v).await;
+        }
         if v["op"] == "call_notify_ready" {
             return self.notify_call_ready(&v).await;
         }

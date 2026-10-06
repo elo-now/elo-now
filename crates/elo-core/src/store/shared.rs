@@ -29,6 +29,7 @@ pub(super) async fn run(
     mut receiver: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<()>>,
     pool: Arc<Semaphore>,
+    lock: Option<File>,
 ) {
     let permit = pool
         .clone()
@@ -37,7 +38,7 @@ pub(super) async fn run(
         .expect("permanent SQLite pool");
     let opened = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        open_connection(&path)
+        open_connection(&path, lock)
     })
     .await;
     let mut state = match opened {
@@ -122,9 +123,15 @@ mod tests {
         let mut stores = Vec::new();
         for index in 0..24 {
             let path = temp.path().join(index.to_string());
+            let lock = if index % 2 == 0 {
+                fs::create_dir(&path).unwrap();
+                Some(lock_profile(&path).unwrap())
+            } else {
+                None
+            };
             let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
             let (ready, result) = oneshot::channel();
-            tokio::spawn(run(path, receiver, ready, pool.clone()));
+            tokio::spawn(run(path, receiver, ready, pool.clone(), lock));
             result.await.unwrap().unwrap();
             stores.push(ClientStore { sender });
         }

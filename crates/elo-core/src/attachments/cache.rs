@@ -65,6 +65,26 @@ fn name(hash: &str) -> std::io::Result<String> {
     Ok(format!("{hash}.ciphertext"))
 }
 
+pub(crate) fn remove(root: &Path, hash: &str) -> std::io::Result<()> {
+    let directory = root.join("attachment-cache");
+    if !directory.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("Unsafe attachment cache."));
+    }
+    let path = directory.join(name(hash)?);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(path)
+        }
+        Ok(_) => Err(std::io::Error::other("Unsafe attachment cache file.")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn store(root: &Path, source: &Path, hash: &str) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file()

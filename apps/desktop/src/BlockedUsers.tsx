@@ -43,7 +43,8 @@ export function BlockingProvider({
       !person ||
       (services.has(person.identity) && !blocked) ||
       pending.current
-    ) return;
+    )
+      return;
     const identity = view.identity;
     pending.current = true;
     setWorking(true);

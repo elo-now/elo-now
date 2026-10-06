@@ -412,7 +412,7 @@ async fn database_images(
     let mut images = Vec::new();
     for (index, app) in profiles.iter().enumerate() {
         let image = if include_files {
-            app.store.backup_image(remaining).await?
+            app.store.local_content_backup_image(remaining).await?
         } else {
             app.store
                 .selected_message_backup_image(

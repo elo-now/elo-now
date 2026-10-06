@@ -96,6 +96,48 @@ pub(super) fn biometric_password(
     )
     .map_err(|_| "dataNeedsReenrollment".into())
 }
+
+fn change_local_password(
+    client: &mut ClientApp,
+    path: &Path,
+    current: SecretString,
+    password: SecretString,
+) -> Result<bool> {
+    // Reject invalid input before changing the existing biometric enrollment.
+    if !client.password_matches(&current) {
+        return Err("password_change_incorrect".into());
+    }
+    vault::validate_new_password(&password)?;
+    if client.password_matches(&password) {
+        return Err("password_change_unchanged".into());
+    }
+    let envelope_path = path.join("biometric-unlock.age");
+    let envelope = if envelope_path.try_exists()? {
+        Some(vault::read_private(&envelope_path)?)
+    } else {
+        None
+    };
+    if envelope.is_some() {
+        std::fs::remove_file(&envelope_path)?;
+    }
+    match client.change_password(current, password) {
+        Ok(()) => Ok(envelope.is_some()),
+        Err(error) => {
+            // An unresolved vault transaction must be repaired by the next
+            // password unlock, never by a stale biometric password envelope.
+            if error.to_string() == "password_change_recovery_required" {
+                return Err(error);
+            }
+            if let Some(bytes) = envelope
+                && vault::write_private(&envelope_path, &bytes, false).is_err()
+            {
+                return Err("password_change_recovery_required".into());
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn saved(app: &tauri::AppHandle) -> Result<Vec<Value>> {
     let mut entries = Vec::new();
     for value in index(app)?["saved"]
@@ -110,7 +152,9 @@ pub fn saved(app: &tauri::AppHandle) -> Result<Vec<Value>> {
         let public: Value =
             serde_json::from_slice(&vault::read_private(&path.join("profile.json"))?)?;
         entries.push(
-            json!({"id":name,"identity":public["identity_id"],"active":path == active(app)?}),
+            json!({"id":name,"identity":public["identity_id"],"active":path == active(app)?,
+                "biometric_enrolled":std::fs::symlink_metadata(path.join("biometric-unlock.age"))
+                    .is_ok_and(|metadata| metadata.is_file())}),
         );
     }
     Ok(entries)
@@ -462,6 +506,7 @@ async fn run(
         "biometric_enroll"
             | "biometric_forget"
             | "biometric_prompt_begin"
+            | "change_password"
             | "account_deletion_status"
             | "cancel"
             | "select"
@@ -480,6 +525,42 @@ async fn run(
         crate::release_policy::require_online(app)?;
     }
     match op {
+        "change_password" => {
+            let id = text(&v, "id")?;
+            let identity = text(&v, "identity")?;
+            let path = biometric_profile(app, id, identity)?;
+            let client = state.client.as_mut().ok_or("The profile is locked")?;
+            if client.identity_id().to_string() != identity {
+                return Err("dataNeedsReenrollment".into());
+            }
+            let result = change_local_password(
+                client,
+                &path,
+                text(&v, "current_password")?.to_owned().into(),
+                text(&v, "new_password")?.to_owned().into(),
+            );
+            if result
+                .as_ref()
+                .is_err_and(|error| error.to_string() == "password_change_recovery_required")
+            {
+                crate::realtime::clear(app);
+                app.state::<crate::background_history::BackgroundHistory>()
+                    .suspend();
+                if let Some(client) = state.detach_profile() {
+                    let _ = client.close().await;
+                }
+                let _ = crate::push::suspend(app, None).await;
+                let _ = crate::exchange::clear(app);
+                #[cfg(desktop)]
+                crate::desktop_activity::clear(app);
+            } else if result.is_ok() {
+                // Pending device-link responses may contain the previous
+                // password. A fresh linking attempt uses the updated one.
+                state.pair_source = None;
+                state.pair_target = None;
+            }
+            return Ok(json!({"biometric_refresh_required":result?}));
+        }
         "biometric_prompt_begin" => {
             biometric_profile(app, text(&v, "id")?, text(&v, "identity")?)?;
             if state.client.is_some() {
@@ -1039,6 +1120,90 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OLD_PASSWORD: &str = "copper meadow current synthetic password";
+    const NEW_PASSWORD: &str = "violet lantern new synthetic password";
+
+    #[tokio::test]
+    async fn password_rejection_keeps_the_biometric_envelope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("profile");
+        let mut client = ProfileDraft::new()
+            .unwrap()
+            .save(path.clone(), OLD_PASSWORD.into(), "Test")
+            .await
+            .unwrap();
+        let (bytes, _) =
+            vault::biometric::seal(OLD_PASSWORD.into(), client.identity_id(), "profile").unwrap();
+        let envelope = path.join("biometric-unlock.age");
+        vault::write_private(&envelope, &bytes, false).unwrap();
+        for (old, new) in [
+            ("wrong synthetic password", NEW_PASSWORD),
+            (OLD_PASSWORD, "weak"),
+            (OLD_PASSWORD, OLD_PASSWORD),
+        ] {
+            assert!(change_local_password(&mut client, &path, old.into(), new.into()).is_err());
+            assert_eq!(vault::read_private(&envelope).unwrap(), bytes);
+            assert!(client.password_matches(&OLD_PASSWORD.into()));
+        }
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn password_success_invalidates_the_old_biometric_envelope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("profile");
+        let mut client = ProfileDraft::new()
+            .unwrap()
+            .save(path.clone(), OLD_PASSWORD.into(), "Test")
+            .await
+            .unwrap();
+        let (bytes, _) =
+            vault::biometric::seal(OLD_PASSWORD.into(), client.identity_id(), "profile").unwrap();
+        let envelope = path.join("biometric-unlock.age");
+        vault::write_private(&envelope, &bytes, false).unwrap();
+        assert!(
+            change_local_password(&mut client, &path, OLD_PASSWORD.into(), NEW_PASSWORD.into(),)
+                .unwrap()
+        );
+        assert!(!envelope.exists());
+        assert!(client.password_matches(&NEW_PASSWORD.into()));
+        client.close().await.unwrap();
+        ClientApp::open(path, NEW_PASSWORD.into(), false)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn password_storage_failure_restores_the_existing_biometric_envelope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("profile");
+        let mut client = ProfileDraft::new()
+            .unwrap()
+            .save(path.clone(), OLD_PASSWORD.into(), "Test")
+            .await
+            .unwrap();
+        let (bytes, _) =
+            vault::biometric::seal(OLD_PASSWORD.into(), client.identity_id(), "profile").unwrap();
+        let envelope = path.join("biometric-unlock.age");
+        vault::write_private(&envelope, &bytes, false).unwrap();
+        let vault_path = path.join("vault.age");
+        let original = path.join("original-vault.age");
+        std::fs::rename(&vault_path, &original).unwrap();
+        std::fs::create_dir(&vault_path).unwrap();
+        assert!(
+            change_local_password(&mut client, &path, OLD_PASSWORD.into(), NEW_PASSWORD.into(),)
+                .is_err()
+        );
+        assert_eq!(vault::read_private(&envelope).unwrap(), bytes);
+        assert!(client.password_matches(&OLD_PASSWORD.into()));
+        std::fs::remove_dir(vault_path).unwrap();
+        std::fs::rename(original, path.join("vault.age")).unwrap();
+        client.close().await.unwrap();
+    }
+
     #[test]
     fn device_removal_requires_explicit_confirmation_without_recovery_material() {
         for request in [

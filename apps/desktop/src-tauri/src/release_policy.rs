@@ -129,6 +129,7 @@ fn local_operation(request: &serde_json::Value) -> bool {
         | "create_group"
         | "set_chat_group"
         | "set_chat_muted"
+        | "delete_chat_local"
         | "set_user_blocked"
         | "invitation_notifications_seen"
         | "invitation_list"
@@ -294,6 +295,7 @@ mod tests {
             "mark_read",
             "remind",
             "set_chat_muted",
+            "delete_chat_local",
         ] {
             assert!(local_operation(&json!({"op":op})), "{op}");
         }

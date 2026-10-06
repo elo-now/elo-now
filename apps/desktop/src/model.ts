@@ -73,6 +73,10 @@ export function spaceStatusText(
 }
 export type Stream = {
   is_general?: boolean;
+  /** Device-local deletion is offered only when explicitly allowed by the core. */
+  can_delete_local?: boolean;
+  /** Local history epoch used to reject pages fetched before local deletion. */
+  history_generation?: number;
   owner_managed?: boolean;
   space_context?: string;
   name: string;

@@ -30,6 +30,19 @@ struct RecordCache {
     bytes: usize,
 }
 impl Presentation {
+    pub(super) fn forget_chat(&self, space: SpaceId, stream: StreamId) {
+        let mut cache = self.records.lock().expect("record cache");
+        cache
+            .records
+            .retain(|key, _| key.0 != space || key.1 != stream);
+        cache.order.retain(|key| key.0 != space || key.1 != stream);
+        cache.bytes = cache
+            .records
+            .values()
+            .map(|record| record.bytes().len() * 4)
+            .sum();
+    }
+
     pub(super) fn member_names(&self, a: &Authority) -> BTreeMap<String, String> {
         let cache = self.records.lock().expect("record cache");
         let mut names = BTreeMap::<String, (u64, String)>::new();

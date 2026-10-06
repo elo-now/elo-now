@@ -36,10 +36,14 @@ impl ClientApp {
         if person == own {
             return self.open_notes(name).await;
         }
-        // Do not reopen a removed membership, match a group DM, or silently
-        // alter an existing conversation's permissions/devices.
+        // Both people can create a DM before receiving the other's bootstrap.
+        // Select the same signed scope regardless of pin order, while retaining
+        // every existing stream and its history. Never match by display name.
+        let mut existing: Option<(SpaceId, StreamId, usize)> = None;
         for (index, (pin, authority)) in self.pins.iter().zip(&self.authorities.0).enumerate() {
             let head = authority.head()?;
+            // Do not reopen removed membership or a group conversation, and do
+            // not change an existing conversation's permissions or devices.
             if head.chat_kind.or(pin.chat_kind) == Some(ChatKind::Direct)
                 && self.authorities.space_ready(authority)
                 && head.members.len() == 2
@@ -49,18 +53,31 @@ impl ClientApp {
                         && m.credential_ids.contains(&self.session.credential().id())
                         && m.capabilities.contains(&Capability::Read)
                 })
+                && existing
+                    .is_none_or(|(space, stream, _)| (pin.space, pin.stream) < (space, stream))
             {
-                // An interrupted local creation may still need its envelopes.
-                if !state
-                    .personal
-                    .get(&person.to_string())
-                    .is_some_and(|d| d.stream == pin.stream)
-                {
-                    let stream = pin.stream;
-                    self.pins[index].name = name.into();
-                    self.persist_workspace()?;
-                    return Ok(json!({"stream":stream,"view":self.view().await?}));
-                }
+                existing = Some((pin.space, pin.stream, index));
+            }
+        }
+        if let Some((space, stream, index)) = existing {
+            // Explicitly opening the contact restores an empty composer only.
+            self.store.reveal_local_chat(space, stream).await?;
+            // An interrupted local creation may still need its envelopes. Its
+            // draft must match the full scope, not a stream in another namespace.
+            let resume = state
+                .personal
+                .get(&person.to_string())
+                .is_some_and(|draft| {
+                    draft.stream == stream
+                        && draft
+                            .bundle
+                            .as_ref()
+                            .is_none_or(|bundle| bundle.space == space)
+                });
+            if !resume {
+                self.pins[index].name = name.into();
+                self.persist_workspace()?;
+                return Ok(json!({"stream":stream,"view":self.view().await?}));
             }
         }
         let known = self.known_people()?;

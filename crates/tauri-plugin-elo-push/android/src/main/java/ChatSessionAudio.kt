@@ -22,12 +22,41 @@ internal object ChatSessionAudio {
     private var selectedByUs = false
     private var initialDevices = emptySet<Int>()
     private var removeCommunicationListener: (() -> Unit)? = null
-    private var changed: (() -> Unit)? = null
+    private var changed: ((JSObject) -> Unit)? = null
+    private var systemActions: ((JSObject) -> Unit)? = null
+    private var telecomManaged = false
+
+    fun telecomChanged() { changed?.invoke(JSObject()) }
+    fun detach() { changed = null }
 
     fun owns(id: String, activation: String) = sessionId == id && this.activation == activation
 
-    fun listen(id: String, activation: String, listener: (() -> Unit)?) {
-        if (owns(id, activation)) changed = listener
+    fun listen(id: String, activation: String, listener: ((JSObject) -> Unit)?) {
+        if (owns(id, activation)) { changed = listener; systemActions = listener }
+    }
+
+    fun systemAction(id: String, activation: String, action: String, muted: Boolean? = null, systemMuteRevision: Long? = null) {
+        if (!owns(id, activation)) return
+        val value = JSObject().put("action", action)
+        if (muted != null) value.put("muted", muted)
+        if (systemMuteRevision != null) value.put("systemMuteRevision", systemMuteRevision)
+        runCatching { systemActions?.invoke(value) }
+    }
+
+    fun adoptTelecom(id: String, activation: String) {
+        if (!owns(id, activation) || telecomManaged) return
+        val audio = manager ?: return
+        runCatching { audio.unregisterAudioDeviceCallback(devicesChanged) }
+        runCatching { removeCommunicationListener?.invoke() }
+        removeCommunicationListener = null
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 31) audio.clearCommunicationDevice()
+            else if (selectedByUs) LegacyAudio.speaker(audio, previousSpeaker)
+        }
+        selectedByUs = false
+        initialDevices = emptySet()
+        telecomManaged = true
+        telecomChanged()
     }
 
     private val devicesChanged = object : AudioDeviceCallback() {
@@ -43,11 +72,11 @@ internal object ChatSessionAudio {
                 }
             }
             initialDevices = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.id }.toSet()
-            changed?.invoke()
+            changed?.invoke(JSObject())
         }
         override fun onAudioDevicesRemoved(devices: Array<out AudioDeviceInfo>) {
             manager?.let { audio -> initialDevices = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.id }.toSet() }
-            changed?.invoke()
+            changed?.invoke(JSObject())
         }
     }
 
@@ -61,6 +90,10 @@ internal object ChatSessionAudio {
         manager = audio
         sessionId = id
         this.activation = activation
+        telecomManaged = IncomingCalls.ownsTelecom(id) || OutgoingCalls.owns(id)
+        // Telecom owns focus, device selection and communication mode for a
+        // self-managed call. Independent AudioManager overrides fight its routes.
+        if (telecomManaged) return
         initialDevices = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.id }.toSet()
         try {
             audio.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -80,7 +113,7 @@ internal object ChatSessionAudio {
             }
             audio.registerAudioDeviceCallback(devicesChanged, handler)
             if (Build.VERSION.SDK_INT >= 31) {
-                val listener = AudioManager.OnCommunicationDeviceChangedListener { changed?.invoke() }
+                val listener = AudioManager.OnCommunicationDeviceChangedListener { changed?.invoke(JSObject()) }
                 audio.addOnCommunicationDeviceChangedListener(context.mainExecutor, listener)
                 removeCommunicationListener = { audio.removeOnCommunicationDeviceChangedListener(listener) }
             }
@@ -96,6 +129,12 @@ internal object ChatSessionAudio {
         sessionId = null
         activation = null
         changed = null
+        systemActions = null
+        if (telecomManaged) {
+            telecomManaged = false
+            manager = null
+            return
+        }
         runCatching { audio.unregisterAudioDeviceCallback(devicesChanged) }
         runCatching { removeCommunicationListener?.invoke() }
         removeCommunicationListener = null
@@ -150,7 +189,7 @@ internal object ChatSessionAudio {
                 (outputId == "receiver" && external == null && hasReceiver)) { "unavailable" }
             LegacyAudio.speaker(audio, outputId == "speaker")
             selectedByUs = true
-            changed?.invoke()
+            changed?.invoke(JSObject())
         }
         val speakerActive = LegacyAudio.speaker(audio)
         val outputs = JSONArray()

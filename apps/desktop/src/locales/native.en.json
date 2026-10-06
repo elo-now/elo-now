@@ -6,5 +6,12 @@
   "notifications.channelMessages": "Messages",
   "notifications.channelInvitations": "Invitations",
   "calls.nativeOngoing": "Chat session in progress",
-  "calls.nativeChannel": "Chat sessions"
+  "calls.nativeChannel": "Chat sessions",
+  "calls.nativeIncoming": "Incoming call",
+  "calls.nativeConnecting": "Connecting…",
+  "calls.nativeAnswer": "Answer",
+  "calls.nativeEndAndAnswer": "End & answer",
+  "calls.nativeDecline": "Decline",
+  "calls.nativeEnd": "End call",
+  "calls.nativeChannelIncoming": "Incoming calls"
 }

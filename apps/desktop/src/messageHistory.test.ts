@@ -198,3 +198,56 @@ test("deleted placeholders replace bodies and locators without resurrection or l
   expect(timeline[0].thread?.rootId).toBe("original");
   expect(timeline[0].thread?.replies).toHaveLength(1);
 });
+
+test("prepared history from before local deletion cannot reopen after the conversation reappears", async () => {
+  const { preparedHistoryMatches } = await import("./messageHistory");
+  const page: HistoryPage = {
+    identity: "me",
+    space_context: "hosting",
+    space: "space",
+    stream: "chat",
+    revision: 4,
+    rows: [row("old", 1)],
+    context: [],
+    next: null,
+  };
+  expect(
+    preparedHistoryMatches(
+      page,
+      "me",
+      "hosting",
+      "space",
+      "chat",
+      "old",
+      undefined,
+      "",
+      0,
+    ),
+  ).toBe(true);
+  expect(
+    preparedHistoryMatches(
+      page,
+      "me",
+      "hosting",
+      "space",
+      "chat",
+      "old",
+      undefined,
+      "",
+      1,
+    ),
+  ).toBe(false);
+  expect(
+    preparedHistoryMatches(
+      { ...page, history_generation: 1 },
+      "me",
+      "hosting",
+      "space",
+      "chat",
+      "old",
+      undefined,
+      "",
+      1,
+    ),
+  ).toBe(true);
+});

@@ -22,9 +22,10 @@ mod download_protection;
 mod drafts;
 mod exchange;
 mod hosting;
+mod incoming_calls;
 mod mail;
 mod native_media;
-#[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
 mod native_session;
 mod notification_counts;
 mod profiles;
@@ -52,6 +53,7 @@ struct Runtime {
     control_recovery: Option<serde_json::Value>,
     view_revision: u64,
     draft_session: Option<String>,
+    drafts: drafts::DraftSessions,
     draft_attachments: std::collections::BTreeMap<String, elo_core::app::drafts::StoredAttachment>,
 }
 type State = Mutex<Runtime>;
@@ -554,6 +556,7 @@ fn application_operation(op: &str) -> bool {
             | "create_group"
             | "set_chat_group"
             | "set_chat_muted"
+            | "delete_chat_local"
             | "set_user_blocked"
             | "message_debug"
             | "send"
@@ -568,6 +571,7 @@ fn application_operation(op: &str) -> bool {
             | "mark_unread"
             | "thread_follow"
             | "call_endpoint"
+            | "call_notify_ready"
             | "call_authorization"
             | "call_encrypt_signal"
             | "call_open_signal"
@@ -622,6 +626,99 @@ fn application_operation(op: &str) -> bool {
             | "invitation_join"
     )
 }
+const NOTIFICATION_OPEN_EXPIRED: &str = "notification_open_expired";
+
+/// A push navigation can wait behind synchronization. Verify its budget and
+/// native tap again under the profile lock before changing the selected Space.
+struct NotificationNavigation {
+    deadline_ms: u64,
+    open_id: String,
+}
+impl NotificationNavigation {
+    fn parse(request: &serde_json::Value) -> Result<Option<Self>, String> {
+        if request.get("nav_deadline_ms").is_none() && request.get("nav_open_id").is_none() {
+            return Ok(None);
+        }
+        let invalid = || NOTIFICATION_OPEN_EXPIRED.to_owned();
+        if request["op"] != "space_select" {
+            return Err(invalid());
+        }
+        let deadline_ms = request["nav_deadline_ms"].as_u64().ok_or_else(invalid)?;
+        let open_id = request["nav_open_id"].as_str().ok_or_else(invalid)?;
+        if open_id.len() != 64
+            || !open_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid());
+        }
+        Ok(Some(Self {
+            deadline_ms,
+            open_id: open_id.into(),
+        }))
+    }
+    fn remaining(&self, now_ms: u64) -> Result<std::time::Duration, String> {
+        match self.deadline_ms.checked_sub(now_ms) {
+            Some(remaining @ 1..=30_000) => Ok(std::time::Duration::from_millis(remaining)),
+            _ => Err(NOTIFICATION_OPEN_EXPIRED.into()),
+        }
+    }
+    fn check_opened(&self, now_ms: u64, encoded: Option<&str>) -> Result<(), String> {
+        self.remaining(now_ms)?;
+        let current = encoded
+            .map(|value| elo_core::ids::ObjectId::of_ciphertext(value.as_bytes()).to_string());
+        if current.as_deref() != Some(self.open_id.as_str()) {
+            return Err(NOTIFICATION_OPEN_EXPIRED.into());
+        }
+        Ok(())
+    }
+    async fn verify<F>(&self, snapshot: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<Option<String>, String>>,
+    {
+        let remaining = self.remaining(notification_navigation_now()?)?;
+        let opened = tokio::time::timeout(remaining, snapshot)
+            .await
+            .map_err(|_| NOTIFICATION_OPEN_EXPIRED.to_owned())??;
+        // The OS callback itself can consume the rest of the opening budget.
+        self.check_opened(notification_navigation_now()?, opened.as_deref())
+    }
+}
+fn notification_navigation_now() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or_else(|| NOTIFICATION_OPEN_EXPIRED.to_owned())
+}
+async fn verify_notification_navigation(
+    app: &tauri::AppHandle,
+    navigation: &NotificationNavigation,
+) -> Result<(), String> {
+    #[cfg(all(mobile, feature = "mobile-push"))]
+    {
+        let app = app.clone();
+        navigation
+            .verify(async move {
+                // The plugin's synchronous callback bridge must not block the
+                // runtime mutex beyond this tap's deadline if the OS stalls.
+                tokio::task::spawn_blocking(move || {
+                    let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
+                    let native = adapter.call("status", serde_json::json!({}))?;
+                    Ok(native["opened"].as_str().map(str::to_owned))
+                })
+                .await
+                .map_err(|_| NOTIFICATION_OPEN_EXPIRED.to_owned())?
+            })
+            .await
+    }
+    #[cfg(not(all(mobile, feature = "mobile-push")))]
+    {
+        let _ = app;
+        navigation.verify(async { Ok(None) }).await
+    }
+}
+
 #[tauri::command]
 async fn operate(
     app: tauri::AppHandle,
@@ -631,6 +728,10 @@ async fn operate(
     // New core/CLI operations require an explicit native capability review.
     if !application_operation(request["op"].as_str().unwrap_or_default()) {
         return Err("Unsupported application operation.".into());
+    }
+    let navigation = NotificationNavigation::parse(&request)?;
+    if let Some(navigation) = &navigation {
+        navigation.remaining(notification_navigation_now()?)?;
     }
     #[cfg(debug_assertions)]
     let timing = std::time::Instant::now();
@@ -687,18 +788,25 @@ async fn operate(
     )
     .then(|| request.clone());
     let revision = state.view_revision;
+    let local_deletion = (request["op"] == "delete_chat_local").then(|| request.clone());
     let client = state.client.as_mut().ok_or("The profile is locked")?;
-    // Invitation discovery also waits on the network while holding the runtime.
-    // Keep existing local history readable until that pass publishes its changes.
+    // Discovery and session notifications wait on the network while holding
+    // the runtime. Keep existing local history readable during these passes.
     let _history = matches!(
         request["op"].as_str(),
-        Some("sync" | "sync_live" | "invitation_sync")
+        Some("sync" | "sync_live" | "invitation_sync" | "call_notify_ready")
     )
     .then(|| {
         app.state::<background_history::BackgroundHistory>()
             .publish(client.history_snapshot(), revision)
     });
     hosting::prepare_operation(&app, client, &mut request)?;
+    if let Some(navigation) = navigation {
+        if request["expected_identity"] != serde_json::json!(client.identity_id()) {
+            return Err("The open profile has changed.".into());
+        }
+        verify_notification_navigation(&app, &navigation).await?;
+    }
     let mut result = if request["op"] == "space_join_demo" {
         if request["expected_identity"] != serde_json::json!(client.identity_id()) {
             return Err("The open profile has changed.".into());
@@ -717,9 +825,18 @@ async fn operate(
                 desktop_activity::update(&app, &view);
             }
         }
-        exchange::clear_disconnected(&app, &client.connected_space_ids())?;
+        if local_deletion.is_none() {
+            exchange::clear_disconnected(&app, &client.connected_space_ids())?;
+        }
         outcome?
     };
+    if let Some(request) = &local_deletion
+        && drafts::delete_conversation(&app, &mut state, request).is_err()
+    {
+        // History has already been durably removed. Keep that outcome and
+        // refresh the UI even if cleaning a temporary staged file failed.
+        result["cleanup_pending"] = serde_json::json!(true);
+    }
     if preferences_changed && let Some(client) = state.client.as_ref() {
         result["notification_pending"] = serde_json::json!(push::changed(&app, client).await);
     }
@@ -750,6 +867,9 @@ async fn operate(
         let _ = push::messages_read(&app, client, &request);
     }
     state.view_revision = state.view_revision.saturating_add(1);
+    if local_deletion.is_some() {
+        result["revision"] = serde_json::json!(state.view_revision);
+    }
     annotate_result(
         &mut result,
         state.client.as_ref().map(ClientApp::identity_id),
@@ -854,6 +974,7 @@ pub fn run() {
         .manage(realtime::Live::default())
         .manage(release_policy::Checks::default())
         .manage(native_media::MediaGate::default())
+        .manage(incoming_calls::Incoming::default())
         .manage(AttachmentTransfers::default())
         .manage(exchange::ExchangeFiles::default())
         .manage(background_history::BackgroundHistory::default())
@@ -867,7 +988,10 @@ pub fn run() {
             release_policy::setup(app.handle());
             realtime::setup(app.handle());
             #[cfg(all(mobile, feature = "mobile-push"))]
-            push::setup(app.handle());
+            {
+                push::setup(app.handle());
+                incoming_calls::setup(app.handle());
+            }
             exchange::clear(app.handle()).map_err(std::io::Error::other)?;
             #[cfg(desktop)]
             desktop_activity::setup(app.handle());
@@ -895,6 +1019,7 @@ pub fn run() {
             #[cfg(desktop)]
             desktop_notifications::desktop_notification_task,
             native_media::native_call_media,
+            incoming_calls::native_call_incoming,
             native_media::native_call_state,
             native_media::native_call_audio,
             profiles::profile_task,
@@ -938,6 +1063,125 @@ pub fn run() {
 }
 
 #[cfg(test)]
+mod notification_navigation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn navigation(encoded: &str, deadline_ms: u64) -> NotificationNavigation {
+        NotificationNavigation::parse(&json!({
+            "op":"space_select", "nav_deadline_ms":deadline_ms,
+            "nav_open_id":elo_core::ids::ObjectId::of_ciphertext(encoded.as_bytes()).to_string()
+        }))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn only_complete_bounded_push_navigation_guards_are_accepted() {
+        assert!(
+            NotificationNavigation::parse(&json!({"op":"space_select", "id":"space"}))
+                .unwrap()
+                .is_none()
+        );
+        let valid = json!({
+            "op":"space_select", "nav_deadline_ms":1_008_000,
+            "nav_open_id":"a".repeat(64)
+        });
+        for (field, value) in [
+            ("op", json!("send")),
+            ("nav_deadline_ms", json!(null)),
+            ("nav_deadline_ms", json!(-1)),
+            ("nav_deadline_ms", json!(1.5)),
+            ("nav_deadline_ms", json!("1008000")),
+            ("nav_open_id", json!(null)),
+            ("nav_open_id", json!("A".repeat(64))),
+            ("nav_open_id", json!("g".repeat(64))),
+            ("nav_open_id", json!("a".repeat(63))),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(
+                NotificationNavigation::parse(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        for field in ["nav_deadline_ms", "nav_open_id"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(NotificationNavigation::parse(&invalid).is_err());
+        }
+        let guard = NotificationNavigation::parse(&valid).unwrap().unwrap();
+        assert_eq!(guard.remaining(1_000_000).unwrap().as_millis(), 8_000);
+        assert!(guard.remaining(1_008_000).is_err());
+        assert!(guard.remaining(1_009_000).is_err());
+        assert!(guard.remaining(900_000).is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_queued_navigation_does_not_query_native_or_select_a_space() {
+        let state = std::sync::Arc::new(Mutex::new("original"));
+        let locked = state.lock().await;
+        let queued_state = state.clone();
+        let guard = navigation("synthetic tap", notification_navigation_now().unwrap() + 20);
+        let queued = tokio::spawn(async move {
+            let mut selected = queued_state.lock().await;
+            guard
+                .verify(async { panic!("An expired tap must not query native state") })
+                .await?;
+            *selected = "notification";
+            Ok::<(), String>(())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drop(locked);
+        assert_eq!(
+            queued.await.unwrap().unwrap_err(),
+            NOTIFICATION_OPEN_EXPIRED
+        );
+        assert_eq!(*state.lock().await, "original");
+    }
+
+    #[tokio::test]
+    async fn newer_or_acknowledged_native_tap_prevents_queued_space_selection() {
+        let state = std::sync::Arc::new(Mutex::new(("original", Some("first tap"))));
+        let mut locked = state.lock().await;
+        let queued_state = state.clone();
+        let guard = navigation("first tap", notification_navigation_now().unwrap() + 8_000);
+        let queued = tokio::spawn(async move {
+            let mut state = queued_state.lock().await;
+            guard
+                .verify(async { Ok(state.1.map(str::to_owned)) })
+                .await?;
+            state.0 = "notification";
+            Ok::<(), String>(())
+        });
+        locked.1 = Some("newer tap");
+        drop(locked);
+        assert_eq!(
+            queued.await.unwrap().unwrap_err(),
+            NOTIFICATION_OPEN_EXPIRED
+        );
+        assert_eq!(state.lock().await.0, "original");
+        let guard = navigation("first tap", notification_navigation_now().unwrap() + 8_000);
+        assert!(guard.verify(async { Ok(None) }).await.is_err());
+        guard
+            .verify(async { Ok(Some("first tap".into())) })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_native_callback_cannot_outlive_the_navigation_budget() {
+        let guard = navigation("synthetic tap", notification_navigation_now().unwrap() + 20);
+        assert_eq!(
+            guard.verify(std::future::pending()).await.unwrap_err(),
+            NOTIFICATION_OPEN_EXPIRED
+        );
+        let guard = navigation("synthetic tap", 100);
+        assert!(guard.check_opened(100, Some("synthetic tap")).is_err());
+    }
+}
+
+#[cfg(test)]
 mod result_metadata_tests {
     use super::*;
     #[test]
@@ -958,10 +1202,12 @@ mod result_metadata_tests {
             "space_join",
             "history_page",
             "call_endpoint",
+            "call_notify_ready",
             "call_authorization",
             "invitation_activity_seen",
             "invitation_notifications_seen",
             "space_select",
+            "delete_chat_local",
         ] {
             assert!(application_operation(op), "{op}");
         }

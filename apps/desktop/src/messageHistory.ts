@@ -30,6 +30,8 @@ export type HistoryPage = {
   space: string;
   stream: string;
   revision: number;
+  /** Device-local erasure epoch; old pages must never repopulate deleted history. */
+  history_generation?: number;
   rows: Stream["rows"];
   context: Stream["rows"];
   next: string | null;
@@ -48,9 +50,11 @@ export function preparedHistoryMatches(
   around: string | undefined,
   thread: string | undefined,
   query: string,
+  historyGeneration = 0,
 ) {
   return (
     !!page &&
+    (page.history_generation ?? 0) === historyGeneration &&
     !!around &&
     !query.trim() &&
     !page.query &&

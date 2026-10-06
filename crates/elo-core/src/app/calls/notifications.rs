@@ -1,5 +1,5 @@
-//! Ordinary recipient-encrypted hints for voluntary sessions. A native read of
-//! current signed call authorization precedes every notification handoff.
+//! Recipient-encrypted session and ringing hints. A native read of current
+//! signed call authorization precedes every notification handoff.
 use super::*;
 use std::time::Duration;
 
@@ -47,17 +47,17 @@ impl ClientApp {
         let index = self.authority_index(request)?;
         let authority = &self.authorities.0[index];
         self.require_fresh_membership(authority).await?;
-        let mut endpoint = reqwest::Url::parse(&host.url)?;
-        endpoint.set_path("/calls/v1");
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
+        let Some(mut endpoint) = call_audience(self.hosting_services.active.as_ref(), &host.url)?
+        else {
+            return Ok(json!({"notified":false}));
+        };
         let mut authorization = request.clone();
         authorization["op"] = json!("call_authorization");
         authorization["audience"] = json!(endpoint.as_str());
         authorization["operation"] = json!({"type":"subscribe"});
         authorization["include_proof"] = json!(true);
         let body = self.call_operation(&authorization)?;
-        endpoint.set_path("/calls/v1/state");
+        endpoint.set_path(&format!("{}/state", endpoint.path().trim_end_matches('/')));
         let mut response = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -80,6 +80,33 @@ impl ClientApp {
         }
         let response: Value = serde_json::from_slice(&bytes)?;
         let call_id = field(request, "call_id")?;
+        let call = &response["call"];
+        let time = now()?.as_millis() as u64 / 1000;
+        let explicit = request["invitation_id"].is_string();
+        let matches_scope = call["call_id"] == call_id
+            && call["scope"]["hosting_space_id"] == json!(hosting)
+            && call["scope"]["conversation"]["space_id"] == json!(authority.space())
+            && call["scope"]["conversation"]["stream_id"] == json!(authority.stream())
+            && call["config_id"] == json!(authority.head_id());
+        if explicit {
+            let to: IdentityId = field(request, "to")?.parse()?;
+            let invitation = &call["invitations"][to.to_string()];
+            if !matches_scope
+                || invitation["invitation_id"] != request["invitation_id"]
+                || invitation["invited_by"] != json!(self.identity_id())
+                || invitation["expires_at"]
+                    .as_u64()
+                    .is_none_or(|until| until <= time || until > time + TTL)
+                || call["participants"][self.identity_id().to_string()]["credential_id"]
+                    != json!(self.session.credential().id())
+            {
+                return Ok(json!({"notified":false}));
+            }
+            return Ok(serde_json::to_value(
+                self.notify_ringing_session(authority, call, Some(to))
+                    .await?,
+            )?);
+        }
         let Some(expires) = ready_expiry(
             &response["call"],
             authority,
@@ -92,7 +119,15 @@ impl ClientApp {
         else {
             return Ok(json!({"notified":false}));
         };
-        Ok(json!({"notified":self.notify_ready_session(authority,call_id,expires).await?}))
+        if call["kind"] == "direct" {
+            return Ok(serde_json::to_value(
+                self.notify_ringing_session(authority, call, None).await?,
+            )?);
+        }
+        Ok(serde_json::to_value(
+            self.notify_ready_session(authority, call_id, expires)
+                .await?,
+        )?)
     }
 }
 
