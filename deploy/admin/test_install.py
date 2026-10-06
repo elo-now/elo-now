@@ -13,31 +13,101 @@ import install
 
 HASH = '$2a$14$' + 'a' * 53
 KEY = 'p' * 64
+VPN_IP = '10.77.36.10'
+VPN_IPV6 = 'fd77:36:9b17::10'
 ORIGIN = 'https://hosting.example:9443'
 CONFIG = '{\n\tadmin off\n}\n' + ORIGIN + ' {\n\trespond /health 204\n}\n'
 
 
 class InstallerTests(unittest.TestCase):
     def test_proxy_has_one_authenticated_block_and_never_forwards_the_password(self):
-        value = install.proxy_config(CONFIG, HASH, KEY, ORIGIN)
-        self.assertIn('basic_auth {\n\t\t\tadmin ' + HASH, value)
+        value = install.proxy_config(CONFIG, HASH, KEY, ORIGIN, VPN_IP)
+        self.assertIn('basic_auth {\n\t\t\t\tadmin ' + HASH, value)
         self.assertIn('header_up -Authorization', value)
         self.assertIn('header_up X-Elo-Admin-Proxy-Key ' + KEY, value)
         self.assertIn('max_size 32768', value)
         self.assertIn('response_header_timeout 10s', value)
         self.assertIn('respond /health 204', value)
-        replacement = install.proxy_config(value, HASH, 'n' * 64, ORIGIN)
+        replacement = install.proxy_config(value, HASH, 'n' * 64, ORIGIN, VPN_IP)
         self.assertEqual(replacement.count(install.BEGIN), 1)
         self.assertNotIn(KEY, replacement)
-        self.assertEqual(install.proxy_config(replacement, HASH, 'n' * 64, ORIGIN), replacement)
+        self.assertEqual(install.proxy_config(replacement, HASH, 'n' * 64, ORIGIN, VPN_IP), replacement)
 
     def test_proxy_rejects_different_or_multiple_sites_and_injected_credentials(self):
         for value in [CONFIG.replace(ORIGIN, 'https://other.example'), CONFIG + '\nhttps://other.example {\n}\n', CONFIG + install.BEGIN]:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                install.proxy_config(value, HASH, KEY, ORIGIN)
+                install.proxy_config(value, HASH, KEY, ORIGIN, VPN_IP)
         for hashed, key in [(HASH + '\nrespond 200', KEY), (HASH, KEY + '\n}')]:
             with self.assertRaises(ValueError):
-                install.proxy_config(CONFIG, hashed, key, ORIGIN)
+                install.proxy_config(CONFIG, hashed, key, ORIGIN, VPN_IP)
+
+    def test_vpn_gate_covers_all_admin_paths_before_redirect_and_authentication(self):
+        value = install.proxy_config(CONFIG, HASH, KEY, ORIGIN, VPN_IP, VPN_IPV6)
+        self.assertIn('@elo_admin_paths path /admin /admin/*', value)
+        self.assertIn('@elo_admin_outside_vpn not remote_ip 10.77.36.10/32 fd77:36:9b17::10/128', value)
+        self.assertIn('handle @elo_admin_paths {\n\t\troute {\n\t\t\trespond @elo_admin_outside_vpn 404', value)
+        deny = value.index('respond @elo_admin_outside_vpn 404')
+        redirect = value.index('redir /admin /admin/ 308')
+        auth = value.index('basic_auth')
+        backend = value.index('reverse_proxy 127.0.0.1:17910')
+        self.assertLess(deny, redirect)
+        self.assertLess(redirect, auth)
+        self.assertLess(auth, backend)
+        self.assertNotIn('client_ip', value)
+        self.assertNotIn('X-Forwarded-For', value)
+        before, after = value.split(install.BEGIN)
+        after = after.split(install.END)[1]
+        self.assertEqual(before.rstrip('\n') + after, CONFIG)
+
+    def test_vpn_addresses_allow_only_single_private_hosts(self):
+        for address in ('10.0.0.1', '172.16.0.1', '172.31.255.254', '192.168.10.2', VPN_IP + '/32'):
+            with self.subTest(address=address):
+                self.assertEqual(install.vpn_client_ip(address), address.removesuffix('/32') + '/32')
+        for address in ('8.8.8.8', '192.0.2.1', '100.64.0.1', '240.0.0.1',
+                        '224.0.0.1', '127.0.0.1', '169.254.0.1', '0.0.0.0',
+                        '10.0.0.1/24', '0.0.0.0/0', '10.0.0.1/255.255.255.255',
+                        '10.0.0.1-10.0.0.2', '10.0.0.1 10.0.0.2', '10.0.0.1,10.0.0.2',
+                        '\n10.0.0.1', '10.0.0.1\n', '', None, VPN_IPV6, '::ffff:10.0.0.1'):
+            with self.subTest(address=address), self.assertRaisesRegex(ValueError, '^invalid_vpn_client_ip$'):
+                install.vpn_client_ip(address)
+        for address in (VPN_IPV6, VPN_IPV6 + '/128', 'fc00::1'):
+            with self.subTest(address=address):
+                self.assertEqual(install.vpn_client_ipv6(address), address.removesuffix('/128') + '/128')
+        for address in ('2001:4860:4860::8888', '2001:db8::1', 'fe80::1', 'ff00::1',
+                        '::1', '::', '::/0', VPN_IPV6 + '/64', VPN_IPV6 + '%eth0',
+                        VPN_IPV6 + '\n', VPN_IPV6 + ' fd00::2', '::ffff:10.0.0.1', '', None, VPN_IP):
+            with self.subTest(address=address), self.assertRaisesRegex(ValueError, '^invalid_vpn_client_ipv6$'):
+                install.vpn_client_ipv6(address)
+
+    def test_reinstall_cannot_drop_the_gate_or_add_a_broad_network(self):
+        value = install.proxy_config(CONFIG, HASH, KEY, ORIGIN, VPN_IP, VPN_IPV6)
+        with self.assertRaises(TypeError):
+            install.proxy_config(value, HASH, KEY, ORIGIN)
+        for address in ('', None, '10.77.36.0/24', '0.0.0.0/0', VPN_IP + '\nrespond 200'):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                install.proxy_config(value, HASH, KEY, ORIGIN, address)
+        with self.assertRaises(ValueError):
+            install.proxy_config(value, HASH, KEY, ORIGIN, VPN_IP, 'fc00::/7')
+        replacement = install.proxy_config(value, HASH, KEY, ORIGIN, '192.168.50.10')
+        self.assertIn('not remote_ip 192.168.50.10/32\n', replacement)
+        self.assertNotIn(VPN_IP, replacement)
+        self.assertNotIn(VPN_IPV6, replacement)
+        self.assertEqual(replacement.count(install.BEGIN), 1)
+
+    def test_cli_requires_a_valid_vpn_client_before_reading_secrets_or_changing_the_host(self):
+        required = ['install.py', '--role', 'api', '--origin', ORIGIN, '--related-origin', ORIGIN,
+                    '--state', '/srv/elo-api-test', '--bundle', '/srv/elo-api-test', '--version', '1136']
+        for suffix in ([], ['--vpn-client-ip', '0.0.0.0/0'],
+                       ['--vpn-client-ip', VPN_IP, '--vpn-client-ipv6', '::/0']):
+            with self.subTest(suffix=suffix), patch.object(sys, 'argv', required + suffix), \
+                    patch.object(sys, 'stderr', io.StringIO()), patch.object(install, 'deployment_path') as path, \
+                    patch.object(install, 'read_file') as read, patch.object(install, 'command') as run:
+                with self.assertRaises(SystemExit) as result:
+                    install.main()
+                self.assertEqual(result.exception.code, 2)
+                path.assert_not_called()
+                read.assert_not_called()
+                run.assert_not_called()
 
     def test_password_hash_is_offline_and_receives_the_password_only_on_stdin(self):
         password = 'synthetic-password-12345678'

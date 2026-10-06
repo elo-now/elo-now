@@ -5,6 +5,7 @@ Read the initial HTTPS password and internal proxy credential from JSON on stdin
 Only the API or storage service can be restarted by configuration changes.
 """
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,37 @@ from schema import origin
 FILES = ('server.py', 'schema.py', 'apply.py', 'static/index.html', 'static/app.js',
          'static/style.css', 'static/en.json')
 BEGIN, END = '\t# BEGIN ELO ADMIN\n', '\t# END ELO ADMIN\n'
+PRIVATE_IPV4 = tuple(ipaddress.IPv4Network(value) for value in
+                     ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+PRIVATE_IPV6 = ipaddress.IPv6Network('fc00::/7')
+
+
+def vpn_client_ip(value):
+    """Accept one RFC 1918 host, never a network or a forwarded-header value."""
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError('invalid_vpn_client_ip')
+    try:
+        address = ipaddress.IPv4Interface(value)
+    except ValueError:
+        raise ValueError('invalid_vpn_client_ip') from None
+    if (address.network.prefixlen != 32 or ('/' in value and not value.endswith('/32'))
+            or not any(address.ip in network for network in PRIVATE_IPV4)):
+        raise ValueError('invalid_vpn_client_ip')
+    return str(address)
+
+
+def vpn_client_ipv6(value):
+    """Accept one ULA host without a scope identifier or a network prefix."""
+    if not isinstance(value, str) or value != value.strip() or '%' in value:
+        raise ValueError('invalid_vpn_client_ipv6')
+    try:
+        address = ipaddress.IPv6Interface(value)
+    except ValueError:
+        raise ValueError('invalid_vpn_client_ipv6') from None
+    if (address.network.prefixlen != 128 or ('/' in value and not value.endswith('/128'))
+            or address.ip not in PRIVATE_IPV6):
+        raise ValueError('invalid_vpn_client_ipv6')
+    return str(address)
 
 
 def command(args, **kwargs):
@@ -61,7 +93,11 @@ def password_hash(password):
                    input=(password + '\n').encode()).decode().strip()
 
 
-def proxy_config(previous, password_hash, proxy_key, public_origin):
+def proxy_config(previous, password_hash, proxy_key, public_origin, client_ip,
+                 client_ipv6=None):
+    allowed = vpn_client_ip(client_ip)
+    if client_ipv6 is not None:
+        allowed += ' ' + vpn_client_ipv6(client_ipv6)
     if not re.fullmatch(r'\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}', password_hash):
         raise ValueError('invalid_password_hash')
     if not re.fullmatch(r'[A-Za-z0-9_-]{32,256}', proxy_key):
@@ -78,20 +114,27 @@ def proxy_config(previous, password_hash, proxy_key, public_origin):
     position = previous.rfind('\n}')
     if position < 0:
         raise ValueError('invalid_proxy_config')
-    block = BEGIN + f'''\tredir /admin /admin/ 308
-\thandle /admin/* {{
-\t\tbasic_auth {{
-\t\t\tadmin {password_hash}
-\t\t}}
-\t\trequest_body {{
-\t\t\tmax_size 32768
-\t\t}}
-\t\treverse_proxy 127.0.0.1:17910 {{
-\t\t\theader_up -Authorization
-\t\t\theader_up X-Elo-Admin-Proxy-Key {proxy_key}
-\t\t\ttransport http {{
-\t\t\t\tdial_timeout 2s
-\t\t\t\tresponse_header_timeout 10s
+    # Literal route ordering prevents redirection or authentication from running
+    # before the VPN check. remote_ip inspects the direct socket, not X-Forwarded-For.
+    block = BEGIN + f'''\t@elo_admin_paths path /admin /admin/*
+\t@elo_admin_outside_vpn not remote_ip {allowed}
+\thandle @elo_admin_paths {{
+\t\troute {{
+\t\t\trespond @elo_admin_outside_vpn 404
+\t\t\tredir /admin /admin/ 308
+\t\t\tbasic_auth {{
+\t\t\t\tadmin {password_hash}
+\t\t\t}}
+\t\t\trequest_body {{
+\t\t\t\tmax_size 32768
+\t\t\t}}
+\t\t\treverse_proxy 127.0.0.1:17910 {{
+\t\t\t\theader_up -Authorization
+\t\t\t\theader_up X-Elo-Admin-Proxy-Key {proxy_key}
+\t\t\t\ttransport http {{
+\t\t\t\t\tdial_timeout 2s
+\t\t\t\t\tresponse_header_timeout 10s
+\t\t\t\t}}
 \t\t\t}}
 \t\t}}
 \t}}
@@ -256,6 +299,10 @@ def main():
     parser.add_argument('--state', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--version', required=True)
+    parser.add_argument('--vpn-client-ip', type=vpn_client_ip, required=True,
+                        help='Single private IPv4 address of the VPN client (optionally /32).')
+    parser.add_argument('--vpn-client-ipv6', type=vpn_client_ipv6,
+                        help='Optional single ULA IPv6 address of the VPN client (optionally /128).')
     parser.add_argument('--api-port', type=int, choices=(18900, 19900), default=18900)
     args = parser.parse_args()
     if sys.platform != 'linux' or os.geteuid() != 0:
@@ -287,7 +334,8 @@ def main():
     hashed = password_hash(secret['password'])
     caddy = args.state / 'proxy/config/Caddyfile'
     before = read_file(caddy)
-    updated = proxy_config(before.decode(), hashed, secret['proxy_key'], public_origin).encode()
+    updated = proxy_config(before.decode(), hashed, secret['proxy_key'], public_origin,
+                           args.vpn_client_ip, args.vpn_client_ipv6).encode()
     try:
         group = grp.getgrgid(21010)
         if group.gr_name != 'elo-admin':
