@@ -30,7 +30,7 @@ fn fixture(path: &Path) -> (PublicSpaceService, ServiceConfig, Session) {
         address: SpaceAddress {
             url: "https://host.example.test/team/v1/spaces".into(),
             scope: service.team_scope().unwrap(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             service_credential: Some(service.transport_credential()),
         },
         peer: crate::sync::PeerDescriptor {

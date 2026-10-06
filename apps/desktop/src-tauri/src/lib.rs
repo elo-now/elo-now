@@ -21,6 +21,7 @@ mod device_name;
 mod download_protection;
 mod drafts;
 mod exchange;
+mod hosting;
 mod mail;
 mod native_media;
 #[cfg(any(all(target_os = "ios", feature = "mobile-push"), test))]
@@ -697,10 +698,7 @@ async fn operate(
         app.state::<background_history::BackgroundHistory>()
             .publish(client.history_snapshot(), revision)
     });
-    if request["op"] == "space_create" {
-        // Host selection is native configuration, never a renderer-supplied URL.
-        request["host"] = serde_json::json!(env!("ELO_CONFIGURED_SPACE_HOST"));
-    }
+    hosting::prepare_operation(&app, client, &mut request)?;
     let mut result = if request["op"] == "space_join_demo" {
         if request["expected_identity"] != serde_json::json!(client.identity_id()) {
             return Err("The open profile has changed.".into());
@@ -889,6 +887,7 @@ pub fn run() {
             attachment_transfer,
             cancel_attachment_transfer,
             operate,
+            hosting::hosting_catalog,
             drafts::draft_load,
             drafts::draft_save,
             realtime::realtime_context,

@@ -3,9 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { SpaceContactInput } from "./SpaceContact";
 import {
   AttachmentStorageForm,
-  attachmentStorageRequest,
   emptyAttachmentStorage,
 } from "./AttachmentStorageForm";
+import {
+  chooseHosting,
+  hostingLifetime,
+  hostingAttachmentRequest,
+  messageLifetimeLabel,
+  useHostingCatalog,
+  type MessageLifetime,
+} from "./Hosting";
+import { HostingPicker } from "./HostingPicker";
 import { ScreenHeader } from "./ScreenHeader";
 import { InvitationCode } from "./InvitationFlow";
 import { useToast } from "./Toast";
@@ -25,9 +33,9 @@ export function SpaceCreate({
 }) {
   const [name, setName] = useState(view.space_creation?.name ?? "");
   const [email, setEmail] = useState(view.space_creation?.contact_email ?? "");
-  const [messageLifetime, setMessageLifetime] = useState(
-    view.space_creation?.message_lifetime_seconds ?? 86_400,
-  );
+  const [messageLifetime, setMessageLifetime] = useState<
+    MessageLifetime | undefined
+  >(view.space_creation?.message_lifetime_seconds);
   const [requireApproval, setRequireApproval] = useState(
     view.space_creation?.require_approval ?? true,
   );
@@ -47,6 +55,33 @@ export function SpaceCreate({
   }, []);
   const { reportError, showError, onInvalid } = useToast();
   const creation = view.space_creation;
+  const catalog = useHostingCatalog();
+  const [hostingId, setHostingId] = useState(creation?.hosting_id);
+  const host = creation
+    ? catalog.entries.find((entry) => entry.id === creation.hosting_id)
+    : chooseHosting(catalog.entries, hostingId);
+  const lifetime = creation
+    ? (creation.message_lifetime_seconds ?? 86_400)
+    : host
+      ? hostingLifetime(
+          host,
+          hostingId === host.id ? messageLifetime : undefined,
+        )
+      : undefined;
+  const managedAttachments =
+    creation?.attachment_storage_managed ??
+    host?.attachment_storage_managed ??
+    false;
+  const storageAvailable =
+    host?.attachment_storage_available ??
+    (!!creation && !!view.attachment_storage_available);
+  const selectHosting = (id: string) => {
+    if (creation) return;
+    setHostingId(id);
+    const selected = catalog.entries.find((entry) => entry.id === id);
+    setMessageLifetime(selected?.default_message_lifetime);
+    setAttachmentStorage(emptyAttachmentStorage());
+  };
   const ready = !!creation?.invitation && !creation.attachment_storage_pending;
   const call = async (request: Record<string, unknown>) => {
     const reply = await invoke<{ view: View }>("operate", {
@@ -102,20 +137,34 @@ export function SpaceCreate({
             onInvalid={onInvalid}
             onSubmit={(event) => {
               event.preventDefault();
-              if (pending.current) return;
+              if (
+                pending.current ||
+                (!creation &&
+                  (catalog.status !== "ready" ||
+                    !host ||
+                    lifetime === undefined))
+              )
+                return;
               pending.current = true;
               setBusy(true);
               void call({
                 op: "space_create",
                 name: creation?.name ?? name.trim(),
                 contact_email: creation?.contact_email || email.trim(),
-                message_lifetime_seconds:
-                  creation?.message_lifetime_seconds ?? messageLifetime,
+                ...((creation?.hosting_id ?? host?.id)
+                  ? { hosting_id: creation?.hosting_id ?? host?.id }
+                  : {}),
+                message_lifetime_seconds: lifetime,
                 require_approval: creation?.require_approval ?? requireApproval,
-                ...(view.attachment_storage_available
+                ...(storageAvailable || managedAttachments
                   ? {
-                      attachment_storage:
-                        attachmentStorageRequest(attachmentStorage),
+                      attachment_storage: hostingAttachmentRequest(
+                        {
+                          attachment_storage_available: storageAvailable,
+                          attachment_storage_managed: managedAttachments,
+                        },
+                        attachmentStorage,
+                      ),
                     }
                   : {}),
               })
@@ -130,6 +179,7 @@ export function SpaceCreate({
                   if (!alive.current) return;
                   if (
                     attachmentStorage.enabled ||
+                    managedAttachments ||
                     creation?.attachment_storage_pending
                   )
                     showError(t("spaces.attachments.creationFailed"));
@@ -143,6 +193,17 @@ export function SpaceCreate({
             }}
           >
             <p className="page-description">{t("spaces.createHelp")}</p>
+            <HostingPicker
+              entries={catalog.entries}
+              selectedId={creation?.hosting_id ?? host?.id}
+              onSelect={selectHosting}
+              status={catalog.status}
+              request={catalog.request}
+              refresh={catalog.refresh}
+              disabled={busy || !!creation}
+              pendingCreation={!!creation}
+              mobile={mobile}
+            />
             <div className="space-form-field">
               <label htmlFor="space-name">{t("spaces.name")}</label>
               <input
@@ -166,22 +227,31 @@ export function SpaceCreate({
               </label>
               <select
                 id="space-message-lifetime"
-                value={creation?.message_lifetime_seconds ?? messageLifetime}
-                disabled={busy || !!creation}
+                value={lifetime ?? ""}
+                disabled={busy || !!creation || !host}
                 onChange={(event) =>
-                  setMessageLifetime(Number(event.target.value))
+                  setMessageLifetime(
+                    event.target.value === "no_expiry"
+                      ? "no_expiry"
+                      : Number(event.target.value),
+                  )
                 }
               >
-                {[21_600, 43_200, 86_400].map((seconds) => (
+                {(creation
+                  ? [lifetime ?? 86_400]
+                  : (host?.message_lifetimes ?? [])
+                ).map((seconds) => (
                   <option value={seconds} key={seconds}>
-                    {t(
-                      `spaces.messageLifetime.${seconds}` as "spaces.messageLifetime.21600",
-                    )}
+                    {messageLifetimeLabel(seconds)}
                   </option>
                 ))}
               </select>
               <p className="caption muted">
-                {t("spaces.messageLifetime.help")}
+                {t(
+                  lifetime === "no_expiry"
+                    ? "spaces.messageLifetime.noExpiryHelp"
+                    : "spaces.messageLifetime.help",
+                )}
               </p>
             </div>
             <label className="check">
@@ -193,12 +263,18 @@ export function SpaceCreate({
               />
               <span>{t("spaces.requireApproval")}</span>
             </label>
-            {view.attachment_storage_available && (
-              <AttachmentStorageForm
-                value={attachmentStorage}
-                onChange={setAttachmentStorage}
-                disabled={busy}
-              />
+            {managedAttachments ? (
+              <p className="caption muted">
+                {t("hosting.managedAttachmentsHelp")}
+              </p>
+            ) : (
+              storageAvailable && (
+                <AttachmentStorageForm
+                  value={attachmentStorage}
+                  onChange={setAttachmentStorage}
+                  disabled={busy}
+                />
+              )
             )}
             {creation?.attachment_storage_pending && (
               <p className="caption muted" role="status">
@@ -208,15 +284,26 @@ export function SpaceCreate({
             {creation && <p className="muted">{t("spaces.resumeHelp")}</p>}
             <p id="space-hosting-limits" className="space-hosting-limits muted">
               {t(
-                view.attachment_storage_available
-                  ? "spaces.hostingLimitsExternalAttachments"
-                  : "spaces.hostingLimits",
+                !host?.builtin
+                  ? "hosting.independentLimits"
+                  : managedAttachments
+                    ? "hosting.managedLimits"
+                    : storageAvailable
+                      ? "spaces.hostingLimitsExternalAttachments"
+                      : "spaces.hostingLimits",
               )}
             </p>
             <button
               type="submit"
               className="space-switch"
-              disabled={busy || !(creation?.name ?? name).trim()}
+              disabled={
+                busy ||
+                !(creation?.name ?? name).trim() ||
+                (!creation &&
+                  (catalog.status !== "ready" ||
+                    !host ||
+                    lifetime === undefined))
+              }
               aria-busy={busy}
             >
               {busy && (

@@ -18,6 +18,9 @@ async fn foreground_discovery_completes_open_admission_without_approving_manual_
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 150_000_000,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -166,6 +169,9 @@ async fn owner_managed_general_uses_public_hosting_and_linked_owner_after_origin
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 150_000_000,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -377,7 +383,7 @@ async fn legacy_creation_is_rejected_before_reserving_capacity_or_private_keys()
         issued: current().unwrap(),
         name: "Legacy request".into(),
         contact_email: "owner@example.test".into(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
         require_approval: true,
         authority: None,
     };

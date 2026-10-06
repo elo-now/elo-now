@@ -29,6 +29,15 @@ infrastructure, or host and manage it for you.**
 [Talk to 9bits](mailto:contact@9bits.com) about your organization and we will help
 you choose a setup and prepare an offer.
 
+In **Create Space**, choose the included **elo.now** hosting or import a private
+hosting configuration by QR or link. The hosting catalog stays on your device;
+each Space uses its selected services and supported retention policy. Private
+operators can offer 24 hours, 48 hours or no automatic server expiry, and managed
+attachment storage without putting storage credentials in the QR. See
+[hosting profiles](docs/SELF_HOSTING.md#imported-hosting-profiles) and the
+[two-host Docker installer](deploy/containers/README.md) for installation,
+supported services and trust boundaries.
+
 ## Work together
 
 | Area                             | What you can do                                                                                                                                                                                |

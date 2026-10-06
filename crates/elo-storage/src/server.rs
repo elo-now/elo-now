@@ -31,6 +31,31 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+/// Optional operator-owned storage. Access is separately allowlisted on the
+/// broker: possession of the public hosting QR never grants provider access.
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStorage {
+    pub provider: ProviderConfig,
+    pub allowed_owners: Vec<elo_core::ids::IdentityId>,
+}
+impl ManagedStorage {
+    fn for_command(&self, verified: &Verified) -> Result<&ProviderConfig> {
+        let owner = verified
+            .authority
+            .credential(verified.command.credential_id)?
+            .identity();
+        if !verified
+            .authority
+            .can_manage(verified.command.credential_id)
+            || !self.allowed_owners.contains(&owner)
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(&self.provider)
+    }
+}
+
 #[derive(Clone)]
 pub struct Service {
     engine: Arc<Mutex<Engine>>,
@@ -41,6 +66,7 @@ pub struct Service {
     transfers: Arc<Semaphore>,
     rate: Arc<Mutex<BTreeMap<IpAddr, (u64, u32)>>>,
     witness: Option<Arc<WitnessGate>>,
+    managed_storage: Option<Arc<ManagedStorage>>,
     #[cfg(test)]
     test_storage: Option<Arc<dyn AttachmentStorage>>,
 }
@@ -64,6 +90,7 @@ impl Service {
             transfers: Arc::new(Semaphore::new(8)),
             rate: Arc::new(Mutex::new(BTreeMap::new())),
             witness,
+            managed_storage: None,
             #[cfg(test)]
             test_storage: None,
         }
@@ -71,6 +98,16 @@ impl Service {
     pub fn trust_loopback_proxy(mut self, enabled: bool) -> Self {
         self.trusted_loopback_proxy = enabled;
         self
+    }
+    pub fn with_managed_storage(mut self, storage: Option<ManagedStorage>) -> Result<Self> {
+        if let Some(storage) = &storage {
+            storage.provider.validate()?;
+            if storage.allowed_owners.len() > 1024 {
+                return Err(Error::Invalid);
+            }
+        }
+        self.managed_storage = storage.map(Arc::new);
+        Ok(self)
     }
     fn source_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<IpAddr> {
         if self.trusted_loopback_proxy && peer.ip().is_loopback() {
@@ -284,12 +321,32 @@ async fn command(
             return Ok(axum::Json(response));
         }
     }
-    if let Operation::Configure {
-        expected_revision,
-        provider,
-        ..
-    } = &verified.command.operation
-    {
+    let managed = if matches!(
+        verified.command.operation,
+        Operation::ConfigureManaged { .. }
+    ) {
+        Some(
+            service
+                .managed_storage
+                .as_ref()
+                .ok_or(Error::Unauthorized)?
+                .for_command(&verified)?,
+        )
+    } else {
+        None
+    };
+    let configuration = match &verified.command.operation {
+        Operation::Configure {
+            expected_revision,
+            provider,
+            ..
+        } => Some((*expected_revision, provider)),
+        Operation::ConfigureManaged {
+            expected_revision, ..
+        } => Some((*expected_revision, managed.ok_or(Error::Unauthorized)?)),
+        _ => None,
+    };
+    if let Some((expected_revision, provider)) = configuration {
         let _config_slot = service
             .configs
             .clone()
@@ -359,7 +416,12 @@ async fn command(
     let lease = service.fresh(scope.0, scope.1, scope.2).await?;
     let mut engine = service.lock()?;
     service.check_lease(&engine, &lease)?;
-    Ok(axum::Json(engine.apply(&verified, ip, now())?))
+    Ok(axum::Json(engine.apply_with_managed(
+        &verified,
+        ip,
+        now(),
+        managed,
+    )?))
 }
 fn bearer(headers: &HeaderMap) -> Result<&str> {
     headers

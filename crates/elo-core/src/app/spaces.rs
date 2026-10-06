@@ -26,7 +26,7 @@ struct Entry {
     owner: bool,
     #[serde(default)]
     contact_email: Option<String>,
-    message_lifetime_seconds: u64,
+    message_lifetime_seconds: crate::message_retention::MessageRetention,
     address: Option<SpaceAddress>,
     #[serde(default)]
     requests: usize,
@@ -44,6 +44,8 @@ struct Entry {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreationIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosting_profile: Option<crate::hosting_profile::HostingProfile>,
     #[serde(default)]
     attachment_storage_pending: bool,
     #[serde(default)]
@@ -51,7 +53,7 @@ struct CreationIntent {
     host: String,
     request_id: String,
     name: String,
-    message_lifetime_seconds: u64,
+    message_lifetime_seconds: crate::message_retention::MessageRetention,
     #[serde(default = "super::space_host::default_require_approval")]
     require_approval: bool,
     #[serde(default)]
@@ -63,6 +65,8 @@ struct CreationIntent {
 #[serde(deny_unknown_fields)]
 struct Catalog {
     v: u8,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hosting_bindings: BTreeMap<String, crate::hosting_profile::HostingProfile>,
     #[serde(default)]
     setup: bool,
     #[serde(default)]
@@ -97,6 +101,17 @@ pub(super) struct Spaces {
 
 fn safe_id(id: &str) -> Result<()> {
     record::hex::<32>(id)?;
+    Ok(())
+}
+fn require_hosting_address(
+    profile: &crate::hosting_profile::HostingProfile,
+    address: &SpaceAddress,
+) -> Result<()> {
+    if reqwest::Url::parse(&profile.create_url)?.origin()
+        != reqwest::Url::parse(&address.url)?.origin()
+    {
+        return Err("Space address does not match its approved hosting configuration.".into());
+    }
     Ok(())
 }
 fn child_path(root: &ClientApp, id: &str) -> Result<PathBuf> {
@@ -373,6 +388,7 @@ impl ClientApp {
                 .map(|a| STANDARD.encode(a.genesis().bytes()));
             Catalog {
                 v: 1,
+                hosting_bindings: BTreeMap::new(),
                 setup: false,
                 creation: None,
                 creation_retry: None,
@@ -395,7 +411,7 @@ impl ClientApp {
                     message_lifetime_seconds: address
                         .as_ref()
                         .map(|value| value.message_lifetime_seconds)
-                        .unwrap_or(86_400),
+                        .unwrap_or_default(),
                     address,
                     requests: 0,
                     role: String::new(),
@@ -418,6 +434,34 @@ impl ClientApp {
             return Err("Invalid Space catalog.".into());
         }
         let mut unique = BTreeSet::new();
+        for (id, profile) in &catalog.hosting_bindings {
+            safe_id(id)?;
+            profile.validate()?;
+            let address = catalog
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .and_then(|e| e.address.as_ref())
+                .ok_or("Invalid Space hosting binding.")?;
+            require_hosting_address(profile, address)?;
+            self.configure_hosting_profile(profile.clone())?;
+        }
+        for intent in [&catalog.creation, &catalog.creation_retry]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(profile) = &intent.hosting_profile {
+                profile.validate()?;
+                if profile.create_url != intent.host
+                    || !profile
+                        .message_lifetimes
+                        .contains(&intent.message_lifetime_seconds)
+                {
+                    return Err("Invalid pending hosting configuration.".into());
+                }
+                self.configure_hosting_profile(profile.clone())?;
+            }
+        }
         for entry in &catalog.entries {
             safe_id(&entry.id)?;
             if !unique.insert(&entry.id)
@@ -481,9 +525,11 @@ impl ClientApp {
             if let Some(address) = &entry.address {
                 child.configure_space_team(address)?;
             }
-            child.push_endpoint = self.push_endpoint.clone();
-            child.configure_witness_pin(self.witness_pin.clone())?;
-            child.push_allow_loopback = self.push_allow_loopback;
+            let context = match spaces.catalog.hosting_bindings.get(&entry.id) {
+                Some(profile) => hosting_services::Context::profile(profile)?,
+                None => hosting_services::Context::capture(self),
+            };
+            context.apply(&mut child);
             child.profile_details = self.profile_details.clone();
             child.blocked = self.blocked.clone();
             spaces.children.insert(entry.id.clone(), child);
@@ -655,6 +701,17 @@ impl ClientApp {
     pub fn has_spaces_catalog(&self) -> bool {
         self.directory.join("spaces.age").exists()
     }
+    /// A persisted unfinished creation may outlive its native catalog entry.
+    pub fn pending_creation_hosting(
+        &self,
+    ) -> Option<Option<crate::hosting_profile::HostingProfile>> {
+        self.spaces
+            .as_ref()?
+            .catalog
+            .creation
+            .as_ref()
+            .map(|intent| intent.hosting_profile.clone())
+    }
 }
 pub(super) fn restore_file_removed(
     directory: &Path,
@@ -680,12 +737,79 @@ pub(super) fn restore_file_removed(
     Ok(catalog.root_disconnected && DATA_FILES.contains(&name))
 }
 impl Spaces {
+    fn context_for(
+        &self,
+        root: &mut ClientApp,
+        id: Option<&str>,
+    ) -> Result<hosting_services::Context> {
+        match id.and_then(|id| self.catalog.hosting_bindings.get(id)) {
+            Some(profile) => hosting_services::Context::profile(profile),
+            None => Ok(root.default_hosting_context()),
+        }
+    }
+    fn configure_children(&mut self, root: &mut ClientApp) -> Result<()> {
+        let defaults = root.default_hosting_context();
+        for (id, child) in &mut self.children {
+            let context = match self.catalog.hosting_bindings.get(id) {
+                Some(profile) => hosting_services::Context::profile(profile)?,
+                None => defaults.clone(),
+            };
+            context.apply(child);
+        }
+        Ok(())
+    }
+    fn operation_context(
+        &self,
+        root: &mut ClientApp,
+        value: &Value,
+    ) -> Result<hosting_services::Context> {
+        let op = field(value, "op")?;
+        if matches!(op, "space_preview" | "space_join") {
+            if let Some(link) = value["link"]
+                .as_str()
+                .filter(|link| link.starts_with(crate::witness::link::PREFIX))
+            {
+                let link = crate::witness::link::InvitationLink::parse(link)?;
+                if let Some(id) = link.hosting_id() {
+                    let profile = root
+                        .hosting_profile_for_id(id)
+                        .ok_or("Add this hosting configuration before opening the invitation.")?;
+                    return hosting_services::Context::profile(profile);
+                }
+                // Version-one links belong to the deployment's built-in host.
+                return Ok(root.default_hosting_context());
+            }
+            return root.creation_hosting_context();
+        }
+        if op == "space_create" {
+            if let Some(intent) = &self.catalog.creation
+                && let Some(profile) = &intent.hosting_profile
+                && value["host"].as_str() == Some(&intent.host)
+            {
+                return hosting_services::Context::profile(profile);
+            }
+            return root.creation_hosting_context();
+        }
+        let id = if op.starts_with("space_") {
+            value["id"].as_str()
+        } else {
+            value["target_space"].as_str()
+        }
+        .or(self.catalog.active.as_deref());
+        self.context_for(root, id)
+    }
     pub(super) fn configure_witness_pin(
         &mut self,
         pin: Option<crate::authority::WitnessPin>,
     ) -> Result<()> {
-        for child in self.children.values_mut() {
-            child.configure_witness_pin(pin.clone())?;
+        for (id, child) in &mut self.children {
+            child.configure_witness_pin(
+                self.catalog
+                    .hosting_bindings
+                    .get(id)
+                    .map(|profile| profile.witness.clone())
+                    .or_else(|| pin.clone()),
+            )?;
         }
         Ok(())
     }
@@ -814,7 +938,7 @@ impl Spaces {
             .catalog
             .creation
             .as_ref()
-            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"require_approval":c.require_approval,"space":c.space,"invitation":if c.attachment_storage_pending { None } else { c.invitation.as_ref() },"attachment_storage_pending":c.attachment_storage_pending}))
+            .map(|c| json!({"name":c.name,"contact_email":c.contact_email,"message_lifetime_seconds":c.message_lifetime_seconds,"require_approval":c.require_approval,"space":c.space,"invitation":if c.attachment_storage_pending { None } else { c.invitation.as_ref() },"attachment_storage_pending":c.attachment_storage_pending,"attachment_storage_managed":c.hosting_profile.as_ref().and_then(|p|p.storage.as_ref()).and_then(|s|s.managed.as_ref()).is_some(),"hosting_id":c.hosting_profile.as_ref().map(crate::hosting_profile::HostingProfile::id)}))
             .unwrap_or(Value::Null);
         view["space_role_requests"] = json!(self.catalog.entries.iter().flat_map(|e|e.role_requests.iter().map(|request|json!({"space_id":e.id,"space_name":e.name,"revision":e.roles_revision,"request":request}))).collect::<Vec<_>>());
         if let Some(streams) = view["streams"].as_array_mut() {
@@ -965,6 +1089,7 @@ impl Spaces {
                 )?);
         }
         self.catalog.entries.retain(|e| e.id != id);
+        self.catalog.hosting_bindings.remove(id);
         if self.catalog.active.as_deref() == Some(id) {
             self.catalog.active = self
                 .catalog
@@ -1008,6 +1133,15 @@ impl Spaces {
         result: Value,
     ) -> Result<String> {
         let id = address.scope.space.to_string();
+        let hosting_profile = self
+            .catalog
+            .hosting_bindings
+            .get(&id)
+            .cloned()
+            .or_else(|| root.hosting_services.active.clone());
+        if let Some(profile) = &hosting_profile {
+            require_hosting_address(profile, &address)?;
+        }
         let status = field(&result, "status")?;
         if let Some(previous) = self
             .catalog
@@ -1190,9 +1324,7 @@ impl Spaces {
                     child.profile_details = root.profile_details.clone();
                     child.blocked = root.blocked.clone();
                     child.configure_space_team(&address)?;
-                    child.configure_witness_pin(root.witness_pin.clone())?;
-                    child.push_endpoint = root.push_endpoint.clone();
-                    child.push_allow_loopback = root.push_allow_loopback;
+                    hosting_services::Context::capture(root).apply(&mut child);
                     child.accept_space_enrollment(enrollment).await?;
                     if let Some(genesis) = &self.catalog.personal_genesis {
                         let signed = decode_record(genesis)?;
@@ -1275,6 +1407,9 @@ impl Spaces {
         } else {
             self.catalog.entries.push(entry);
         }
+        if let Some(profile) = hosting_profile {
+            self.catalog.hosting_bindings.insert(id.clone(), profile);
+        }
         if status == "approved" && self.catalog.active.is_none() {
             self.catalog.active = Some(id.clone());
         }
@@ -1292,16 +1427,35 @@ impl Spaces {
             if root.attachment_storage_endpoint.is_none() {
                 return Err("Attachment storage is unavailable in this build.".into());
             }
-            super::external_storage::provider(&request["attachment_storage"])?;
+            if root
+                .hosting_services
+                .active
+                .as_ref()
+                .and_then(|p| p.storage.as_ref())
+                .and_then(|s| s.managed.as_ref())
+                .is_none()
+            {
+                super::external_storage::provider(&request["attachment_storage"])?;
+            }
         }
         let host = field(request, "host")?;
         super::space_host::validate_host(host, root.allow_loopback)?;
         let email = field(request, "contact_email")?.trim();
         super::space_service::validate_contact_email(email)?;
-        let message_lifetime_seconds = request["message_lifetime_seconds"]
-            .as_u64()
-            .ok_or("Choose a server message lifetime.")?;
+        let message_lifetime_seconds =
+            serde_json::from_value(request["message_lifetime_seconds"].clone())
+                .map_err(|_| "Choose a valid server message retention policy.")?;
         super::space_service::validate_message_lifetime(message_lifetime_seconds)?;
+        if let Some(profile) = &root.hosting_services.active
+            && (profile.create_url != host
+                || !profile
+                    .message_lifetimes
+                    .contains(&message_lifetime_seconds))
+        {
+            return Err(
+                "Choose a message retention policy offered by this hosting service.".into(),
+            );
+        }
         let require_approval = match request.get("require_approval") {
             Some(value) => value.as_bool().ok_or("Invalid Space request.")?,
             None => true,
@@ -1345,6 +1499,7 @@ impl Spaces {
                     && intent.require_approval == require_approval
             });
             self.catalog.creation = Some(retry.unwrap_or(CreationIntent {
+                hosting_profile: root.hosting_services.active.clone(),
                 attachment_storage_pending: storage_enabled,
                 contact_email: email.into(),
                 host: host.into(),
@@ -1587,8 +1742,6 @@ impl Spaces {
             &*root
         } else {
             let child = self.children.get_mut(id).ok_or("Space unavailable.")?;
-            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
-            child.configure_witness_pin(root.witness_pin.clone())?;
             &*child
         };
         let status = client.external_storage_status(address).await?;
@@ -1596,15 +1749,29 @@ impl Spaces {
             .as_bool()
             .ok_or("Configure attachment storage for the created Space to continue.")?;
         let response = if enabled {
+            let managed = intent
+                .hosting_profile
+                .as_ref()
+                .and_then(|p| p.storage.as_ref())
+                .and_then(|s| s.managed.as_ref());
             client
                 .external_storage_command(
                     address,
-                    Operation::Configure {
-                        expected_revision: status.revision,
-                        retention_hours: status.retention_hours.unwrap_or(1),
-                        provider: super::external_storage::provider(
-                            &request["attachment_storage"],
-                        )?,
+                    if let Some(managed) = managed {
+                        Operation::ConfigureManaged {
+                            expected_revision: status.revision,
+                            retention_hours: status
+                                .retention_hours
+                                .unwrap_or(managed.retention_hours),
+                        }
+                    } else {
+                        Operation::Configure {
+                            expected_revision: status.revision,
+                            retention_hours: status.retention_hours.unwrap_or(1),
+                            provider: super::external_storage::provider(
+                                &request["attachment_storage"],
+                            )?,
+                        }
                     },
                 )
                 .await?
@@ -1648,10 +1815,23 @@ impl Spaces {
         entry: Entry,
         mode: PollMode,
     ) -> Result<bool> {
+        let context = self.context_for(root, Some(&entry.id))?;
+        let mut scope = hosting_services::Scope::new(root, context);
+        Box::pin(self.poll_entry_scoped(&mut scope, entry, mode)).await
+    }
+    async fn poll_entry_scoped(
+        &mut self,
+        root: &mut ClientApp,
+        entry: Entry,
+        mode: PollMode,
+    ) -> Result<bool> {
         let Some(address) = entry.address.clone() else {
             return Ok(false);
         };
         if root.witness_pin.is_some() {
+            if entry.status == "checking" {
+                return Box::pin(self.verify_restored_witnessed(root, entry, address, mode)).await;
+            }
             let origin = root.invitation_origin()?.to_owned();
             if let Some((pending, authority)) = root
                 .witness_reconcile_pending_scope(&address.scope, &origin)
@@ -1820,6 +2000,78 @@ impl Spaces {
         }
         Ok(owner_sync_failed)
     }
+    async fn verify_restored_witnessed(
+        &mut self,
+        root: &mut ClientApp,
+        entry: Entry,
+        address: SpaceAddress,
+        mode: PollMode,
+    ) -> Result<bool> {
+        // A restored child is deliberately not in the usable-client map.
+        // Read its local authority only, and close it before requesting
+        // fresh permission. No cached history or owner control is exposed.
+        let known = if entry.root {
+            Self::general_authority(root, &address)?
+        } else if let Some(child) = self.children.get(&entry.id) {
+            Self::general_authority(child, &address)?
+        } else {
+            let child = root
+                .open_space_child(child_path(root, &entry.id)?, entry.id.parse()?)
+                .await?;
+            let known = if child.identity_id() == root.identity_id()
+                && child.session.credential().id() == root.session.credential().id()
+            {
+                Self::general_authority(&child, &address)
+            } else {
+                Err("Space profile identity mismatch.".into())
+            };
+            child.close().await?;
+            known?
+        };
+        let refresh = async {
+            let current = root.witness_read_authority(&known).await?;
+            root.sync_witnessed_host(&address, &current).await
+        };
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(if mode == PollMode::Regular { 24 } else { 2 }),
+            refresh,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Err(_) => return Ok(true),
+            Ok(Err(error)) if Self::verification_transport_unavailable(error.as_ref()) => {
+                return Ok(true);
+            }
+            Ok(Err(error)) => return Err(error),
+        };
+        self.add_joined(root, address, response).await?;
+        Ok(false)
+    }
+    fn general_authority(client: &ClientApp, address: &SpaceAddress) -> Result<Authority> {
+        client
+            .authorities
+            .0
+            .iter()
+            .find(|authority| {
+                authority.space() == address.scope.space
+                    && authority.stream() == address.scope.stream
+            })
+            .cloned()
+            .ok_or_else(|| "General unavailable.".into())
+    }
+    fn verification_transport_unavailable(
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        error.is::<super::witness_client::WitnessUnavailable>()
+            || matches!(
+                error.to_string().as_str(),
+                "Space server timed out."
+                    | "Space server unreachable."
+                    | "Space server is busy."
+                    | "Space server unavailable."
+            )
+    }
     pub(super) fn history_clients<'a>(
         &'a self,
         root: &'a ClientApp,
@@ -1852,10 +2104,30 @@ impl Spaces {
         F: Fn(u64, u64) + Send + Sync + 'static,
         A: Fn(AttachmentActivity) + Send + Sync + 'static,
     {
-        for child in self.children.values_mut() {
-            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
-            child.configure_witness_pin(root.witness_pin.clone())?;
-        }
+        self.configure_children(root)?;
+        let context = self.operation_context(root, v)?;
+        let mut scope = hosting_services::Scope::new(root, context);
+        Box::pin(self.operate_attachment_transfer_scoped(
+            &mut scope,
+            v,
+            cancellation,
+            progress,
+            activity,
+        ))
+        .await
+    }
+    async fn operate_attachment_transfer_scoped<F, A>(
+        &mut self,
+        root: &mut ClientApp,
+        v: &Value,
+        cancellation: AttachmentCancellation,
+        progress: F,
+        activity: A,
+    ) -> Result<Value>
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+        A: Fn(AttachmentActivity) + Send + Sync + 'static,
+    {
         if v.get("expected_identity")
             .is_some_and(|id| id != &json!(root.identity_id()))
         {
@@ -1922,10 +2194,12 @@ impl Spaces {
         Ok(response)
     }
     pub(super) async fn operate(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
-        for child in self.children.values_mut() {
-            child.attachment_storage_endpoint = root.attachment_storage_endpoint.clone();
-            child.configure_witness_pin(root.witness_pin.clone())?;
-        }
+        self.configure_children(root)?;
+        let context = self.operation_context(root, &v)?;
+        let mut scope = hosting_services::Scope::new(root, context);
+        Box::pin(self.operate_scoped(&mut scope, v)).await
+    }
+    async fn operate_scoped(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
         // Inner operations only mutate/report. Build one combined snapshot at
         // the Space boundary, or return the affected chat's partial snapshot.
         let _root_view = root.presentation.defer_view();
@@ -2216,6 +2490,8 @@ impl Spaces {
                             self.add_joined(root, address.clone(), response).await?;
                             let mut management =
                                 root.call_space(&address, "manage", json!({})).await?;
+                            management["attachment_storage_available"] =
+                                json!(root.attachment_storage_endpoint.is_some());
                             management["offers"] = root.witnessed_offer_list(&address)?;
                             if let Some(entry) =
                                 self.catalog.entries.iter_mut().find(|entry| entry.id == id)
@@ -2375,6 +2651,8 @@ impl Spaces {
                     return Ok(result);
                 }
                 if op == "space_manage" {
+                    result["result"]["attachment_storage_available"] =
+                        json!(root.attachment_storage_endpoint.is_some());
                     if let Some(entry) =
                         self.catalog.entries.iter_mut().find(|entry| entry.id == id)
                     {
@@ -2535,7 +2813,9 @@ impl Spaces {
             }
             let entry = self.catalog.entries.iter().find(|e| &e.id == id).unwrap();
             let report = if entry.root {
-                Box::pin(root.operate_local(v.clone())).await
+                let context = self.context_for(root, Some(id))?;
+                let mut scope = hosting_services::Scope::new(root, context);
+                Box::pin(scope.operate_local(v.clone())).await
             } else {
                 Box::pin(
                     self.children
@@ -2810,6 +3090,9 @@ impl ClientApp {
 }
 
 #[cfg(test)]
+mod restore_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::space_service::ServiceConfig;
     use super::*;
@@ -2873,6 +3156,146 @@ mod tests {
         ClientApp::open(base.join(name), PASSWORD.into(), true)
             .await
             .unwrap()
+    }
+    #[tokio::test]
+    async fn hosting_bindings_survive_restart_and_keep_children_and_push_routes_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut user = profile(temp.path(), "hosting owner").await;
+        user.enable_spaces().await.unwrap();
+        let first = hosting_services::test_profile(41);
+        let second = hosting_services::test_profile(51);
+        let public = hosting_services::test_profile(61);
+        user.configure_witness_pin(Some(public.witness.clone()))
+            .unwrap();
+        user.configure_invitation_host(&public.create_url).unwrap();
+        user.configure_push("https://public-wake.example.test/", false)
+            .unwrap();
+        let first_address = SpaceAddress {
+            url: "https://api41.example.test/team/v1/spaces".into(),
+            scope: user.team_scope().unwrap(),
+            service_credential: None,
+            message_lifetime_seconds: Default::default(),
+        };
+        let first_id = first_address.scope.space.to_string();
+        let second_id = "51".repeat(32);
+        let mut second_address = first_address.clone();
+        second_address.url = "https://api51.example.test/team/v1/spaces".into();
+        second_address.scope.space = second_id.parse().unwrap();
+        let mut child = profile(temp.path(), "hosting child").await;
+        child
+            .configure_push("https://public-wake.example.test/", false)
+            .unwrap();
+        let route = push::Route {
+            endpoint: "https://public-wake.example.test/".into(),
+            id: "01".repeat(16),
+            notify_key: "02".repeat(32),
+            scope_key: "03".repeat(32),
+            since: 1,
+        };
+        child.advertise_wake_route(Some(route.clone())).unwrap();
+        let mut spaces = user.spaces.take().unwrap();
+        spaces.catalog.entries[0].id = first_id.clone();
+        spaces.catalog.entries[0].address = Some(first_address);
+        spaces.catalog.active = Some(first_id.clone());
+        let mut pending = spaces.catalog.entries[0].clone();
+        pending.id = second_id.clone();
+        pending.address = Some(second_address);
+        pending.root = false;
+        pending.status = "pending".into();
+        spaces.catalog.entries.push(pending);
+        spaces
+            .catalog
+            .hosting_bindings
+            .insert(first_id.clone(), first.clone());
+        spaces
+            .catalog
+            .hosting_bindings
+            .insert(second_id.clone(), second.clone());
+        spaces.children.insert(second_id.clone(), child);
+        spaces.configure_children(&mut user).unwrap();
+        spaces
+            .configure_witness_pin(Some(public.witness.clone()))
+            .unwrap();
+        assert_eq!(
+            spaces.children[&second_id].witness_pin,
+            Some(second.witness.clone())
+        );
+        assert_eq!(
+            spaces.children[&second_id].attachment_storage_endpoint,
+            second.storage.as_ref().map(|s| s.url.clone())
+        );
+        assert!(spaces.children[&second_id].push_endpoint.is_none());
+        let context = spaces
+            .operation_context(&mut user, &json!({"op":"space_manage","id":first_id}))
+            .unwrap();
+        {
+            let scope = hosting_services::Scope::new(&mut user, context);
+            assert_eq!(scope.witness_pin, Some(first.witness.clone()));
+        }
+        assert_eq!(user.witness_pin, Some(public.witness.clone()));
+        spaces.save(&user).unwrap();
+        user.spaces = Some(spaces);
+        user.advertise_wake_route(Some(route)).unwrap();
+        let child = &user.spaces.as_ref().unwrap().children[&second_id];
+        let invitation_bytes =
+            vault::read_private(&child.directory.join("invitations.age")).unwrap();
+        let invitation_plain = crypto::open_bytes(
+            &invitation_bytes,
+            child.session.age_identity(),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let invitation_state: Value = serde_json::from_slice(&invitation_plain).unwrap();
+        assert!(invitation_state["own_wake"].is_null());
+        user.close().await.unwrap();
+        let mut reopened =
+            ClientApp::open(temp.path().join("hosting owner"), PASSWORD.into(), true)
+                .await
+                .unwrap();
+        reopened
+            .configure_witness_pin(Some(public.witness.clone()))
+            .unwrap();
+        reopened.enable_spaces().await.unwrap();
+        assert_eq!(reopened.hosting_profile_for_id(&first.id()), Some(&first));
+        assert_eq!(reopened.hosting_profile_for_id(&second.id()), Some(&second));
+        let spaces = reopened.spaces.take().unwrap();
+        let context = spaces.context_for(&mut reopened, Some(&second_id)).unwrap();
+        {
+            let scope = hosting_services::Scope::new(&mut reopened, context);
+            assert_eq!(scope.witness_pin, Some(second.witness.clone()));
+            assert_eq!(scope.current_hosting_id(), Some(second.id()));
+        }
+        assert_eq!(reopened.witness_pin, Some(public.witness));
+        reopened.spaces = Some(spaces);
+        reopened.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn unknown_hosting_invitation_fails_before_network_and_preserves_default_context() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let temp = tempfile::tempdir().unwrap();
+        let mut user = profile(temp.path(), "unknown host").await;
+        user.enable_spaces().await.unwrap();
+        let public = hosting_services::test_profile(63);
+        user.configure_witness_pin(Some(public.witness.clone()))
+            .unwrap();
+        let mut bytes = vec![7u8; 97];
+        bytes[0] = 2;
+        let link = format!(
+            "{}{}",
+            crate::witness::link::PREFIX,
+            URL_SAFE_NO_PAD.encode(bytes)
+        );
+        let error = user
+            .operate(json!({"op":"space_preview","link":link}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Add this hosting configuration before opening the invitation."
+        );
+        assert_eq!(user.witness_pin, Some(public.witness));
+        assert!(user.current_hosting_id().is_none());
+        user.close().await.unwrap();
     }
     async fn command(
         server: &std::sync::Arc<tokio::sync::Mutex<ClientApp>>,
@@ -2940,7 +3363,7 @@ mod tests {
             service_credential: None,
             url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
             scope: user.team_scope().unwrap(),
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         let id = address.scope.space.to_string();
         let router = axum::Router::new().route(
@@ -3116,7 +3539,7 @@ mod tests {
                         .into(),
                     controller: owner.session.credential().id(),
                 },
-                message_lifetime_seconds: 21_600,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours6,
                 service_credential: None,
             },
             witness: pin.clone(),
@@ -3328,7 +3751,7 @@ mod tests {
                 service_credential: None,
                 url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
                 scope: server.team_scope().unwrap(),
-                message_lifetime_seconds: 86400,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             },
             owners: vec![owner.identity_id()],
             contact_email: None,
@@ -3569,7 +3992,7 @@ mod tests {
                     service_credential: None,
                     url: format!("http://{address}/spaces/{pending}/team/v1/spaces"),
                     scope: scope.clone(),
-                    message_lifetime_seconds: 86_400,
+                    message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 }),
                 ..joined.clone()
             },
@@ -3594,7 +4017,7 @@ mod tests {
             service_credential: None,
             url: format!("http://{address}/spaces/{}/team/v1/spaces", scope.space),
             scope,
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         let mut receiving = request.clone();
         receiving["receive_only"] = json!(true);
@@ -3680,7 +4103,7 @@ mod tests {
                         space: id.parse().unwrap(),
                         ..scope.clone()
                     },
-                    message_lifetime_seconds: 86_400,
+                    message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 }),
                 ..template.clone()
             })
@@ -3769,7 +4192,7 @@ mod tests {
                 root: pin.root.clone(),
                 controller: owner.team_scope().unwrap().controller,
             },
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         helper.selected_space_client_mut().unwrap().call_host = Some(address.clone());
         restored.selected_space_client_mut().unwrap().call_host = Some(address.clone());
@@ -4060,7 +4483,7 @@ mod tests {
                     service_credential: None,
                     url: service_url,
                     scope: server.team_scope().unwrap(),
-                    message_lifetime_seconds: 86_400,
+                    message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 },
                 owners: vec![owner.identity_id()],
                 contact_email: None,

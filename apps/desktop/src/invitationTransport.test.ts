@@ -8,11 +8,8 @@ import {
   normalizeInvitationLink,
 } from "./invitationTransport";
 
-function shortLink(version = 1) {
-  const bytes = Uint8Array.from(
-    { length: 65 },
-    (_, index) => (index * 17) % 256,
-  );
+function shortLink(version = 1, length = 65) {
+  const bytes = Uint8Array.from({ length }, (_, index) => (index * 17) % 256);
   bytes[0] = version;
   return (
     SHORT_SPACE_PREFIX +
@@ -24,6 +21,13 @@ function shortLink(version = 1) {
 }
 
 describe("invitation input classification", () => {
+  it("preserves the full private-host selector without fetching or trusting it", () => {
+    const link = shortLink(2, 97);
+    expect(link.slice(SHORT_SPACE_PREFIX.length)).toHaveLength(130);
+    expect(normalizeInvitationLink(link)).toEqual({ kind: "space", link });
+    expect(normalizeInvitationLink(shortLink(1, 97))).toBeNull();
+    expect(normalizeInvitationLink(shortLink(2))).toBeNull();
+  });
   it("routes a canonical short link to Space while preserving the secret fragment", () => {
     const link = shortLink();
     expect(link.slice(SHORT_SPACE_PREFIX.length)).toHaveLength(87);

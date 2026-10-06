@@ -63,6 +63,29 @@ const known: Record<string, MessageKey> = {
   "Space access denied.": "error.replicaAccess",
   "Space endpoint unavailable.": "error.spaceUnavailable",
   "Space hosting unavailable.": "error.hostingUnavailable",
+  "Invalid signed hosting configuration.": "hosting.invalidLink",
+  "The hosting link is too large.": "hosting.linkTooLarge",
+  "This hosting configuration conflicts with its saved trust pins or revision.":
+    "hosting.trustConflict",
+  "This hosting address already has an approved configuration.":
+    "hosting.trustConflict",
+  "Hosting configuration cannot replace an approved trust anchor.":
+    "hosting.trustConflict",
+  "This device has reached its hosting configuration limit.":
+    "hosting.catalogFull",
+  "The hosting catalog is full.": "hosting.catalogFull",
+  "Add this hosting configuration before opening the invitation.":
+    "hosting.invitationMissing",
+  "Choose hosting before creating a Space.": "hosting.creationMissing",
+  "Continue creating the Space on its saved hosting.": "hosting.creationSaved",
+  "Choose a valid server message retention policy.":
+    "hosting.policyUnavailable",
+  "Choose a message retention policy offered by this hosting service.":
+    "hosting.policyUnavailable",
+  "Attachment storage is unavailable on this hosting service.":
+    "hosting.storageUnavailable",
+  "This hosting service does not provide managed attachment storage.":
+    "hosting.managedUnavailable",
   "Space server is busy.": "error.serverBusy",
   "Space is busy. Try again.": "error.serverBusy",
   "Hosting capacity reached.": "error.hostingCapacity",

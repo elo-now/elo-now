@@ -238,7 +238,7 @@ mod tests {
             request_id: "synthetic".into(),
             name: "Unpublished".into(),
             contact_email: None,
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
             require_approval: true,
             mailbox: MailboxDescriptor::random().unwrap(),
             password: String::new(),

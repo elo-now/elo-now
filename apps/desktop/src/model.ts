@@ -1,4 +1,5 @@
 import { t } from "./i18n";
+import type { MessageLifetime } from "./Hosting";
 /** Signed records require UTC whole seconds; keep display/reminder dates separate. */
 export const recordTimestamp = (date = new Date()): string =>
   date.toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -49,7 +50,7 @@ export type SpaceSummary = {
   deletable?: boolean;
   role?: "primary_owner" | "owner" | "member";
   roles_revision?: number;
-  message_lifetime_seconds?: number;
+  message_lifetime_seconds?: MessageLifetime;
 };
 export function spaceStatusText(
   space: Pick<SpaceSummary, "status" | "pending_reason">,
@@ -175,7 +176,9 @@ export type View = {
     require_approval?: boolean;
     space?: string;
     invitation?: string;
-    message_lifetime_seconds?: number;
+    message_lifetime_seconds?: MessageLifetime;
+    hosting_id?: string;
+    attachment_storage_managed?: boolean;
     attachment_storage_pending?: boolean;
   } | null;
   space_role_requests?: SpaceRoleRequest[];

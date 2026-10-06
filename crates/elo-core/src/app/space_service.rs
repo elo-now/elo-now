@@ -41,7 +41,7 @@ pub(super) fn space_status_error(status: reqwest::StatusCode) -> &'static str {
 pub struct SpaceAddress {
     pub url: String,
     pub scope: team::TeamScope,
-    pub message_lifetime_seconds: u64,
+    pub message_lifetime_seconds: crate::message_retention::MessageRetention,
     /// Pinned HTTP response signer, separate from the owner-managed General.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_credential: Option<String>,
@@ -106,12 +106,10 @@ pub struct ServiceConfig {
     pub peer: PeerDescriptor,
 }
 
-pub fn validate_message_lifetime(value: u64) -> Result<()> {
-    if matches!(value, 21_600 | 43_200 | 86_400) {
-        Ok(())
-    } else {
-        Err("Choose a server message lifetime of 6, 12 or 24 hours.".into())
-    }
+pub fn validate_message_lifetime(_value: crate::message_retention::MessageRetention) -> Result<()> {
+    // Invalid values cannot be constructed or deserialized. Hosting separately
+    // restricts the valid policies it is willing to serve.
+    Ok(())
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1547,7 +1545,7 @@ mod transport_tests {
                 service_credential: None,
                 url: format!("{base}/team/v1/spaces"),
                 scope: client.team_scope().unwrap(),
-                message_lifetime_seconds: 86_400,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             },
             token: "ab".repeat(32),
         };
@@ -1574,7 +1572,7 @@ mod transport_tests {
                     &"cd".repeat(16),
                     "Family",
                     "owner@example.test",
-                    86_400,
+                    crate::message_retention::MessageRetention::Hours24,
                     true,
                 )
                 .await
@@ -1660,7 +1658,7 @@ mod deletion_tests {
                     .into(),
                 controller: session.credential().id(),
             },
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         let receipt = |signer: &Session, space: SpaceId| {
             let body = json!({"v":1,"kind":"space.deleted","space":space,"deleted_at":1});

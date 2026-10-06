@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hosting-catalog"
+description = "Enables the hosting_catalog command without any pre-configured scope."
+commands.allow = ["hosting_catalog"]
+
+[[permission]]
+identifier = "deny-hosting-catalog"
+description = "Denies the hosting_catalog command without any pre-configured scope."
+commands.deny = ["hosting_catalog"]

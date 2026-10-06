@@ -104,7 +104,7 @@ async fn linked_general_owner_can_create_private_dm_without_old_device_key_or_re
             root: pin.root.clone(),
             controller: old_device,
         },
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         service_credential: None,
     });
     alex.pins.push(pin);

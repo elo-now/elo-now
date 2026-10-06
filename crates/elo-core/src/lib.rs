@@ -7,9 +7,11 @@ pub mod store;
 
 pub mod crypto;
 pub mod erasure;
+pub mod message_retention;
 pub mod retention_access;
 
 pub mod client_policy;
+pub mod hosting_profile;
 pub mod http;
 pub mod realtime;
 pub mod replica;

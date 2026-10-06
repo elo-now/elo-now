@@ -1,0 +1,108 @@
+name: elo-witness
+services:
+  witness:
+    image: elo-witness:${ELO_VERSION:?Set the locally built image version}
+    pull_policy: never
+    user: "21002:21002"
+    network_mode: host
+    read_only: true
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    ulimits: {core: 0}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=21002,gid=21002
+      - /run/elo-witness:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=21002,gid=21002
+    volumes:
+      - type: bind
+        source: ${ELO_STATE:?Initialize the witness state directory}/witness/config
+        target: /etc/elo/witness
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/witness/data
+        target: /var/lib/elo-witness
+        bind: {create_host_path: false}
+    # Readiness is deliberately separate: a healthy process may remain sealed.
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:17845/livez]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  storage:
+    profiles: [storage]
+    image: elo-storage:${ELO_VERSION:?Set the locally built image version}
+    pull_policy: never
+    user: "21003:21003"
+    network_mode: host
+    read_only: true
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 768m
+    memswap_limit: 768m
+    ulimits: {core: 0}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=21003,gid=21003
+    volumes:
+      - type: bind
+        source: ${ELO_STATE}/storage/config
+        target: /etc/elo/storage
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/storage/data
+        target: /var/lib/elo-storage
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:17846/health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  proxy:
+    image: caddy:2.11.7-alpine
+    user: "21004:21004"
+    network_mode: host
+    read_only: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    memswap_limit: 256m
+    ulimits: {core: 0}
+    environment:
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /tmp/caddy-config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=21004,gid=21004
+    volumes:
+      - type: bind
+        source: ${ELO_STATE}/proxy/config
+        target: /etc/caddy
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/proxy/data
+        target: /data
+        bind: {create_host_path: false}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

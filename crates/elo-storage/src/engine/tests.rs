@@ -6,6 +6,31 @@ use elo_core::{
     vault::Session,
 };
 const NOW: u64 = 1_800_000_000;
+
+#[test]
+fn managed_configuration_never_accepts_missing_server_credentials_and_keeps_replay_fence() {
+    let (_dir, mut engine, owner, a) = configured();
+    let request = prepared(
+        &a,
+        &owner,
+        Operation::ConfigureManaged {
+            expected_revision: 1,
+            retention_hours: 12,
+        },
+    );
+    let ip = "127.0.0.1".parse().unwrap();
+    assert!(engine.apply(&request, ip, NOW).is_err());
+    assert_eq!(engine.status(a.space()).unwrap().revision, 1);
+    engine
+        .apply_with_managed(&request, ip, NOW, Some(&provider()))
+        .unwrap();
+    assert_eq!(engine.status(a.space()).unwrap().revision, 2);
+    assert_eq!(engine.status(a.space()).unwrap().retention_hours, Some(12));
+    engine
+        .apply_with_managed(&request, ip, NOW, Some(&provider()))
+        .unwrap();
+    assert_eq!(engine.status(a.space()).unwrap().revision, 2);
+}
 pub(crate) const AUDIENCE: &str = "https://storage.example.test/storage/v1";
 fn authority(owner: &Session) -> Authority {
     authority_with_pin(owner, None)

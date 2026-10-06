@@ -18,6 +18,7 @@ import { pauseBackgroundSync } from "./backgroundSyncPause";
 import { spaceStatusText, type View, type SpaceSummary } from "./model";
 import "./spaces.css";
 import { SpaceCreate } from "./SpaceCreate";
+import { messageLifetimeLabel, type MessageLifetime } from "./Hosting";
 import { ServiceRequests } from "./ServiceRequests";
 import { SpaceDetails } from "./SpaceDetails";
 import { EmptyState } from "./EmptyState";
@@ -44,7 +45,7 @@ type Reply = {
     name: string;
     require_approval: boolean;
     expires_at: number;
-    message_lifetime_seconds: number;
+    message_lifetime_seconds: MessageLifetime;
   };
   result?: Management & { link?: string };
 };
@@ -596,11 +597,13 @@ export function Spaces({
                   )}
                 </p>
                 <p className="caption muted">
-                  {t("spaces.messageLifetime.joinHelp", {
-                    lifetime: t(
-                      `spaces.messageLifetime.${preview.message_lifetime_seconds}` as "spaces.messageLifetime.21600",
-                    ),
-                  })}
+                  {preview.message_lifetime_seconds === "no_expiry"
+                    ? t("spaces.messageLifetime.noExpiryJoinHelp")
+                    : t("spaces.messageLifetime.joinHelp", {
+                        lifetime: messageLifetimeLabel(
+                          preview.message_lifetime_seconds,
+                        ),
+                      })}
                 </p>
                 {
                   <div className="space-join-note">
@@ -735,9 +738,6 @@ export function Spaces({
                         identity={view.identity}
                         space={selected}
                         management={management}
-                        attachmentStorageAvailable={
-                          view.attachment_storage_available
-                        }
                         onChanged={() => manage(selected)}
                         onView={onView}
                       />

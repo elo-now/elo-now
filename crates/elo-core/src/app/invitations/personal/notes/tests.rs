@@ -155,7 +155,7 @@ async fn notes_concurrent_creation_reopen_and_two_devices_use_one_private_encryp
         issued: now().unwrap().as_millis() as u64,
         name: "Notes test Space".into(),
         contact_email: "owner@example.invalid".into(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         require_approval: false,
         authority: Some(proof),
     };
@@ -180,7 +180,7 @@ async fn notes_concurrent_creation_reopen_and_two_devices_use_one_private_encryp
     let address = SpaceAddress {
         url: format!("{origin}/team/v1/spaces"),
         scope: service.team_scope().unwrap(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         service_credential: Some(service.transport_credential()),
     };
     let config = ServiceConfig {

@@ -58,6 +58,7 @@ fn main() {
             "attachment_transfer",
             "cancel_attachment_transfer",
             "operate",
+            "hosting_catalog",
             "draft_load",
             "draft_save",
             "realtime_context",

@@ -18,7 +18,79 @@ Debian 13 is the deployment path exercised by this project. Oracle Linux 10 foll
 
 For upgrades to an existing installation, read [API compatibility and application updates](API_COMPATIBILITY.md) first. The current security baseline is a clean cutover with matching clients and services, without older-client support or existing-data migration; this guide is not an in-place migration procedure. The optional `client_policy` field in `/etc/elo/host/config.json` controls platform minimums. Leave them disabled until the replacement app is available to users.
 
+## Current-source container deployment on two hosts
+
+The [container deployment package](../deploy/containers/README.md) provides a
+separate path for new installations using current matching clients and
+services: an API host and an independent witness host, with an optional
+S3-compatible attachment broker on the witness host. It builds local versioned
+images from an allowlisted source context; no published elo image is assumed.
+The initializer creates separate persistent data and private key directories,
+restricts new Space creation to explicitly listed identities, and prepares a
+signed public hosting profile for import. Linux host networking preserves the
+services' loopback-only trust boundary behind a local TLS proxy.
+
+Every witness process remains sealed until the operator explicitly activates
+it against a separately trusted, latest journal anchor. The package does not
+automate that trust decision. It also does not include calls, push, MEGAcmd,
+external anchor collection or automated backups. Local initializer and Compose
+validation are distinct from a real Linux build, two-host deployment and
+restore acceptance run. Follow the package's prerequisites, activation and
+acceptance instructions before offering this path to users. The single-VPS
+instructions below remain a separate deployment layout.
+
 ## 1. What runs where
+
+### Imported hosting profiles
+
+Current clients keep a device-local hosting catalog. **elo.now** is present on
+first use. In **Create Space**, use **+** beside Hosting to scan or paste the
+operator's `elo://hosting/v1#…` configuration, inspect the endpoint and policies,
+and explicitly add it. Removing a catalog entry only hides that creation option;
+it does not disconnect or migrate existing Spaces. The default entry can be
+restored. The catalog is not synchronized between devices.
+
+The signed profile contains a name, revision, creation endpoint, witness pin,
+an optional storage endpoint, a reserved push field, allowed message policies
+and a default policy.
+The signing key identifies the profile. Import is an explicit trust decision:
+a self-signature does not identify a trustworthy operator. Later imports must
+preserve the approved endpoints and keys and increase the revision. Removed
+entries retain their pins, so removing and re-adding is not a key-reset flow.
+Each joined Space separately retains its hosting binding in encrypted profile
+state. Host selection never reassigns an existing Space.
+
+Imported hosting currently supports API, witness and optional attachment broker.
+Its `push_url` must be `null`: native push registration still belongs to the
+built-in hosting. A private Space does not send push-route information to that
+public service. Private mobile push and call-service provisioning are outside
+the container package's current scope.
+
+Private-host invitation links carry a compact hosting identifier in addition
+to the invitation capability. Recipients must import that hosting's configuration
+before opening its invitation; an invitation cannot supply or replace a trusted
+witness key. The full invitation fragment remains on the client. The server
+receives only the ciphertext locator and signed admission requests.
+
+The server's `allowed_message_retentions` is authoritative. Omission retains the
+public policies `[21600,43200,86400]` (6/12/24 hours). A private operator may use
+`[86400,172800,"no_expiry"]`. No expiry keeps server delivery copies after
+recipient acknowledgment, subject to quota and explicit deletion; it does not
+disable message **Keep**, attachment expiry, access revocation or backup policy.
+See [retention semantics](REPLICA_RETENTION.md). Client and server must both
+support the selected policy.
+
+`allowed_creators: null` permits public creation; `[]` denies creation; a list
+of identity IDs permits those creators. Importing the public hosting QR grants
+neither creation permission nor Space membership. Resource limits still apply.
+
+Storage may be owner-configured or operator-managed. The public profile only
+advertises the broker and provider type. For managed storage, the broker reads
+a separate private `managed_storage` file containing `provider` and
+`allowed_owners`; a signed request from a currently authorized owner is required
+to activate it. Neither the API nor QR gets the credentials. Provider changes
+use the existing storage revision and cleanup rules. The container package
+supports S3; MEGA requires the separately installed and verified MEGAcmd adapter.
 
 | Component | Install on the VPS | Public route / port | Private configuration |
 | --- | --- | --- | --- |

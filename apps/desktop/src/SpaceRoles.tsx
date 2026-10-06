@@ -23,6 +23,7 @@ export type SpaceManagement = {
   roles_revision: number;
   primary_owner: string;
   contact_email?: string | null;
+  attachment_storage_available?: boolean;
   attachments?: {
     policy: {
       enabled: boolean;

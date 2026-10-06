@@ -454,12 +454,76 @@ export const en = {
   "spaces.messageLifetime.21600": "6 hours",
   "spaces.messageLifetime.43200": "12 hours",
   "spaces.messageLifetime.86400": "24 hours",
+  "spaces.messageLifetime.172800": "48 hours",
+  "spaces.messageLifetime.hours": "{hours} hours",
+  "spaces.messageLifetime.no_expiry": "No automatic expiry",
   "spaces.messageLifetime.help":
-    "The server keeps encrypted message copies for at most this long (maximum 24 hours). After that they live on members’ devices. If you stay offline longer, you may need someone else from this Space to be using elo, and some messages may be gone.",
+    "The server keeps encrypted message copies for at most this long. After that they live on members’ devices. If you stay offline longer, you may need someone else from this Space to be using elo, and some messages may be gone.",
+  "spaces.messageLifetime.noExpiryHelp":
+    "Encrypted server copies have no automatic time limit. Storage limits and deletion still apply. Direct-message copies can be removed after the recipient’s device accepts them. This setting is separate from a message’s Keep timer.",
+  "spaces.messageLifetime.noExpiryJoinHelp":
+    "This Space has no automatic time limit for encrypted server message copies. Storage limits and deletion still apply. Direct-message copies can be removed after the recipient’s device accepts them.",
+  "spaces.messageLifetime.noExpiryDetails":
+    "Encrypted server message copies have no automatic time limit. Storage limits, deletion and direct-message acceptance still apply.",
   "spaces.messageLifetime.joinHelp":
     "This Space keeps encrypted copies on the server for {lifetime}. After that, messages stay on members’ devices. If you are offline longer than that, some messages may be missing unless another member can share them.",
   "spaces.messageLifetime.details":
     "Encrypted message copies remain on the server for at most {lifetime}.",
+  "hosting.label": "Hosting",
+  "hosting.localHelp": "This list is saved on this device.",
+  "hosting.saved": "Saved hosting",
+  "hosting.savedHelp": "Continue setting up this Space on its saved hosting.",
+  "hosting.loading": "Loading hosting…",
+  "hosting.choose": "Choose hosting",
+  "hosting.empty": "Add hosting or restore elo.now to create a Space.",
+  "hosting.loadFailed": "The hosting list could not be loaded. Try again.",
+  "hosting.retry": "Try again",
+  "hosting.restore": "Restore elo.now",
+  "hosting.addTitle": "Add hosting",
+  "hosting.addHelp":
+    "Scan a hosting QR code or paste its link. Review the details and only add hosting from an administrator you trust.",
+  "hosting.link": "Hosting link",
+  "hosting.scan": "Scan hosting QR",
+  "hosting.scanHint": "Point the camera at the hosting QR code.",
+  "hosting.preview": "Preview hosting",
+  "hosting.checking": "Checking hosting…",
+  "hosting.add": "Add",
+  "hosting.adding": "Adding hosting…",
+  "hosting.invalidLink": "This link does not contain a valid hosting profile.",
+  "hosting.linkTooLarge":
+    "This hosting link is too large. Ask the hosting administrator for a new link.",
+  "hosting.trustConflict":
+    "This link conflicts with the hosting configuration saved on this device. Ask the hosting administrator to check it.",
+  "hosting.catalogFull":
+    "This device has reached its hosting configuration limit. You can restore a previously removed hosting configuration.",
+  "hosting.previewFailed":
+    "This hosting link could not be checked. Check the link and try again.",
+  "hosting.addFailed": "Hosting could not be added. Try again.",
+  "hosting.saveFailed": "The hosting list could not be saved. Try again.",
+  "hosting.invitationMissing":
+    "Add this hosting configuration before opening the invitation.",
+  "hosting.creationMissing": "Choose hosting before creating a Space.",
+  "hosting.creationSaved": "Continue creating the Space on its saved hosting.",
+  "hosting.policyUnavailable":
+    "Choose a message lifetime offered by this hosting service.",
+  "hosting.storageUnavailable":
+    "Attachment storage is unavailable on this hosting service.",
+  "hosting.managedUnavailable":
+    "This hosting service does not provide managed attachment storage.",
+  "hosting.removeTitle": "Remove {name}?",
+  "hosting.removeHelp":
+    "Remove {name} from the hosting list on this device? Existing Spaces keep using their current hosting.",
+  "hosting.remove": "Remove",
+  "hosting.attachments": "Attachments",
+  "hosting.managedAttachments": "Storage provided by the host",
+  "hosting.ownAttachments": "Connect your own storage",
+  "hosting.noAttachments": "Unavailable",
+  "hosting.managedAttachmentsHelp":
+    "Attachments are enabled using storage provided by this host.",
+  "hosting.independentLimits":
+    "Space and storage limits are set by this hosting provider.",
+  "hosting.managedLimits":
+    "Message and attachment storage limits are set by this hosting provider.",
   "spaces.creating": "Creating your Space…",
   "spaces.resume": "Continue creating your Space",
   "spaces.resumeHelp":

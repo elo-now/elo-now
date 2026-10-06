@@ -125,7 +125,7 @@ fn fixture() -> Fixture {
                 root: record::encode_hex(root.verifying_key().as_bytes()),
                 controller: credential.id(),
             },
-            message_lifetime_seconds: 21_600,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours6,
             service_credential: Some(STANDARD.encode(credential.record().bytes())),
         },
         witness: pin.clone(),
@@ -146,6 +146,33 @@ fn encrypted(f: &Fixture) -> EncryptedInvitation {
 
 fn unchecked(f: &Fixture, descriptor: &Descriptor) -> EncryptedInvitation {
     encrypt_signed(&signed(descriptor, &f.owner), seed()).unwrap()
+}
+
+#[test]
+fn routed_link_selects_a_host_without_changing_crypto_or_trusting_new_keys() {
+    let f = fixture();
+    let invitation = encrypted(&f);
+    let id = record::encode_hex(&[4; 32]);
+    let link = invitation.link.with_hosting(&id).unwrap();
+    let encoded = link.to_url();
+    assert_eq!(encoded.len(), PREFIX.len() + 130);
+    let parsed = InvitationLink::parse(&encoded).unwrap();
+    assert_eq!(parsed.hosting_id(), Some(id.as_str()));
+    assert!(
+        parsed
+            .open(&invitation.ciphertext, API, &f.pin, NOW)
+            .is_ok()
+    );
+    assert!(
+        parsed
+            .open(
+                &invitation.ciphertext,
+                "https://other.example/",
+                &f.pin,
+                NOW
+            )
+            .is_err()
+    );
 }
 
 #[test]

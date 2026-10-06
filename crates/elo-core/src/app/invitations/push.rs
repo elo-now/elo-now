@@ -74,12 +74,19 @@ impl ClientApp {
     pub fn configure_push(&mut self, value: &str, allow_loopback: bool) -> Result<()> {
         self.push_endpoint = Some(endpoint(value, allow_loopback)?.to_string());
         self.push_allow_loopback = allow_loopback;
+        self.refresh_default_hosting_context();
         Ok(())
     }
     pub fn advertise_wake_route(&self, route: Option<Route>) -> Result<()> {
         if let Some(spaces) = &self.spaces {
             for client in spaces.clients(self) {
-                client.advertise_wake_route_local(route.clone())?;
+                let scoped = route
+                    .as_ref()
+                    .filter(|route| {
+                        client.push_endpoint.as_deref() == Some(route.endpoint.as_str())
+                    })
+                    .cloned();
+                client.advertise_wake_route_local(scoped)?;
             }
             return Ok(());
         }
@@ -1026,7 +1033,7 @@ mod tests {
             service_credential: None,
             url: "https://api.example.test/team/v1/spaces".into(),
             scope: hosting_scope,
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         assert_ne!(hosting, authority.space());
         let route = Route {

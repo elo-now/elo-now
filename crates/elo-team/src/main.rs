@@ -29,6 +29,17 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Export a signed public hosting profile; the private key never enters the QR.
+    HostingConfig {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        qr_output: Option<PathBuf>,
+    },
     /// Serve isolated, self-service Spaces and their ciphertext replica.
     Host {
         #[arg(long)]
@@ -147,6 +158,38 @@ async fn operator_statistics(
 }
 async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::HostingConfig {
+            input,
+            key,
+            output,
+            qr_output,
+        } => {
+            let bytes = Zeroizing::new(vault::read_private(&key)?);
+            let key: &[u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Expected a 32-byte signing key.")?;
+            let body = std::fs::read(input)?;
+            let body = body.strip_suffix(b"\n").unwrap_or(&body);
+            let public = elo_core::hosting_profile::HostingProfile::export(body, key)?;
+            let qr = qr_output
+                .as_ref()
+                .map(|_| -> Result<String> {
+                    let link = public["link"]
+                        .as_str()
+                        .ok_or("Invalid exported hosting profile.")?;
+                    let code = qrcode::QrCode::new(link.as_bytes())?;
+                    Ok(code
+                        .render::<qrcode::render::svg::Color>()
+                        .min_dimensions(512, 512)
+                        .build())
+                })
+                .transpose()?;
+            vault::write_private(&output, &serde_json::to_vec_pretty(&public)?, false)?;
+            if let (Some(path), Some(svg)) = (qr_output, qr) {
+                vault::write_private(&path, svg.as_bytes(), false)?;
+            }
+        }
         Command::Host { config, bind } => hosting::run(config, bind).await?,
         Command::Init {
             config,
@@ -187,7 +230,7 @@ async fn run() -> Result<()> {
                 url,
                 token,
                 scope: client.team_scope()?,
-                message_lifetime_seconds: 86_400,
+                message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
             };
             team.validate(false)?;
             vault::write_private(
@@ -413,7 +456,7 @@ mod tests {
             url: format!("http://{}/team/v1/enroll", listener.local_addr().unwrap()),
             token: "fe".repeat(32),
             scope: owner.team_scope().unwrap(),
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
         };
         let managed_space = ServiceConfig {
             name: "Demo".into(),

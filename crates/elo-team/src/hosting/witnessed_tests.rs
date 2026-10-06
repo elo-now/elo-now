@@ -306,6 +306,9 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
         max_spaces: 128,
         max_space_creations_per_day: 32,
         mailbox_quota_bytes: 150_000_000,
+        allowed_message_retentions: elo_core::message_retention::MessageRetention::public_policies(
+        ),
+        allowed_creators: None,
         operator_snapshot: None,
         backup_access_key: None,
         call_admission_key: None,
@@ -329,7 +332,7 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
         issued: current().unwrap(),
         name: "Witnessed test".into(),
         contact_email: "owner@example.test".into(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
         require_approval: true,
         authority: Some(authority.call_proof().unwrap()),
     };

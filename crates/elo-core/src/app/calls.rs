@@ -220,7 +220,7 @@ mod freshness_tests {
                     service_credential: None,
                     url: "http://127.0.0.1:9/team/v1/spaces".into(),
                     scope: app.team_scope().unwrap(),
-                    message_lifetime_seconds: 86400,
+                    message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 });
                 let probe = app.membership_probe().unwrap();
                 app.accept_membership_probe(

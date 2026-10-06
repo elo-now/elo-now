@@ -79,7 +79,7 @@ async fn server(
             .unwrap()
             .into(),
         },
-        message_lifetime_seconds: 86_400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         service_credential: Some(STANDARD.encode(app.session.credential().record().bytes())),
     });
     let state = Arc::new(Mutex::new(Witness {

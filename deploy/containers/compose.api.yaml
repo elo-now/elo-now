@@ -1,0 +1,76 @@
+name: elo-api
+services:
+  api:
+    image: elo-api:${ELO_VERSION:?Set the locally built image version}
+    pull_policy: never
+    user: "21001:21001"
+    network_mode: host
+    read_only: true
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 2g
+    memswap_limit: 2g
+    ulimits:
+      core: 0
+      nofile: 8192
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=21001,gid=21001
+    volumes:
+      - type: bind
+        source: ${ELO_STATE:?Initialize the API state directory}/api/config
+        target: /etc/elo/api
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/api/data
+        target: /var/lib/elo-api
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:18900/spaces/v1/health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  proxy:
+    image: caddy:2.11.7-alpine
+    user: "21004:21004"
+    network_mode: host
+    read_only: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    memswap_limit: 256m
+    ulimits: {core: 0}
+    environment:
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /tmp/caddy-config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=21004,gid=21004
+    volumes:
+      - type: bind
+        source: ${ELO_STATE}/proxy/config
+        target: /etc/caddy
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/proxy/data
+        target: /data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ELO_STATE}/public
+        target: /srv/elo-public
+        read_only: true
+        bind: {create_host_path: false}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

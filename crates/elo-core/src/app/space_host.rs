@@ -96,7 +96,7 @@ pub(crate) mod tests {
             issued: 100,
             name: "Team".into(),
             contact_email: "owner@example.test".into(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             require_approval: true,
             authority: Some(authority.call_proof().unwrap()),
         };
@@ -228,7 +228,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .into(),
             },
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             service_credential: Some(STANDARD.encode(transport.credential().record().bytes())),
         };
         address.validate(false).unwrap();
@@ -329,7 +329,7 @@ pub struct CreateCommand {
     pub issued: u64,
     pub name: String,
     pub contact_email: String,
-    pub message_lifetime_seconds: u64,
+    pub message_lifetime_seconds: crate::message_retention::MessageRetention,
     #[serde(default = "default_require_approval")]
     pub require_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,7 +525,7 @@ impl ClientApp {
         request_id: &str,
         name: &str,
         contact_email: &str,
-        message_lifetime_seconds: u64,
+        message_lifetime_seconds: crate::message_retention::MessageRetention,
         require_approval: bool,
     ) -> Result<CreateRequest> {
         let mut request = self.hosted_create_payload(
@@ -545,7 +545,7 @@ impl ClientApp {
         request_id: &str,
         name: &str,
         contact_email: &str,
-        message_lifetime_seconds: u64,
+        message_lifetime_seconds: crate::message_retention::MessageRetention,
         require_approval: bool,
     ) -> Result<CreateRequest> {
         validate_host(host, self.allow_loopback)?;
@@ -582,7 +582,7 @@ impl ClientApp {
         request_id: &str,
         name: &str,
         contact_email: &str,
-        message_lifetime_seconds: u64,
+        message_lifetime_seconds: crate::message_retention::MessageRetention,
         require_approval: bool,
     ) -> Result<HostedCreation> {
         let mut request = self.hosted_create_payload(
@@ -663,7 +663,7 @@ impl ClientApp {
             || value["host"] != host
             || value["name"] != name
             || value["contact_email"] != contact_email
-            || value["message_lifetime_seconds"] != message_lifetime_seconds
+            || value["message_lifetime_seconds"] != serde_json::to_value(message_lifetime_seconds)?
             || value["require_approval"] != require_approval
         {
             return Err("Unexpected Space hosting response.".into());

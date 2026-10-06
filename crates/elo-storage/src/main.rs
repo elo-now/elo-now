@@ -25,6 +25,9 @@ struct Config {
     max_spaces: usize,
     #[serde(default)]
     trusted_loopback_proxy: bool,
+    /// Private file on the broker host, never included in hosting QR exports.
+    #[serde(default)]
+    managed_storage: Option<PathBuf>,
 }
 fn max_spaces() -> usize {
     128
@@ -53,8 +56,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.public_url.clone(),
         config.max_spaces,
     )?;
+    let managed_storage = config
+        .managed_storage
+        .map(
+            |path| -> Result<server::ManagedStorage, Box<dyn std::error::Error + Send + Sync>> {
+                let bytes = Zeroizing::new(elo_core::vault::read_private(&path)?);
+                if bytes.len() > 128 * 1024 {
+                    return Err("Managed storage configuration is too large.".into());
+                }
+                Ok(serde_json::from_slice(&bytes)?)
+            },
+        )
+        .transpose()?;
     let service = Service::new(engine, config.public_url, config.witness)?
-        .trust_loopback_proxy(config.trusted_loopback_proxy);
+        .trust_loopback_proxy(config.trusted_loopback_proxy)
+        .with_managed_storage(managed_storage)?;
     let worker = service.clone();
     let maintenance = tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(30));

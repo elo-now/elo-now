@@ -1,8 +1,9 @@
 # Independent attachment storage broker
 
-This service is staged development work. Do not expose it publicly or enable
-`ELO_STORAGE_URL` in a released client until the complete witnessed-client flow, live-provider validation and deployment
-checks are complete.
+Deploy this service with matching clients that support witnessed General and
+external attachment descriptors. Validate the witnessed authorization flow,
+provider access and object lifecycle on the intended deployment before offering
+attachments to users.
 
 `elo-storage` receives requests directly from the client over its separately pinned HTTPS endpoint. The Space API never receives the provider configuration, transfer bearer tokens, or provider credentials. Deploy it as a separate service account on the witness host; do not put its key or database on the API host. Deployment is a separate operational step.
 
@@ -28,9 +29,9 @@ download preparation and subsequent streaming are each limited to 90 seconds.
 Already delivered ciphertext cannot be recalled. Account/device revocation must
 be represented in the witnessed General authority to affect this gate.
 
-**Staging gate:** keep this service reachable only on loopback, without a public
-proxy route, and leave `ELO_STORAGE_URL` / `TAURI_ELO_STORAGE_URL` unset in
-distributed clients until the full witnessed-client rollout is validated.
+**Deployment boundary:** keep the service listener on loopback and expose only
+the documented storage routes through its independent HTTPS proxy. Configure
+the client endpoint explicitly or through an approved hosting profile.
 Retention is an owner-signed broker policy, enforced independently of the upload
 client's clock or preferences.
 
@@ -86,10 +87,35 @@ parent-death handling and stale-operation cleanup limit discarded sessions.
 Memory, swap and process limits also apply to all child processes. Keep backups
 and their decryption keys independent of the attachment provider.
 
-The client endpoint is explicit native build configuration (`ELO_STORAGE_URL` or
-`TAURI_ELO_STORAGE_URL`), never inferred from a Space API response. Missing
+The client endpoint comes from explicit native build configuration (`ELO_STORAGE_URL` or
+`TAURI_ELO_STORAGE_URL`) for the public hosting, or from an imported, approved
+signed hosting profile for a private hosting. Each Space retains its own binding;
+the endpoint is never inferred from an untrusted Space API response. Missing
 configuration leaves this feature off. Updated recipients are required for the
 new `external_storage` attachment descriptor: older strict parsers reject it.
+
+### Operator-managed storage
+
+An operator may add `"managed_storage": "/etc/elo/storage/managed.json"` to the
+service configuration. This optional private file contains a validated
+`provider` configuration and an explicit `allowed_owners` array of profile
+identity IDs. Keep the file readable only by the broker service account; an
+empty allowlist permits no owner to activate operator-managed storage.
+
+The public hosting profile advertises only the provider type and attachment
+retention, never the provider credentials. During Space creation the client sends
+an owner-signed `ConfigureManaged` command, including the expected configuration
+revision, proof of work for initial registration, and current witnessed General
+authority. The broker checks the owner allowlist, probes the provider, and uses
+the same configuration, replay, revision and encrypted-credential protections as
+an owner-supplied provider. Credentials stay on the broker host.
+
+The allowlist controls activation and reconfiguration. Removing an owner from it
+does not revoke storage already configured for that owner's Spaces. Disable
+storage through a separately authorized Space operation when revocation is
+required. Existing objects retain their original expiry and provider generation.
+See [the container installer](../../deploy/containers/README.md) for an isolated
+API/witness installation with optional operator-managed S3 storage.
 
 ## Object lifecycle
 

@@ -596,7 +596,7 @@ mod tests {
             // response. This unreachable host must never be contacted by seal.
             url: "https://unreachable.invalid/team/v1/spaces".into(),
             scope: app.team_scope().unwrap(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         let captured = app.realtime_snapshot();
         assert!(
@@ -741,7 +741,7 @@ mod tests {
             service_credential: None,
             url: "https://unreachable.invalid/team/v1/spaces".into(),
             scope: app.team_scope().unwrap(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         let general = app.authorities.0[0].clone();
         let root = root_key(
@@ -831,7 +831,7 @@ mod tests {
             service_credential: None,
             url: format!("http://{}/team/v1/spaces", listener.local_addr().unwrap()),
             scope: app.team_scope().unwrap(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();

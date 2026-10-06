@@ -50,6 +50,7 @@
       ]
     },
     "allow-operate",
+    "allow-hosting-catalog",
     "allow-draft-load",
     "allow-draft-save",
     "allow-realtime-context",

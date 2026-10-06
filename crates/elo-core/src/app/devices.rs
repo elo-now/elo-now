@@ -335,7 +335,7 @@ mod tests {
                 root: app.pins[0].root.clone(),
                 controller: general.initial_controller().id(),
             },
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         let mut pin = app.pins[0].clone();
         pin.space = general.space();
@@ -395,7 +395,7 @@ mod tests {
             service_credential: None,
             url: "http://127.0.0.1:9/team/v1/spaces".into(),
             scope: app.team_scope().unwrap(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         });
         let encoded = STANDARD.encode(retired.credential().record().bytes());
         let result = app.revoke_linked_device(&encoded).await.unwrap();

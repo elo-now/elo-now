@@ -94,7 +94,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
         RetentionClaim::MessageBody {
             locator_nonce: nonce.clone(),
             record_id: record,
-            lifetime_seconds: 21_600,
+            lifetime_seconds: elo_core::message_retention::MessageRetention::Hours6,
             direct_peer: None,
             request_key: public_key(REQUEST_SECRET).unwrap(),
             accept_key: None,
@@ -109,7 +109,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
             locator_nonce: nonce,
             body_object_id: body_id,
             record_id: record,
-            lifetime_seconds: 21_600,
+            lifetime_seconds: elo_core::message_retention::MessageRetention::Hours6,
             request_key: public_key(REQUEST_SECRET).unwrap(),
         },
     );
@@ -155,7 +155,7 @@ async fn expired_body_requires_request_and_can_be_refilled_for_five_minutes() {
                 locator_nonce: "01010101010101010101010101010101".into(),
                 body_object_id: body_id,
                 record_id: record,
-                lifetime_seconds: 21_600,
+                lifetime_seconds: elo_core::message_retention::MessageRetention::Hours6,
                 request_key: public_key(REQUEST_SECRET).unwrap(),
             }),
         )
@@ -260,7 +260,7 @@ async fn direct_peer_acceptance_removes_only_the_body() {
         RetentionClaim::MessageBody {
             locator_nonce: nonce.clone(),
             record_id: record,
-            lifetime_seconds: 86_400,
+            lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
             direct_peer: Some(bob.identity_id()),
             request_key: public_key(REQUEST_SECRET).unwrap(),
             accept_key: Some(public_key(ACCEPT_SECRET).unwrap()),
@@ -275,7 +275,7 @@ async fn direct_peer_acceptance_removes_only_the_body() {
             locator_nonce: nonce,
             body_object_id: body_id,
             record_id: record,
-            lifetime_seconds: 86_400,
+            lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
             request_key: public_key(REQUEST_SECRET).unwrap(),
         },
     );

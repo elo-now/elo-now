@@ -11,16 +11,22 @@ export function normalizeInvitationLink(value: string): InvitationLink | null {
   const link = value.trim();
   if (link.startsWith(SHORT_SPACE_PREFIX)) {
     const fragment = link.slice(SHORT_SPACE_PREFIX.length);
-    if (!/^[A-Za-z0-9_-]{87}$/.test(fragment)) return null;
+    if (!/^(?:[A-Za-z0-9_-]{87}|[A-Za-z0-9_-]{130})$/.test(fragment))
+      return null;
     try {
-      const bytes = atob(fragment.replace(/-/g, "+").replace(/_/g, "/") + "=");
+      const bytes = atob(
+        fragment.replace(/-/g, "+").replace(/_/g, "/") +
+          "=".repeat((4 - (fragment.length % 4)) % 4),
+      );
       const canonical = btoa(bytes)
         .replace(/\+/g, "-")
         .replace(/\//g, "_")
         .replace(/=+$/, "");
       if (
-        bytes.length !== 65 ||
-        bytes.charCodeAt(0) !== 1 ||
+        !(
+          (bytes.length === 65 && bytes.charCodeAt(0) === 1) ||
+          (bytes.length === 97 && bytes.charCodeAt(0) === 2)
+        ) ||
         canonical !== fragment
       )
         return null;

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { messageLifetimeLabel } from "./Hosting";
 import { invoke } from "@tauri-apps/api/core";
 import { ActionDialog } from "./ActionDialog";
 import { locale, t } from "./i18n";
@@ -123,11 +124,13 @@ export function SpaceStorage({
         )}
         <p className="muted">{t("spaces.storage.help")}</p>
         <p className="caption muted">
-          {t("spaces.messageLifetime.details", {
-            lifetime: t(
-              `spaces.messageLifetime.${space.message_lifetime_seconds ?? 86_400}` as "spaces.messageLifetime.21600",
-            ),
-          })}
+          {space.message_lifetime_seconds === "no_expiry"
+            ? t("spaces.messageLifetime.noExpiryDetails")
+            : t("spaces.messageLifetime.details", {
+                lifetime: messageLifetimeLabel(
+                  space.message_lifetime_seconds ?? 86_400,
+                ),
+              })}
         </p>
       </section>
       {!space.message_lifetime_seconds && (

@@ -30,7 +30,7 @@ pub enum RetentionClaim {
     MessageBody {
         locator_nonce: String,
         record_id: RecordId,
-        lifetime_seconds: u64,
+        lifetime_seconds: crate::message_retention::MessageRetention,
         direct_peer: Option<IdentityId>,
         #[serde(default)]
         request_key: String,
@@ -40,7 +40,7 @@ pub enum RetentionClaim {
         locator_nonce: String,
         body_object_id: ObjectId,
         record_id: RecordId,
-        lifetime_seconds: u64,
+        lifetime_seconds: crate::message_retention::MessageRetention,
         #[serde(default)]
         request_key: String,
     },
@@ -165,8 +165,8 @@ fn valid_retention(
     issuer: IdentityId,
     subjects: &[IdentityId],
 ) -> bool {
-    let valid_common = |nonce: &str, lifetime: u64| {
-        record::hex::<16>(nonce).is_ok() && matches!(lifetime, 21_600 | 43_200 | 86_400)
+    let valid_common = |nonce: &str, _lifetime: crate::message_retention::MessageRetention| {
+        record::hex::<16>(nonce).is_ok()
     };
     match retention {
         None => true,

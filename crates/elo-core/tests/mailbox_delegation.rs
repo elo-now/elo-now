@@ -206,7 +206,7 @@ async fn recognized_v1_migrates_but_unknown_schema_is_not_modified() {
     assert_eq!(
         db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        9
+        10
     );
     assert_eq!(
         db.query_row("SELECT COUNT(*) FROM access_nonces", [], |r| r

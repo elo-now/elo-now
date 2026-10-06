@@ -77,12 +77,13 @@ impl InvitationSeed {
 pub struct InvitationLink {
     ciphertext_id: [u8; 32],
     seed: InvitationSeed,
+    hosting_id: Option<String>,
 }
 
 impl InvitationLink {
     pub fn parse(value: &str) -> Result<Self> {
         let fragment = value.strip_prefix(PREFIX).ok_or(RecordError::Framing)?;
-        if fragment.len() != FRAGMENT_LENGTH {
+        if !matches!(fragment.len(), FRAGMENT_LENGTH | 130) {
             return Err(RecordError::Framing.into());
         }
         let bytes = Zeroizing::new(
@@ -91,30 +92,49 @@ impl InvitationLink {
                 .map_err(|_| RecordError::Framing)?,
         );
         let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
-        if bytes.len() != 65 || canonical.as_str() != fragment {
+        if canonical.as_str() != fragment {
             return Err(RecordError::Framing.into());
         }
-        if bytes[0] != VERSION {
+        if !matches!((bytes.first(), bytes.len()), (Some(1), 65) | (Some(2), 97)) {
             return Err(RecordError::Unsupported.into());
         }
         let mut seed = Zeroizing::new([0; 32]);
-        seed.copy_from_slice(&bytes[33..]);
+        seed.copy_from_slice(&bytes[33..65]);
         Ok(Self {
             ciphertext_id: bytes[1..33].try_into().map_err(|_| RecordError::Framing)?,
             seed: InvitationSeed(seed),
+            hosting_id: (bytes.len() == 97).then(|| record::encode_hex(&bytes[65..])),
         })
     }
 
     pub fn ciphertext_id(&self) -> String {
         record::encode_hex(&self.ciphertext_id)
     }
+    /// A selector for a previously approved local hosting profile, never a URL
+    /// or a new trust anchor. Unknown IDs must fail before any network request.
+    pub fn hosting_id(&self) -> Option<&str> {
+        self.hosting_id.as_deref()
+    }
+
+    pub fn with_hosting(mut self, id: &str) -> Result<Self> {
+        record::hex::<32>(id)?;
+        self.hosting_id = Some(id.to_owned());
+        Ok(self)
+    }
 
     /// Explicit secret export for sharing or QR rendering; never use in logs.
     pub fn to_url(&self) -> Zeroizing<String> {
-        let mut bytes = Zeroizing::new([0; 65]);
-        bytes[0] = VERSION;
+        let mut bytes = Zeroizing::new(vec![0; if self.hosting_id.is_some() { 97 } else { 65 }]);
+        bytes[0] = if self.hosting_id.is_some() {
+            2
+        } else {
+            VERSION
+        };
         bytes[1..33].copy_from_slice(&self.ciphertext_id);
-        bytes[33..].copy_from_slice(self.seed.0.as_ref());
+        bytes[33..65].copy_from_slice(self.seed.0.as_ref());
+        if let Some(id) = &self.hosting_id {
+            bytes[65..].copy_from_slice(&record::hex::<32>(id).expect("validated hosting ID"));
+        }
         let mut url = Zeroizing::new(String::from(PREFIX));
         URL_SAFE_NO_PAD.encode_string(bytes.as_slice(), &mut url);
         url
@@ -275,6 +295,7 @@ fn encrypt_signed(signed: &SignedRecord, seed: InvitationSeed) -> Result<Encrypt
         link: InvitationLink {
             ciphertext_id,
             seed,
+            hosting_id: None,
         },
         ciphertext,
     })

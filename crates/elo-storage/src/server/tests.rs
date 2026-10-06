@@ -10,6 +10,34 @@ use elo_core::{
 };
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+#[test]
+fn operator_storage_requires_a_separate_owner_allowlist() {
+    let (_dir, _engine, owner, authority) = configured_with_pin(None);
+    let operation = Operation::ConfigureManaged {
+        expected_revision: 1,
+        retention_hours: 1,
+    };
+    let input = request(&authority, &owner, operation);
+    let verified = Verified::new_test(input, AUDIENCE, now()).unwrap();
+    let mut managed = ManagedStorage {
+        provider: ProviderConfig::S3Compatible {
+            endpoint: "https://s3.example.test".into(),
+            region: "test".into(),
+            bucket: "private".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+        },
+        allowed_owners: vec![],
+    };
+    assert!(managed.for_command(&verified).is_err());
+    managed
+        .allowed_owners
+        .push(Session::create().unwrap().0.identity_id());
+    assert!(managed.for_command(&verified).is_err());
+    managed.allowed_owners.push(owner.identity_id());
+    assert!(managed.for_command(&verified).is_ok());
+}
+
 struct WitnessFixture {
     key: SigningKey,
     pin: WitnessPin,

@@ -34,13 +34,19 @@ See [message actions](../crates/elo-core/src/app/message_actions.rs),
 
 ## Replica body lifetime
 
-At Space creation, the owner chooses **6 / 12 / 24 hours**, default **24 hours**.
+At Space creation, the owner chooses from the hosting service's allowed policies.
+The public default remains **6 / 12 / 24 hours**, default **24 hours**. An operator
+can additionally allow **48 hours** or **No expiry** on a separate hosting profile.
+The server validates the choice during creation and accepts message bodies and
+locators only with that Space's configured policy, including retries and refills.
 The duration measures elapsed time from the server's original receipt of a
 classified message body, not from the message's claimed display timestamp.
 The current interface does not change this setting on an existing Space.
+Removing a policy from a host's current offer affects new reservations only;
+existing Spaces and creation retries retain their signed original policy.
 Legacy descriptors without this policy retain their separate manual cleanup path.
 
-Replica is temporary delivery storage. Expiry removes the body ciphertext;
+For a finite lifetime, Replica is temporary delivery storage. Expiry removes the body ciphertext;
 devices retain history they already accepted. A separate signed, encrypted
 locator remains available to the original admitted recipients so an offline
 device can discover a missing message in the correct conversation. Joining later
@@ -51,9 +57,24 @@ If a device stays offline longer than the body lifetime, retrieval can require
 another current member's device with a copy, online with elo open and the profile
 unlocked. If no usable copy or key remains, the message cannot be recovered.
 
+**No expiry** has no automatic body or locator deadline. It keeps encrypted copies
+and their authorization metadata beyond 30 days, including after a one-to-one
+peer acknowledges acceptance. It does not promise unlimited capacity or override
+account/Space deletion, owner cleanup tombstones, Keep, or attachment expiry.
+Data still consumes the configured quota and survives or disappears with the
+operator's storage and backup policy.
+
+The signed `message_lifetime_seconds` and outer `lifetime_seconds` fields preserve
+the existing numeric values, add `172800`, and use the explicit JSON string
+`"no_expiry"` for no expiry. Zero, arbitrary durations and far-future sentinels
+are rejected. Replica schema version 10 stores a checked policy and nullable
+deadline; migration preserves existing receipt times, deadlines and access proofs.
+Duplicate uploads never restart finite deadlines or locator lifetimes.
+
 ### Earlier deletion in one-to-one DMs
 
-A Direct conversation with exactly two HUMAN identities can drop its body earlier:
+A Direct conversation with exactly two HUMAN identities and a **finite** policy
+can drop its body earlier (including with a 48-hour lifetime):
 a device of the **other identity** must decrypt the complete body, verify its
 signature and authority, and durably commit it as ACCEPTED before acknowledging.
 One device is sufficient; another device of that same identity may subsequently
@@ -122,12 +143,12 @@ conservative 1024-byte metadata allowance in addition to ciphertext.
 
 | Item | Retention |
 | --- | --- |
-| Message body | Space lifetime, or eligible one-to-one peer acceptance |
-| Locator | 30 days from the locator's first server receipt |
+| Message body | Finite Space lifetime or eligible one-to-one peer acceptance; no automatic expiry/acceptance deletion under No expiry |
+| Locator | 30 days from first server receipt for finite policies; no deadline under No expiry |
 | Active retrieval request | At most five minutes; replay metadata until the signed deadline |
 | Refilled body | Until its valid request window ends |
 | Acceptance retry metadata | At most 24 hours |
-| Body-absence metadata | Associated locator lifecycle |
+| Body/absence metadata | Associated locator lifecycle, including no deadline under No expiry |
 | Authorization, admission and invitation state | Their own protocol lifecycle; not sacrificed to make room for messages |
 
 Maintenance reclaims expired bodies, ended refill windows and expired metadata,
@@ -139,7 +160,8 @@ copies remain separate retention boundaries.
 
 The [Replica retention implementation](../crates/elo-core/src/replica/retention.rs),
 [message capability proofs](../crates/elo-core/src/retention_access.rs),
-[retention tests](../crates/elo-core/tests/retention.rs) and
+[retention tests](../crates/elo-core/tests/retention.rs),
+[policy and migration tests](../crates/elo-core/tests/retention_policies.rs), and
 [access tests](../crates/elo-core/tests/message_access.rs) define these checks.
 Deploy matching applications and services: earlier identity-only requests are not
 accepted as a fallback when current capability proofs are absent. Historical

@@ -140,6 +140,9 @@ mod tests {
                 max_spaces: default_max_spaces(),
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
+                allowed_message_retentions:
+                    elo_core::message_retention::MessageRetention::public_policies(),
+                allowed_creators: None,
                 operator_snapshot: None,
                 backup_access_key: None,
                 call_admission_key: Some(key_path),
@@ -205,6 +208,9 @@ mod tests {
                 max_spaces: default_max_spaces(),
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 32 * 1024 * 1024,
+                allowed_message_retentions:
+                    elo_core::message_retention::MessageRetention::public_policies(),
+                allowed_creators: None,
                 operator_snapshot: None,
                 backup_access_key: None,
                 call_admission_key: Some(key_path),

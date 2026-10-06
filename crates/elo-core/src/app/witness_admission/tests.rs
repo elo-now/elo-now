@@ -375,7 +375,7 @@ async fn fixture(approval: bool) -> Fixture {
                 root: record::encode_hex(root.verifying_key().as_bytes()),
                 controller: credential.id(),
             },
-            message_lifetime_seconds: 21_600,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours6,
             service_credential: None,
         },
         witness: pin.clone(),

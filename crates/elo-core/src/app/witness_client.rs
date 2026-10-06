@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 
 const FLOOR_BYTES: usize = 32 * 1024;
 
+/// An unavailable transport cannot verify a restored Space, but must not be
+/// confused with a successfully received, invalid authorization proof.
+#[derive(Debug, thiserror::Error)]
+#[error("Chat permissions need to be refreshed.")]
+pub(super) struct WitnessUnavailable;
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Floors {
@@ -42,6 +48,7 @@ impl ClientApp {
         if let Some(spaces) = &mut self.spaces {
             spaces.configure_witness_pin(pin)?;
         }
+        self.refresh_default_hosting_context();
         Ok(())
     }
 
@@ -261,7 +268,15 @@ impl ClientApp {
             .json(&request)
             .send()
             .await
-            .map_err(|_| "Chat permissions need to be refreshed.")?;
+            .map_err(|_| WitnessUnavailable)?;
+        if response.status().is_server_error()
+            || matches!(
+                response.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            return Err(WitnessUnavailable.into());
+        }
         if !response.status().is_success()
             || response.content_length().is_some_and(|size| size > 24_576)
         {
@@ -271,7 +286,7 @@ impl ClientApp {
         let mut chunks = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|_| "Chat permissions need to be refreshed.")?;
+            let chunk = chunk.map_err(|_| WitnessUnavailable)?;
             if bytes.len().saturating_add(chunk.len()) > 24_576 {
                 return Err("Chat permissions need to be refreshed.".into());
             }

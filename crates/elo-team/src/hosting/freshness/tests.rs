@@ -297,6 +297,9 @@ async fn creation_rechecks_the_lease_after_waiting_before_publication() {
         max_spaces: 128,
         max_space_creations_per_day: 32,
         mailbox_quota_bytes: 150_000_000,
+        allowed_message_retentions: elo_core::message_retention::MessageRetention::public_policies(
+        ),
+        allowed_creators: None,
         operator_snapshot: None,
         backup_access_key: None,
         call_admission_key: None,
@@ -314,7 +317,7 @@ async fn creation_rechecks_the_lease_after_waiting_before_publication() {
         issued: current().unwrap(),
         name: "Witness test".into(),
         contact_email: "owner@example.test".into(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
         require_approval: false,
         authority: Some(authority.call_proof().unwrap()),
     };

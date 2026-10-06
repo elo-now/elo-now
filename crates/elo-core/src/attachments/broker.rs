@@ -93,6 +93,10 @@ pub enum Operation {
         provider: ProviderConfig,
         retention_hours: u32,
     },
+    ConfigureManaged {
+        expected_revision: u64,
+        retention_hours: u32,
+    },
     Policy {
         expected_revision: u64,
         retention_hours: u32,
@@ -117,7 +121,7 @@ pub enum Operation {
 }
 impl Operation {
     pub fn ttl(&self) -> u64 {
-        if matches!(self, Self::Configure { .. }) {
+        if matches!(self, Self::Configure { .. } | Self::ConfigureManaged { .. }) {
             CONFIGURE_TTL
         } else {
             COMMAND_TTL
@@ -137,7 +141,11 @@ impl Operation {
                 }
                 provider.validate()?;
             }
-            Self::Policy {
+            Self::ConfigureManaged {
+                expected_revision,
+                retention_hours,
+            }
+            | Self::Policy {
                 expected_revision,
                 retention_hours,
             } => {
@@ -283,6 +291,9 @@ pub fn sign_command(
         Operation::Configure {
             expected_revision: 0,
             ..
+        } | Operation::ConfigureManaged {
+            expected_revision: 0,
+            ..
         }
     ) {
         let base = work_base(&command)?;
@@ -331,7 +342,10 @@ pub fn verify_command(
     signed.verify_signature(authority.credential(command.credential_id)?.key())?;
     if matches!(
         command.operation,
-        Operation::Configure { .. } | Operation::Policy { .. } | Operation::Disable { .. }
+        Operation::Configure { .. }
+            | Operation::ConfigureManaged { .. }
+            | Operation::Policy { .. }
+            | Operation::Disable { .. }
     ) && !authority.can_manage(command.credential_id)
     {
         return Err(RecordError::Authority);
@@ -340,6 +354,9 @@ pub fn verify_command(
     if matches!(
         command.operation,
         Operation::Configure {
+            expected_revision: 0,
+            ..
+        } | Operation::ConfigureManaged {
             expected_revision: 0,
             ..
         }

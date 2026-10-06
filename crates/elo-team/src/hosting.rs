@@ -54,6 +54,11 @@ pub(super) struct HostConfig {
     #[serde(default = "default_daily_creations")]
     pub max_space_creations_per_day: usize,
     pub mailbox_quota_bytes: u64,
+    #[serde(default = "elo_core::message_retention::MessageRetention::public_policies")]
+    pub allowed_message_retentions: Vec<elo_core::message_retention::MessageRetention>,
+    /// None allows public creation; an empty list closes private provisioning.
+    #[serde(default)]
+    pub allowed_creators: Option<Vec<IdentityId>>,
     #[serde(default)]
     pub operator_snapshot: Option<PathBuf>,
     /// A dedicated private bearer key for the loopback backup endpoints.
@@ -95,7 +100,7 @@ struct Reservation {
     name: String,
     #[serde(default)]
     contact_email: Option<String>,
-    message_lifetime_seconds: u64,
+    message_lifetime_seconds: elo_core::message_retention::MessageRetention,
     #[serde(default = "space_host::default_require_approval")]
     require_approval: bool,
     mailbox: MailboxDescriptor,
@@ -213,6 +218,17 @@ impl Host {
     async fn open(config: HostConfig, allow_loopback: bool) -> Result<Arc<Self>> {
         elo_core::store::ClientStore::configure_shared_workers(4)?;
         config.client_policy.validate()?;
+        if config.allowed_creators.as_ref().is_some_and(|ids| {
+            ids.len() > 1024
+                || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+        }) {
+            return Err("Invalid hosting creator allowlist.".into());
+        }
+        if !elo_core::message_retention::MessageRetention::validate_allowed(
+            &config.allowed_message_retentions,
+        ) {
+            return Err("Invalid hosting message retention policies.".into());
+        }
         if let Some(pin) = &config.witness {
             pin.validate()?;
         }
@@ -293,6 +309,7 @@ impl Host {
         )?))?;
         config.address.validate(self.allow_loopback)?;
         if config.name != reservation.name
+            || config.address.message_lifetime_seconds != reservation.message_lifetime_seconds
             || config.address.url
                 != format!("{}/spaces/{id}/team/v1/spaces", self.config.public_url)
             || config.peer.mailbox_id != reservation.mailbox.mailbox_id
@@ -301,6 +318,7 @@ impl Host {
         }
         let replica = ReplicaStore::open(path.join("replica"))
             .await?
+            .with_allowed_message_retentions(vec![reservation.message_lifetime_seconds])?
             .with_revocations(self.revocations.clone());
         if replica.supports_account_erasure().await? {
             replica.require_content_ownership().await?;
@@ -477,6 +495,16 @@ impl Host {
     ) -> Result<(String, Reservation)> {
         // Never allocate a new server-owned profile, including through internal callers.
         require_owner_managed_creation(command)?;
+        if self
+            .config
+            .allowed_creators
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&creator))
+        {
+            return Err(
+                "This profile is not allowed to create Spaces on this hosting service.".into(),
+            );
+        }
         if let Some((authority, _)) = freshness {
             let proof = command
                 .authority
@@ -513,6 +541,18 @@ impl Host {
         let mut reservation: Reservation = if reservation_path.exists() {
             serde_json::from_slice(&Zeroizing::new(vault::read_private(&reservation_path)?))?
         } else {
+            // An operator's current offer only governs new reservations. Existing
+            // signed reservations retain their original policy, including retries.
+            if !self
+                .config
+                .allowed_message_retentions
+                .contains(&command.message_lifetime_seconds)
+            {
+                return Err(
+                    "This hosting service does not allow the selected message retention policy."
+                        .into(),
+                );
+            }
             let (allocated, owned) = {
                 let index = self
                     .allocations
@@ -626,6 +666,7 @@ impl Host {
             if !path.join("config.json").exists() {
                 let replica = ReplicaStore::open(path.join("replica"))
                     .await?
+                    .with_allowed_message_retentions(vec![reservation.message_lifetime_seconds])?
                     .with_revocations(self.revocations.clone());
                 replica
                     .reserve_mailbox(reservation.mailbox.clone(), self.config.mailbox_quota_bytes)
@@ -759,6 +800,14 @@ async fn create(
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
     require_owner_managed_creation(&command).map_err(|_| StatusCode::UPGRADE_REQUIRED)?;
+    if host
+        .config
+        .allowed_creators
+        .as_ref()
+        .is_some_and(|ids| !ids.contains(&credential.identity()))
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if credential.authorizing_device().is_some() {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -816,6 +865,10 @@ async fn create(
         .map_err(|e| {
             if e.to_string() == "Hosting capacity reached." {
                 StatusCode::TOO_MANY_REQUESTS
+            } else if e.to_string()
+                == "This hosting service does not allow the selected message retention policy."
+            {
+                StatusCode::BAD_REQUEST
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -1586,7 +1639,7 @@ mod tests {
                 &"11".repeat(16),
                 name,
                 "owner@example.test",
-                86400,
+                elo_core::message_retention::MessageRetention::Hours24,
                 true,
             )
             .unwrap();
@@ -1615,6 +1668,209 @@ mod tests {
                 .unwrap();
         }
         drop(host);
+    }
+    #[tokio::test]
+    async fn configured_message_policies_gate_signed_creation_and_persist_on_restart() {
+        use elo_core::message_retention::MessageRetention;
+        let temp = tempfile::tempdir().unwrap();
+        let owner = profile(&temp.path().join("owner")).await;
+        let base = "https://host.example.test";
+        let endpoint = format!("{base}/spaces/v1/create");
+        let config: HostConfig = serde_json::from_value(json!({
+            "root":temp.path().join("host"), "public_url":base,
+            "max_spaces_per_identity":4, "mailbox_quota_bytes":150_000_000
+        }))
+        .unwrap();
+        assert_eq!(
+            config.allowed_message_retentions,
+            MessageRetention::public_policies()
+        );
+        let host = Host::open(config.clone(), false).await.unwrap();
+        for (index, policy) in [MessageRetention::Hours48, MessageRetention::NoExpiry]
+            .into_iter()
+            .enumerate()
+        {
+            let request = owner
+                .hosted_create_request(
+                    &endpoint,
+                    &format!("{:032x}", index + 1),
+                    "Retention test",
+                    "owner@example.test",
+                    policy,
+                    false,
+                )
+                .unwrap();
+            let response = app(host.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/spaces/v1/create")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(host.spaces.read().await.is_empty());
+        close_host(host).await;
+        let mut config = config;
+        config.allowed_message_retentions =
+            vec![MessageRetention::Hours48, MessageRetention::NoExpiry];
+        let host = Host::open(config.clone(), false).await.unwrap();
+        let mut created_requests = Vec::new();
+        for (index, policy) in [MessageRetention::Hours48, MessageRetention::NoExpiry]
+            .into_iter()
+            .enumerate()
+        {
+            let request = owner
+                .hosted_create_request(
+                    &endpoint,
+                    &format!("{:032x}", index + 1),
+                    "Retention test",
+                    "owner@example.test",
+                    policy,
+                    false,
+                )
+                .unwrap();
+            let response = app(host.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/spaces/v1/create")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            created_requests.push(request);
+        }
+        let mut policies: Vec<_> = host
+            .spaces
+            .read()
+            .await
+            .values()
+            .map(|space| space.config.address.message_lifetime_seconds)
+            .collect();
+        policies.sort();
+        assert_eq!(policies, config.allowed_message_retentions);
+        close_host(host).await;
+        config.allowed_message_retentions = MessageRetention::public_policies();
+        let host = Host::open(config, false).await.unwrap();
+        let mut restored: Vec<_> = host
+            .spaces
+            .read()
+            .await
+            .values()
+            .map(|space| space.config.address.message_lifetime_seconds)
+            .collect();
+        restored.sort();
+        assert_eq!(restored, policies);
+        for request in created_requests {
+            let response = app(host.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/spaces/v1/create")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a completed reservation remains retryable after the offer changes"
+            );
+        }
+        for (index, policy) in policies.into_iter().enumerate() {
+            let request = owner
+                .hosted_create_request(
+                    &endpoint,
+                    &format!("{:032x}", index + 10),
+                    "New retention test",
+                    "owner@example.test",
+                    policy,
+                    false,
+                )
+                .unwrap();
+            let response = app(host.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/spaces/v1/create")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "new reservations follow the current offer"
+            );
+        }
+        assert_eq!(host.spaces.read().await.len(), 2);
+        close_host(host).await;
+        owner.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn private_hosting_requires_an_explicit_creator_even_with_a_valid_signed_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = profile(&temp.path().join("owner")).await;
+        let endpoint = "https://host.example.test/spaces/v1/create";
+        let mut config: HostConfig = serde_json::from_value(json!({
+            "root":temp.path().join("host"),"public_url":"https://host.example.test",
+            "max_spaces_per_identity":2,"mailbox_quota_bytes":150_000_000,"allowed_creators":[]
+        }))
+        .unwrap();
+        let request = owner
+            .hosted_create_request(
+                endpoint,
+                "0123456789abcdef0123456789abcdef",
+                "Private Space",
+                "owner@example.test",
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let host = Host::open(config.clone(), false).await.unwrap();
+        let response = app(host.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/spaces/v1/create")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(host.spaces.read().await.is_empty());
+        close_host(host).await;
+        config.allowed_creators = Some(vec![owner.identity_id()]);
+        let host = Host::open(config, false).await.unwrap();
+        let response = app(host.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/spaces/v1/create")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(host.spaces.read().await.len(), 1);
+        close_host(host).await;
+        owner.close().await.unwrap();
     }
     #[tokio::test]
     async fn public_release_policy_preserves_v1_contract_without_identity() {
@@ -1663,6 +1919,9 @@ mod tests {
             max_spaces: 0,
             max_space_creations_per_day: 1,
             mailbox_quota_bytes: 150_000_000,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -1796,6 +2055,9 @@ mod tests {
                 max_spaces: default_max_spaces(),
                 max_space_creations_per_day: default_daily_creations(),
                 mailbox_quota_bytes: 256 * 1024 * 1024,
+                allowed_message_retentions:
+                    elo_core::message_retention::MessageRetention::public_policies(),
+                allowed_creators: None,
                 operator_snapshot: None,
                 backup_access_key: None,
                 call_admission_key: None,
@@ -2257,6 +2519,9 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             recovery_recipient: None,
             operator_snapshot: None,
             backup_access_key: None,
@@ -2706,6 +2971,9 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -2960,6 +3228,9 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -3034,7 +3305,7 @@ mod tests {
             issued: current().unwrap(),
             name: reservation.name,
             contact_email: "owner@example.test".into(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: elo_core::message_retention::MessageRetention::Hours24,
             require_approval: true,
         };
         assert_eq!(
@@ -3093,6 +3364,9 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
@@ -3634,6 +3908,9 @@ mod tests {
             max_spaces: default_max_spaces(),
             max_space_creations_per_day: default_daily_creations(),
             mailbox_quota_bytes: 32 * 1024 * 1024,
+            allowed_message_retentions:
+                elo_core::message_retention::MessageRetention::public_policies(),
+            allowed_creators: None,
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,

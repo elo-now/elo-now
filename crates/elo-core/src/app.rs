@@ -68,6 +68,7 @@ pub mod drafts;
 mod external_storage;
 mod groups;
 mod history_reader;
+mod hosting_services;
 mod invitations;
 mod membership;
 mod message_actions;
@@ -221,6 +222,7 @@ pub struct ClientApp {
     membership_checks: membership::MembershipChecks,
     witness_pin: Option<crate::authority::WitnessPin>,
     invitation_api_origin: Option<String>,
+    hosting_services: Box<hosting_services::Services>,
     witness_floor_lock: std::sync::Mutex<()>,
     #[cfg(test)]
     witness_test_url: Option<String>,
@@ -447,6 +449,7 @@ impl ClientApp {
                     membership_checks: Default::default(),
                     witness_pin: None,
                     invitation_api_origin: None,
+                    hosting_services: Default::default(),
                     witness_floor_lock: Default::default(),
                     #[cfg(test)]
                     witness_test_url: None,
@@ -1149,7 +1152,7 @@ impl ClientApp {
                     .team
                     .as_ref()
                     .map(|team| team.message_lifetime_seconds)
-                    .unwrap_or(86_400);
+                    .unwrap_or_default();
                 let locator_nonce = chat.nonce.clone();
                 self.require_fresh_membership(a).await?;
                 let cipher = crypto::seal_chat(&r, &recipients)?;

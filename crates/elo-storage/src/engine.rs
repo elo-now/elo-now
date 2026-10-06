@@ -300,6 +300,9 @@ impl Engine {
                 Operation::Configure {
                     expected_revision: 0,
                     ..
+                } | Operation::ConfigureManaged {
+                    expected_revision: 0,
+                    ..
                 }
             ) =>
             {
@@ -315,7 +318,10 @@ impl Engine {
         }
         if matches!(
             c.operation,
-            Operation::Configure { .. } | Operation::Policy { .. } | Operation::Disable { .. }
+            Operation::Configure { .. }
+                | Operation::ConfigureManaged { .. }
+                | Operation::Policy { .. }
+                | Operation::Disable { .. }
         ) && !verified.authority.can_manage(c.credential_id)
         {
             return Err(Error::Unauthorized);
@@ -368,6 +374,9 @@ impl Engine {
         if let Operation::Configure {
             expected_revision, ..
         }
+        | Operation::ConfigureManaged {
+            expected_revision, ..
+        }
         | Operation::Policy {
             expected_revision, ..
         }
@@ -377,7 +386,12 @@ impl Engine {
             if status.revision != *expected_revision {
                 return Err(Error::Conflict);
             }
-            if *expected_revision == 0 && matches!(c.operation, Operation::Configure { .. }) {
+            if *expected_revision == 0
+                && matches!(
+                    c.operation,
+                    Operation::Configure { .. } | Operation::ConfigureManaged { .. }
+                )
+            {
                 let ip = ip_hash(ip);
                 let count: u64 = self.db.query_row(
                     "SELECT coalesce(sum(count),0) FROM registrations WHERE day=?1 AND ip=?2",
@@ -402,21 +416,45 @@ impl Engine {
     }
 
     pub fn apply(&mut self, verified: &Verified, ip: IpAddr, now: u64) -> Result<Response> {
+        self.apply_with_managed(verified, ip, now, None)
+    }
+
+    /// The provider is supplied by trusted server configuration, never the API
+    /// or a renderer. Authorization and replay retain the original signed command.
+    pub(crate) fn apply_with_managed(
+        &mut self,
+        verified: &Verified,
+        ip: IpAddr,
+        now: u64,
+        managed: Option<&ProviderConfig>,
+    ) -> Result<Response> {
         if let Some(response) = self.preflight(verified, ip, now)? {
             return Ok(response);
         }
         let c = &verified.command;
         let space = c.space_id.to_string();
-        let secret = if let Operation::Configure {
-            expected_revision,
-            provider,
-            ..
-        } = &c.operation
-        {
-            Some(self.seal(&space, expected_revision + 1, provider)?)
-        } else {
-            None
+        let configuration = match &c.operation {
+            Operation::Configure {
+                expected_revision,
+                provider,
+                retention_hours,
+            } => Some((*expected_revision, provider, *retention_hours)),
+            Operation::ConfigureManaged {
+                expected_revision,
+                retention_hours,
+            } => Some((
+                *expected_revision,
+                managed.ok_or(Error::Unauthorized)?,
+                *retention_hours,
+            )),
+            _ => None,
         };
+        if let Some((_, provider, _)) = configuration {
+            provider.validate()?;
+        }
+        let secret = configuration
+            .map(|(revision, provider, _)| self.seal(&space, revision + 1, provider))
+            .transpose()?;
         let token = self.token(verified.request_id)?;
         let token_hash = hash(&token);
         let audience = self.audience.clone();
@@ -425,11 +463,9 @@ impl Engine {
             Operation::Status => Response::Status {
                 status: status_from(&tx, &space)?,
             },
-            Operation::Configure {
-                expected_revision,
-                provider,
-                retention_hours,
-            } => {
+            Operation::Configure { .. } | Operation::ConfigureManaged { .. } => {
+                let (expected_revision, provider, retention_hours) =
+                    configuration.ok_or(Error::Invalid)?;
                 let revision = expected_revision + 1;
                 let count: u64 = tx.query_row(
                     "SELECT count(*) FROM providers WHERE space=?1",
@@ -444,7 +480,7 @@ impl Engine {
                     params![space, integer(revision)?, secret],
                 )?;
                 tx.execute("INSERT INTO settings(space,revision,provider,enabled,provider_revision,retention_hours) VALUES(?1,?2,?3,1,?2,?4) ON CONFLICT(space) DO UPDATE SET revision=excluded.revision,provider=excluded.provider,enabled=1,provider_revision=excluded.provider_revision,retention_hours=excluded.retention_hours",params![space,integer(revision)?,provider.name(),retention_hours])?;
-                if *expected_revision == 0 {
+                if expected_revision == 0 {
                     tx.execute("INSERT INTO registrations(ip,day,count) VALUES(?1,?2,1) ON CONFLICT(ip,day) DO UPDATE SET count=count+1",params![ip_hash(ip),integer(now/86400)?])?;
                 }
                 Response::Status {
@@ -592,7 +628,12 @@ impl Engine {
             [&space],
             |r| r.get(0),
         )?;
-        if known || matches!(c.operation, Operation::Configure { .. }) {
+        if known
+            || matches!(
+                c.operation,
+                Operation::Configure { .. } | Operation::ConfigureManaged { .. }
+            )
+        {
             tx.execute("INSERT INTO heads(space,stream,head,sequence) VALUES(?1,?2,?3,?4) ON CONFLICT(space) DO UPDATE SET head=excluded.head,sequence=excluded.sequence",params![space,c.stream_id.to_string(),c.config_id.to_string(),integer(verified.authority.head()?.sequence)?])?;
         }
         let mut saved = response.clone();

@@ -289,13 +289,13 @@ async fn recovered_device_repairs_imported_seed_without_hiding_ordinary_general(
         url: "http://127.0.0.1:9/team/v1/enroll".into(),
         token: "ab".repeat(32),
         scope: scope.clone(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
     };
     let address = super::super::super::space_service::SpaceAddress {
         service_credential: None,
         url: "http://127.0.0.1:9".into(),
         scope,
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
     };
     for app in [&mut owner, &mut restored] {
         app.configure_team(descriptor.clone()).unwrap();

@@ -232,7 +232,8 @@ mod tests {
                     request_id: "synthetic".into(),
                     name: "Unpublished".into(),
                     contact_email: None,
-                    message_lifetime_seconds: 86400,
+                    message_lifetime_seconds:
+                        elo_core::message_retention::MessageRetention::Hours24,
                     require_approval: true,
                     mailbox: MailboxDescriptor::random().unwrap(),
                     password: "synthetic".into(),
@@ -394,7 +395,8 @@ mod reservation_limits_tests {
                     request_id: "synthetic".into(),
                     name: "Unclaimed".into(),
                     contact_email: None,
-                    message_lifetime_seconds: 86400,
+                    message_lifetime_seconds:
+                        elo_core::message_retention::MessageRetention::Hours24,
                     require_approval: true,
                     mailbox: MailboxDescriptor::random().unwrap(),
                     password: "synthetic".into(),

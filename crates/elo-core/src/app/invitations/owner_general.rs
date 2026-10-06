@@ -455,7 +455,7 @@ mod tests {
             url: "https://host.example.test/team/v1/enroll".into(),
             token: "73".repeat(32),
             scope,
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             service_credential: None,
         };
         app.configure_team(descriptor(legacy_scope.clone()))

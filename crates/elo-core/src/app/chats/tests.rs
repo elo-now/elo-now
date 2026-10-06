@@ -44,7 +44,7 @@ async fn owner_managed_general_rejects_legacy_membership_and_private_chat_source
             root: personal.root.clone(),
             controller: app.session.credential().id(),
         },
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         service_credential: None,
     });
     let private = app.private_device_genesis().unwrap();
@@ -695,7 +695,7 @@ async fn personal_seed_stays_hidden_after_device_updates_without_hiding_real_cha
         url: "http://127.0.0.1:9/team/v1/enroll".into(),
         token: "ab".repeat(32),
         scope: foreign.team_scope().unwrap(),
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
     };
     app.configure_team(descriptor.clone()).unwrap();
     let authority = &mut app.authorities.0[0];

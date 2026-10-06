@@ -258,7 +258,15 @@ impl ClientApp {
             .json(&request)
             .send()
             .await
-            .map_err(|_| ERROR)?;
+            .map_err(|_| super::witness_client::WitnessUnavailable)?;
+        if response.status().is_server_error()
+            || matches!(
+                response.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            return Err(super::witness_client::WitnessUnavailable.into());
+        }
         if !response.status().is_success()
             || response
                 .content_length()
@@ -270,7 +278,7 @@ impl ClientApp {
         let mut chunks = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|_| ERROR)?;
+            let chunk = chunk.map_err(|_| super::witness_client::WitnessUnavailable)?;
             if bytes.len().saturating_add(chunk.len()) > RESPONSE_BYTES {
                 return Err(ERROR.into());
             }

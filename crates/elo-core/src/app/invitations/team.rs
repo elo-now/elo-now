@@ -18,7 +18,7 @@ pub struct TeamDescriptor {
     pub url: String,
     pub token: String,
     pub scope: TeamScope,
-    pub message_lifetime_seconds: u64,
+    pub message_lifetime_seconds: crate::message_retention::MessageRetention,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_credential: Option<String>,
 }
@@ -634,7 +634,7 @@ mod tests {
             url: "https://host.example.test/team/v1/enroll".into(),
             token: "76".repeat(32),
             scope: scope.clone(),
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             service_credential: None,
         })
         .unwrap();
@@ -706,7 +706,7 @@ mod tests {
             url: "http://127.0.0.1:9/team/v1/enroll".into(),
             token: "ab".repeat(32),
             scope: server.team_scope().unwrap(),
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         for client in [&mut server, &mut alex, &mut maya] {
             client.ensure_peer(peer.clone()).unwrap();
@@ -895,7 +895,7 @@ mod tests {
             url: "http://127.0.0.1:9/team/v1/enroll".into(),
             token: "ab".repeat(32),
             scope: scope.clone(),
-            message_lifetime_seconds: 86_400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         };
         assert!(descriptor.validate(false).is_err());
         alex.configure_team(descriptor.clone()).unwrap();

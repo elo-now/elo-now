@@ -1,0 +1,53 @@
+.hosting-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hosting-select-row select {
+  flex: 1;
+  min-width: 0;
+}
+.hosting-select-row .icon {
+  flex: 0 0 auto;
+}
+.hosting-add-form {
+  display: grid;
+  gap: 16px;
+}
+.hosting-add-form > p,
+.hosting-status > p,
+.hosting-preview p {
+  margin: 0;
+}
+.hosting-add-form textarea {
+  resize: vertical;
+  overflow-wrap: anywhere;
+}
+.hosting-preview {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--elo-line);
+  border-radius: var(--elo-radius-button);
+  text-align: left;
+}
+.hosting-address {
+  overflow-wrap: anywhere;
+  font-size: var(--elo-type-caption);
+}
+.hosting-preview dl,
+.hosting-preview dd {
+  margin: 0;
+}
+.hosting-preview dl {
+  display: grid;
+  gap: 12px;
+}
+.hosting-preview dt {
+  font-size: var(--elo-type-caption);
+  color: var(--elo-muted);
+}
+.hosting-status {
+  display: grid;
+  gap: 12px;
+}

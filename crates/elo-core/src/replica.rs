@@ -35,6 +35,8 @@ const ACCESS_MIGRATION: &str = include_str!("../../../migrations/003_replica_spa
 const NONCE_MIGRATION: &str = include_str!("../../../migrations/008_replica_request_nonces.sql");
 const MESSAGE_ACCESS_MIGRATION: &str =
     include_str!("../../../migrations/009_replica_message_access.sql");
+const MESSAGE_POLICY_MIGRATION: &str =
+    include_str!("../../../migrations/010_replica_message_retention_policy.sql");
 pub const MAX_CHILD_MAILBOXES: u64 = 256;
 pub const MAX_MAILBOX_LIFETIME_MS: u64 = 37 * 86_400_000;
 #[derive(Debug, Error)]
@@ -172,7 +174,10 @@ impl VerifiedReceipt {
             || b.storage_class != "sqlite-wal-full"
             || !matches!(
                 b.retention.as_str(),
-                "manual-no-auto-gc" | "message-body-ttl" | "message-locator-30d"
+                "manual-no-auto-gc"
+                    | "message-body-ttl"
+                    | "message-locator-30d"
+                    | "message-no-expiry"
             )
         {
             return Err(ReplicaError::Invalid);
@@ -202,6 +207,7 @@ struct Db {
 }
 #[derive(Clone)]
 pub struct ReplicaStore {
+    allowed_message_retentions: Arc<Vec<crate::message_retention::MessageRetention>>,
     pub(crate) realtime: Arc<crate::realtime::Events>,
     admitted_devices: Arc<Mutex<std::collections::BTreeSet<crate::ids::RecordId>>>,
     revocations: crate::identity::revocations::Revocations,
@@ -217,6 +223,9 @@ impl ReplicaStore {
             .map_err(|_| ReplicaError::Storage)??;
         let key = db.key.verifying_key();
         Ok(Self {
+            allowed_message_retentions: Arc::new(
+                crate::message_retention::MessageRetention::public_policies(),
+            ),
             realtime: Arc::new(crate::realtime::Events::default()),
             admitted_devices: Arc::new(Mutex::new(Default::default())),
             revocations: crate::identity::revocations::Revocations::open(registry_path)
@@ -228,6 +237,18 @@ impl ReplicaStore {
     pub fn with_revocations(mut self, registry: crate::identity::revocations::Revocations) -> Self {
         self.revocations = registry;
         self
+    }
+    /// Operator configuration, never supplied by an upload request. Hosted
+    /// Spaces narrow this list to the policy in their signed creation record.
+    pub fn with_allowed_message_retentions(
+        mut self,
+        policies: Vec<crate::message_retention::MessageRetention>,
+    ) -> Result<Self> {
+        if !crate::message_retention::MessageRetention::validate_allowed(&policies) {
+            return Err(ReplicaError::Invalid);
+        }
+        self.allowed_message_retentions = Arc::new(policies);
+        Ok(self)
     }
     pub fn revocations(&self) -> &crate::identity::revocations::Revocations {
         &self.revocations
@@ -567,6 +588,7 @@ impl ReplicaStore {
         actor: Option<crate::retention_access::Actor>,
     ) -> Result<(bool, Vec<u8>)> {
         let revocations = self.revocations.clone();
+        let allowed_message_retentions = self.allowed_message_retentions.clone();
         let result = self.call(move|db|{
    authorize(&db.connection,mailbox,&token,true)?;
    let identity = actor.map(|actor| actor.identity);
@@ -577,6 +599,7 @@ impl ReplicaStore {
    retention::check_pruned(db,mailbox,id)?;
    let content = crate::erasure::inspect(&bytes).map_err(|_| ReplicaError::Invalid)?;
    let retention = retention::classify(content.as_ref(), message);
+   if retention.policy().is_some_and(|policy| !allowed_message_retentions.contains(&policy)) { return Err(ReplicaError::Invalid); }
    retention::check_upload(&db.connection,&revocations,mailbox,id,&retention,identity,time)?;
    let mut subjects = content.as_ref().map(|value| value.subjects.clone()).unwrap_or_default();
    if subjects.is_empty() {
@@ -621,7 +644,7 @@ impl ReplicaStore {
    };
    let stored_time:i64=tx.query_row("SELECT stored_local_ms FROM objects WHERE object_id=?1",[id.to_string()],|r|r.get(0))?;
    tx.commit()?;
-   let policy=match retention { retention::UploadRetention::MessageBody{..}=>"message-body-ttl",retention::UploadRetention::MessageLocator{..}=>"message-locator-30d",_=>"manual-no-auto-gc"};
+   let policy=match retention { retention::UploadRetention::MessageBody{lifetime_seconds,..} | retention::UploadRetention::MessageLocator{lifetime_seconds,..} if lifetime_seconds.seconds().is_none()=>"message-no-expiry",retention::UploadRetention::MessageBody{..}=>"message-body-ttl",retention::UploadRetention::MessageLocator{..}=>"message-locator-30d",_=>"manual-no-auto-gc"};
    let body=ReceiptBody{v:1,kind:"storage.receipt".into(),peer_id:peer_id(&db.key.verifying_key()),mailbox_id:mailbox,object_id:id,size_bytes:bytes.len() as u64,arrival_seq:seq as u64,storage_generation:db.generation.clone(),storage_class:"sqlite-wal-full".into(),retention:policy.into(),nonce:random_hex::<16>().map_err(|_|ReplicaError::Storage)?,stored_local_ms:stored_time as u64};
    let body=serde_json::to_vec(&body).map_err(|_|ReplicaError::Storage)?;let receipt=SignedRecord::sign(&body,&db.key).map_err(|_|ReplicaError::Storage)?;
    Ok((inserted,receipt.bytes().to_vec()))
@@ -763,7 +786,7 @@ fn open_db(path: PathBuf) -> Result<Db> {
     )?;
     if version == 0 && count == 0 {
         c.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-    } else if !(1..=9).contains(&version) {
+    } else if !(1..=10).contains(&version) {
         return Err(ReplicaError::Directory);
     }
     c.pragma_update(None, "journal_mode", "WAL")?;
@@ -803,6 +826,9 @@ fn open_db(path: PathBuf) -> Result<Db> {
     if version >= 9 {
         reference.execute_batch(MESSAGE_ACCESS_MIGRATION)?;
     }
+    if version >= 10 {
+        reference.execute_batch(MESSAGE_POLICY_MIGRATION)?;
+    }
     if schema(&c)? != schema(&reference)? {
         return Err(ReplicaError::Directory);
     }
@@ -829,6 +855,9 @@ fn open_db(path: PathBuf) -> Result<Db> {
     }
     if version < 9 {
         c.execute_batch(MESSAGE_ACCESS_MIGRATION)?;
+    }
+    if version < 10 {
+        c.execute_batch(MESSAGE_POLICY_MIGRATION)?;
     }
     c.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
     let pragmas:(String,i64,i64)=c.query_row("SELECT (SELECT journal_mode FROM pragma_journal_mode),(SELECT synchronous FROM pragma_synchronous),(SELECT foreign_keys FROM pragma_foreign_keys)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;

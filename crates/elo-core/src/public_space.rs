@@ -2400,7 +2400,7 @@ mod tests {
             address: SpaceAddress {
                 url: "http://127.0.0.1:12345/team/v1/spaces".into(),
                 scope: service.team_scope().unwrap(),
-                message_lifetime_seconds: 86400,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 service_credential: Some(service.transport_credential()),
             },
             peer: crate::sync::PeerDescriptor {
@@ -2610,7 +2610,7 @@ mod tests {
             address: SpaceAddress {
                 url: "http://127.0.0.1:12345/team/v1/spaces".into(),
                 scope: service.team_scope().unwrap(),
-                message_lifetime_seconds: 86400,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 service_credential: Some(service.transport_credential()),
             },
             peer: crate::sync::PeerDescriptor {
@@ -2752,7 +2752,7 @@ mod tests {
             address: SpaceAddress {
                 url: "http://127.0.0.1:12345/team/v1/spaces".into(),
                 scope: service.team_scope().unwrap(),
-                message_lifetime_seconds: 86400,
+                message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
                 service_credential: Some(service.transport_credential()),
             },
             peer: crate::sync::PeerDescriptor {

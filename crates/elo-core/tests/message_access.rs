@@ -82,7 +82,7 @@ impl Fixture {
             Some(RetentionClaim::MessageBody {
                 locator_nonce: chat.nonce.clone(),
                 record_id: message.id(),
-                lifetime_seconds: 21_600,
+                lifetime_seconds: elo_core::message_retention::MessageRetention::Hours6,
                 direct_peer: Some(bob.identity_id()),
                 request_key: public_key(&request_seed).unwrap(),
                 accept_key: Some(public_key(&accept_seed).unwrap()),
@@ -109,7 +109,7 @@ impl Fixture {
                 locator_nonce: chat.nonce.clone(),
                 record_id: message.id(),
                 body_object_id: ObjectId::of_ciphertext(&body),
-                lifetime_seconds: 21_600,
+                lifetime_seconds: elo_core::message_retention::MessageRetention::Hours6,
                 request_key: public_key(&request_seed).unwrap(),
             }),
         )

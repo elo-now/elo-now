@@ -32,6 +32,7 @@ impl ClientApp {
         let mut origin = reqwest::Url::parse(host)?;
         origin.set_path("/");
         self.invitation_api_origin = Some(origin.to_string());
+        self.refresh_default_hosting_context();
         Ok(())
     }
 
@@ -218,10 +219,14 @@ impl ClientApp {
                 &pin,
                 current,
             )?;
+            let invitation_link = match self.current_hosting_id() {
+                Some(id) => encrypted.link.with_hosting(&id)?,
+                None => encrypted.link,
+            };
             offers.push(Offer {
                 id: signed.id(),
                 address: address.clone(),
-                link: encrypted.link.to_url().to_string(),
+                link: invitation_link.to_url().to_string(),
                 policy: STANDARD.encode(signed.bytes()),
                 ciphertext: STANDARD.encode(&encrypted.ciphertext),
                 issued_at: current,

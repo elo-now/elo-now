@@ -115,6 +115,7 @@ impl ClientApp {
             .filter(|value| !value.is_empty())
             .map(|value| endpoint(value, self.allow_loopback))
             .transpose()?;
+        self.refresh_default_hosting_context();
         Ok(())
     }
 
@@ -138,12 +139,18 @@ impl ClientApp {
             .ok_or("General unavailable.")?;
         if matches!(
             operation,
-            Operation::Configure { .. } | Operation::Disable { .. } | Operation::Policy { .. }
+            Operation::Configure { .. }
+                | Operation::ConfigureManaged { .. }
+                | Operation::Disable { .. }
+                | Operation::Policy { .. }
         ) && !authority.can_manage(self.session.credential().id())
         {
             return Err("Only a Space owner can configure attachment storage.".into());
         }
-        let timeout = if matches!(operation, Operation::Configure { .. }) {
+        let timeout = if matches!(
+            operation,
+            Operation::Configure { .. } | Operation::ConfigureManaged { .. }
+        ) {
             broker::CONFIGURE_TTL
         } else {
             90
@@ -407,7 +414,7 @@ mod tests {
         let address = space_service::SpaceAddress {
             url: "http://127.0.0.1:9/team/v1/spaces".into(),
             scope: scope.clone(),
-            message_lifetime_seconds: 86400,
+            message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
             service_credential: None,
         };
         (temp, app, address)

@@ -67,7 +67,7 @@ async fn fixture() -> (
             root: genesis.owners[0].root_public_key.clone(),
             controller: app.session.credential().id(),
         },
-        message_lifetime_seconds: 86400,
+        message_lifetime_seconds: crate::message_retention::MessageRetention::Hours24,
         service_credential: None,
     });
     app.authorities = Authorities(vec![general.clone(), legacy].into());
