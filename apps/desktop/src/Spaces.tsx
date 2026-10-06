@@ -13,7 +13,7 @@ import { ActionDialog } from "./ActionDialog";
 import { InvitationCode } from "./InvitationFlow";
 import { Icon, NewIndicator } from "./Icon";
 import { useToast } from "./Toast";
-import { t, formatInvitationValidity } from "./i18n";
+import { t, locale, formatInvitationValidity } from "./i18n";
 import { pauseBackgroundSync } from "./backgroundSyncPause";
 import { spaceStatusText, type View, type SpaceSummary } from "./model";
 import "./spaces.css";
@@ -243,6 +243,12 @@ export function Spaces({
   initialLink?: string;
 }) {
   const { reportError, showError } = useToast();
+  const spaces = [...(view.spaces ?? [])].sort(
+    (left, right) =>
+      Number(right.id === view.active_space) -
+        Number(left.id === view.active_space) ||
+      left.name.localeCompare(right.name, locale, { sensitivity: "base" }),
+  );
   const [page, setPage] = useState<"list" | "join" | "manage" | "create">(
     initialPage,
   );
@@ -457,7 +463,7 @@ export function Spaces({
               <div>
                 <p className="page-description">{t("spaces.help")}</p>
                 <div className="space-list">
-                  {(view.spaces ?? []).map((space) => (
+                  {spaces.map((space) => (
                     <div
                       className="space-row"
                       key={space.id}
