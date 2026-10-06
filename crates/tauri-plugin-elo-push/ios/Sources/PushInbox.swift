@@ -22,7 +22,7 @@ enum PushInbox {
 
     static func removals(
         _ entries: [DeliveredPush], registration: String, scopes: Set<String>,
-        reads: Set<String>, now: TimeInterval
+        reads: Set<String>, otherRegistrations: Set<String> = [], now: TimeInterval
     ) -> (identifiers: [String], remaining: Bool) {
         var identifiers: [String] = []
         var remaining = false
@@ -30,6 +30,11 @@ enum PushInbox {
             let data = entry.data
             guard data["elo_wake"] as? String == "1", let scope = data["elo_scope"] as? String else { continue }
             let event = data["elo_event"] as? String ?? ""
+            if let other = data["elo_registration"] as? String, otherRegistrations.contains(other) {
+                if isExpired(entry, now: now) || reads.contains(scope + ":" + event) { identifiers.append(entry.identifier) }
+                else if data["elo_category"] as? String != "session_start" { remaining = true }
+                continue
+            }
             if data["elo_registration"] as? String != registration || !scopes.contains(scope)
                 || reads.contains(scope + ":" + event) || isExpired(entry, now: now) {
                 identifiers.append(entry.identifier)

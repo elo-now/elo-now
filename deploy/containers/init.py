@@ -2,6 +2,7 @@
 """Provision one Linux container host without starting services or activating witness."""
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,8 @@ import sys
 import unicodedata
 from urllib.parse import urlsplit
 
-UIDS = {"api": 21001, "witness": 21002, "storage": 21003, "proxy": 21004, "export": 21005}
+UIDS = {"api": 21001, "witness": 21002, "storage": 21003, "proxy": 21004, "export": 21005,
+        "wake": 21006, "calls": 21007, "media": 21008, "turn": 21009}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -104,12 +106,22 @@ def json_bytes(value):
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
-def managed_s3(value):
-    require(isinstance(value, dict) and set(value) == {"provider", "allowed_owners"}, "Invalid managed S3 configuration.")
+def managed_storage(value):
+    require(isinstance(value, dict) and set(value) == {"provider", "allowed_owners"}, "Invalid managed storage configuration.")
     provider, owners = value["provider"], value["allowed_owners"]
-    require(isinstance(provider, dict) and set(provider) ==
-            {"provider", "endpoint", "region", "bucket", "access_key", "secret_key"}
-            and provider["provider"] == "s3_compatible", "Only the S3-compatible provider is packaged.")
+    require(isinstance(provider, dict), "Invalid provider configuration.")
+    require(isinstance(owners, list) and len(owners) <= 1024
+            and all(isinstance(owner, str) and HEX.fullmatch(owner) for owner in owners)
+            and len(set(owners)) == len(owners), "Invalid managed storage owner allowlist.")
+    if provider.get("provider") == "mega_folder":
+        require(set(provider) == {"provider", "folder_link", "write_auth"}
+                and isinstance(provider["folder_link"], str)
+                and re.fullmatch(r"https://mega\.nz/folder/[A-Za-z0-9_-]{8}#[A-Za-z0-9_-]{22,64}", provider["folder_link"])
+                and isinstance(provider["write_auth"], str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{16,128}", provider["write_auth"]), "Invalid limited MEGA folder credentials.")
+        return value
+    require(set(provider) == {"provider", "endpoint", "region", "bucket", "access_key", "secret_key"}
+            and provider["provider"] == "s3_compatible", "Unsupported managed storage provider.")
     require(all(isinstance(item, str) and 0 < len(item.encode()) <= 4096
                 and not any(unicodedata.category(c) == "Cc" for c in item) for item in provider.values()),
             "Invalid S3 configuration value.")
@@ -119,9 +131,18 @@ def managed_s3(value):
             "S3 requires an HTTPS origin without credentials, path or query.")
     require(re.fullmatch(r"[A-Za-z0-9-]{1,128}", provider["region"])
             and re.fullmatch(r"[A-Za-z0-9.-]+", provider["bucket"]), "Invalid S3 region or bucket.")
-    require(isinstance(owners, list) and len(owners) <= 1024
-            and all(isinstance(owner, str) and HEX.fullmatch(owner) for owner in owners)
-            and len(set(owners)) == len(owners), "Invalid managed S3 owner allowlist.")
+    return value
+
+
+def firebase_account(value):
+    require(isinstance(value, dict) and value.get("type") == "service_account"
+            and value.get("token_uri") == "https://oauth2.googleapis.com/token"
+            and isinstance(value.get("project_id"), str) and re.fullmatch(r"[a-z][a-z0-9-]{4,62}", value["project_id"])
+            and isinstance(value.get("client_email"), str) and value["client_email"].endswith(".iam.gserviceaccount.com")
+            and isinstance(value.get("private_key_id"), str) and 1 <= len(value["private_key_id"]) <= 256
+            and isinstance(value.get("private_key"), str)
+            and value["private_key"].startswith("-----BEGIN PRIVATE KEY-----\n")
+            and value["private_key"].rstrip().endswith("-----END PRIVATE KEY-----"), "Invalid Firebase service account.")
     return value
 
 
@@ -146,10 +167,40 @@ def public_key(seed):
     return result.stdout[len(prefix):].hex()
 
 
-def proxy_config(role, public_origin, storage):
+def proxy_config(role, public_origin, storage, wake=False, calls=False):
     global_options = "{\n\tadmin off\n\tpersist_config off\n}\n"
     if role == "api":
-        routes = """\tredir /hosting /hosting/ 308
+        routes = ""
+        if wake:
+            routes += """\t@wake path /v1/routes /v1/routes/* /v1/wake /wake/v1/account-deletion /wake/health
+\thandle @wake {
+\t\trequest_body {
+\t\t\tmax_size 1048576
+\t\t}
+\t\treverse_proxy 127.0.0.1:8788 {
+\t\t\theader_up X-Real-IP {remote_host}
+\t\t}
+\t}
+"""
+        if calls:
+            routes += """\t@calls path /calls/v1/connect /calls/v1/health
+\thandle @calls {
+\t\trequest_body {
+\t\t\tmax_size 1048576
+\t\t}
+\t\treverse_proxy 127.0.0.1:18920 {
+\t\t\theader_up X-Real-IP {remote_host}
+\t\t}
+\t}
+\t@media_private path /media/twirp /media/twirp/*
+\thandle @media_private {
+\t\trespond 404
+\t}
+\thandle_path /media/* {
+\t\treverse_proxy 127.0.0.1:7880
+\t}
+"""
+        routes += """\tredir /hosting /hosting/ 308
 \thandle_path /hosting/* {
 \t\troot * /srv/elo-public
 \t\theader Cache-Control no-store
@@ -178,8 +229,71 @@ def proxy_config(role, public_origin, storage):
     return (global_options + public_origin + " {\n" + routes + "}\n").encode()
 
 
+def setup_calls(root, public_origin, public_ip, uids):
+    """Share only the individual admission/media secrets needed by each service."""
+    data = root / "calls/data"
+    admission = secret(root / "calls/config/admission.key", uids["calls"], data, hexadecimal=True)
+    stable(root / "api/config/call-admission.key", admission, uids["api"])
+    media_secret = secret(root / "calls/config/media.key", uids["calls"], data, hexadecimal=True).decode()
+    turn_secret = secret(root / "calls/config/turn.key", uids["calls"], data, hexadecimal=True).decode()
+    domain = urlsplit(public_origin).hostname
+    config = {"bind": "127.0.0.1:18920", "public_url": public_origin + "/calls/v1",
+              "data": "/var/lib/elo-calls", "admission_url": "http://127.0.0.1:18901/internal/calls/admission",
+              "admission_key": "/etc/elo/calls/admission.key", "max_connections": 128,
+              "media": {"url": "wss://" + domain + "/media", "api_url": "http://127.0.0.1:7880",
+                        "api_key": "elo-private", "api_secret": media_secret, "turn_secret": turn_secret,
+                        "turn_urls": ["turn:" + domain + ":3478?transport=udp", "turn:" + domain + ":3478?transport=tcp"]}}
+    stable(root / "calls/config/config.json", json_bytes(config), uids["calls"])
+    # JSON is valid YAML, with no interpolated secrets or hostnames in shell code.
+    media = {"port": 7880, "bind_addresses": ["127.0.0.1"], "keys": {"elo-private": media_secret},
+             "rtc": {"tcp_port": 7881, "udp_port": 7882, "use_external_ip": False, "node_ip": public_ip,
+                     "turn_servers": [{"host": domain, "port": 3478, "protocol": "udp", "secret": turn_secret},
+                                      {"host": domain, "port": 3478, "protocol": "tcp", "secret": turn_secret}]},
+             "room": {"max_participants": 32}, "logging": {"level": "warn"}}
+    stable(root / "media/config/livekit.yaml", json_bytes(media), uids["media"])
+    turn = f"""listening-port=3478
+listening-ip={public_ip}
+relay-ip={public_ip}
+realm={domain}
+server-name={domain}
+use-auth-secret
+static-auth-secret={turn_secret}
+fingerprint
+min-port=49160
+max-port=49200
+total-quota=256
+user-quota=16
+max-bps=2000000
+bps-capacity=64000000
+stale-nonce=600
+no-tls
+no-dtls
+no-cli
+no-multicast-peers
+no-tcp-relay
+no-software-attribute
+no-rfc5780
+no-stun-backward-compatibility
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+log-file=stdout
+simple-log
+pidfile=/tmp/turnserver.pid
+"""
+    stable(root / "turn/config/turnserver.conf", turn.encode(), uids["turn"])
+
+
 def prepare(root, role, public_origin, version, witness_pin=None, storage=False, uids=None, owner=None,
-            creators=(), name="Private elo", storage_url=None, managed=None, advertise_managed_s3=False):
+            creators=(), name="Private elo", storage_url=None, managed=None, advertise_managed_s3=False,
+            mega=False, advertise_managed=None, firebase=None, call_ip=None, public_hosting=False):
     uids = UIDS if uids is None else uids
     owner = os.getuid() if owner is None else owner
     origin(public_origin)
@@ -191,10 +305,24 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
     require(isinstance(name, str) and 1 <= len(name.encode()) <= 96 and name.strip() == name
             and not any(unicodedata.category(c) in {"Cc", "Cf"} for c in name), "Invalid hosting name.")
     require(role == "api" or not creators, "Creator allowlists belong on the API host.")
-    require(not advertise_managed_s3 or (role == "api" and storage_url is not None), "Advertising managed S3 requires an API broker URL.")
+    require(not public_hosting or (role == "api" and not creators), "Public hosting is an API-only opt-in incompatible with creator allowlists.")
+    require(not (advertise_managed_s3 and advertise_managed), "Choose one managed storage advertisement.")
+    advertise_managed = "s3" if advertise_managed_s3 else advertise_managed
+    require(not (public_hosting and advertise_managed), "Public hosting requires each Space owner's own storage credentials.")
+    require(advertise_managed in {None, "s3", "mega"}, "Invalid managed storage advertisement.")
+    require(not advertise_managed or (role == "api" and storage_url is not None), "Advertising managed storage requires an API broker URL.")
+    require(not mega or (role == "witness" and storage), "MEGA belongs on the witness host with storage enabled.")
     if managed is not None:
-        require(role == "witness" and storage, "Managed S3 credentials belong only on the witness host with storage enabled.")
-        managed_s3(managed)
+        require(role == "witness" and storage, "Managed credentials belong only on the witness host with storage enabled.")
+        managed_storage(managed)
+        require(managed["provider"]["provider"] != "mega_folder" or mega, "Managed MEGA requires --with-mega.")
+    if firebase is not None:
+        require(role == "api", "Firebase credentials belong only on the API host.")
+        firebase_account(firebase)
+    if call_ip is not None:
+        require(role == "api" and isinstance(call_ip, str), "Calls belong on the API host.")
+        address = ipaddress.ip_address(call_ip)
+        require(address.version == 4 and address.is_global, "Calls require the API host's public IPv4 address.")
     if storage_url is not None:
         require(role == "api" and storage_url.endswith("/storage/v1"), "Invalid broker URL.")
         origin(storage_url[:-len("/storage/v1")])
@@ -215,6 +343,7 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
     stable(root / "role", (role + "\n").encode(), owner)
     directory(root / "public", owner, 0o755)
     roles = [role, "proxy"] + (["storage"] if storage else []) + (["export"] if role == "api" else [])
+    roles += (["wake"] if firebase is not None else []) + (["calls", "media", "turn"] if call_ip else [])
     for role_name in roles:
         directory(root / role_name, owner)
         for subdirectory in ("config", "data"):
@@ -228,16 +357,25 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
                   "activation_file": "/run/elo-witness/activation.json", "trusted_loopback_proxy": True}
     else:
         secret(service / "config/backup-access.key", uids[role], service / "data", hexadecimal=True)
+        retentions = [21600, 43200, 86400] if public_hosting else [86400, 172800, "no_expiry"]
         config = {"root": "/var/lib/elo-api", "public_url": public_origin, "max_spaces_per_identity": 2,
                   "max_spaces": 128, "max_space_creations_per_day": 32, "mailbox_quota_bytes": 150000000,
                   "backup_access_key": "/etc/elo/api/backup-access.key", "witness": witness_pin,
-                  "allowed_creators": list(creators), "allowed_message_retentions": [86400, 172800, "no_expiry"]}
+                  "allowed_creators": None if public_hosting else list(creators), "allowed_message_retentions": retentions}
+        if call_ip:
+            config["call_admission_key"] = "/etc/elo/api/call-admission.key"
+            setup_calls(root, public_origin, call_ip, uids)
+        if firebase is not None:
+            stable(root / "wake/config/firebase.json", json_bytes(firebase), uids["wake"])
+            stable(root / "wake/config/config.json", json_bytes({"public_url": public_origin}), uids["wake"])
         signing_key = secret(root / "export/config/signing-key.bin", uids["export"], root / "api/data")
         body = {"v": 1, "kind": "hosting.configuration", "revision": 1, "name": name,
                 "signing_public_key": public_key(signing_key), "create_url": public_origin + "/spaces/v1/create",
                 "witness": witness_pin, "storage": {"url": storage_url, "managed":
-                    {"provider": "s3", "retention_hours": 1} if advertise_managed_s3 else None} if storage_url else None,
-                "push_url": None, "message_lifetimes": [86400, 172800, "no_expiry"], "default_message_lifetime": 86400}
+                    {"provider": advertise_managed, "retention_hours": 1} if advertise_managed else None} if storage_url else None,
+                "push_url": public_origin + "/" if firebase is not None else None,
+                "call_url": public_origin + "/calls/v1" if call_ip else None,
+                "message_lifetimes": retentions, "default_message_lifetime": 86400}
         stable(root / "export/config/manifest-input.json", json_bytes(body), uids["export"])
     stable(service / "config/config.json", json_bytes(config), uids[role])
     if storage:
@@ -247,14 +385,22 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
                   "data": "/var/lib/elo-storage", "secret_key": "/etc/elo/storage/secret.key",
                   "max_spaces": 128, "trusted_loopback_proxy": True, "witness": witness_pin}
         if managed is not None:
-            stable(service / "config/managed-s3.json", json_bytes(managed), uids["storage"])
-            config["managed_storage"] = "/etc/elo/storage/managed-s3.json"
+            stable(service / "config/managed-storage.json", json_bytes(managed), uids["storage"])
+            config["managed_storage"] = "/etc/elo/storage/managed-storage.json"
         stable(service / "config/config.json", json_bytes(config), uids["storage"])
     stable(root / "public/witness-pin.json", json_bytes(witness_pin), owner, 0o644)
-    stable(root / "proxy/config/Caddyfile", proxy_config(role, public_origin, storage), uids["proxy"])
+    stable(root / "proxy/config/Caddyfile", proxy_config(role, public_origin, storage, firebase is not None, bool(call_ip)), uids["proxy"])
     env = f"ELO_STATE={root}\nELO_VERSION={version}\n"
+    profiles = []
     if storage:
-        env += "COMPOSE_PROFILES=storage\n"
+        profiles.append("storage")
+        env += "ELO_STORAGE_IMAGE=elo-storage" + ("-mega" if mega else "") + "\n"
+    if firebase is not None:
+        profiles.append("wake")
+    if call_ip:
+        profiles.append("calls")
+    if profiles:
+        env += "COMPOSE_PROFILES=" + ",".join(profiles) + "\n"
     stable(root / "compose.env", env.encode(), owner)
     return witness_pin
 
@@ -272,6 +418,12 @@ def main():
     parser.add_argument("--storage-url", help="API: independently operated broker URL ending in /storage/v1.")
     parser.add_argument("--managed-s3", type=Path, help="Witness: root-owned mode-0600 private managed S3 JSON.")
     parser.add_argument("--advertise-managed-s3", action="store_true", help="API: advertise the separately configured managed S3 option.")
+    parser.add_argument("--with-mega", action="store_true", help="Witness: select the broker image with the limited MEGA folder adapter.")
+    parser.add_argument("--managed-storage", type=Path, help="Witness: root-owned mode-0600 managed MEGA or S3 JSON.")
+    parser.add_argument("--advertise-managed", choices=("s3", "mega"), help="API: advertise an independently configured managed provider.")
+    parser.add_argument("--firebase", type=Path, help="API: root-owned mode-0600 Firebase service account for this app's project.")
+    parser.add_argument("--call-ip", help="API: public IPv4 of this host; enables call control, LiveKit and TURN.")
+    parser.add_argument("--public-hosting", action="store_true", help="API: explicitly allow public creation with 6/12/24-hour retention and owner-supplied storage.")
     args = parser.parse_args()
     require(sys.platform == "linux" and os.geteuid() == 0, "Run this initializer as root on the target Linux host.")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -282,10 +434,17 @@ def main():
         require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not stat.S_IMODE(info.st_mode) & 0o022,
                 "State ancestors must be root-owned directories without group/world write permission.")
     supplied_pin = json.loads(args.witness_pin.read_text()) if args.witness_pin else None
-    managed = json.loads(read(args.managed_s3, 0)) if args.managed_s3 else None
+    require(not (args.managed_s3 and args.managed_storage), "Choose one managed storage input file.")
+    managed_file = args.managed_storage or args.managed_s3
+    managed = json.loads(read(managed_file, 0)) if managed_file else None
+    if args.managed_s3:
+        require(managed.get("provider", {}).get("provider") == "s3_compatible", "--managed-s3 requires an S3 provider.")
+    firebase = json.loads(read(args.firebase, 0)) if args.firebase else None
     result = prepare(args.state, args.role, args.origin, args.version, supplied_pin, args.with_storage,
                      creators=args.creator, name=args.name, storage_url=args.storage_url, managed=managed,
-                     advertise_managed_s3=args.advertise_managed_s3)
+                     advertise_managed_s3=args.advertise_managed_s3, mega=args.with_mega,
+                     advertise_managed=args.advertise_managed, firebase=firebase, call_ip=args.call_ip,
+                     public_hosting=args.public_hosting)
     print(json.dumps({"state": str(args.state), "role": args.role, "witness": result,
                       "services_started": False, "witness_activated": False}, indent=2))
 

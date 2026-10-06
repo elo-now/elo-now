@@ -33,8 +33,8 @@ enum PushBadge {
         let token = UUID()
         init(_ prefs: UserDefaults) { self.prefs = prefs }
     }
-    // A preferences instance owns one active registration. Advancing its
-    // generation also prevents an A -> B -> A switch from reviving old work.
+    // A preferences instance owns the active profile’s hosting registrations.
+    // Advancing its generation prevents old callbacks from reviving stale work.
     private static var generations: [ObjectIdentifier: Generation] = [:]
 
     static func invalidate(prefs: UserDefaults) {
@@ -58,7 +58,7 @@ enum PushBadge {
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
         guard prefs.bool(forKey: "elo.push.enabled"),
-              prefs.string(forKey: "elo.push.registration") == registration else { completion(nil); return }
+              PushRegistrations.contains(registration, prefs: prefs) else { completion(nil); return }
         generations = generations.filter { $0.value.prefs != nil }
         let identity = ObjectIdentifier(prefs)
         let generation = Generation(prefs)
@@ -77,10 +77,10 @@ enum PushBadge {
         center.delivered { notifications in
             DispatchQueue.main.async {
                 guard prefs.bool(forKey: "elo.push.enabled"),
-                      prefs.string(forKey: "elo.push.registration") == registration,
+                      PushRegistrations.contains(registration, prefs: prefs),
                       generations[identity]?.token == generation.token else { completion(nil); return }
                 let result = PushInbox.removals(notifications, registration: registration,
-                    scopes: Set(scopes), reads: Set(acknowledged.keys), now: Date().timeIntervalSince1970)
+                    scopes: Set(scopes), reads: Set(acknowledged.keys), otherRegistrations: PushRegistrations.all(prefs).subtracting([registration]), now: Date().timeIntervalSince1970)
                 center.remove(result.identifiers)
                 // iOS has no dot-only badge. One indicates unread activity; it is not a message total.
                 center.badge(unread || result.remaining ? 1 : 0, completion: completion)

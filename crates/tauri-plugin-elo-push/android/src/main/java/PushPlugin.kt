@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class RegisterArgs { var registration: String = ""; var background: Boolean = false }
 
 @InvokeArg
+class StatusArgs { var registration: String? = null }
+
+@InvokeArg
 class AckArgs { var opened: String? = null; var wake: String? = null }
 
 @InvokeArg
@@ -59,7 +62,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var statusChannel: Channel? = null
     private val statusChanged = SharedPreferences.OnSharedPreferenceChangeListener { values, key ->
-        if (key in listOf("wake", "opened", "challenge", "installation-id") && values.getString(key, null) != null) {
+        if ((key in listOf("wake", "opened", "installation-id") || key?.startsWith("challenge:") == true) && values.getString(key, null) != null) {
             statusChannel?.send(JSObject())
         }
     }
@@ -96,9 +99,11 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
     private fun onIntent(intent: Intent?) {
         val target = intent?.getStringExtra("elo_target") ?: return
-        if (prefs.getBoolean("enabled", false) && intent.getStringExtra("elo_registration") == prefs.getString("registration", null)
+        if (prefs.getBoolean("enabled", false) && PushRegistrations.contains(prefs, intent.getStringExtra("elo_registration"))
             && target.length <= 2048 && target.matches(Regex("[A-Za-z0-9_-]{64,}"))) {
-            prefs.edit().putString("wake", target).putString("opened", target).commit()
+            prefs.edit().putString("wake", target).putString("opened", target)
+                .putString("wake-registration", intent.getStringExtra("elo_registration"))
+                .putString("opened-registration", intent.getStringExtra("elo_registration")).commit()
         }
         intent.removeExtra("elo_target")
     }
@@ -110,7 +115,12 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             invoke.reject("Allow notifications in system settings."); return
         }
-        prefs.edit().putString("registration", args.registration).remove("challenge").putBoolean("enabled", true).commit()
+        if (!PushRegistrations.add(prefs, args.registration)) { invoke.reject("Too many notification registrations."); return }
+        val token = prefs.getString("installation-id", null)
+        if (prefs.getBoolean("enabled", false) && !token.isNullOrEmpty()) {
+            invoke.resolve(JSObject().put("token", token)); return
+        }
+        prefs.edit().putBoolean("enabled", true).commit()
         val messaging = FirebaseMessaging.getInstance()
         messaging.isAutoInitEnabled = true
         val registration = PushRegistration.register()
@@ -125,7 +135,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
             if (!finished.compareAndSet(false, true)) return@addOnCompleteListener
             mainHandler.removeCallbacks(timeout)
             if (result.isSuccessful && prefs.getBoolean("enabled", false) &&
-                prefs.getString("registration", null) == args.registration) {
+                PushRegistrations.contains(prefs, args.registration)) {
                 prefs.edit().putString("installation-id", result.result).remove("token").apply()
                 if (!args.background) invoke.resolve(JSObject().put("token", result.result))
             } else if (!args.background) { invoke.reject("Could not register notifications. Try again.") }
@@ -135,13 +145,15 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
     @Command
     fun status(invoke: Invoke) {
+        val requested = invoke.parseArgs(StatusArgs::class.java).registration
+        val registration = requested?.takeIf { PushRegistrations.contains(prefs, it) }
         val value = JSObject().put("available", available())
             .put("enabled", prefs.getBoolean("enabled", false))
-            .put("registration", prefs.getString("registration", null))
+            .put("registration", registration)
             .put("token", prefs.getString("installation-id", null))
-            .put("challenge", prefs.getString("challenge", null))
-            .put("wake", prefs.getString("wake", null))
-            .put("opened", prefs.getString("opened", null))
+            .put("challenge", registration?.let { prefs.getString("challenge:$it", null) })
+            .put("wake", if (requested == null || registration != null && PushRegistrations.targetRegistration(prefs, "wake") == registration) prefs.getString("wake", null) else null)
+            .put("opened", if (requested == null || registration != null && PushRegistrations.targetRegistration(prefs, "opened") == registration) prefs.getString("opened", null) else null)
             .put("permission", NotificationManagerCompat.from(activity).areNotificationsEnabled())
         invoke.resolve(value)
     }
@@ -183,6 +195,14 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
             try { invoke.resolve(ChatSessionAudio.route(args.sessionId, args.activation, args.outputId)) }
             catch (_: RuntimeException) { invoke.reject("unavailable") }
         }
+    }
+    @Command
+    fun remove(invoke: Invoke) {
+        val registration = invoke.parseArgs(RegisterArgs::class.java).registration
+        PushRegistrations.remove(prefs, registration)
+        val manager = activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.activeNotifications.filter { it.notification.extras.getString("elo_registration") == registration }.forEach { manager.cancel(it.tag, it.id) }
+        invoke.resolve()
     }
     @Command
     fun disable(invoke: Invoke) {

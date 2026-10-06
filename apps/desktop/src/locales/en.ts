@@ -506,6 +506,8 @@ export const en = {
   "hosting.creationSaved": "Continue creating the Space on its saved hosting.",
   "hosting.policyUnavailable":
     "Choose a message lifetime offered by this hosting service.",
+  "hosting.callsUnavailable":
+    "This hosting service does not provide audio or video sessions.",
   "hosting.storageUnavailable":
     "Attachment storage is unavailable on this hosting service.",
   "hosting.managedUnavailable":

@@ -42,6 +42,8 @@ pub struct HostingProfile {
     pub witness: WitnessPin,
     pub storage: Option<Storage>,
     pub push_url: Option<String>,
+    #[serde(default)]
+    pub call_url: Option<String>,
     pub message_lifetimes: Vec<MessageRetention>,
     pub default_message_lifetime: MessageRetention,
 }
@@ -93,10 +95,11 @@ impl HostingProfile {
                 return Err(RecordError::Json);
             }
         }
-        // Native push registration currently belongs to the built-in hosting.
-        // Do not accept a private endpoint that cannot receive a device route.
-        if self.push_url.is_some() {
-            return Err(RecordError::Json);
+        if let Some(url) = &self.push_url {
+            endpoint(url, "/")?;
+        }
+        if let Some(url) = &self.call_url {
+            endpoint(url, "/calls/v1")?;
         }
         Ok(())
     }
@@ -114,6 +117,7 @@ impl HostingProfile {
             && self.witness == next.witness
             && self.storage.as_ref().map(|s| &s.url) == next.storage.as_ref().map(|s| &s.url)
             && self.push_url == next.push_url
+            && self.call_url == next.call_url
     }
     pub fn sign(&self, key: &SigningKey) -> record::Result<SignedRecord> {
         self.validate()?;
@@ -201,6 +205,7 @@ mod tests {
             },
             storage: None,
             push_url: None,
+            call_url: None,
             message_lifetimes: vec![MessageRetention::Hours24, MessageRetention::NoExpiry],
             default_message_lifetime: MessageRetention::Hours24,
         }
@@ -231,9 +236,16 @@ mod tests {
         bad = p.clone();
         bad.message_lifetimes.push(MessageRetention::Hours24);
         assert!(bad.validate().is_err());
-        bad = p;
-        bad.push_url = Some("https://private-push.example/".into());
-        assert!(bad.validate().is_err());
+        for invalid in [
+            "http://push.example/",
+            "https://push.example/token",
+            "https://push.example/?token=secret",
+            "https://user@push.example/",
+        ] {
+            bad = p.clone();
+            bad.push_url = Some(invalid.into());
+            assert!(bad.validate().is_err());
+        }
     }
     #[test]
     fn revision_updates_cannot_replace_trust_pins() {
@@ -247,5 +259,33 @@ mod tests {
         next.witness.public_key =
             record::encode_hex(SigningKey::from_bytes(&[9; 32]).verifying_key().as_bytes());
         assert!(!p.accepts_update(&next));
+    }
+    #[test]
+    fn optional_services_are_signed_and_cannot_change_after_approval() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut p = profile(&key);
+        p.push_url = Some("https://push.example/".into());
+        p.call_url = Some("https://calls.example/calls/v1".into());
+        assert_eq!(
+            HostingProfile::from_record(p.sign(&key).unwrap().bytes()).unwrap(),
+            p
+        );
+        let mut next = p.clone();
+        next.revision += 1;
+        assert!(p.accepts_update(&next));
+        next.call_url = Some("https://other.example/calls/v1".into());
+        assert!(!p.accepts_update(&next));
+        next.call_url = p.call_url.clone();
+        next.push_url = None;
+        assert!(!p.accepts_update(&next));
+        for invalid in [
+            "http://calls.example/calls/v1",
+            "https://calls.example/",
+            "https://calls.example/calls/v1?token=secret",
+            "https://user@calls.example/calls/v1",
+        ] {
+            next.call_url = Some(invalid.into());
+            assert!(next.validate().is_err());
+        }
     }
 }

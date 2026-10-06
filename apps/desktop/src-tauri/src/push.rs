@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 #[path = "push_preferences.rs"]
 mod preferences;
 
+#[cfg(any(all(mobile, feature = "mobile-push"), test))]
+#[path = "push_round.rs"]
+mod round;
+
 #[cfg(all(mobile, feature = "mobile-push"))]
 pub fn setup(app: &tauri::AppHandle) {
     use tauri::{Emitter, Manager};
@@ -174,14 +178,14 @@ pub async fn suspend(app: &tauri::AppHandle, client: Option<&ClientApp>) -> Resu
     }
 }
 /// Called only after every account service durably accepted deletion.
-pub fn forget(app: &tauri::AppHandle) -> Result<(), String> {
+pub fn forget(app: &tauri::AppHandle, identity: &str) -> Result<(), String> {
     #[cfg(all(mobile, feature = "mobile-push"))]
     {
-        return mobile::forget(app);
+        return mobile::forget(app, identity);
     }
     #[cfg(not(all(mobile, feature = "mobile-push")))]
     {
-        let _ = app;
+        let _ = (app, identity);
         Ok(())
     }
 }
@@ -278,22 +282,70 @@ mod mobile {
             .map(|t| t.as_secs())
             .unwrap_or(0)
     }
-    fn path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-        Ok(app
+    fn path(app: &tauri::AppHandle, url: &str) -> Result<std::path::PathBuf, String> {
+        let root = app
+            .path()
+            .app_data_dir()
+            .map_err(|_| "Cannot open notification settings")?;
+        if url == env!("ELO_CONFIGURED_WAKE") {
+            return Ok(root.join("push-registration.json"));
+        }
+        let directory = root.join("push-registrations");
+        std::fs::create_dir_all(&directory).map_err(|_| "Cannot open notification settings")?;
+        Ok(directory.join(format!(
+            "{}.json",
+            elo_core::ids::ObjectId::of_ciphertext(url.as_bytes())
+        )))
+    }
+    fn registered_endpoints(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
+        let mut urls = vec![env!("ELO_CONFIGURED_WAKE").to_owned()];
+        let root = app
             .path()
             .app_data_dir()
             .map_err(|_| "Cannot open notification settings")?
-            .join("push-registration.json"))
+            .join("push-registrations");
+        if root.exists() {
+            for file in std::fs::read_dir(root).map_err(|_| "Cannot open notification settings")? {
+                let file = file
+                    .map_err(|_| "Cannot read notification settings")?
+                    .path();
+                if file.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                if urls.len() >= 33 {
+                    return Err("Too many notification registrations".into());
+                }
+                let bytes = Zeroizing::new(
+                    vault::read_private(&file).map_err(|_| "Cannot read notification settings")?,
+                );
+                let value: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| "Invalid notification settings")?;
+                let url = value["route"]["endpoint"]
+                    .as_str()
+                    .ok_or("Invalid notification settings")?;
+                endpoint(url, cfg!(debug_assertions))
+                    .map_err(|_| "Invalid notification settings")?;
+                if path(app, url)? != file {
+                    return Err("Invalid notification registration location".into());
+                }
+                urls.push(url.to_owned());
+            }
+        }
+        Ok(urls)
+    }
+    fn native_status(app: &tauri::AppHandle, registration: Option<&str>) -> Result<Value, String> {
+        app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+            .call("status", json!({"registration":registration}))
     }
     fn save(app: &tauri::AppHandle, device: &Device) -> Result<(), String> {
         let bytes = Zeroizing::new(
             serde_json::to_vec(device).map_err(|_| "Cannot save notification settings")?,
         );
-        vault::write_private(&path(app)?, &bytes, true)
+        vault::write_private(&path(app, &device.route.endpoint)?, &bytes, true)
             .map_err(|_| "Cannot save notification settings".into())
     }
     fn load(app: &tauri::AppHandle, url: &str) -> Result<Option<Device>, String> {
-        let file = path(app)?;
+        let file = path(app, url)?;
         if !file.exists() {
             return Ok(None);
         }
@@ -351,8 +403,12 @@ mod mobile {
         Ok(prefs)
     }
     pub(super) fn remember(app: &tauri::AppHandle, client: &ClientApp) -> Result<(), String> {
-        let device = load(app, env!("ELO_CONFIGURED_WAKE"))?;
-        choices(client, device.as_ref()).map(|_| ())
+        for url in registered_endpoints(app)? {
+            if let Some(device) = load(app, &url)? {
+                choices(client, Some(&device))?;
+            }
+        }
+        Ok(())
     }
     async fn request(
         app: &tauri::AppHandle,
@@ -407,7 +463,7 @@ mod mobile {
         }
         serde_json::from_slice(&bytes).map_err(|_| "Invalid notification setup response".into())
     }
-    async fn policy(
+    fn prepare_policy(
         app: &tauri::AppHandle,
         client: &ClientApp,
         device: &mut Device,
@@ -426,6 +482,14 @@ mod mobile {
                 .ok_or("Invalid notification revision")?;
             save(app, device)?;
         }
+        Ok(())
+    }
+    async fn policy(
+        app: &tauri::AppHandle,
+        client: &ClientApp,
+        device: &mut Device,
+    ) -> Result<(), String> {
+        prepare_policy(app, client, device)?;
         // Persist the revision before sending. An interrupted call retries the identical policy.
         if device.active && device.acknowledged != device.revision {
             let mut body = device.policy.clone();
@@ -485,7 +549,13 @@ mod mobile {
         });
     }
     fn reconcile(app: &tauri::AppHandle) -> Result<(), String> {
-        let Some(device) = load(app, env!("ELO_CONFIGURED_WAKE"))? else {
+        for url in registered_endpoints(app)? {
+            reconcile_route(app, &url)?;
+        }
+        Ok(())
+    }
+    fn reconcile_route(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+        let Some(device) = load(app, url)? else {
             return Ok(());
         };
         if !device.enabled || !device.policy["scopes"].is_array() {
@@ -522,17 +592,18 @@ mod mobile {
         client: &ClientApp,
         request: &Value,
     ) -> Result<(), String> {
-        let url = env!("ELO_CONFIGURED_WAKE");
-        let Some(mut device) = load(app, url)? else {
-            return Ok(());
-        };
-        if !device.enabled || device.identity != client.identity_id().to_string() {
-            return Ok(());
+        for url in registered_endpoints(app)? {
+            let Some(mut device) = load(app, &url)? else {
+                continue;
+            };
+            if !device.enabled || device.identity != client.identity_id().to_string() {
+                continue;
+            }
+            let receipts = client
+                .notification_read_receipts(&device.route, request)
+                .map_err(|_| "Could not update read notifications")?;
+            record_read_receipts(app, &mut device, receipts)?;
         }
-        let receipts = client
-            .notification_read_receipts(&device.route, request)
-            .map_err(|_| "Could not update read notifications")?;
-        record_read_receipts(app, &mut device, receipts)?;
         schedule_reconcile(app);
         Ok(())
     }
@@ -584,13 +655,15 @@ mod mobile {
                 let state = app.state::<crate::State>();
                 let runtime = state.lock().await;
                 if let Some(client) = runtime.client.as_ref() {
-                    if let Ok(Some(mut device)) = load(&app, env!("ELO_CONFIGURED_WAKE")) {
-                        if device.enabled && device.identity == client.identity_id().to_string() {
-                            let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
-                            if let Ok(native) = adapter.call("status", json!({})) {
-                                let _ =
-                                    reconcile_delivered(&app, client, &mut device, &native).await;
-                                schedule_reconcile(&app);
+                    for url in registered_endpoints(&app).unwrap_or_default() {
+                        if let Ok(Some(mut device)) = load(&app, &url) {
+                            if device.enabled && device.identity == client.identity_id().to_string()
+                            {
+                                if let Ok(native) = native_status(&app, Some(&device.route.id)) {
+                                    let _ = reconcile_delivered(&app, client, &mut device, &native)
+                                        .await;
+                                    schedule_reconcile(&app);
+                                }
                             }
                         }
                     }
@@ -655,9 +728,19 @@ mod mobile {
         app: &tauri::AppHandle,
         client: &ClientApp,
     ) -> Result<bool, String> {
-        let url = env!("ELO_CONFIGURED_WAKE");
+        let mut pending = false;
+        for url in client.notification_endpoints() {
+            pending |= changed_route(app, client, &url).await?;
+        }
+        Ok(pending)
+    }
+    async fn changed_route(
+        app: &tauri::AppHandle,
+        client: &ClientApp,
+        url: &str,
+    ) -> Result<bool, String> {
         let Some(mut device) = load(app, url)? else {
-            return Ok(false);
+            return Ok(true);
         };
         if !device.enabled || device.identity != client.identity_id().to_string() {
             return Ok(false);
@@ -667,47 +750,69 @@ mod mobile {
             save(app, &device)?;
             return Ok(true);
         }
-        policy(app, client, &mut device).await?;
+        prepare_policy(app, client, &mut device)?;
         Ok(!device.active || device.acknowledged != device.revision)
     }
     pub(super) async fn suspend(app: &tauri::AppHandle) -> Result<(), String> {
-        let url = env!("ELO_CONFIGURED_WAKE");
-        let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
-        // Disable local delivery even if saved registration data cannot be read.
-        let disabled = adapter
-            .call("disable", json!({}))
-            .map_err(|_| "Could not turn off notifications".to_owned());
+        // Stop local delivery before any network or private-file operation.
+        app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+            .call("disable", json!({}))?;
+        let endpoints = registered_endpoints(app)?;
+        for url in &endpoints {
+            if let Some(mut saved) = load(app, url)?
+                && saved.enabled
+            {
+                saved.enabled = false;
+                saved.active = false;
+                saved.next_attempt = 0;
+                save(app, &saved)?;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for url in endpoints {
+            if let Some(result) = super::round::until(deadline, suspend_route(app, &url)).await {
+                result?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+    async fn suspend_route(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
         if let Some(mut saved) = load(app, url)? {
+            app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+                .call("remove", json!({"registration":saved.route.id}))?;
             if saved.enabled {
                 saved.enabled = false;
                 saved.active = false;
                 saved.next_attempt = 0;
             }
-            // Retry offline revocation at most once per 30 seconds, not on every status poll.
             if saved.next_attempt > time() {
-                return disabled.map(|_| ());
+                return Ok(());
             }
             saved.next_attempt = time() + 30;
             save(app, &saved)?;
-            // Keep the owner capability for revocation retries after an offline logout.
             if request(app, &saved, "", None, reqwest::Method::DELETE)
                 .await
                 .is_ok()
             {
-                std::fs::remove_file(path(app)?)
+                std::fs::remove_file(path(app, url)?)
                     .map_err(|_| "Could not save notification settings")?;
             }
         }
-        disabled.map(|_| ())
+        Ok(())
     }
-    pub(super) fn forget(app: &tauri::AppHandle) -> Result<(), String> {
-        let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
-        let _: Value = adapter
-            .call("disable", json!({}))
-            .map_err(|_| "Could not turn off notifications")?;
-        let path = path(app)?;
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|_| "Could not remove notification settings")?;
+    pub(super) fn forget(app: &tauri::AppHandle, identity: &str) -> Result<(), String> {
+        app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>()
+            .call("disable", json!({}))?;
+        for url in registered_endpoints(app)? {
+            if load(app, &url)?.is_none_or(|device| device.identity != identity) {
+                continue;
+            }
+            let file = path(app, &url)?;
+            if file.exists() {
+                std::fs::remove_file(file).map_err(|_| "Could not remove notification settings")?;
+            }
         }
         Ok(())
     }
@@ -717,9 +822,8 @@ mod mobile {
         op: String,
         expected: Option<String>,
     ) -> Result<Value, String> {
-        let url = env!("ELO_CONFIGURED_WAKE");
         let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
-        let mut native: Value = adapter
+        let native: Value = adapter
             .call("status", json!({}))
             .map_err(|_| "Could not read notification settings")?;
         if native["available"] != true {
@@ -736,19 +840,115 @@ mod mobile {
         if expected.as_deref() != Some(identity.as_str()) {
             return Err("The open profile has changed".into());
         }
-        let mut device = load(&app, url)?;
-        let mut prefs = choices(client, device.as_ref())?;
+        let mut endpoints = client.notification_endpoints();
+        if !matches!(op.as_str(), "enable" | "disable" | "maintain" | "status")
+            && !op.starts_with("ack:")
+        {
+            return Err("Unknown notification action".into());
+        }
         if op == "disable" {
+            let mut prefs = choices(client, None)?;
             prefs.enabled = false;
             prefs.save(client.profile_path())?;
             suspend(&app).await?;
             client
                 .advertise_wake_route(None)
                 .map_err(|_| "Could not update notification settings")?;
-            return Ok(
-                json!({"available":true,"enabled":false,"pending":load(&app,url)?.is_some(),"wake":false}),
-            );
+            return Ok(json!({"available":true,"enabled":false,"pending":false,"wake":false}));
         }
+        if op == "enable" {
+            if app
+                .notification()
+                .request_permission()
+                .map_err(|_| "Could not request notifications")?
+                != tauri_plugin_notification::PermissionState::Granted
+            {
+                return Err("Allow notifications in system settings.".into());
+            }
+            let mut prefs = choices(client, None)?;
+            prefs.enabled = true;
+            prefs.save(client.profile_path())?;
+        }
+        let mut stale = Vec::new();
+        for url in registered_endpoints(&app)? {
+            if op != "status" && !endpoints.contains(&url) {
+                if let Some(mut saved) = load(&app, &url)? {
+                    adapter.call("remove", json!({"registration":saved.route.id}))?;
+                    if saved.enabled {
+                        saved.enabled = false;
+                        saved.active = false;
+                        saved.next_attempt = 0;
+                        save(&app, &saved)?;
+                    }
+                }
+                stale.push(url);
+            }
+        }
+        let mut round = super::round::Round::new(
+            choices(client, None)?.enabled && native["permission"] == true,
+        );
+        let maintenance = matches!(op.as_str(), "maintain" | "enable");
+        if maintenance {
+            // Capture every locally verified tap before an offline hosting service
+            // can consume the network budget. Status does not contact a relay.
+            for url in &endpoints {
+                if let Ok(value) = operate_route(&app, client, url, "status").await {
+                    round.snapshot(json!({"opened":value["opened"],"wake":value["wake"]}));
+                }
+            }
+        }
+        let mut work = endpoints
+            .drain(..)
+            .map(|url| (url, false))
+            .collect::<Vec<_>>();
+        if maintenance {
+            work.extend(stale.into_iter().map(|url| (url, true)));
+        }
+        static NEXT_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if maintenance && !work.is_empty() {
+            let start = NEXT_HOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % work.len();
+            work.rotate_left(start);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for (url, stale) in work {
+            if stale {
+                // Retired hosts participate in the same rotation, so a repeatedly
+                // unavailable active host cannot starve revocation retries.
+                if let Some(result) = super::round::until(deadline, suspend_route(&app, &url)).await
+                {
+                    result?;
+                } else {
+                    round.defer();
+                    break;
+                }
+            } else if maintenance {
+                // Each side effect persists its capability/revision before awaiting
+                // the network, so cancellation safely retries on a later round.
+                match super::round::until(deadline, operate_route(&app, client, &url, &op)).await {
+                    Some(value) => round.accept(value),
+                    None => {
+                        round.defer();
+                        break;
+                    }
+                }
+            } else {
+                round.accept(operate_route(&app, client, &url, &op).await);
+            }
+        }
+        round.finish()
+    }
+
+    async fn operate_route(
+        app: &tauri::AppHandle,
+        client: &mut ClientApp,
+        url: &str,
+        op: &str,
+    ) -> Result<Value, String> {
+        let adapter = app.state::<tauri_plugin_elo_push::Push<tauri::Wry>>();
+        let identity = client.identity_id().to_string();
+        let mut device = load(app, url)?;
+        let mut native = native_status(app, device.as_ref().map(|d| d.route.id.as_str()))?;
+        let prefs = choices(client, device.as_ref())?;
         if let Some(saved) = device.as_ref()
             && (saved.identity != identity
                 || !saved.enabled
@@ -758,52 +958,42 @@ mod mobile {
             // A status read must not wait for an offline logout's server cleanup.
             let cleanup_due =
                 saved.enabled || native["enabled"] == true || saved.next_attempt <= time();
-            if op != "status" && cleanup_due {
-                suspend(&app).await?;
+            if matches!(op, "maintain" | "enable") && cleanup_due {
+                suspend_route(app, url).await?;
                 client
-                    .advertise_wake_route(None)
+                    .withdraw_wake_route(url)
                     .map_err(|_| "Could not update notification settings")?;
-                device = load(&app, url)?;
-                native = adapter.call("status", json!({}))?;
+                device = load(app, url)?;
+                native = native_status(app, device.as_ref().map(|d| d.route.id.as_str()))?;
             }
             if device.is_some() {
-                schedule_reconcile(&app);
+                schedule_reconcile(app);
                 let enabled = prefs.enabled && native["permission"] == true;
                 return Ok(json!({"available":true,"enabled":enabled,"pending":true,"wake":false}));
             }
         }
         // Local delivery cleanup must finish before any registration/policy
         // network attempt can fail while the phone is offline.
-        if matches!(op.as_str(), "status" | "maintain") {
+        if matches!(op, "status" | "maintain") {
             let local = if let Some(saved) = device.as_mut() {
-                reconcile_delivered(&app, client, saved, &native).await
+                reconcile_delivered(app, client, saved, &native).await
             } else {
                 Ok(())
             };
-            schedule_reconcile(&app);
+            schedule_reconcile(app);
             local?;
         }
         let automatic = preferences::should_resume(
             prefs.enabled,
             native["permission"] == true,
             op == "maintain",
-            device.as_ref().is_none_or(|d| d.token.is_empty()),
+            device
+                .as_ref()
+                .is_none_or(|d| d.token.is_empty() || native["registration"] != d.route.id),
             time(),
             device.as_ref().map_or(0, |d| d.next_registration_attempt),
         );
         if op == "enable" || automatic {
-            if op == "enable" {
-                if app
-                    .notification()
-                    .request_permission()
-                    .map_err(|_| "Could not request notifications")?
-                    != tauri_plugin_notification::PermissionState::Granted
-                {
-                    return Err("Allow notifications in system settings.".into());
-                }
-                prefs.enabled = true;
-                prefs.save(client.profile_path())?;
-            }
             if device.is_none() {
                 device = Some(Device {
                     v: 2,
@@ -831,7 +1021,7 @@ mod mobile {
             }
             let saved = device.as_mut().ok_or("Could not prepare notifications")?;
             saved.next_registration_attempt = time() + 30;
-            save(&app, saved)?;
+            save(app, saved)?;
             let registered: Value = adapter
                 .call(
                     "register",
@@ -844,11 +1034,9 @@ mod mobile {
                     .ok_or("Could not register notifications")?
                     .into();
                 saved.next_attempt = 0;
-                save(&app, saved)?;
+                save(app, saved)?;
             }
-            native = adapter
-                .call("status", json!({}))
-                .map_err(|_| "Could not read notifications")?;
+            native = native_status(app, Some(&saved.route.id))?;
         } else if op != "maintain" && op != "status" && !op.starts_with("ack:") {
             return Err("Unknown notification action".into());
         }
@@ -862,7 +1050,8 @@ mod mobile {
                 && (saved.token != token || saved.generation != client.notification_generation())
             {
                 // Require acknowledgement before replacing the revocation capability.
-                request(&app, saved, "", None, reqwest::Method::DELETE).await?;
+                request(app, saved, "", None, reqwest::Method::DELETE).await?;
+                let old_registration = saved.route.id.clone();
                 saved.route.id = random::<16>()?;
                 saved.route.notify_key = random::<32>()?;
                 saved.route.scope_key = random::<32>()?;
@@ -876,13 +1065,12 @@ mod mobile {
                 saved.token = token.into();
                 saved.generation = client.notification_generation();
                 saved.reads.clear();
-                save(&app, saved)?;
+                save(app, saved)?;
+                adapter.call("remove", json!({"registration":old_registration}))?;
                 let _: Value = adapter
                     .call("register", json!({"registration":saved.route.id}))
                     .map_err(|_| "Could not refresh notifications")?;
-                native = adapter
-                    .call("status", json!({}))
-                    .map_err(|_| "Could not read notifications")?;
+                native = native_status(app, Some(&saved.route.id))?;
             }
             if saved.token.is_empty()
                 && native["registration"] == saved.route.id
@@ -894,13 +1082,13 @@ mod mobile {
             // A lost policy acknowledgement may leave the server on the new
             // notify key. Retry that durable revision before renewing the route.
             if saved.active && saved.acknowledged != saved.revision {
-                policy(&app, client, saved).await?;
+                policy(app, client, saved).await?;
             }
             if !saved.token.is_empty() && saved.next_attempt <= time() {
                 saved.next_attempt = time() + 15;
-                save(&app, saved)?;
+                save(app, saved)?;
                 let result = request(
-                    &app, saved,
+                    app, saved,
                     "",
                     Some(json!({"token":saved.token,"notify_key":saved.route.notify_key,"binding":client.account_route_binding(&saved.route.endpoint,&saved.route.id,&saved.token).map_err(|_|"Could not register notification identity")?})),
                     reqwest::Method::POST,
@@ -913,13 +1101,13 @@ mod mobile {
                 if saved.active {
                     saved.next_attempt = time() + 86400;
                 }
-                save(&app, saved)?;
+                save(app, saved)?;
             }
             if !saved.active
                 && let Some(challenge) = native["challenge"].as_str()
             {
                 let result = request(
-                    &app,
+                    app,
                     saved,
                     "/confirm",
                     Some(json!({"challenge":challenge})),
@@ -933,13 +1121,13 @@ mod mobile {
                 if saved.active {
                     saved.next_attempt = time() + 86400;
                 }
-                save(&app, saved)?;
+                save(app, saved)?;
             }
-            policy(&app, client, saved).await?;
+            policy(app, client, saved).await?;
             if saved.active {
                 // A read acknowledgement must not turn a healthy notification
                 // registration into a pending-settings error while offline.
-                let _ = flush_reads(&app, saved).await;
+                let _ = flush_reads(app, saved).await;
             }
             if saved.active && saved.revision == saved.acknowledged {
                 client
@@ -968,7 +1156,7 @@ mod mobile {
                 .call("ack", json!({"wake":wake}))
                 .map_err(|_| "Could not acknowledge notification")?;
         }
-        schedule_reconcile(&app);
+        schedule_reconcile(app);
         let enabled = prefs.enabled && native["permission"] == true;
         let current = device
             .as_ref()

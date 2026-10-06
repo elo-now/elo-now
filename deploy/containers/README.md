@@ -8,16 +8,18 @@ an API URL.
 
 | Host | Services | Persistent state |
 | --- | --- | --- |
-| API | `elo-team host`, Caddy | Hosted Spaces, ciphertext replicas, service keys, TLS state |
+| API | `elo-team host`, Caddy; optional wake, call control, LiveKit and coturn | Hosted Spaces, ciphertext replicas, device push routes, call state, service keys, TLS state |
 | Independent witness | `elo-witness`, Caddy, optional `elo-storage` | Authorization journal, witness key, optional broker database/key, TLS state |
 
-The optional broker supports S3-compatible providers with the existing owner
-configuration flow. It has no provider credentials by default. MEGAcmd is not
-included in these images; do not advertise MEGA support from this package.
-Calls, TURN, LiveKit and mobile push are not included. The hosting profile has
-no push endpoint. Message retention and attachment retention remain separate:
-this initializer offers 24 hours, 48 hours and no automatic message expiry;
-the broker still uses its own supported attachment policy.
+The optional broker supports S3-compatible providers and limited MEGA folder
+credentials. The `storage-mega` image adds the bounded MEGAcmd adapter; it does
+not receive an account password. Optional API profiles add push via the app's
+Firebase project, call control, LiveKit and TURN. Their endpoints are included
+in the signed hosting configuration only when explicitly enabled. Message
+retention and attachment retention remain separate. Private initialization
+offers 24 hours, 48 hours and no automatic message expiry; explicit
+`--public-hosting` offers 6, 12 and 24 hours, defaulting to 24 hours. The broker
+uses its own supported attachment policy.
 
 ## Prerequisites and trust boundaries
 
@@ -25,7 +27,7 @@ Use two separate Linux machines, current Docker Engine and Compose, Python
 3.11 or newer, OpenSSL with Ed25519 support, public DNS names, correct clocks
 and working HTTPS egress. This is a rootful Linux Docker layout, not a Docker
 Desktop, rootless Docker, Swarm or Kubernetes recipe. Reserve numeric UIDs
-21001–21005 for this installation; they must not belong to unrelated host
+21001–21009 for this installation; they must not belong to unrelated host
 users or services. Containers do not require matching host login accounts.
 
 Allow inbound TCP 80/443 for Caddy's automatic TLS and managed SSH access.
@@ -57,13 +59,14 @@ sh deploy/containers/build.sh "$VERSION" witness
 ```
 
 `build.sh` creates and removes a temporary allowlisted context. It includes
-only the four Rust server crates, required protocol data and SQL migrations,
-plus the container runtime helpers. It does not send the repository, desktop
-application, `.private`, internal documentation, credentials or runtime data
+only the six Rust server crates, required protocol data and SQL migrations,
+the native notification text catalog and container runtime helpers. It does not send the repository, desktop
+application code, `.private`, internal documentation, credentials or runtime data
 to Docker. Do not replace this with `docker build .` at the repository root.
 
 The multi-stage build uses Rust 1.98.1 and local `elo-api:VERSION`,
-`elo-witness:VERSION`, `elo-storage:VERSION` tags. Cargo removes client-only
+`elo-witness:VERSION`, `elo-storage:VERSION`, `elo-storage-mega:VERSION`,
+`elo-wake:VERSION` and `elo-calls:VERSION` tags. Cargo removes client-only
 feature edges from the workspace lock. A verification step rejects any new
 package version, source or checksum, then the build uses `--locked`. The
 resulting lock is retained at `/usr/share/doc/elo/Cargo.lock` in each image.
@@ -115,8 +118,10 @@ of creating an empty root-owned directory. Data/config directories have mode
 0700, private files 0600, and each service has a distinct UID. Config and key
 mounts are read-only; data mounts persist through container recreation. Runtime
 and temporary directories use bounded tmpfs. Services run without root,
-privileged mode, a Docker socket, or general Linux capabilities. Only Caddy
-receives `NET_BIND_SERVICE` to bind HTTP/HTTPS.
+privileged mode, a Docker socket, or general Linux capabilities. Caddy and coturn
+receive `NET_BIND_SERVICE`, required by their upstream file-capability-marked
+binaries; all other capabilities are dropped. Coturn's database directory is
+bounded tmpfs, not an anonymous persistent Docker volume.
 
 Initialization is repeatable with identical arguments and never overwrites
 keys or configuration. Changed arguments or unsafe ownership/permissions fail.
@@ -192,6 +197,14 @@ On the API host, use the independently verified public witness pin. Set
 arguments the server denies all new Space creation; importing a hosting link
 does not grant creation, owner or membership privileges.
 
+An operator deliberately offering public Space creation can instead pass
+`--public-hosting`. This explicit API-only mode removes the creator allowlist
+while retaining abuse and capacity limits, offers only 6/12/24-hour retention,
+and defaults to 24 hours. It conflicts with `--creator` and managed-storage
+advertisements. Each Space owner must supply their own provider credentials.
+The default private mode continues to deny creation without a creator allowlist
+and offers 24/48 hours or no automatic expiry.
+
 ```sh
 CREATOR_ID=REPLACE_WITH_64_LOWERCASE_HEX_IDENTITY_ID
 sudo python3 deploy/containers/init.py api \
@@ -254,7 +267,7 @@ credentials and intended owner identities:
 
 At initial witness provisioning add `--managed-s3 /root/elo-managed-s3.json`
 together with `--with-storage`. The initializer installs the file privately
-under the storage service's read-only config mount; neither API nor witness
+under the storage service's read-only `managed-storage.json` config mount; neither API nor witness
 receives it. Add `--advertise-managed-s3` at API initialization to include only
 the public `{provider:"s3",retention_hours:1}` option in the signed hosting
 profile. This advertisement does not enable a Space automatically: its
@@ -273,8 +286,8 @@ server in another container.
 ## Backups, upgrades and acceptance
 
 For the smallest consistent backup, stop the role's containers and copy its
-complete state tree with numeric owners and modes preserved. Back up keys and
-encrypted databases as a coherent set, including SQLite WAL files if present;
+complete state tree with numeric owners and modes preserved. Back up service
+keys and all databases as a coherent set, including SQLite WAL files if present;
 do not copy live SQLite files individually. Encrypt off-host backups and keep
 their recovery key separately. A broker database backup is not a backup of its
 provider objects. Preserve still-needed ciphertext objects and provider
@@ -298,10 +311,10 @@ Local checks without image downloads or a running Docker daemon:
 
 ```sh
 python3 -B -m unittest discover -s deploy/containers -p 'test_*.py' -v
-sh -n deploy/containers/build.sh deploy/containers/entrypoint.sh
+sh -n deploy/containers/build.sh deploy/containers/entrypoint.sh deploy/containers/install_mega.sh
 ```
 
-CI additionally builds all three Linux images and runs `smoke.py` against
+CI additionally builds all six elo Linux images and runs `smoke.py` against
 disposable synthetic state. That check covers non-root startup, sealed witness
 activation, recreation with retained keys, offline public profile/QR export,
 and the generated Caddy HTTP routes.
@@ -317,7 +330,7 @@ membership; message expiry; real S3 upload/download/expiry; restart with sealed
 witness; retained data and keys after recreation; wrong/stale activation
 rejection; and restore rejection against a newer independently retained anchor.
 
-After all three images have been built locally, run the bounded Linux image
+After all six elo images have been built locally, run the bounded Linux image
 smoke check (a current Docker Engine with volume subpath support):
 
 ```sh
@@ -336,3 +349,125 @@ checks that the witness proxy hides private health routes. It removes only its
 own containers, volumes and network in `finally`.
 The test sends no Space or provider commands and is not public TLS or two-host
 acceptance. It never mounts the Docker socket or existing application data.
+
+## Push, calls and MEGA
+
+Enable these services during **fresh** initialization. The initializer never
+rewrites an existing configuration to add or remove services. Prepare the API
+host's mode-0600 Firebase service-account file outside the checkout and supply:
+
+```sh
+sudo python3 deploy/containers/init.py api \
+  --state /srv/elo-api --origin https://api.example.org --version "$VERSION" \
+  --witness-pin ./witness-pin.json --name 'Private elo' --creator "$CREATOR_ID" \
+  --storage-url https://witness.example.org/storage/v1 --advertise-managed mega \
+  --firebase /root/elo-firebase.json --call-ip YOUR_API_PUBLIC_IPV4
+sudo docker compose --env-file /srv/elo-api/compose.env \
+  -f deploy/containers/compose.api.yaml pull proxy media turn
+```
+
+Firebase must belong to the same project as the installed mobile app. Importing
+a hosting configuration cannot replace a mobile binary's Firebase project or
+APNs entitlements. Operators using the public elo mobile binaries need an
+explicit arrangement for push credentials; never put a Firebase key in a QR,
+app bundle, repository or a public installation page. Custom mobile builds
+should use the operator's own Firebase project. A separate trusted push gateway
+could provide another arrangement, but no such gateway is implemented here.
+Do not share the public elo project's service-account key with arbitrary
+operators; the QR never carries it. The relay uses Firebase's APNs
+integration on iOS and does not require CallKit, VoIP push or background access
+to a microphone. Startup smoke checks use a synthetic RSA key and do not prove
+FCM/APNs delivery; test both platforms with authorized real installations.
+
+The wake container alone receives Firebase credentials. The call-control
+admission key is shared only with the API, LiveKit's key only with call control,
+and the TURN secret only with call control, LiveKit and coturn. None enters the
+public profile. Each component runs under its own UID with read-only private
+configuration. HTTP administration for LiveKit remains loopback-only; Caddy
+explicitly refuses `/media/twirp` and its descendants. WebSocket signalling
+uses `/calls/v1/connect` and `/media/`; no proxy reaches API port 18901.
+
+Call networking also needs inbound TCP 7881, UDP 7882, TCP/UDP 3478 and UDP
+49160–49200 on the API host and provider firewall. Set `--call-ip` to an IPv4
+actually assigned to the host, not an address of a proxy. The recipe is for a
+publicly addressed VPS, not a NATed home server. Coturn uses short-lived HMAC
+credentials, quotas and denies private/loopback peer ranges. It accepts UDP
+and TCP TURN on 3478. It does **not** issue a separate TURN-TLS certificate or
+provide a port-443 TURN fallback; unusually restrictive networks may require
+an operator-managed TURN-TLS endpoint and reviewed configuration. WebRTC media
+still uses its encrypted transport with UDP/TCP TURN. No extra plaintext media
+path is enabled.
+
+On the witness host, `--with-storage --with-mega` selects `elo-storage-mega`.
+The helper runs MEGAcmd 2.6.0 with a separate per-operation HOME and private Unix
+socket on `/run/elo-storage` tmpfs. It has no FUSE device, privileged capability,
+public WebDAV server, account login or persistent provider session. Root can
+still read the broker's limited folder credentials. For an optional managed
+MEGA account, use a root-owned mode-0600 JSON file:
+
+```json
+{
+  "provider": {
+    "provider": "mega_folder",
+    "folder_link": "https://mega.nz/folder/REPLACE_HANDLE#REPLACE_FOLDER_KEY",
+    "write_auth": "REPLACE_LIMITED_FOLDER_WRITE_AUTH"
+  },
+  "allowed_owners": ["64_lowercase_hex_identity_id"]
+}
+```
+
+Pass `--managed-storage /root/elo-managed-storage.json` with `--with-storage
+--with-mega`; the API receives only `--advertise-managed mega`. S3 can use the
+same `--managed-storage` flag and `--advertise-managed s3`; the earlier S3-specific
+flags remain aliases. Do not pass an account email/password as folder access.
+A dedicated folder, compatible MEGA plan and bounded folder write authorization
+must be prepared separately by the account owner. Test real provider upload,
+download and deletion with this broker before offering attachments.
+
+Versions checked against upstream on 2026-10-06:
+[LiveKit 1.13.7](https://github.com/livekit/livekit/releases/tag/v1.13.7),
+[coturn 4.18.0-r0](https://github.com/coturn/coturn/releases/tag/docker%2F4.18.0-r0),
+and [MEGAcmd 2.6.0 Debian 13 packages](https://mega.nz/linux/repo/Debian_13/Packages).
+The MEGA installer pins separate amd64/arm64 package hashes. LiveKit and coturn
+use versioned upstream images; record reviewed image digests when releasing.
+The storage image without MEGA remains available for S3-only installations.
+
+After building, pull the reviewed upstream images explicitly; smoke never pulls:
+
+```sh
+docker pull caddy:2.11.7-alpine
+docker pull livekit/livekit-server:v1.13.7
+docker pull coturn/coturn:4.18.0-r0
+python3 -B deploy/containers/smoke.py --version "$VERSION" \
+  --caddy-image caddy:2.11.7-alpine \
+  --media-image livekit/livekit-server:v1.13.7 --turn-image coturn/coturn:4.18.0-r0
+```
+
+The extended smoke verifies six elo CLIs, unprivileged MEGAcmd IPC without
+provider login, synthetic Firebase relay startup, call-control health, private
+proxy boundaries, LiveKit startup and authenticated TURN allocation without
+sending media to an external peer. Actual two-device push/audio/video acceptance
+is separate. Build hosts without Docker NAT can use `ELO_BUILD_NETWORK=host`;
+this affects build networking, not service endpoints or secret mounts.
+
+## Replacing a native installation on these same new hosts
+
+This is a deliberate clean-install operation, not an automated migration.
+First retain validated encrypted backups and independent witness receipts,
+record the current unit names, ports and firewall, and prepare the fresh state
+under separate `/srv/elo-api` and `/srv/elo-witness` directories. Build and smoke
+images before stopping anything. Do not stop or alter unrelated SSH/SFTP
+accounts, upload directories, mounts or firewall access. Never apply this
+procedure to an older review environment that must remain unchanged.
+
+At the planned switch, stop and disable only the old elo units on the selected
+new hosts. Stop their existing HTTP proxy before starting Caddy on 80/443;
+ensure that proxy has no unrelated sites requiring preservation. Start witness
+and the broker, manually activate the never-used witness with its independently
+retained initial pin, then start API and its optional services. Validate public
+TLS, health, signed configuration import, creator limits, Space enrollment,
+push, attachment upload/download/deletion and two-device media before removing
+old elo state. A service health response alone does not establish acceptance.
+Do not delete certificates, SFTP data or previous backups as a side effect of
+clearing old Spaces. After any state is acknowledged, preserve and update the
+external witness anchor; an empty-boot anchor cannot be reused after a reset.

@@ -18,7 +18,7 @@ internal object NotificationInbox {
     @Synchronized fun wasRead(context: Context, scope: String, event: String): Boolean = reads(context).has("$scope:$event")
     @Synchronized fun reconcile(context: Context, args: ReconcileArgs) {
         val prefs = prefs(context)
-        if (!prefs.getBoolean("enabled", false) || prefs.getString("registration", null) != args.registration) return
+        if (!prefs.getBoolean("enabled", false) || !PushRegistrations.contains(prefs, args.registration)) return
         val saved = reads(context)
         args.receipts.take(1024).forEach { receipt ->
             val scope = receipt["scope"] ?: return@forEach
@@ -38,14 +38,14 @@ internal object NotificationInbox {
             val data = active.notification.extras
             val scope = data.getString("elo_scope") ?: return@forEach
             val event = data.getString("elo_event") ?: ""
-            if (data.getString("elo_registration") != args.registration || scope !in args.scopes || saved.has("$scope:$event") || (data.containsKey("elo_expires") && data.getLong("elo_expires") <= System.currentTimeMillis())) {
+            if (!PushRegistrations.contains(prefs, data.getString("elo_registration")) || (data.getString("elo_registration") == args.registration && scope !in args.scopes) || saved.has("$scope:$event") || (data.containsKey("elo_expires") && data.getLong("elo_expires") <= System.currentTimeMillis())) {
                 manager.cancel(active.tag, active.id)
             }
         }
     }
     @Synchronized fun post(context: Context, registration: String?, scope: String, event: String, notification: android.app.Notification) {
         val current = prefs(context)
-        if (!current.getBoolean("enabled", false) || current.getString("registration", null) != registration || wasRead(context, scope, event)) return
+        if (!current.getBoolean("enabled", false) || !PushRegistrations.contains(current, registration) || wasRead(context, scope, event)) return
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify("elo-wake:$scope", 71001, notification)
     }

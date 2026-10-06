@@ -47,6 +47,7 @@ export type SpaceSummary = {
   requests: number;
   activity?: number;
   managed: boolean;
+  calls_available?: boolean;
   deletable?: boolean;
   role?: "primary_owner" | "owner" | "member";
   roles_revision?: number;

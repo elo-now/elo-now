@@ -82,6 +82,8 @@ const known: Record<string, MessageKey> = {
     "hosting.policyUnavailable",
   "Choose a message retention policy offered by this hosting service.":
     "hosting.policyUnavailable",
+  "This hosting service does not provide audio or video sessions.":
+    "hosting.callsUnavailable",
   "Attachment storage is unavailable on this hosting service.":
     "hosting.storageUnavailable",
   "This hosting service does not provide managed attachment storage.":

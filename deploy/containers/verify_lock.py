@@ -14,7 +14,7 @@ def verify(original, normalized):
     if not after <= before:
         raise ValueError("Server lock introduced a dependency version/source/checksum absent from the reviewed workspace lock.")
     names = {value[0] for value in after}
-    if not {"elo-core", "elo-team", "elo-witness", "elo-storage"} <= names:
+    if not {"elo-core", "elo-team", "elo-witness", "elo-storage", "elo-wake", "elo-call-service"} <= names:
         raise ValueError("Server lock is missing a required workspace package.")
 
 

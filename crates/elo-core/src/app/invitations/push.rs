@@ -77,20 +77,54 @@ impl ClientApp {
         self.refresh_default_hosting_context();
         Ok(())
     }
+    /// Only connected Spaces contribute endpoints. Importing a hosting catalog
+    /// entry alone must not disclose this installation to that service.
+    pub fn notification_endpoints(&self) -> Vec<String> {
+        self.spaces
+            .as_ref()
+            .map(|spaces| spaces.clients(self))
+            .unwrap_or_else(|| vec![self])
+            .into_iter()
+            .filter_map(|client| client.notification_push_endpoint())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
     pub fn advertise_wake_route(&self, route: Option<Route>) -> Result<()> {
         if let Some(spaces) = &self.spaces {
             for client in spaces.clients(self) {
-                let scoped = route
+                if route.as_ref().is_none_or(|route| {
+                    client.notification_push_endpoint().as_deref() == Some(route.endpoint.as_str())
+                }) {
+                    client.advertise_wake_route_local(route.clone())?;
+                } else if client
+                    .invitation_state()?
+                    .own_wake
                     .as_ref()
-                    .filter(|route| {
-                        client.push_endpoint.as_deref() == Some(route.endpoint.as_str())
+                    .is_some_and(|old| {
+                        client.notification_push_endpoint().as_deref()
+                            != Some(old.endpoint.as_str())
                     })
-                    .cloned();
-                client.advertise_wake_route_local(scoped)?;
+                {
+                    client.advertise_wake_route_local(None)?;
+                }
             }
             return Ok(());
         }
         self.advertise_wake_route_local(route)
+    }
+    pub fn withdraw_wake_route(&self, endpoint: &str) -> Result<()> {
+        for client in self
+            .spaces
+            .as_ref()
+            .map(|spaces| spaces.clients(self))
+            .unwrap_or_else(|| vec![self])
+        {
+            if client.notification_push_endpoint().as_deref() == Some(endpoint) {
+                client.advertise_wake_route_local(None)?;
+            }
+        }
+        Ok(())
     }
     fn advertise_wake_route_local(&self, route: Option<Route>) -> Result<()> {
         let mut state = self.invitation_state()?;
@@ -123,7 +157,7 @@ impl ClientApp {
         };
         valid_route(
             &route,
-            self.push_endpoint
+            self.notification_push_endpoint()
                 .as_deref()
                 .ok_or("Notifications are not configured.")?,
             self.push_allow_loopback,
@@ -419,6 +453,9 @@ impl ClientApp {
     }
     /// Opaque scope identifiers expose neither chat names nor signed record IDs.
     pub fn notification_policy(&self, route: &Route) -> Result<Value> {
+        if !self.notification_endpoints().contains(&route.endpoint) {
+            return Err("Notifications are not configured for this hosting.".into());
+        }
         let blocked = self
             .blocked
             .entries()?
@@ -428,7 +465,9 @@ impl ClientApp {
         if let Some(spaces) = &self.spaces {
             let mut scopes = BTreeMap::new();
             let mut introductions = BTreeSet::new();
-            for client in spaces.clients(self) {
+            for client in spaces.clients(self).into_iter().filter(|client| {
+                client.notification_push_endpoint().as_deref() == Some(route.endpoint.as_str())
+            }) {
                 for value in client.notification_policy_local(route)?["scopes"]
                     .as_array()
                     .ok_or("Invalid notification policy.")?
@@ -597,7 +636,12 @@ impl ClientApp {
             .spaces
             .as_ref()
             .map(|spaces| spaces.clients(self))
-            .unwrap_or_else(|| vec![self]);
+            .unwrap_or_else(|| vec![self])
+            .into_iter()
+            .filter(|client| {
+                client.notification_push_endpoint().as_deref() == Some(route.endpoint.as_str())
+            })
+            .collect::<Vec<_>>();
         let mut receipts = Vec::new();
         let mut pending = BTreeMap::<_, Vec<(RecordId, Value)>>::new();
         for value in delivered {
@@ -706,7 +750,9 @@ impl ClientApp {
                 .map(|spaces| spaces.clients(self))
                 .unwrap_or_else(|| vec![self]);
             let mut receipts = Vec::new();
-            for client in clients {
+            for client in clients.into_iter().filter(|client| {
+                client.notification_push_endpoint().as_deref() == Some(route.endpoint.as_str())
+            }) {
                 let state = client.invitation_state()?;
                 let ids = request["ids"].as_array().ok_or("Invalid read receipt.")?;
                 for id in ids.iter().filter_map(Value::as_str) {
@@ -747,10 +793,19 @@ impl ClientApp {
                 if client.pins.iter().any(|p| {
                     json!(p.space) == request["space"] && json!(p.stream) == request["stream"]
                 }) {
-                    return client.notification_read_receipts_local(route, request);
+                    return if client.notification_push_endpoint().as_deref()
+                        == Some(route.endpoint.as_str())
+                    {
+                        client.notification_read_receipts_local(route, request)
+                    } else {
+                        Ok(Vec::new())
+                    };
                 }
             }
             return Err("Chat unavailable.".into());
+        }
+        if self.notification_push_endpoint().as_deref() != Some(route.endpoint.as_str()) {
+            return Ok(Vec::new());
         }
         self.notification_read_receipts_local(route, request)
     }
@@ -1140,6 +1195,8 @@ mod tests {
                 "General",
             )
             .await
+            .unwrap();
+        app.configure_push("https://notifications.example/", false)
             .unwrap();
         let (peer, recovery) = Session::create().unwrap();
         let replacement = Session::recover(&recovery, peer.identity_id()).unwrap();

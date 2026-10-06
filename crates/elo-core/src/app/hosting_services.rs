@@ -39,6 +39,7 @@ pub(super) fn test_profile(index: u8) -> HostingProfile {
             managed: None,
         }),
         push_url: None,
+        call_url: None,
         message_lifetimes: crate::message_retention::MessageRetention::public_policies(),
         default_message_lifetime: Default::default(),
     }

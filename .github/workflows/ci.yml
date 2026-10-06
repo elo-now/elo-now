@@ -82,12 +82,15 @@ jobs:
       # Native Kotlin/Swift mobile code remains part of mobile release builds.
       - run: cargo check --locked -p elo-desktop -p tauri-plugin-elo-push -p tauri-plugin-elo-privacy --all-targets --features elo-desktop/mobile-push,elo-desktop/custom-protocol
       - name: Native hosting catalog and trust boundaries
-        run: cargo test --locked -p elo-desktop --lib hosting::tests
+        run: |
+          cargo test --locked -p elo-desktop --lib hosting::tests
+          cargo test --locked -p elo-desktop --lib push::
       - name: iOS notification inbox logic
         if: runner.os == 'macOS'
         run: |
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/PushInbox.swift crates/tauri-plugin-elo-push/ios/Tests/PushInboxTests.swift -o "$RUNNER_TEMP/elo-push-inbox-tests"
           "$RUNNER_TEMP/elo-push-inbox-tests"
+          python3 tools/check_ios_badge.py --ordering-only
       - name: iOS unlock privacy cover state
         if: runner.os == 'macOS'
         run: |
@@ -116,6 +119,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service -p elo-storage -p elo-witness --all-targets -- -D warnings
       - run: cargo test --locked -p elo-core -p elo-team -p elo-wake -p elo-call-service -p elo-storage -p elo-witness
+      - run: cargo test --locked -p elo-core --example witnessed_space_qa
       - run: sudo apt-get update && sudo apt-get install -y age
       - run: python3 -m unittest discover -s deploy/hosting -v
       - run: python3 -m unittest discover -s deploy/storage -v
@@ -132,9 +136,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Build API, witness and storage from allowlisted source
+      - name: Build all elo services from allowlisted source
         run: sh deploy/containers/build.sh "ci-$GITHUB_SHA" all
-      - name: Load the versioned proxy image
-        run: docker pull caddy:2.11.7-alpine
-      - name: Check isolated startup, activation, recreation and public QR export
-        run: python3 deploy/containers/smoke.py --version "ci-$GITHUB_SHA" --caddy-image caddy:2.11.7-alpine
+      - name: Load versioned proxy and media images
+        run: |
+          docker pull caddy:2.11.7-alpine
+          docker pull livekit/livekit-server:v1.13.7
+          docker pull coturn/coturn:4.18.0-r0
+      - name: Check lifecycle, public QR export, media ports and authenticated TURN
+        run: python3 deploy/containers/smoke.py --version "ci-$GITHUB_SHA" --caddy-image caddy:2.11.7-alpine --media-image livekit/livekit-server:v1.13.7 --turn-image coturn/coturn:4.18.0-r0

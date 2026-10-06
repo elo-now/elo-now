@@ -10,6 +10,13 @@ fn route() -> Route {
     }
 }
 
+async fn profile(path: std::path::PathBuf) -> ClientApp {
+    let mut app = crate::app::performance::profile(path).await;
+    // Native profile unlock configures the built-in relay before reading push state.
+    app.configure_push(&route().endpoint, false).unwrap();
+    app
+}
+
 fn target(app: &ClientApp, record: RecordId) -> Target {
     Target {
         v: 1,
@@ -59,9 +66,10 @@ async fn mark(app: &mut ClientApp, id: RecordId, op: &str) {
 #[tokio::test]
 async fn delivered_late_read_receipts_preserve_new_and_manually_unread_messages() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = crate::app::performance::profile(tmp.path().join("profile")).await;
+    let mut app = profile(tmp.path().join("profile")).await;
     let id = send(&mut app).await;
     let route = route();
+    assert_eq!(app.notification_endpoints(), vec![route.endpoint.clone()]);
     let read = delivery(&app, &route, &target(&app, id));
     let new = delivery(&app, &route, &target(&app, RecordId::from_bytes([91; 32])));
     assert!(
@@ -88,6 +96,7 @@ async fn delivered_late_read_receipts_preserve_new_and_manually_unread_messages(
     mark(&mut app, id, "mark_read").await;
     // Connected Spaces use the same verified local read state after startup.
     app.enable_spaces().await.unwrap();
+    assert_eq!(app.notification_endpoints(), vec![route.endpoint.clone()]);
     assert_eq!(
         app.notification_delivered_read_receipts(&route, std::slice::from_ref(&read))
             .await
@@ -116,7 +125,7 @@ async fn delivered_late_read_receipts_preserve_new_and_manually_unread_messages(
 #[tokio::test]
 async fn private_read_state_clears_one_delivered_chat_while_another_stays_unread() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = crate::app::performance::profile(tmp.path().join("profile")).await;
+    let mut app = profile(tmp.path().join("profile")).await;
     let first = send(&mut app).await;
     let route = route();
     let first_alert = delivery(&app, &route, &target(&app, first));
@@ -166,11 +175,28 @@ async fn private_read_state_clears_one_delivered_chat_while_another_stays_unread
 #[tokio::test]
 async fn delivered_receipts_require_exact_scope_event_recipient_and_bounded_targets() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = crate::app::performance::profile(tmp.path().join("profile")).await;
+    let mut app = profile(tmp.path().join("profile")).await;
     let id = send(&mut app).await;
     mark(&mut app, id, "mark_read").await;
     let route = route();
     let valid = delivery(&app, &route, &target(&app, id));
+    assert_eq!(
+        app.notification_delivered_read_receipts(&route, std::slice::from_ref(&valid))
+            .await
+            .unwrap(),
+        vec![json!({"scope":valid["scope"],"event":valid["event"]})]
+    );
+    let other_host = Route {
+        endpoint: "https://other-notifications.example/".into(),
+        ..route.clone()
+    };
+    assert!(app.notification_policy(&other_host).is_err());
+    assert!(
+        app.notification_delivered_read_receipts(&other_host, std::slice::from_ref(&valid))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut wrong_scope = valid.clone();
     wrong_scope["scope"] = json!("0".repeat(64));
     let mut wrong_event = valid.clone();
@@ -226,7 +252,7 @@ async fn delivered_receipts_require_exact_scope_event_recipient_and_bounded_targ
 #[tokio::test]
 async fn delivered_deleted_messages_are_cleared_but_expired_unknown_targets_are_not() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = crate::app::performance::profile(tmp.path().join("profile")).await;
+    let mut app = profile(tmp.path().join("profile")).await;
     let id = send(&mut app).await;
     let route = route();
     let mut expired = target(&app, id);
@@ -269,7 +295,7 @@ async fn delivered_deleted_messages_are_cleared_but_expired_unknown_targets_are_
 #[tokio::test]
 async fn delivered_signed_expired_message_is_cleared_without_marking_it_read() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = crate::app::performance::profile(tmp.path().join("profile")).await;
+    let app = profile(tmp.path().join("profile")).await;
     let clock = now().unwrap().as_millis() as u64 - 7_200_000;
     let mut message = crate::app::performance::message(&app, 0, clock)
         .chat()

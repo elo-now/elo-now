@@ -483,6 +483,7 @@ mod tests {
                 }),
             }),
             push_url: None,
+            call_url: None,
             message_lifetimes: vec![MessageRetention::Hours48, MessageRetention::NoExpiry],
             default_message_lifetime: MessageRetention::NoExpiry,
         }

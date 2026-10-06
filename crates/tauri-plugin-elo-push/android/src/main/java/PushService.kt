@@ -22,13 +22,13 @@ class PushService : FirebaseMessagingService() {
         }
     }
     override fun onMessageReceived(message: RemoteMessage) {
-        if (!prefs.getBoolean("enabled", false) || message.data["elo_registration"] != prefs.getString("registration", null)) return
+        if (!prefs.getBoolean("enabled", false) || !PushRegistrations.contains(prefs, message.data["elo_registration"])) return
         // Legacy call pushes cannot start capture or interrupt the user.
         if (message.data["elo_call"] == "1") return
         val challenge = message.data["elo_challenge"]
         if (challenge != null && challenge.matches(Regex("[a-f0-9]{64}")) &&
-            message.data["elo_registration"] == prefs.getString("registration", null)) {
-            prefs.edit().putString("challenge", challenge).apply()
+            PushRegistrations.contains(prefs, message.data["elo_registration"])) {
+            prefs.edit().putString("challenge:${message.data["elo_registration"]}", challenge).apply()
             return
         }
         if (message.data["elo_wake"] != "1") return
@@ -41,7 +41,7 @@ class PushService : FirebaseMessagingService() {
         val event = message.data["elo_event"] ?: return
         if (!event.matches(Regex("[a-f0-9]{64}")) || NotificationInbox.wasRead(this, scope, event)) return
         if (target.length > 2048 || !target.matches(Regex("[A-Za-z0-9_-]{64,}")) || !scope.matches(Regex("[a-f0-9]{64}"))) return
-        prefs.edit().putString("wake", target).commit()
+        prefs.edit().putString("wake", target).putString("wake-registration", message.data["elo_registration"]).commit()
         val foreground = ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return

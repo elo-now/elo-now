@@ -2451,7 +2451,9 @@ function App() {
                   {stream &&
                     view.spaces?.some(
                       (space) =>
-                        space.id === view.active_space && space.managed,
+                        space.id === view.active_space &&
+                        space.managed &&
+                        space.calls_available !== false,
                     ) && (
                       <span className="desktop-only">
                         <CallButton
@@ -2733,7 +2735,9 @@ function App() {
                     stream &&
                     view.spaces?.some(
                       (space) =>
-                        space.id === view.active_space && space.managed,
+                        space.id === view.active_space &&
+                        space.managed &&
+                        space.calls_available !== false,
                     ) && (
                       <div className="floating-call">
                         <CallButton

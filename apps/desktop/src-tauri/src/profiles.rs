@@ -979,7 +979,7 @@ async fn run(
             app.state::<crate::background_history::BackgroundHistory>()
                 .suspend();
             if op == "delete_account" {
-                crate::push::forget(app)?;
+                crate::push::forget(app, &client.identity_id().to_string())?;
             } else {
                 crate::push::suspend(app, Some(client)).await?;
             }

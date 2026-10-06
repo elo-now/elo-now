@@ -191,7 +191,10 @@ export class Calls {
           !chat.forked &&
           this.view?.spaces?.some(
             (s) =>
-              s.id === chat.space_context && s.managed && s.status === "joined",
+              s.id === chat.space_context &&
+              s.managed &&
+              s.calls_available !== false &&
+              s.status === "joined",
           ),
       );
   }

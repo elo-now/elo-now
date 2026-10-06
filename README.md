@@ -103,7 +103,8 @@ message groups may be omitted to fit. Keep backups independently of your device.
 
 ## How data moves
 
-A **Replica** is a temporary delivery store, not a Space or an archive. Devices
+A **Replica** is a delivery store, not a Space or a guaranteed archive. Its
+retention follows the Space's selected hosting policy. Devices
 sign messages and encrypt them for authorized device keys before upload.
 Recipients decrypt locally and verify the signature and authorization before
 accepting a message. Hosted sending also requires fresh authorization evidence;
@@ -116,7 +117,7 @@ authorization checks, not message content.
 
 ```mermaid
 flowchart LR
-    A["Sender device<br/>Sign and encrypt"] -->|Encrypted message| R["API / Replica<br/>Temporary delivery storage"]
+    A["Sender device<br/>Sign and encrypt"] -->|Encrypted message| R["API / Replica<br/>Delivery storage"]
     R -->|Encrypted message| B["Recipient device<br/>Verify and decrypt"]
     A -.->|General authority| W["Witness<br/>Signed authorization state"]
     B -.->|General authority| W
@@ -180,13 +181,14 @@ See the [storage broker contract](crates/elo-storage/README.md).
 
 | Setting                     | Choices                                           | What it controls                                                                                                                                         |
 | --------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Server message lifetime** | **6 h / 12 h / 24 h**, default **24 h**           | How long the Replica retains an encrypted message body, measured from server receipt. It does not erase history already on devices.                      |
+| **Server message lifetime** | Public elo.now: **6 h / 12 h / 24 h**, default **24 h**; private hosting: its advertised policies | How long the Replica retains an encrypted message body, measured from server receipt. It does not erase history already on devices.                      |
 | **Keep** on a text message  | **No expiry / 1 h / 24 h**, default **No expiry** | When updated clients hide that message's content and show **Message expired**. The composer represents No expiry as **∞**.                               |
 | **Attachment expiry**       | **1 h / 12 h / 24 h**, default **1 h**            | When the attachment stops being downloadable and its encrypted object becomes due for deletion from storage. New policy choices apply to future uploads. |
 
-A one-to-one DM body can leave the Replica earlier: after one device of the other
-identity verifies and durably accepts it. This is not a human read receipt, and
-another device of that identity may still need to retrieve a copy.
+With a finite server lifetime, a one-to-one DM body can leave the Replica earlier:
+after one device of the other identity verifies and durably accepts it. This is
+not a human read receipt, and another device of that identity may still need to
+retrieve a copy. **No expiry** does not remove the body on this acknowledgment.
 
 Server expiry does **not** mean all Space data disappears. Encrypted locators,
 authorization and membership state, operational metadata, logs and backups have

@@ -63,6 +63,22 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe("call subscriptions", () => {
+  it("does not contact a call service for a hosting without the capability", async () => {
+    vi.useFakeTimers();
+    const calls = new Calls();
+    const command = vi.fn(async () => ({ type: "result" }));
+    Object.assign(calls, { command });
+    calls.update({
+      ...view,
+      spaces: view.spaces!.map((space) => ({
+        ...space,
+        calls_available: false,
+      })),
+    });
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(command).not.toHaveBeenCalled();
+    calls.dispose();
+  });
   it("subscribes beyond 32 chats in bounded batches and cancels queued work on logout", async () => {
     vi.useFakeTimers();
     const calls = new Calls();

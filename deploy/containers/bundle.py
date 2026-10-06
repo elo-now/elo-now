@@ -10,7 +10,7 @@ import shutil
 import stat
 import tomllib
 
-SERVERS = ("elo-core", "elo-team", "elo-witness", "elo-storage")
+SERVERS = ("elo-core", "elo-team", "elo-witness", "elo-storage", "elo-wake", "elo-call-service")
 EXTENSIONS = {".rs", ".toml", ".sql", ".html"}
 
 
@@ -44,7 +44,8 @@ def bundle(source, output):
     output = output.absolute()
     if output.is_relative_to(source):
         raise ValueError("Create the context outside the source checkout.")
-    paths = [Path(name) for name in ("rust-toolchain.toml", "LICENSE", "protocol/reactions.json")]
+    paths = [Path(name) for name in ("rust-toolchain.toml", "LICENSE", "protocol/reactions.json",
+                                   "apps/desktop/src/locales/native.en.json")]
     for name in SERVERS:
         root = source / "crates" / name
         for path in root.rglob("*"):
@@ -58,7 +59,8 @@ def bundle(source, output):
     paths.extend(Path("protocol/fixtures") / name for name in
                  ("chat-message-v1.record.bin", "chat-message-v1.expected.json", "chat-message-v1.body.json"))
     paths.extend(Path("deploy/containers") / name for name in
-                 ("Dockerfile", ".dockerignore", "Dockerfile.dockerignore", "entrypoint.sh", "activate.py", "verify_lock.py"))
+                 ("Dockerfile", ".dockerignore", "Dockerfile.dockerignore", "entrypoint.sh", "activate.py", "verify_lock.py", "wake.py", "install_mega.sh"))
+    paths.append(Path("deploy/storage/mega_folder.py"))
     # Reject links before copying anything. Only enumerated source files enter the context.
     for relative in paths:
         path = source / relative

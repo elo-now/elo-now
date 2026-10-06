@@ -34,6 +34,13 @@ struct PushInboxTests {
         assert(PushInbox.removals([old, local], registration: "current", scopes: [scope], reads: [], now: now).identifiers == ["old-profile"], "Cleanup must not remove local reminders")
         assert(PushInbox.removals([unseen], registration: "current", scopes: [], reads: [], now: now).identifiers == ["not-synced-yet"], "Notifications from removed scopes must be cleared")
 
+        var privateData = data
+        privateData["elo_registration"] = "private-host"
+        let privateMessage = DeliveredPush(identifier: "private-host-message", deliveredAt: now, data: privateData)
+        let isolated = PushInbox.removals([read, privateMessage, old], registration: "current", scopes: [], reads: [], otherRegistrations: ["private-host"], now: now)
+        assert(isolated.identifiers == ["read", "old-profile"] && isolated.remaining, "Updating one hosting must retain unread notifications from another active hosting")
+        assert(PushInbox.pendingMessages([privateMessage], registration: "current", reads: [], now: now).isEmpty, "A host must not receive another host's delivered targets")
+
         let pending = PushInbox.pendingMessages([read, unseen, expired, old, local], registration: "current", reads: acknowledgement, now: now)
         assert(pending.count == 1 && pending[0]["event"] == nextEvent, "Only unacknowledged current message targets go to the unlocked verifier")
         assert(PushInbox.pendingMessages([read], registration: "current", reads: [], now: now).count == 1, "A lost receipt must be recoverable from the delivered target")

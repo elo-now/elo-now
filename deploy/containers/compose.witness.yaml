@@ -40,7 +40,7 @@ services:
       options: {max-size: "10m", max-file: "3"}
   storage:
     profiles: [storage]
-    image: elo-storage:${ELO_VERSION:?Set the locally built image version}
+    image: ${ELO_STORAGE_IMAGE:-elo-storage}:${ELO_VERSION:?Set the locally built image version}
     pull_policy: never
     user: "21003:21003"
     network_mode: host
@@ -57,6 +57,7 @@ services:
     ulimits: {core: 0}
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=21003,gid=21003
+      - /run/elo-storage:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=21003,gid=21003
     volumes:
       - type: bind
         source: ${ELO_STATE}/storage/config

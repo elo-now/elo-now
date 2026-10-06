@@ -13,6 +13,7 @@ private struct NativeMediaArgs: Decodable { let payload: String }
 private struct CallStateArgs: Decodable { let active: Bool; let sessionId: String; let activation: String; let camera: Bool; let routeChannel: Channel? }
 private struct CallAudioArgs: Decodable { let sessionId: String; let activation: String; let outputId: String? }
 private struct PushRegisterArgs: Decodable { let registration: String; let background: Bool? }
+private struct PushStatusArgs: Decodable { let registration: String? }
 private struct PushAckArgs: Decodable { let opened: String?; let wake: String? }
 private struct PushStatusListenerArgs: Decodable { let channel: Channel }
 private struct PushReconcileArgs: Decodable {
@@ -133,17 +134,22 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
 
     private func receive(_ data: [AnyHashable: Any], opened: Bool) {
         guard prefs.bool(forKey: "elo.push.enabled"),
-              data["elo_registration"] as? String == prefs.string(forKey: "elo.push.registration") else { return }
+              let registration = data["elo_registration"] as? String,
+              PushRegistrations.contains(registration, prefs: prefs) else { return }
         if let challenge = data["elo_challenge"] as? String,
            challenge.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil {
-            prefs.set(challenge, forKey: "elo.push.challenge")
+            prefs.set(challenge, forKey: PushRegistrations.challengeKey(registration))
         } else if data["elo_wake"] as? String == "1", let target = data["elo_target"] as? String,
                   target.count <= 2048, target.range(of: "^[A-Za-z0-9_-]{64,}$", options: .regularExpression) != nil {
             if data["elo_category"] as? String == "session_start",
                PushInbox.isExpired(DeliveredPush(identifier: "", deliveredAt: Date().timeIntervalSince1970, data: data),
                    now: Date().timeIntervalSince1970) { return }
             prefs.set(target, forKey: "elo.push.wake")
-            if opened { prefs.set(target, forKey: "elo.push.opened") }
+            prefs.set(registration, forKey: "elo.push.wake.registration")
+            if opened {
+                prefs.set(target, forKey: "elo.push.opened")
+                prefs.set(registration, forKey: "elo.push.opened.registration")
+            }
         } else { return }
         try? statusChannel?.send([:] as [String: Bool])
     }
@@ -163,8 +169,15 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
                 invoke.reject("Notifications are not configured."); return
             }
             PushBadge.invalidate(prefs: self.prefs)
-            self.prefs.set(args.registration, forKey: "elo.push.registration")
-            self.prefs.removeObject(forKey: "elo.push.challenge")
+            guard PushRegistrations.add(args.registration, prefs: self.prefs) else {
+                invoke.reject("Too many notification registrations."); return
+            }
+            // One Firebase installation delivers every hosting route. Adding a
+            // route must not restart provider registration or discard challenges.
+            if self.prefs.bool(forKey: "elo.push.enabled"),
+               let token = self.prefs.string(forKey: "elo.push.installation-id"), !token.isEmpty {
+                invoke.resolve(["token": token]); return
+            }
             self.prefs.set(true, forKey: "elo.push.enabled")
             self.waiting?.reject("Notification setup was restarted.")
             let attempt = UUID()
@@ -219,14 +232,15 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         prefs.removeObject(forKey: "elo.push.token")
         try? statusChannel?.send([:] as [String: Bool])
     }
-    @objc func status(_ invoke: Invoke) {
+    @objc func status(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(PushStatusArgs.self)
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { [weak self] settings in
             center.getDeliveredNotifications { notifications in
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { invoke.reject("Notifications are unavailable."); return }
                     let enabled = self.prefs.bool(forKey: "elo.push.enabled")
-                    let registration = self.prefs.string(forKey: "elo.push.registration")
+                    let registration = args.registration.flatMap { PushRegistrations.contains($0, prefs: self.prefs) ? $0 : nil }
                     let now = Date().timeIntervalSince1970
                     let reads = self.prefs.dictionary(forKey: "elo.push.reads") as? [String: Double] ?? [:]
                     let delivered = enabled ? PushInbox.pendingMessages(
@@ -237,8 +251,9 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
                         enabled: enabled,
                         permission: settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
                         registration: registration,
-                        wake: self.prefs.string(forKey: "elo.push.wake"), opened: self.prefs.string(forKey: "elo.push.opened"),
-                        token: self.prefs.string(forKey: "elo.push.installation-id"), challenge: self.prefs.string(forKey: "elo.push.challenge"),
+                        wake: args.registration == nil || registration != nil && PushRegistrations.targetRegistration("wake", prefs: self.prefs) == registration ? self.prefs.string(forKey: "elo.push.wake") : nil,
+                        opened: args.registration == nil || registration != nil && PushRegistrations.targetRegistration("opened", prefs: self.prefs) == registration ? self.prefs.string(forKey: "elo.push.opened") : nil,
+                        token: self.prefs.string(forKey: "elo.push.installation-id"), challenge: registration.flatMap { self.prefs.string(forKey: PushRegistrations.challengeKey($0)) },
                         delivered: delivered))
                 }
             }
@@ -267,13 +282,30 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
         }
         invoke.resolve()
     }
+    @objc func remove(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(PushRegisterArgs.self)
+        DispatchQueue.main.async { [self] in
+            PushBadge.invalidate(prefs: prefs)
+            PushRegistrations.remove(args.registration, prefs: prefs)
+            let center = UNUserNotificationCenter.current()
+            if PushRegistrations.all(prefs).isEmpty { center.setBadgeCount(0) { _ in } }
+            center.getDeliveredNotifications { notifications in
+                center.removeDeliveredNotifications(withIdentifiers: notifications.filter {
+                    $0.request.content.userInfo["elo_registration"] as? String == args.registration
+                }.map { $0.request.identifier })
+                invoke.resolve()
+            }
+        }
+    }
     @objc func disable(_ invoke: Invoke) {
         DispatchQueue.main.async { [self] in
             PushBadge.invalidate(prefs: prefs)
             waiting?.reject("Notification setup was cancelled.")
             waiting = nil
             registrationAttempt = nil
-            for key in ["enabled", "token", "installation-id", "challenge", "registration", "wake", "opened", "reads"] { prefs.removeObject(forKey: "elo.push." + key) }
+            for key in prefs.dictionaryRepresentation().keys where key.hasPrefix("elo.push.") {
+                prefs.removeObject(forKey: key)
+            }
             let center = UNUserNotificationCenter.current()
             center.setBadgeCount(0) { _ in }
             center.getDeliveredNotifications { notifications in

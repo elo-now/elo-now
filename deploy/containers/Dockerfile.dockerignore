@@ -2,6 +2,11 @@
 **
 !Cargo.toml
 !Cargo.lock
+!apps/
+!apps/desktop/
+!apps/desktop/src/
+!apps/desktop/src/locales/
+!apps/desktop/src/locales/native.en.json
 !rust-toolchain.toml
 !LICENSE
 !crates/
@@ -9,6 +14,8 @@
 !crates/elo-team/**
 !crates/elo-witness/**
 !crates/elo-storage/**
+!crates/elo-wake/**
+!crates/elo-call-service/**
 !migrations/
 !migrations/*.sql
 !protocol/
@@ -21,6 +28,10 @@
 !deploy/containers/entrypoint.sh
 !deploy/containers/activate.py
 !deploy/containers/verify_lock.py
+!deploy/containers/wake.py
+!deploy/containers/install_mega.sh
+!deploy/storage/
+!deploy/storage/mega_folder.py
 **/.private/**
 **/.git/**
 **/target/**

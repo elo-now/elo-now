@@ -23,17 +23,17 @@ For upgrades to an existing installation, read [API compatibility and applicatio
 The [container deployment package](../deploy/containers/README.md) provides a
 separate path for new installations using current matching clients and
 services: an API host and an independent witness host, with an optional
-S3-compatible attachment broker on the witness host. It builds local versioned
+MEGA/S3 attachment broker on the witness host. Optional API-host services provide
+mobile push and audio/video sessions through LiveKit and TURN. It builds local versioned
 images from an allowlisted source context; no published elo image is assumed.
 The initializer creates separate persistent data and private key directories,
-restricts new Space creation to explicitly listed identities, and prepares a
+restricts new Space creation to explicitly listed identities by default, and prepares a
 signed public hosting profile for import. Linux host networking preserves the
 services' loopback-only trust boundary behind a local TLS proxy.
 
 Every witness process remains sealed until the operator explicitly activates
 it against a separately trusted, latest journal anchor. The package does not
-automate that trust decision. It also does not include calls, push, MEGAcmd,
-external anchor collection or automated backups. Local initializer and Compose
+automate that trust decision, external anchor collection or automated backups. Local initializer and Compose
 validation are distinct from a real Linux build, two-host deployment and
 restore acceptance run. Follow the package's prerequisites, activation and
 acceptance instructions before offering this path to users. The single-VPS
@@ -51,7 +51,7 @@ it does not disconnect or migrate existing Spaces. The default entry can be
 restored. The catalog is not synchronized between devices.
 
 The signed profile contains a name, revision, creation endpoint, witness pin,
-an optional storage endpoint, a reserved push field, allowed message policies
+optional storage, push and call endpoints, allowed message policies
 and a default policy.
 The signing key identifies the profile. Import is an explicit trust decision:
 a self-signature does not identify a trustworthy operator. Later imports must
@@ -60,11 +60,23 @@ entries retain their pins, so removing and re-adding is not a key-reset flow.
 Each joined Space separately retains its hosting binding in encrypted profile
 state. Host selection never reassigns an existing Space.
 
-Imported hosting currently supports API, witness and optional attachment broker.
-Its `push_url` must be `null`: native push registration still belongs to the
-built-in hosting. A private Space does not send push-route information to that
-public service. Private mobile push and call-service provisioning are outside
-the container package's current scope.
+Each imported hosting may declare `push_url` as a canonical HTTPS origin ending
+in `/` and `call_url` as an HTTPS endpoint ending in `/calls/v1`. Omit either
+field, or set it to `null`, when the service is not provided. The client does
+not fall back to public services for that private Space. Call controls are
+available only when that hosting provides sessions. Native mobile push uses
+separate registration credentials per approved endpoint while sharing the
+installation's platform push token. Policies, route publication, read receipts
+and account deletion stay scoped to their hosting; removing one registration
+does not cancel another hosting's notifications. All declared endpoints are
+pinned by the approved signed profile, including across updates.
+
+The relay's Firebase credentials must belong to the Firebase project embedded
+in the installed mobile app. An unrelated operator cannot use an arbitrary
+Firebase project with the store binary. They need a matching app build or an
+appropriately authorized delivery service; this package does not implement a
+cross-project gateway. Never distribute the publisher's service-account key
+with a hosting profile.
 
 Private-host invitation links carry a compact hosting identifier in addition
 to the invitation capability. Recipients must import that hosting's configuration
@@ -90,7 +102,13 @@ a separate private `managed_storage` file containing `provider` and
 `allowed_owners`; a signed request from a currently authorized owner is required
 to activate it. Neither the API nor QR gets the credentials. Provider changes
 use the existing storage revision and cleanup rules. The container package
-supports S3; MEGA requires the separately installed and verified MEGAcmd adapter.
+includes S3 and an optional MEGAcmd image for limited MEGA folder credentials.
+
+### Baseline native single-VPS layout
+
+The following table and numbered setup steps describe the native systemd/Nginx
+layout. Container deployments use the separate Compose services and state paths
+in the [two-host package](../deploy/containers/README.md).
 
 | Component | Install on the VPS | Public route / port | Private configuration |
 | --- | --- | --- | --- |

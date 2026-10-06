@@ -29,14 +29,16 @@ def require(condition, message):
 
 
 class Smoke:
-    def __init__(self, version, caddy_image=None):
+    def __init__(self, version, caddy_image=None, media_image=None, turn_image=None):
         self.version = version
         self.caddy_image = caddy_image
+        self.media_image = media_image
+        self.turn_image = turn_image
         self.prefix = "elo-smoke-" + uuid.uuid4().hex[:12]
         self.containers = []
         self.volumes = []
         self.network = None
-        self.images = {role: f"elo-{role}:{version}" for role in ("api", "witness", "storage")}
+        self.images = {role: f"elo-{role}:{version}" for role in ("api", "witness", "storage", "wake", "calls", "storage-mega")}
 
     def cleanup(self):
         errors = []
@@ -82,7 +84,7 @@ class Smoke:
         return run(command, data=data)
 
     def start(self, role, volume, namespace):
-        uid = {"api": 21001, "witness": 21002, "storage": 21003}[role]
+        uid = {"api": 21001, "witness": 21002, "storage": 21003, "wake": 21006, "calls": 21007}[role]
         name = self.prefix + "-" + role
         self.containers.append(name)
         command = ["run", "--detach", "--name", name, *self.options(uid, namespace),
@@ -91,6 +93,8 @@ class Smoke:
                    "--mount", f"type=volume,src={volume},dst=/var/lib/elo-{role},volume-subpath=state/{role}/data"]
         if role == "witness":
             command.extend(["--tmpfs", "/run/elo-witness:rw,noexec,nosuid,nodev,size=1m,mode=0700,uid=21002,gid=21002"])
+        if role == "storage":
+            command.extend(["--tmpfs", "/run/elo-storage:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=21003,gid=21003"])
         command.append(self.images[role])
         run(command)
         return name
@@ -127,7 +131,7 @@ root=pathlib.Path('/srv/state'); data=root/'export/data'
 value=json.loads((data/'hosting-profile.json').read_text())
 export.provision.stable(root/'public/hosting-profile.html',export.hosting_page(value['link']),0,0o644)
 export.provision.stable(root/'public/hosting-qr.svg',(data/'hosting-qr.svg').read_bytes(),0,0o644)
-export.provision.stable(root/'proxy/config/Caddyfile.smoke',export.provision.proxy_config('api','http://127.0.0.1:18080',False),21004)
+export.provision.stable(root/'proxy/config/Caddyfile.smoke',export.provision.proxy_config('api','http://127.0.0.1:18080',False,True,True),21004)
 """
         self.helper(["python3", "-B", "-c", publish],
                     mounts=(tools_mount, f"type=volume,src={api_volume},dst=/srv"))
@@ -161,9 +165,114 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
         require("<svg" in svg and "</svg>" in svg, "Public hosting QR route failed.")
         require(self.status(namespace, "http://127.0.0.1:18080/hosting") == "308", "Hosting directory redirect failed.")
         require(self.status(namespace, "http://127.0.0.1:18080/spaces/v1/health") == "200", "API reverse proxy failed.")
+        require(self.status(namespace, "http://127.0.0.1:18080/calls/v1/health") == "204", "Call reverse proxy failed.")
+        require(self.status(namespace, "http://127.0.0.1:18080/wake/health") == "204", "Wake reverse proxy failed.")
+        for path in ("/internal/calls/admission", "/internal/calls/event", "/media/twirp", "/media/twirp/livekit.RoomService/CreateRoom"):
+            require(self.status(namespace, "http://127.0.0.1:18080" + path) == "404", "Proxy exposed a private media route.")
         for path in ("/readyz", "/livez", "/health", "/storage/v1/health"):
             require(self.status(namespace, "http://127.0.0.1:18081" + path) == "404", "Proxy exposed a private health route.")
         print("PASS: isolated Caddy serves the exported page/QR and API; witness private health routes stay hidden", flush=True)
+
+    def check_media(self, api_volume, namespace, tools_mount):
+        if not self.media_image or not self.turn_image:
+            return
+        for image in (self.media_image, self.turn_image):
+            run(["image", "inspect", image])
+        keeper = namespace.removeprefix("container:")
+        interfaces = json.loads(run(["inspect", "--format", "{{json .NetworkSettings.Networks}}", keeper]).stdout)
+        address = interfaces[self.network]["IPAddress"]
+        # Substitute only the synthetic deployment's fictitious public address.
+        # Containers share one isolated namespace and send no peer media traffic.
+        code = """import pathlib,sys
+root=pathlib.Path('/srv/state')
+for name in ('media/config/livekit.yaml','turn/config/turnserver.conf'):
+ p=root/name; s=p.read_text(); assert '8.8.8.8' in s; p.write_text(s.replace('8.8.8.8',sys.argv[1]))
+"""
+        self.helper(["python3", "-c", code, address], mounts=(f"type=volume,src={api_volume},dst=/srv",))
+        for role, uid, image, command in (
+            ("media", 21008, self.media_image, ["--config", "/etc/elo/media/livekit.yaml"]),
+            ("turn", 21009, self.turn_image, ["-c", "/etc/elo/turn/turnserver.conf"]),
+        ):
+            name = self.prefix + "-" + role
+            self.containers.append(name)
+            arguments = ["run", "--detach", "--name", name, *self.options(uid, namespace),
+                         "--mount", f"type=volume,src={api_volume},dst=/etc/elo/{role},volume-subpath=state/{role}/config,readonly"]
+            if role == "turn":
+                arguments += ["--cap-add", "NET_BIND_SERVICE", "--tmpfs",
+                              "/var/lib/coturn:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=21009,gid=21009",
+                              "--entrypoint", "turnserver"]
+            run([*arguments, image, *command])
+            if role == "media":
+                self.wait_healthy(name, namespace, "http://127.0.0.1:7880/", "200")
+        # Only synthetic keys exist in this private volume; do not print them.
+        turn_test = """import importlib.util,json,pathlib,sys,time
+spec=importlib.util.spec_from_file_location('turn_smoke','/tools/turn_smoke.py')
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+secret=json.loads(pathlib.Path('/srv/state/calls/config/config.json').read_text())['media']['turn_secret']
+for attempt in range(15):
+ try:
+  module.allocate(sys.argv[1],secret); break
+ except (TimeoutError,ConnectionError,OSError):
+  if attempt == 14: raise
+  time.sleep(.2)
+"""
+        result = self.helper(["python3", "-B", "-c", turn_test, address],
+                             mounts=(tools_mount, f"type=volume,src={api_volume},dst=/srv,readonly"), network=namespace)
+        require("PASS: TURN" in result.stdout, "TURN allocation probe did not complete.")
+        forbidden = run(["exec", keeper, "curl", "--silent", "--max-time", "3", "--output", "/dev/null",
+                         "--write-out", "%{http_code}", "--header", "Content-Type: application/json", "--data", "{}",
+                         "http://127.0.0.1:7880/twirp/livekit.RoomService/ListRooms"]).stdout
+        require(forbidden == "401",
+                "Unauthenticated media administration was exposed.")
+        sockets = """from pathlib import Path
+def bound(protocol,port):
+ found=[]
+ for suffix in ('','6'):
+  p=Path('/proc/net/'+protocol+suffix)
+  if not p.exists(): continue
+  for row in p.read_text().splitlines()[1:]:
+   host,value=row.split()[1].split(':')
+   if int(value,16)==port: found.append(host)
+ return found
+for protocol,port in (('tcp',7881),('udp',7882)):
+ addresses=bound(protocol,port)
+ assert addresses and any(a not in ('0100007F','00000000000000000000000001000000') for a in addresses), (protocol,port,addresses)
+assert bound('tcp',7880)==['0100007F'], 'LiveKit HTTP escaped loopback'
+print('Public ICE bindings and private LiveKit HTTP verified')
+"""
+        result = self.helper(["python3", "-c", sockets], network=namespace)
+        require("Public ICE bindings" in result.stdout, "ICE socket verification failed.")
+        print("PASS: non-root LiveKit startup and authenticated TURN allocation; no media or external peer traffic", flush=True)
+
+    def check_mega_runtime(self):
+        name = self.prefix + "-mega-runtime"
+        self.containers.append(name)
+        script = """import importlib.util,os,pathlib,signal,subprocess,tempfile,time
+spec=importlib.util.spec_from_file_location('mega','/opt/elo/storage/mega_folder.py')
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+root=module.runtime_root()
+with tempfile.TemporaryDirectory(prefix='op-',dir=root) as temporary:
+ home=pathlib.Path(temporary); (home/'.megaCmd').mkdir(mode=0o700)
+ process=subprocess.Popen(['/usr/bin/mega-cmd-server','--debug=0'],env={'HOME':temporary,'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+ try:
+  ipc=home/'.megaCmd/megacmd.socket'
+  for _ in range(100):
+   if ipc.exists(): break
+   assert process.poll() is None
+   time.sleep(.05)
+  assert ipc.exists()
+  assert module.execute(ipc,'version') == 0
+ finally:
+  os.killpg(process.pid,signal.SIGTERM)
+  try: process.wait(timeout=3)
+  except subprocess.TimeoutExpired: os.killpg(process.pid,signal.SIGKILL); process.wait(timeout=3)
+print('MEGAcmd private IPC and volatile runtime ready')
+"""
+        result = run(["run", "--rm", "--name", name, *self.options(21003),
+                      "--tmpfs", "/run/elo-storage:rw,noexec,nosuid,nodev,size=256m,mode=0700,uid=21003,gid=21003",
+                      self.images["storage-mega"], "python3", "-B", "-c", script])
+        require("private IPC and volatile runtime ready" in result.stdout, "MEGA private helper failed.")
+        print("PASS: MEGAcmd starts unprivileged with private IPC on tmpfs; no login or provider traffic", flush=True)
 
     def execute(self):
         for role, image in self.images.items():
@@ -171,9 +280,11 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
             name = self.prefix + "-help-" + role
             self.containers.append(name)
             help_result = run(["run", "--rm", "--name", name, *self.options(21001), image,
-                               {"api": "elo-team", "witness": "elo-witness", "storage": "elo-storage"}[role], "--help"])
+                               {"api": "elo-team", "witness": "elo-witness", "storage": "elo-storage", "storage-mega": "elo-storage",
+                                "wake": "elo-wake", "calls": "elo-call-service"}[role], "--help"])
             require("Usage:" in help_result.stdout, f"Missing {role} CLI help.")
-        print("PASS: all three Linux image CLIs execute", flush=True)
+        print("PASS: all six Linux image CLIs execute", flush=True)
+        self.check_mega_runtime()
 
         api_volume, witness_volume = self.volume("api-state"), self.volume("witness-state")
         tools_mount = f"type=bind,src={HERE},dst=/tools,readonly"
@@ -186,8 +297,15 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
         api_init = ["python3", "-B", "/tools/init.py", "api", "--state", "/srv/state",
                     "--origin", "https://api.example.test", "--version", self.version,
                     "--witness-pin", "/tmp/witness-pin.json", "--name", "Synthetic container test",
-                    "--storage-url", "https://witness.example.test/storage/v1", "--creator", "11" * 32]
-        code = "import pathlib,subprocess,sys; pathlib.Path('/tmp/witness-pin.json').write_text(sys.stdin.read()); subprocess.run(sys.argv[1:],check=True)"
+                    "--storage-url", "https://witness.example.test/storage/v1", "--creator", "11" * 32,
+                    "--firebase", "/tmp/firebase.json", "--call-ip", "8.8.8.8"]
+        code = """import json,pathlib,subprocess,sys,os
+pathlib.Path('/tmp/witness-pin.json').write_text(sys.stdin.read())
+key=subprocess.run(['openssl','genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:2048'],capture_output=True,check=True).stdout.decode()
+firebase={'type':'service_account','project_id':'elo-synthetic','client_email':'test@elo-synthetic.iam.gserviceaccount.com','private_key_id':'synthetic','private_key':key,'token_uri':'https://oauth2.googleapis.com/token'}
+p=pathlib.Path('/tmp/firebase.json'); p.write_text(json.dumps(firebase)); p.chmod(0o600)
+subprocess.run(sys.argv[1:],check=True)
+"""
         self.helper(["python3", "-c", code, *api_init], mounts=(tools_mount, api_mount), data=json.dumps(pin))
         self.helper(["python3", "-c", "import json,pathlib; p=json.loads(pathlib.Path('/srv/state/export/config/manifest-input.json').read_text()); assert p['name']=='Synthetic container test'"], mounts=(api_mount,))
         print("PASS: Linux root initializer provisions distinct non-root service state", flush=True)
@@ -201,9 +319,13 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
         api = self.start("api", api_volume, namespace)
         witness = self.start("witness", witness_volume, namespace)
         storage = self.start("storage", witness_volume, namespace)
+        wake = self.start("wake", api_volume, namespace)
+        calls = self.start("calls", api_volume, namespace)
         self.wait_healthy(api, namespace, "http://127.0.0.1:18900/spaces/v1/health")
         self.wait_healthy(witness, namespace, "http://127.0.0.1:17845/livez")
         self.wait_healthy(storage, namespace, "http://127.0.0.1:17846/health", "204")
+        self.wait_healthy(wake, namespace, "http://127.0.0.1:8788/wake/health", "204")
+        self.wait_healthy(calls, namespace, "http://127.0.0.1:18920/calls/v1/health", "204")
         require(self.status(namespace, "http://127.0.0.1:17845/readyz") == "503", "Witness unexpectedly started unsealed.")
         print("PASS: all services healthy; witness starts sealed", flush=True)
 
@@ -260,16 +382,20 @@ provision.stable(pathlib.Path('/srv/state/proxy/config/Caddyfile.smoke'),provisi
         print("PASS: offline non-root hosting-config CLI exports the signed profile and local QR SVG", flush=True)
         if self.caddy_image:
             self.check_proxy(api_volume, witness_volume, namespace, tools_mount)
+        self.check_media(api_volume, namespace, tools_mount)
         print("NOT TESTED: public DNS/TLS, two-host trust separation, Space enrollment or a real attachment provider", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", required=True, help="Tag of the three already-built local images")
+    parser.add_argument("--version", required=True, help="Tag of the six already-built local images")
     parser.add_argument("--caddy-image", help="Optional already-present Caddy image for isolated HTTP route checks; never pulled")
+    parser.add_argument("--media-image", help="Optional already-present LiveKit image; use together with --turn-image")
+    parser.add_argument("--turn-image", help="Optional already-present coturn image; use together with --media-image")
     args = parser.parse_args()
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", args.version), "Invalid image version.")
-    smoke = Smoke(args.version, args.caddy_image)
+    require(bool(args.media_image) == bool(args.turn_image), "Provide both media and TURN images.")
+    smoke = Smoke(args.version, args.caddy_image, args.media_image, args.turn_image)
     try:
         smoke.execute()
     except subprocess.CalledProcessError as error:

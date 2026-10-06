@@ -125,19 +125,19 @@ class ProvisioningTests(unittest.TestCase):
                                "access_key": "fictional-access", "secret_key": "fictional-private-value"},
                    "allowed_owners": ["a" * 64]}
         self.prepare(storage=True, managed=managed)
-        path = self.root / "storage/config/managed-s3.json"
+        path = self.root / "storage/config/managed-storage.json"
         self.assertEqual(json.loads(path.read_text()), managed)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         config = json.loads((self.root / "storage/config/config.json").read_text())
-        self.assertEqual(config["managed_storage"], "/etc/elo/storage/managed-s3.json")
+        self.assertEqual(config["managed_storage"], "/etc/elo/storage/managed-storage.json")
         for other in (self.root / "public").rglob("*"):
             if other.is_file():
                 self.assertNotIn(b"fictional-private-value", other.read_bytes())
         self.assertNotIn("managed", json.loads((self.root / "witness/config/config.json").read_text()))
         with self.assertRaises(ValueError):
-            provision.managed_s3(dict(managed, allowed_owners=["not-an-identity"]))
+            provision.managed_storage(dict(managed, allowed_owners=["not-an-identity"]))
         with self.assertRaises(ValueError):
-            provision.managed_s3(dict(managed, provider=dict(managed["provider"], provider="mega_folder")))
+            provision.managed_storage(dict(managed, provider=dict(managed["provider"], provider="mega_folder")))
 
     def test_advertised_managed_option_contains_no_provider_secrets(self):
         pin = {"url": "https://witness.example.test/witness/v1", "public_key": "a" * 64, "key_generation": 1}
@@ -148,6 +148,65 @@ class ProvisioningTests(unittest.TestCase):
         config = json.loads((self.root / "api/config/config.json").read_text())
         self.assertEqual(config["allowed_creators"], ["c" * 64])
         self.assertNotIn("managed_storage", config)
+
+    def test_managed_mega_requires_adapter_and_credentials_remain_role_local(self):
+        managed = {"provider": {"provider": "mega_folder", "folder_link": "https://mega.nz/folder/abcdefgh#" + "a" * 22,
+                               "write_auth": "b" * 32}, "allowed_owners": ["c" * 64]}
+        with self.assertRaisesRegex(ValueError, "--with-mega"):
+            self.prepare(storage=True, managed=managed)
+        self.assertFalse(self.root.exists())
+        self.prepare(storage=True, mega=True, managed=managed)
+        self.assertIn("ELO_STORAGE_IMAGE=elo-storage-mega", (self.root / "compose.env").read_text())
+        for path in self.root.rglob("*"):
+            if path.is_file() and path != self.root / "storage/config/managed-storage.json":
+                self.assertNotIn(managed["provider"]["write_auth"].encode(), path.read_bytes())
+
+    def test_push_and_calls_have_distinct_secrets_and_signed_endpoint_advertisements(self):
+        pin = {"url": "https://witness.example.test/witness/v1", "public_key": "a" * 64, "key_generation": 1}
+        firebase = {"type": "service_account", "project_id": "test-elo", "client_email": "test@test-elo.iam.gserviceaccount.com",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "private_key_id": "fictional-key", "private_key": "-----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY-----\n"}
+        self.prepare(role="api", witness_pin=pin, firebase=firebase, call_ip="8.8.8.8")
+        body = json.loads((self.root / "export/config/manifest-input.json").read_text())
+        self.assertEqual(body["push_url"], "https://api.example.test/")
+        self.assertEqual(body["call_url"], "https://api.example.test/calls/v1")
+        secrets = [(self.root / f"calls/config/{name}.key").read_bytes() for name in ("admission", "media", "turn")]
+        self.assertEqual(len(set(secrets)), 3)
+        self.assertEqual((self.root / "api/config/call-admission.key").read_bytes(), secrets[0])
+        call = json.loads((self.root / "calls/config/config.json").read_text())
+        self.assertEqual(call["admission_url"], "http://127.0.0.1:18901/internal/calls/admission")
+        media = json.loads((self.root / "media/config/livekit.yaml").read_text())
+        self.assertEqual(media["keys"]["elo-private"], secrets[1].decode())
+        self.assertEqual(media["rtc"]["turn_servers"][0]["secret"], secrets[2].decode())
+        self.assertIn(secrets[2].decode(), (self.root / "turn/config/turnserver.conf").read_text())
+        public = json.dumps(body)
+        for secret in secrets:
+            self.assertNotIn(secret.decode(), public)
+        self.assertNotIn("PRIVATE KEY", public)
+        self.prepare(role="api", witness_pin=pin, firebase=firebase, call_ip="8.8.8.8")
+        self.assertEqual(secrets[0], (self.root / "calls/config/admission.key").read_bytes())
+
+    def test_private_service_inputs_fail_before_creating_state(self):
+        pin = {"url": "https://witness.example.test/witness/v1", "public_key": "a" * 64, "key_generation": 1}
+        for bad in ({"call_ip": "127.0.0.1"}, {"call_ip": "10.0.0.1"}, {"firebase": {"type": "service_account"}},
+                    {"advertise_managed": "mega"}, {"mega": True}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.prepare(role="api", witness_pin=pin, **bad)
+            self.assertFalse(self.root.exists())
+
+    def test_public_hosting_requires_explicit_opt_in_and_retains_public_limits(self):
+        pin = {"url": "https://witness.example.test/witness/v1", "public_key": "a" * 64, "key_generation": 1}
+        for bad in ({"creators": ["a" * 64]}, {"advertise_managed": "mega", "storage_url": "https://witness.example.test/storage/v1"}):
+            with self.assertRaises(ValueError):
+                self.prepare(role="api", witness_pin=pin, public_hosting=True, **bad)
+            self.assertFalse(self.root.exists())
+        self.prepare(role="api", witness_pin=pin, public_hosting=True)
+        config = json.loads((self.root / "api/config/config.json").read_text())
+        body = json.loads((self.root / "export/config/manifest-input.json").read_text())
+        self.assertIsNone(config["allowed_creators"])
+        self.assertEqual(config["allowed_message_retentions"], [21600, 43200, 86400])
+        self.assertEqual(body["message_lifetimes"], [21600, 43200, 86400])
+        self.assertEqual(body["default_message_lifetime"], 86400)
 
 
 class ActivationTests(unittest.TestCase):
@@ -243,6 +302,16 @@ class SourceAndComposeTests(unittest.TestCase):
         self.assertNotIn("/export", config)
         self.assertNotIn("/hosting/", provision.proxy_config("witness", "https://witness.example.test", True).decode())
 
+    def test_optional_proxy_routes_are_explicit_and_media_admin_stays_private(self):
+        minimal = provision.proxy_config("api", "https://api.example.test", False).decode()
+        full = provision.proxy_config("api", "https://api.example.test", False, True, True).decode()
+        for path in ("/v1/routes/*", "/v1/wake", "/wake/v1/account-deletion", "/calls/v1/connect", "/media/*"):
+            self.assertNotIn(path, minimal)
+            self.assertIn(path, full)
+        self.assertIn("@media_private path /media/twirp /media/twirp/*", full)
+        self.assertIn("handle @media_private {\n\t\trespond 404\n\t}", full)
+        self.assertNotIn("18901", full)
+
     def test_lock_normalization_cannot_change_dependency_versions_or_checksums(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -264,8 +333,10 @@ class SourceAndComposeTests(unittest.TestCase):
             paths = [str(path.relative_to(output)) for path in output.rglob("*")]
             self.assertTrue((output / "crates/elo-team/src/main.rs").exists())
             self.assertTrue((output / "migrations/001_replica.sql").exists())
-            for forbidden in (".private", "MEMORY.md", "apps/", "vendor/", "docs/", "target/", "credentials", ".git/"):
+            for forbidden in (".private", "MEMORY.md", "vendor/", "docs/", "target/", "credentials", ".git/"):
                 self.assertFalse(any(forbidden in path for path in paths), forbidden)
+            self.assertEqual([str(path.relative_to(output)) for path in (output / "apps").rglob("*") if path.is_file()],
+                             ["apps/desktop/src/locales/native.en.json"])
             with self.assertRaises(ValueError):
                 source_bundle.bundle(HERE.parents[1], output)
         self.assertEqual((HERE / ".dockerignore").read_bytes(), (HERE / "Dockerfile.dockerignore").read_bytes())
@@ -275,7 +346,7 @@ class SourceAndComposeTests(unittest.TestCase):
         environment = dict(os.environ, ELO_STATE="/srv/elo-test", ELO_VERSION="1.0.5-test")
         for role in ("api", "witness"):
             result = subprocess.run(["docker", "compose", "-f", str(HERE / f"compose.{role}.yaml"),
-                                     "--profile", "storage", "config", "--format", "json"],
+                                     "--profile", "*", "config", "--format", "json"],
                                     env=environment, capture_output=True, text=True, check=True, timeout=30)
             config = json.loads(result.stdout)
             for name, service in config["services"].items():

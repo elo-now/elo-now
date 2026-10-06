@@ -218,10 +218,32 @@ impl ClientApp {
         }
         addresses.into_values().collect()
     }
+    pub(super) fn notification_push_endpoint(&self) -> Option<String> {
+        let binding = self.spaces.as_ref().and_then(|spaces| {
+            spaces
+                .catalog
+                .entries
+                .iter()
+                .find(|entry| entry.root)
+                .and_then(|entry| spaces.catalog.hosting_bindings.get(&entry.id))
+        });
+        binding.map_or_else(
+            || self.push_endpoint.clone(),
+            |profile| profile.push_url.clone(),
+        )
+    }
     pub(super) fn account_hosts(&self) -> Result<BTreeSet<String>> {
         let mut hosts = BTreeSet::new();
         if let Some(spaces) = &self.spaces {
             hosts.extend(spaces.catalog.account_hosts.iter().cloned());
+            for profile in spaces.catalog.hosting_bindings.values() {
+                if let Some(push) = &profile.push_url {
+                    hosts.insert(super::account_deletion::wake_endpoint(
+                        push,
+                        self.allow_loopback,
+                    )?);
+                }
+            }
             for entry in &spaces.catalog.entries {
                 if let Some(address) = &entry.address {
                     hosts.insert(super::account_deletion::endpoint(
@@ -947,7 +969,7 @@ impl Spaces {
             }
         }
 
-        view["spaces"] = json!(self.catalog.entries.iter().map(|e|json!({"id":e.id,"name":e.name,"status":e.status,"pending_reason":e.pending_reason,"owner":e.owner,"requests":e.requests,"managed":e.address.is_some(),"role":e.role,"contact_email":e.contact_email,"message_lifetime_seconds":e.message_lifetime_seconds,"roles_revision":e.roles_revision,"deletable":e.address.as_ref().and_then(|a|reqwest::Url::parse(&a.url).ok()).is_some_and(|u|u.path().starts_with("/spaces/"))})).collect::<Vec<_>>());
+        view["spaces"] = json!(self.catalog.entries.iter().map(|e|json!({"id":e.id,"name":e.name,"status":e.status,"pending_reason":e.pending_reason,"owner":e.owner,"requests":e.requests,"managed":e.address.is_some(),"calls_available":e.address.is_some() && self.catalog.hosting_bindings.get(&e.id).is_none_or(|p| p.call_url.is_some()),"role":e.role,"contact_email":e.contact_email,"message_lifetime_seconds":e.message_lifetime_seconds,"roles_revision":e.roles_revision,"deletable":e.address.as_ref().and_then(|a|reqwest::Url::parse(&a.url).ok()).is_some_and(|u|u.path().starts_with("/spaces/"))})).collect::<Vec<_>>());
         view["space_requests"] = json!(
             self.catalog
                 .entries
@@ -1085,6 +1107,19 @@ impl Spaces {
                 .account_hosts
                 .insert(super::account_deletion::endpoint(
                     &address.url,
+                    root.allow_loopback,
+                )?);
+        }
+        if let Some(push) = self
+            .catalog
+            .hosting_bindings
+            .get(id)
+            .and_then(|p| p.push_url.as_deref())
+        {
+            self.catalog
+                .account_hosts
+                .insert(super::account_deletion::wake_endpoint(
+                    push,
                     root.allow_loopback,
                 )?);
         }
@@ -2950,7 +2985,14 @@ impl Spaces {
         {
             return Err("Call Space authorization mismatch.".into());
         }
+        let private_call = self.catalog.hosting_bindings.get(id);
+        if call_operation && private_call.is_some_and(|profile| profile.call_url.is_none()) {
+            return Err("This hosting service does not provide audio or video sessions.".into());
+        }
         if op == "call_endpoint" {
+            if let Some(profile) = private_call {
+                return Ok(json!({"url": profile.call_url.as_ref().unwrap()}));
+            }
             let mut endpoint =
                 reqwest::Url::parse(&entry.address.as_ref().ok_or("Join a Space first.")?.url)?;
             endpoint.set_path("/calls/v1");
@@ -3247,6 +3289,113 @@ mod tests {
         .unwrap();
         let invitation_state: Value = serde_json::from_slice(&invitation_plain).unwrap();
         assert!(invitation_state["own_wake"].is_null());
+        // Two hosts keep independent capabilities and scopes. Updating one must
+        // neither erase the other nor publish the public route in a private Space.
+        let mut private_first = first.clone();
+        private_first.push_url = Some("https://first-wake.example.test/".into());
+        private_first.call_url = Some("https://private-calls.example.test/calls/v1".into());
+        assert!(user.operate(json!({"op":"call_endpoint", "hosting_space_id": first_id, "target_space": first_id})).await.is_err());
+        let mut private_second = second.clone();
+        private_second.push_url = Some("https://second-wake.example.test/".into());
+        {
+            let mut spaces = user.spaces.take().unwrap();
+            spaces
+                .catalog
+                .hosting_bindings
+                .insert(first_id.clone(), private_first.clone());
+            spaces
+                .catalog
+                .hosting_bindings
+                .insert(second_id.clone(), private_second.clone());
+            spaces.configure_children(&mut user).unwrap();
+            user.spaces = Some(spaces);
+        }
+        assert_eq!(user.operate(json!({"op":"call_endpoint", "hosting_space_id": first_id, "target_space": first_id})).await.unwrap()["url"], "https://private-calls.example.test/calls/v1");
+        let first_route = push::Route {
+            endpoint: private_first.push_url.clone().unwrap(),
+            id: "11".repeat(16),
+            notify_key: "12".repeat(32),
+            scope_key: "13".repeat(32),
+            since: 1,
+        };
+        let second_route = push::Route {
+            endpoint: private_second.push_url.clone().unwrap(),
+            id: "21".repeat(16),
+            notify_key: "22".repeat(32),
+            scope_key: "23".repeat(32),
+            since: 1,
+        };
+        assert_eq!(
+            user.notification_endpoints(),
+            vec![first_route.endpoint.clone(), second_route.endpoint.clone()]
+        );
+        user.advertise_wake_route(Some(first_route.clone()))
+            .unwrap();
+        user.advertise_wake_route(Some(second_route.clone()))
+            .unwrap();
+        let own_route = |client: &ClientApp| {
+            let bytes = vault::read_private(&client.directory.join("invitations.age")).unwrap();
+            let plain = crypto::open_bytes(&bytes, client.session.age_identity(), 16 * 1024 * 1024)
+                .unwrap();
+            serde_json::from_slice::<Value>(&plain).unwrap()["own_wake"].clone()
+        };
+        assert_eq!(own_route(&user), json!(first_route));
+        assert_eq!(
+            own_route(&user.spaces.as_ref().unwrap().children[&second_id]),
+            json!(second_route)
+        );
+        let first_policy = user.notification_policy(&first_route).unwrap();
+        let second_policy = user.notification_policy(&second_route).unwrap();
+        let first_pin = &user.pins[0];
+        let second_pin = &user.spaces.as_ref().unwrap().children[&second_id].pins[0];
+        for (policy, route, own, other) in [
+            (&first_policy, &first_route, first_pin, second_pin),
+            (&second_policy, &second_route, second_pin, first_pin),
+        ] {
+            let scopes = policy["scopes"].as_array().unwrap();
+            // One General chat has message and session-start scopes, plus introductions.
+            assert_eq!(scopes.len(), 3);
+            let has_scope = |scope: String| scopes.iter().any(|value| value["scope"] == scope);
+            assert!(has_scope(push::scope(route, None).unwrap()));
+            assert!(has_scope(
+                push::scope(route, Some((own.space, own.stream))).unwrap()
+            ));
+            assert!(!has_scope(
+                push::scope(route, Some((other.space, other.stream))).unwrap()
+            ));
+            assert_eq!(
+                scopes
+                    .iter()
+                    .filter(|scope| scope["alert_once"] == false)
+                    .count(),
+                1
+            );
+        }
+        user.withdraw_wake_route(&first_route.endpoint).unwrap();
+        assert!(own_route(&user).is_null());
+        assert_eq!(
+            own_route(&user.spaces.as_ref().unwrap().children[&second_id]),
+            json!(second_route)
+        );
+        assert!(
+            user.account_hosts()
+                .unwrap()
+                .contains("https://first-wake.example.test/wake/v1/account-deletion")
+        );
+        // Restore the no-push profiles used by the restart assertion below.
+        {
+            let mut spaces = user.spaces.take().unwrap();
+            spaces
+                .catalog
+                .hosting_bindings
+                .insert(first_id.clone(), first.clone());
+            spaces
+                .catalog
+                .hosting_bindings
+                .insert(second_id.clone(), second.clone());
+            spaces.save(&user).unwrap();
+            user.spaces = Some(spaces);
+        }
         user.close().await.unwrap();
         let mut reopened =
             ClientApp::open(temp.path().join("hosting owner"), PASSWORD.into(), true)
