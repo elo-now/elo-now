@@ -93,7 +93,7 @@ jobs:
       - name: iOS call and media policy
         if: runner.os == 'macOS'
         run: |
-          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/IncomingCallState.swift crates/tauri-plugin-elo-push/ios/Sources/OutgoingCallState.swift crates/tauri-plugin-elo-push/ios/Tests/IncomingCallStateTests.swift -o "$RUNNER_TEMP/elo-call-policy-tests"
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/IncomingCallState.swift crates/tauri-plugin-elo-push/ios/Tests/IncomingCallStateTests.swift -o "$RUNNER_TEMP/elo-call-policy-tests"
           "$RUNNER_TEMP/elo-call-policy-tests"
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/NativeGroupPolicy.swift crates/tauri-plugin-elo-push/ios/Tests/NativeGroupPolicyTests.swift -o "$RUNNER_TEMP/elo-group-policy-tests"
           "$RUNNER_TEMP/elo-group-policy-tests"
