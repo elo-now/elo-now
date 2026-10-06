@@ -71,7 +71,9 @@ S3 credentials must be limited to the intended bucket and object prefix (`spaces
 MEGA accepts only a writable public folder link and its write authorization. It does not accept an account email or password. The fixed helper and MEGAcmd runtime are described in the deployment files. Runtime session credentials must remain on private volatile storage; provider operation output is not logged. Live MEGA folder interoperability requires validation against a real limited folder.
 
 Owners configure storage during Space creation or later in Space settings.
-Attachments start disabled. Compromise of the broker host can disclose its
+Owner-configured attachments start disabled; a hosting with managed storage
+instead has the client submit its configuration request during Space creation.
+Compromise of the broker host can disclose its
 provider credentials and delete ciphertext within their scope; filesystem
 encryption does not protect credentials from an attacker controlling that host.
 Use a dedicated folder/bucket and the smallest permissions available.
@@ -115,7 +117,10 @@ does not revoke storage already configured for that owner's Spaces. Disable
 storage through a separately authorized Space operation when revocation is
 required. Existing objects retain their original expiry and provider generation.
 See [the container installer](../../deploy/containers/README.md) for an isolated
-API/witness installation with optional operator-managed S3 storage.
+API/witness installation with optional operator-managed MEGA or S3 storage.
+The [administration panel](../../deploy/admin/README.md) can update this managed
+connection and allowlist. New settings apply to subsequent configuration requests;
+they do not redirect existing Spaces' uploads until an owner reconfigures them.
 
 ## Object lifecycle
 

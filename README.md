@@ -38,6 +38,9 @@ attachment storage without putting storage credentials in the QR. See
 [two-host Docker installer](deploy/containers/README.md) and
 [hosting administration panel](deploy/admin/README.md) for installation,
 supported services and trust boundaries.
+The optional panel is restricted to a configured WireGuard client and also
+requires an HTTPS Basic Auth password. It manages hosting policy and storage;
+users still create their Spaces in the app.
 
 ## Work together
 
@@ -91,8 +94,9 @@ Details and device-admission limits are in [chat groups and Notes](docs/CHAT_GRO
    Save your recovery code somewhere safe.
 2. **Create a Space**, set its name and server message lifetime, and choose whether
    the initial invitation requires owner approval. General is created for you.
-   In a deployment with the attachment broker, attachments start disabled; the
-   owner can enable and configure them during creation or later in Space settings.
+   Owner-configured attachments start disabled; enable them during creation or
+   later in Space settings. If the selected hosting provides managed storage,
+   the app configures it during creation without asking for provider credentials.
 3. Share the Space's invitation QR or link with people you trust. They choose
    **Join a Space**; approval-required requests appear in the owner's **Approvals**.
 4. Open General, create other conversations and configure notifications as needed.
@@ -165,8 +169,14 @@ password. S3 uses credentials restricted to the intended bucket and prefix.
 An owner's MEGA account still uses MEGA's infrastructure; it is not a server
 physically owned by the user.
 
-The client sends provider configuration directly to the separate storage broker.
-The Space API does not receive those credentials. The broker retains encrypted
+A private hosting operator can instead provide managed MEGA or S3 storage.
+Selecting that hosting configures attachments during Space creation through an
+owner-signed request. The broker must allow that owner's identity; importing a
+hosting QR alone grants no storage access. Provider credentials remain on the
+broker host and are never included in the QR.
+
+For owner-configured storage, the client sends provider configuration directly
+to the separate storage broker. The Space API does not receive those credentials. The broker retains encrypted
 provider configuration and uses it to transfer encrypted files; it does not need
 the file decryption keys. An attacker controlling the broker host could still
 obtain provider credentials or delete ciphertext within their scope. Use a

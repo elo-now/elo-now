@@ -270,9 +270,10 @@ together with `--with-storage`. The initializer installs the file privately
 under the storage service's read-only `managed-storage.json` config mount; neither API nor witness
 receives it. Add `--advertise-managed-s3` at API initialization to include only
 the public `{provider:"s3",retention_hours:1}` option in the signed hosting
-profile. This advertisement does not enable a Space automatically: its
-currently authorized owner must request managed configuration, and that owner
-must also be in the broker's `allowed_owners` list. An empty list grants nobody
+profile. When a user creates a Space on this hosting, the client submits a signed
+managed-configuration request on the owner's behalf. The advertisement alone
+grants no access: the broker requires current owner authority and an entry in
+its `allowed_owners` list. An empty list grants nobody
 this option. Keep the API creator allowlist and broker owner allowlist aligned
 with the intended users; they govern different operations. Do not copy the
 private S3 JSON to the API host or distribute it with the hosting link.
@@ -476,4 +477,6 @@ external witness anchor; an empty-boot anchor cannot be reused after a reset.
 
 The optional [administration panel](../admin/README.md) edits hosting policies,
 generates a signed import QR and configures managed attachment storage on the
-separate witness host. Space creation remains in the app.
+separate witness host. Access requires the configured WireGuard client and an
+HTTPS Basic Auth password; public hosting QR and application routes remain
+available without that VPN. Space creation remains in the app.

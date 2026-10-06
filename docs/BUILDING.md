@@ -157,15 +157,17 @@ cargo run --locked -p elo-cli -- --help
 
 Provision your own Replica, Space enrollment service and optional wake service. Live service configuration, infrastructure addresses and private access capabilities are deliberately not supplied in this repository. Use HTTPS and keep private configuration outside the checkout.
 
-This development source also contains the witnessed General and independent
-attachment broker paths. They are not retroactively part of published build
-1114. Building their executables does not enable or validate a deployment. Follow
+Current clients support witnessed General and the independent attachment broker.
+Building their executables does not enable or validate a deployment. Follow
 [witness deployment](../deploy/witness/README.md) and the
 [attachment broker instructions](../crates/elo-storage/README.md), including the
 separate host, trust-pin provisioning, sealed startup and acceptance requirements.
-Both client integrations are disabled when their build settings are absent.
-Keep the broker on loopback and its client endpoint unset in distributed builds
-until the documented rollout checks are complete.
+Build settings configure these services for the built-in hosting. When absent,
+they are unavailable for that hosting. An explicitly approved, signed
+[imported hosting profile](SELF_HOSTING.md#imported-hosting-profiles) can instead
+provide its own witness pin and broker endpoint at runtime; it does not replace
+the built-in pins or move existing Spaces. Keep service listeners on loopback
+behind their documented HTTPS routes and validate each deployment before use.
 
 Set `TAURI_ELO_API_URL` when building a private mobile application, for example `https://chat.example.test`. One HTTPS origin supplies hosted creation at `/spaces/v1/create` and the optional wake service. An explicit private origin has no fallback to the official service. Without an override this source tree builds the official client for `https://api.elo.now`; DNS and services must be provisioned before that client is distributed.
 
@@ -177,8 +179,8 @@ The optional Tauri `mobile-push` feature enables the native push plugin. Its bui
 | --- | --- |
 | `TAURI_ELO_API_URL` | Single HTTPS origin; forwarded by Tauri to Xcode/Gradle. Plain `ELO_API_URL` also works with direct Cargo builds. |
 | `TAURI_ELO_SPACE_HOST_URL`, `TAURI_ELO_WAKE_URL` | Explicit separate overrides; the host value must include `/spaces/v1/create`, while wake is an HTTPS origin. Cannot be combined with the API-origin setting. `ELO_SPACE_HOST_URL` is the direct Cargo alias. |
-| `TAURI_ELO_WITNESS_URL`, `TAURI_ELO_WITNESS_PUBLIC_KEY`, `TAURI_ELO_WITNESS_KEY_GENERATION` | Staged witness integration; configure all three together. The HTTPS URL must end in `/witness/v1`, with the independently verified 64-character lowercase Ed25519 public key and positive key generation. Matching plain `ELO_` aliases are available for direct Cargo builds. |
-| `TAURI_ELO_STORAGE_URL` | Staged independent broker endpoint ending in `/storage/v1`; plain `ELO_STORAGE_URL` is the direct Cargo alias. Never inferred from the API origin. Leave unset until rollout checks pass. |
+| `TAURI_ELO_WITNESS_URL`, `TAURI_ELO_WITNESS_PUBLIC_KEY`, `TAURI_ELO_WITNESS_KEY_GENERATION` | Witness pin for the built-in hosting; configure all three together. The HTTPS URL must end in `/witness/v1`, with the independently verified 64-character lowercase Ed25519 public key and positive key generation. Matching plain `ELO_` aliases are available for direct Cargo builds. Imported hostings supply their own approved pins. |
+| `TAURI_ELO_STORAGE_URL` | Independent broker endpoint for the built-in hosting, ending in `/storage/v1`; plain `ELO_STORAGE_URL` is the direct Cargo alias. Never inferred from the API origin. An imported hosting can supply its own approved broker endpoint. |
 | `TAURI_ELO_FIREBASE_IOS` | Absolute path to your Firebase iOS client plist |
 | `TAURI_ELO_FIREBASE_ANDROID` | Path to your Firebase Android client JSON |
 | `TAURI_ELO_ANDROID_SIGNING` | Absolute path to a private Android signing configuration |

@@ -2,11 +2,11 @@
 
 This guide is for a **new, empty installation** on Debian 13 or Oracle Linux 10. It uses one VPS and one public application origin. It covers hosted Spaces and encrypted messages, attachments, chat audio/video sessions, and optional mobile notifications. There is no migration from the publisher's installation and no requirement for `api.elo.now`.
 
-The configuration below is the baseline without an independent witness. Current
-development sources also include witnessed General and a separate attachment
-broker; those changes are not retroactively included in published build 1114.
-For that staged path, follow [witness deployment](../deploy/witness/README.md)
-and the [attachment broker instructions](../crates/elo-storage/README.md).
+The configuration below is the baseline without an independent witness. For
+witnessed General and a separate attachment broker, use the
+[two-host container deployment](../deploy/containers/README.md), or follow the
+native [witness deployment](../deploy/witness/README.md) and
+[attachment broker instructions](../crates/elo-storage/README.md).
 They require a host separate from the API, independently provisioned matching
 pins in clients and services, and the documented activation and acceptance
 checks. A single API-origin override does not enable either integration. The
@@ -30,6 +30,11 @@ The initializer creates separate persistent data and private key directories,
 restricts new Space creation to explicitly listed identities by default, and prepares a
 signed public hosting profile for import. Linux host networking preserves the
 services' loopback-only trust boundary behind a local TLS proxy.
+
+The optional [hosting administration panel](../deploy/admin/README.md) edits
+retention policies, creator allowlists and managed storage, then publishes a
+signed import QR. It requires a configured WireGuard client and an HTTPS Basic
+Auth password. The panel configures hosting; users create Spaces in the app.
 
 Every witness process remains sealed until the operator explicitly activates
 it against a separately trusted, latest journal anchor. The package does not
@@ -95,13 +100,18 @@ support the selected policy.
 `allowed_creators: null` permits public creation; `[]` denies creation; a list
 of identity IDs permits those creators. Importing the public hosting QR grants
 neither creation permission nor Space membership. Resource limits still apply.
+Creation can be signed by a directly authorized or paired device of an allowed
+identity. The host validates the same-identity credential chain and rejects
+creation if that device or any delegation ancestor is revoked there. This does
+not admit a paired device to existing Spaces or grant it their management rights.
 
 Storage may be owner-configured or operator-managed. The public profile only
 advertises the broker and provider type. For managed storage, the broker reads
 a separate private `managed_storage` file containing `provider` and
 `allowed_owners`; a signed request from a currently authorized owner is required
-to activate it. Neither the API nor QR gets the credentials. Provider changes
-use the existing storage revision and cleanup rules. The container package
+to activate it. The client submits that request during creation when the selected
+hosting offers managed storage. Neither the API nor QR gets the credentials.
+Provider changes use the existing storage revision and cleanup rules. The container package
 includes S3 and an optional MEGAcmd image for limited MEGA folder credentials.
 
 ### Baseline native single-VPS layout

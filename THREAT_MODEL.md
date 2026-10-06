@@ -133,6 +133,12 @@ limits. Approval-required invitations and readmission need explicit owner approv
 An open policy can therefore admit a new participant while the owner is offline.
 A witness signature alone cannot authorize an arbitrary owner or reader change.
 
+An active owner credential can authorize a membership proposal in version 4.
+The protocol does not require a separate primary-owner co-signature when such a
+proposal changes the owner set. Primary-owner restrictions in the management UI
+do not add that cryptographic approval. Treat co-owners as trusted membership
+administrators; stronger primary-owner protection requires a protocol change.
+
 Short invitations store an encrypted, owner-signed descriptor on the API. Their
 URL fragment carries the seed used to decrypt it and derive an admission signing
 key; the native flow sends neither seed nor derived private key to the API or

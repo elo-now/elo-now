@@ -47,6 +47,13 @@ identity; the credential list determines its approved delivery devices. Revoking
 a delegation's parent does not retroactively revoke a child already independently
 admitted to the authority.
 
+Creating a new hosted Space is a separate gate. A directly authorized or paired
+device may sign creation for its own identity, subject to the host's creator
+allowlist, proof of work and quotas. The host validates the complete bounded
+same-identity delegation chain and rejects creation if the signing device or any
+ancestor has a device revocation recorded on that host. A paired device does not
+gain admission or management rights in existing Spaces through this check.
+
 | Capability | Meaning |
 | --- | --- |
 | READ | Eligible recipient of new content in this Stream |
