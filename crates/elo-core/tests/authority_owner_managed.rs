@@ -279,7 +279,7 @@ fn device_admission_requires_an_existing_owner_signature_and_cannot_promote_a_fo
 }
 
 #[test]
-fn an_admitted_owner_can_delegate_to_another_identity_and_transfer_away_the_founder() {
+fn primary_owner_can_delegate_management_but_no_owner_can_remove_the_primary() {
     let mut f = fixture(2, true);
     let mut promotion = next(&f.authority, &f.first);
     promotion.members.push(Member {
@@ -307,25 +307,29 @@ fn an_admitted_owner_can_delegate_to_another_identity_and_transfer_away_the_foun
         .apply_config(promotion.sign(&f.first.key).unwrap())
         .unwrap();
     assert!(f.authority.can_manage(f.foreign.credential.id()));
-    // The founder may authorize its own removal; controller records that signer,
-    // while only the newly delegated owner can manage the resulting head.
-    let mut transfer = next(&f.authority, &f.first);
-    transfer
-        .members
-        .retain(|m| m.identity_id == f.foreign.credential.identity());
-    transfer.owner_credential_ids = vec![f.foreign.credential.id()];
+    // Primary ownership is immutable, including a transfer signed by the
+    // primary owner. Rejected transfers must leave every active owner intact.
+    let head = f.authority.head_id();
+    for signer in [&f.first, &f.foreign] {
+        let mut transfer = next(&f.authority, signer);
+        transfer
+            .members
+            .retain(|m| m.identity_id == f.foreign.credential.identity());
+        transfer.owner_credential_ids = vec![f.foreign.credential.id()];
+        assert!(
+            f.authority
+                .apply_config(transfer.sign(&signer.key).unwrap())
+                .is_err()
+        );
+        assert_eq!(f.authority.head_id(), head);
+        assert_eq!(f.authority.controller().id(), f.first.credential.id());
+        assert!(f.authority.can_manage(f.first.credential.id()));
+        assert!(f.authority.can_manage(f.second.credential.id()));
+        assert!(f.authority.can_manage(f.foreign.credential.id()));
+    }
     f.authority
-        .apply_config(transfer.sign(&f.first.key).unwrap())
+        .apply_config(next(&f.authority, &f.first).sign(&f.first.key).unwrap())
         .unwrap();
-    assert_eq!(f.authority.controller().id(), f.first.credential.id());
-    assert!(!f.authority.can_manage(f.first.credential.id()));
-    assert!(!f.authority.can_manage(f.second.credential.id()));
-    assert!(f.authority.can_manage(f.foreign.credential.id()));
-    assert!(
-        f.authority
-            .apply_config(next(&f.authority, &f.first).sign(&f.first.key).unwrap())
-            .is_err()
-    );
     f.authority
         .apply_config(next(&f.authority, &f.foreign).sign(&f.foreign.key).unwrap())
         .unwrap();
@@ -334,21 +338,28 @@ fn an_admitted_owner_can_delegate_to_another_identity_and_transfer_away_the_foun
         .verify(f.authority.space(), f.authority.stream())
         .unwrap();
     assert!(verified.can_manage(f.foreign.credential.id()));
-    assert!(!verified.can_manage(f.first.credential.id()));
-    let mut no_owner = next(&f.authority, &f.foreign);
-    no_owner.members[0].capabilities = vec![Capability::Read, Capability::Post];
+    assert!(verified.can_manage(f.first.credential.id()));
+    assert!(verified.can_manage(f.second.credential.id()));
+    let mut no_owner = next(&f.authority, &f.first);
+    for member in &mut no_owner.members {
+        member.capabilities = vec![Capability::Read, Capability::Post];
+    }
     no_owner.owner_credential_ids.clear();
     assert!(
         f.authority
-            .apply_config(no_owner.sign(&f.foreign.key).unwrap())
+            .apply_config(no_owner.sign(&f.first.key).unwrap())
             .is_err()
     );
-    let mut incomplete = next(&f.authority, &f.foreign);
-    incomplete.members[0].capabilities =
-        vec![Capability::Read, Capability::Post, Capability::Manage];
+    let mut incomplete = next(&f.authority, &f.first);
+    incomplete
+        .members
+        .iter_mut()
+        .find(|member| member.identity_id == f.foreign.credential.identity())
+        .unwrap()
+        .capabilities = vec![Capability::Read, Capability::Post, Capability::Manage];
     assert!(
         f.authority
-            .apply_config(incomplete.sign(&f.foreign.key).unwrap())
+            .apply_config(incomplete.sign(&f.first.key).unwrap())
             .is_err()
     );
 }

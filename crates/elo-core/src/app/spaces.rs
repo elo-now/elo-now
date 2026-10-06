@@ -5006,14 +5006,16 @@ mod tests {
                 .to_string(),
             "Space server unreachable."
         );
-        let mut restored = ClientApp::restore_profile(
+        // Restore owns several profile-opening futures. Keep it on the heap
+        // separately from this scenario, including with CI's unified features.
+        let mut restored = Box::pin(ClientApp::restore_profile(
             temp.path().join("restored"),
             &backup,
             PASSWORD.into(),
             user.identity_id(),
             "synthetic new spaces password".into(),
             true,
-        )
+        ))
         .await
         .unwrap();
         // Restored managed compartments stay hidden until a fresh pinned
