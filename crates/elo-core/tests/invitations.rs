@@ -752,6 +752,7 @@ async fn seeing_an_invitation_clears_attention_without_accepting_or_hiding_it() 
         scope_key: "c".repeat(64),
         since: 1,
     };
+    owner.configure_push(&route.endpoint, false).unwrap();
     let read = json!({"op":"invitation_activity_seen","ids":[event]});
     let before = owner.view().await.unwrap();
     assert_eq!(before["invitations"]["unseen"], 1);
@@ -771,6 +772,14 @@ async fn seeing_an_invitation_clears_attention_without_accepting_or_hiding_it() 
     assert_eq!(seen["view"]["invitations"]["actionable"], 1);
     let receipts = owner.notification_read_receipts(&route, &read).unwrap();
     assert_eq!(receipts.len(), 1);
+    let mut foreign_route = route.clone();
+    foreign_route.endpoint = "https://other-notifications.example/".into();
+    assert!(
+        owner
+            .notification_read_receipts(&foreign_route, &read)
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         !serde_json::to_string(&receipts)
             .unwrap()
@@ -782,9 +791,10 @@ async fn seeing_an_invitation_clears_attention_without_accepting_or_hiding_it() 
         .unwrap();
     assert_eq!(activity["incoming"].as_array().unwrap().len(), 1);
     owner.close().await.unwrap();
-    let owner = ClientApp::open(d.path().join("owner"), PASSWORD.into(), false)
+    let mut owner = ClientApp::open(d.path().join("owner"), PASSWORD.into(), false)
         .await
         .unwrap();
+    owner.configure_push(&route.endpoint, false).unwrap();
     assert_eq!(owner.view().await.unwrap()["invitations"]["unseen"], 0);
     assert_eq!(
         owner.notification_read_receipts(&route, &read).unwrap(),
