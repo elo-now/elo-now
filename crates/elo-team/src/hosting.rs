@@ -781,6 +781,50 @@ fn require_owner_managed_creation(command: &CreateCommand) -> Result<()> {
     }
     Ok(())
 }
+
+fn require_creation_device(
+    host: &Host,
+    credential: &elo_core::identity::VerifiedCredential,
+) -> std::result::Result<(), StatusCode> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use elo_core::identity::{DeviceCredential, MAX_COMPANION_DEPTH, MAX_CREDENTIAL_BYTES};
+
+    if host
+        .config
+        .allowed_creators
+        .as_ref()
+        .is_some_and(|ids| !ids.contains(&credential.identity()))
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // The signed creation already verifies this complete, bounded chain against
+    // one identity root. Paired devices may create their own owner-managed Space,
+    // but cannot evade retirement by issuing a descendant credential first.
+    let mut record = credential.record().clone();
+    for _ in 0..=MAX_COMPANION_DEPTH {
+        if host
+            .revocations
+            .get(record.id())
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .is_some()
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let body: DeviceCredential = record.decode().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let Some(parent) = body.authorizing_device else {
+            return Ok(());
+        };
+        let bytes = STANDARD
+            .decode(parent)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        if bytes.len() > MAX_CREDENTIAL_BYTES {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        record = record::SignedRecord::parse(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    }
+    Err(StatusCode::BAD_REQUEST)
+}
+
 async fn create(
     State(host): State<Arc<Host>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
@@ -800,25 +844,7 @@ async fn create(
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
     require_owner_managed_creation(&command).map_err(|_| StatusCode::UPGRADE_REQUIRED)?;
-    if host
-        .config
-        .allowed_creators
-        .as_ref()
-        .is_some_and(|ids| !ids.contains(&credential.identity()))
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    if credential.authorizing_device().is_some() {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    if host
-        .revocations
-        .get(credential.id())
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .is_some()
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_creation_device(&host, &credential)?;
     if host.account_requested(credential.identity()) {
         return Err(StatusCode::GONE);
     }

@@ -22,6 +22,229 @@ fn signed<T: Serialize>(body: &T, session: &Session) -> SignedRecord {
 fn encoded(signed: &SignedRecord) -> String {
     STANDARD.encode(signed.bytes())
 }
+fn solve_creation_work(creation: &mut CreateRequest) {
+    let mut prefix = Sha256::new();
+    prefix.update(b"elo.space.create.work.v1\0");
+    prefix.update(Sha256::digest(creation.record.as_bytes()));
+    prefix.update(Sha256::digest(creation.credential.as_bytes()));
+    for nonce in 0u64..64 * (1 << 20) {
+        let mut h = prefix.clone();
+        h.update(nonce.to_be_bytes());
+        let digest = h.finalize();
+        if u32::from_be_bytes(digest[..4].try_into().unwrap()).leading_zeros() >= 20 {
+            creation.work = nonce;
+            creation.verify_work().unwrap();
+            return;
+        }
+    }
+    panic!("Synthetic creation work did not finish");
+}
+fn companion(
+    parent: &elo_core::identity::VerifiedCredential,
+    parent_key: &ed25519_dalek::SigningKey,
+) -> (
+    ed25519_dalek::SigningKey,
+    elo_core::identity::VerifiedCredential,
+) {
+    let key = elo_core::identity::generate_signing_key().unwrap();
+    let age = age::x25519::Identity::generate();
+    let credential = elo_core::identity::DeviceCredential::issue_companion(
+        parent,
+        parent_key,
+        &key.verifying_key(),
+        &age.to_public(),
+    )
+    .unwrap();
+    (key, credential)
+}
+
+#[tokio::test]
+async fn creation_devices_require_allowed_identity_and_unrevoked_authorization_chain() {
+    use elo_core::identity::{DeviceRevocation, MAX_COMPANION_DEPTH};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, recovery) = Session::create().unwrap();
+    let root = recovery.recover_root(owner.identity_id()).unwrap();
+    let (other, _) = Session::create().unwrap();
+    let config: HostConfig = serde_json::from_value(json!({
+        "root":directory.path().join("host"),"public_url":"https://api.example.test",
+        "max_spaces_per_identity":2,"mailbox_quota_bytes":150_000_000,
+        "allowed_creators":[owner.identity_id()]
+    }))
+    .unwrap();
+    let host = Host::open(config, false).await.unwrap();
+    require_creation_device(&host, owner.credential()).unwrap();
+    assert_eq!(
+        require_creation_device(&host, other.credential()),
+        Err(StatusCode::FORBIDDEN)
+    );
+    let (_, foreign_child) = companion(other.credential(), other.signing_key());
+    assert_eq!(
+        require_creation_device(&host, &foreign_child),
+        Err(StatusCode::FORBIDDEN)
+    );
+    let mut parent = owner.credential().clone();
+    let mut key = owner.signing_key().clone();
+    let mut chain = vec![parent.clone()];
+    for _ in 0..MAX_COMPANION_DEPTH {
+        (key, parent) = companion(&parent, &key);
+        require_creation_device(&host, &parent).unwrap();
+        chain.push(parent.clone());
+    }
+    // An unrelated device tombstone must not ban the identity or its other chains.
+    let (_, retired_sibling) = companion(owner.credential(), owner.signing_key());
+    host.revocations
+        .insert(&DeviceRevocation::issue(&root, &retired_sibling).unwrap())
+        .unwrap();
+    assert_eq!(
+        require_creation_device(&host, &retired_sibling),
+        Err(StatusCode::FORBIDDEN)
+    );
+    require_creation_device(&host, &parent).unwrap();
+    for index in (0..chain.len()).rev() {
+        // Use a fresh branch so a descendant's own earlier tombstone cannot
+        // conceal a missing check of this particular ancestor.
+        let mut parent = owner.credential().clone();
+        let mut key = owner.signing_key().clone();
+        let mut branch = vec![parent.clone()];
+        for _ in 0..MAX_COMPANION_DEPTH {
+            (key, parent) = companion(&parent, &key);
+            branch.push(parent.clone());
+        }
+        require_creation_device(&host, &parent).unwrap();
+        host.revocations
+            .insert(&DeviceRevocation::issue(&root, &branch[index]).unwrap())
+            .unwrap();
+        for credential in &branch[index..] {
+            assert_eq!(
+                require_creation_device(&host, credential),
+                Err(StatusCode::FORBIDDEN),
+                "a revoked ancestor must block every descendant"
+            );
+        }
+        for credential in &branch[..index] {
+            require_creation_device(&host, credential).unwrap();
+        }
+    }
+    vault::write_private(
+        &host
+            .config
+            .root
+            .join("revoked-devices")
+            .join(format!("{}.record", chain[0].id())),
+        b"corrupt",
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        require_creation_device(&host, &chain[0]),
+        Err(StatusCode::SERVICE_UNAVAILABLE),
+        "unreadable revocation evidence must fail closed"
+    );
+    super::tests::close_host(host).await;
+}
+
+#[tokio::test]
+async fn witnessed_creation_accepts_paired_owner_and_rejects_revoked_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, witness, pin, template) = fixture();
+    let (key, credential) = companion(owner.credential(), owner.signing_key());
+    let mut genesis: SpaceGenesis = template.genesis().decode().unwrap();
+    genesis.controller_credential_id = credential.id();
+    let genesis = SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), &key).unwrap();
+    let root_bytes: RecordId = owner.credential().record().body()["root_public_key"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let root = ed25519_dalek::VerifyingKey::from_bytes(root_bytes.as_bytes()).unwrap();
+    let mut authority = Authority::new(
+        genesis.bytes(),
+        genesis.id().to_string().parse().unwrap(),
+        &root,
+        credential.clone(),
+        template.stream(),
+    )
+    .unwrap();
+    let mut initial = template.head().unwrap().clone();
+    initial.space_id = authority.space();
+    initial.controller_credential_id = credential.id();
+    initial.members[0].credential_ids = vec![credential.id()];
+    initial.owner_credential_ids = vec![credential.id()];
+    authority.apply_config(initial.sign(&key).unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/head", listener.local_addr().unwrap());
+    let server_pin = pin.clone();
+    let head = authority.head_id().unwrap();
+    let witness = Arc::new(witness);
+    let witness_task = tokio::spawn(axum::serve(listener, Router::new().route("/head", axum::routing::post(move |Json(request): Json<HeadRequest>| {
+        let pin = server_pin.clone(); let witness = witness.clone();
+        async move {
+            let now = current().unwrap();
+            Json(json!({"freshness": encoded(&signed(&Freshness {
+                v:1, kind:"witness.freshness".into(), audience:pin.url,
+                nonce:request.nonce, space_id:request.space_id, stream_id:request.stream_id,
+                authority_head:head, position:Position {sequence:1,record_id:Some(RecordId::from_bytes([1;32]))},
+                issued_at_ms:now, expires_at_ms:now+30_000, witness_key_generation:1,
+            }, &witness))}))
+        }
+    }))).into_future());
+    let config: HostConfig = serde_json::from_value(json!({
+        "root":directory.path().join("host"),"public_url":"https://api.example.test",
+        "max_spaces_per_identity":2,"mailbox_quota_bytes":150_000_000,
+        "allowed_creators":[owner.identity_id()],"witness":pin
+    }))
+    .unwrap();
+    let mut host = Host::open(config, false).await.unwrap();
+    Arc::get_mut(&mut host)
+        .unwrap()
+        .witness
+        .as_mut()
+        .unwrap()
+        .test_endpoint(endpoint);
+    let command = CreateCommand {
+        v: 2,
+        kind: "space.create".into(),
+        host: "https://api.example.test/spaces/v1/create".into(),
+        request_id: "ab".repeat(16),
+        issued: current().unwrap(),
+        name: "Paired owner".into(),
+        contact_email: "owner@example.test".into(),
+        message_lifetime_seconds: Default::default(),
+        require_approval: true,
+        authority: Some(authority.call_proof().unwrap()),
+    };
+    let mut creation = CreateRequest {
+        record: encoded(&SignedRecord::sign(&serde_json::to_vec(&command).unwrap(), &key).unwrap()),
+        credential: encoded(credential.record()),
+        work: 0,
+    };
+    solve_creation_work(&mut creation);
+    let router = app(host.clone());
+    assert_eq!(
+        post(&router, "/spaces/v1/create", &creation).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(host.spaces.read().await.len(), 1);
+    host.revocations
+        .insert(
+            &elo_core::identity::DeviceRevocation::issue_from_device(
+                &credential,
+                &key,
+                owner.credential(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        post(&router, "/spaces/v1/create", &creation).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(host.spaces.read().await.len(), 1);
+    drop(router);
+    super::tests::close_host(host).await;
+    witness_task.abort();
+}
 fn fixture() -> (Session, Session, WitnessPin, Authority) {
     let (signer, _) = Session::create().unwrap();
     let pin = WitnessPin {
@@ -341,19 +564,7 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
         credential: encoded(owner.credential().record()),
         work: 0,
     };
-    let mut prefix = Sha256::new();
-    prefix.update(b"elo.space.create.work.v1\0");
-    prefix.update(Sha256::digest(creation.record.as_bytes()));
-    prefix.update(Sha256::digest(creation.credential.as_bytes()));
-    for nonce in 0u64..64 * (1 << 20) {
-        let mut h = prefix.clone();
-        h.update(nonce.to_be_bytes());
-        let digest = h.finalize();
-        if u32::from_be_bytes(digest[..4].try_into().unwrap()).leading_zeros() >= 20 {
-            creation.work = nonce;
-            break;
-        }
-    }
+    solve_creation_work(&mut creation);
     let router = app(host.clone());
     let (status, reply) = post(&router, "/spaces/v1/create", &creation).await;
     assert_eq!(status, StatusCode::OK);

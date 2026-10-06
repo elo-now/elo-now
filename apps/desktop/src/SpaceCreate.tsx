@@ -53,7 +53,7 @@ export function SpaceCreate({
       alive.current = false;
     };
   }, []);
-  const { reportError, showError, onInvalid } = useToast();
+  const { reportError, onInvalid } = useToast();
   const creation = view.space_creation;
   const catalog = useHostingCatalog();
   const [hostingId, setHostingId] = useState(creation?.hosting_id);
@@ -177,13 +177,7 @@ export function SpaceCreate({
                 })
                 .catch(async (error) => {
                   if (!alive.current) return;
-                  if (
-                    attachmentStorage.enabled ||
-                    managedAttachments ||
-                    creation?.attachment_storage_pending
-                  )
-                    showError(t("spaces.attachments.creationFailed"));
-                  else reportError(error);
+                  reportError(error);
                   await call({ op: "space_list" }).catch(() => {});
                 })
                 .finally(() => {

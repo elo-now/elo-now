@@ -1,6 +1,10 @@
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
+import { invoke } from "@tauri-apps/api/core";
+import type { FormEventHandler } from "react";
 import { SpaceCreate } from "./SpaceCreate";
+import { presentError } from "./errors";
+import { en } from "./locales/en";
 import type { View } from "./model";
 import type { HostingProfileSummary } from "./Hosting";
 
@@ -10,6 +14,36 @@ const catalog = vi.hoisted(() => ({
   request: vi.fn(),
   refresh: vi.fn(),
 }));
+const submission = vi.hoisted(() => ({
+  submit: undefined as FormEventHandler<HTMLFormElement> | undefined,
+  reportError: vi.fn(),
+  showError: vi.fn(),
+}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("./Toast", () => ({
+  useToast: () => ({
+    reportError: submission.reportError,
+    showError: submission.showError,
+    onInvalid: vi.fn(),
+  }),
+}));
+vi.mock("react/jsx-dev-runtime", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("react/jsx-dev-runtime")>();
+  return {
+    ...original,
+    jsxDEV: (...args: Parameters<typeof original.jsxDEV>) => {
+      const element = original.jsxDEV(...args);
+      const props = element.props as {
+        className?: string;
+        onSubmit?: FormEventHandler<HTMLFormElement>;
+      };
+      if (element.type === "form" && props.className === "space-create-form")
+        submission.submit = props.onSubmit;
+      return element;
+    },
+  };
+});
 vi.mock("./Hosting", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./Hosting")>()),
   useHostingCatalog: () => catalog,
@@ -18,6 +52,13 @@ vi.mock("./Hosting", async (importOriginal) => ({
 vi.mock("./InvitationFlow", () => ({
   InvitationCode: () => <div>Invitation QR</div>,
 }));
+
+beforeEach(() => {
+  submission.submit = undefined;
+  submission.reportError.mockReset();
+  submission.showError.mockReset();
+  vi.mocked(invoke).mockReset();
+});
 
 function render(
   creation: View["space_creation"],
@@ -167,3 +208,66 @@ test("resuming keeps the saved host and lifetime even when its catalog entry was
   expect(html).not.toContain('type="password"');
   expect(html).not.toMatch(/type="submit"[^>]*disabled/);
 });
+
+test.each([
+  ["Space server timed out.", "error.serverTimeout"],
+  ["Space access denied.", "error.replicaAccess"],
+  ["Hosting capacity reached.", "error.hostingCapacity"],
+  [
+    "Could not contact attachment storage. Try again.",
+    "spaces.attachments.loadFailed",
+  ],
+  [
+    "Could not configure attachment storage. Check the details and try again.",
+    "spaces.attachments.saveFailed",
+  ],
+  [
+    {
+      message: "unexpected response containing fixture-secret",
+      url: "https://fixture.invalid/private",
+    },
+    "error.generic",
+  ],
+] as const)(
+  "attachment-enabled creation preserves the safe explanation for %j",
+  async (error, key) => {
+    for (const creation of [
+      null,
+      {
+        name: "Saved Space",
+        hosting_id: managedHost.id,
+        attachment_storage_pending: true,
+      },
+    ]) {
+      submission.reportError.mockClear();
+      submission.showError.mockClear();
+      vi.mocked(invoke)
+        .mockReset()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue({ view: {} });
+      render(creation, true, false, [managedHost]);
+      expect(submission.submit).toBeTypeOf("function");
+      const preventDefault = vi.fn();
+      submission.submit!({ preventDefault } as unknown as Parameters<
+        FormEventHandler<HTMLFormElement>
+      >[0]);
+      await vi.waitFor(() =>
+        expect(submission.reportError).toHaveBeenCalledExactlyOnceWith(error),
+      );
+      expect(preventDefault).toHaveBeenCalledOnce();
+      expect(submission.showError).not.toHaveBeenCalled();
+      expect(presentError(submission.reportError.mock.calls[0][0])).toEqual({
+        message: en[key],
+      });
+      expect(invoke).toHaveBeenNthCalledWith(1, "operate", {
+        request: expect.objectContaining({
+          op: "space_create",
+          attachment_storage: { enabled: true, managed: true },
+        }),
+      });
+      expect(invoke).toHaveBeenNthCalledWith(2, "operate", {
+        request: { op: "space_list", expected_identity: "owner" },
+      });
+    }
+  },
+);
