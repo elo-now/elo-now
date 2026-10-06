@@ -4663,6 +4663,12 @@ mod tests {
     }
     #[tokio::test]
     async fn spaces_require_owner_approval_isolate_mailboxes_and_survive_backup_and_disconnect() {
+        // Keep the full multi-profile scenario off the test runtime's stack.
+        // Debug futures retain all live profiles across their awaited phases.
+        Box::pin(spaces_approval_backup_and_disconnect_scenario()).await;
+    }
+
+    async fn spaces_approval_backup_and_disconnect_scenario() {
         let temp = tempfile::tempdir().unwrap();
         let mut first = profile(temp.path(), "first service").await;
         let mut second = profile(temp.path(), "second service").await;
