@@ -2292,7 +2292,7 @@ impl Spaces {
         {
             return Err("The open profile has changed.".into());
         }
-        let prepared = self.prepare_hosted_invitation(root, &v).await?;
+        let prepared = Box::pin(self.prepare_hosted_invitation(root, &v)).await?;
         let (context, invitation) = match prepared {
             Some((context, invitation)) => (context, Some(Box::new(invitation))),
             None => (self.operation_context(root, &v)?, None),

@@ -371,7 +371,9 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
             files.insert(public_name, Zeroizing::new(serde_json::to_vec(&public)?));
         }
     }
-    let result: Result<ClientApp> = async {
+    // Keep staged opening off the caller's stack: the same future is used by
+    // backup recovery, live device pairing and resumable imports.
+    let result: Result<ClientApp> = Box::pin(async {
         if !space_ids.is_empty() {
             for path in std::iter::once(directory.join("spaces"))
                 .chain(space_ids.iter().map(|id| directory.join("spaces").join(id)))
@@ -442,7 +444,7 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
             return Err(error);
         }
         Ok(app)
-    }
+    })
     .await;
     if result.is_err() && !resume && !existing {
         // Only the legacy atomic call's exclusively created directory is
