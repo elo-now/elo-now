@@ -436,7 +436,7 @@ async fn migration_preserves_existing_v1_state_and_rejects_altered_schema() {
     assert_eq!(
         raw.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        9
+        10
     );
     let bad = tempfile::TempDir::new().unwrap();
     let raw = Connection::open(bad.path().join("client.sqlite")).unwrap();
