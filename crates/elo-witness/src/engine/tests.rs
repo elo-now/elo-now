@@ -542,7 +542,25 @@ fn registration_replay_cannot_bypass_current_owner_revocation() {
         Capability::ShareHistory,
         Capability::Manage,
     ];
-    config.owner_credential_ids.push(f.guest.credential.id());
+    let companion_key = SigningKey::from_bytes(&[41; 32]);
+    let age = age::x25519::Identity::generate();
+    let companion = DeviceCredential::issue_companion(
+        &f.owner.credential,
+        &f.owner.key,
+        &companion_key.verifying_key(),
+        &age.to_public(),
+    )
+    .unwrap();
+    let primary = config
+        .members
+        .iter_mut()
+        .find(|m| m.identity_id == f.owner.credential.identity())
+        .unwrap();
+    primary.credential_ids.push(companion.id());
+    primary.credential_ids.sort();
+    config
+        .owner_credential_ids
+        .extend([f.guest.credential.id(), companion.id()]);
     config.owner_credential_ids.sort();
     let proposal = config.sign(&f.owner.key).unwrap();
     f.apply(command(
@@ -550,7 +568,7 @@ fn registration_replay_cannot_bypass_current_owner_revocation() {
         &f.owner,
         Operation::OwnerUpdate {
             proposal: encoded(&proposal),
-            credentials: vec![],
+            credentials: vec![encoded(companion.record())],
         },
     ))
     .unwrap();
@@ -570,16 +588,97 @@ fn registration_replay_cannot_bypass_current_owner_revocation() {
         .members
         .retain(|m| m.identity_id == f.guest.credential.identity());
     config.owner_credential_ids = vec![f.guest.credential.id()];
+    let forged = config.sign(&f.guest.key).unwrap();
+    let head = f.authority.head_id();
+    assert!(
+        f.apply(command(
+            &f.authority,
+            &f.guest,
+            Operation::OwnerUpdate {
+                proposal: encoded(&forged),
+                credentials: vec![],
+            }
+        ))
+        .is_err()
+    );
+    f.refresh();
+    assert_eq!(f.authority.head_id(), head);
+    config.members = f.authority.head().unwrap().members.clone();
+    config
+        .members
+        .iter_mut()
+        .find(|m| m.identity_id == f.owner.credential.identity())
+        .unwrap()
+        .credential_ids = vec![companion.id()];
+    config.owner_credential_ids = vec![f.guest.credential.id(), companion.id()];
+    config.owner_credential_ids.sort();
     let proposal = config.sign(&f.guest.key).unwrap();
+    assert!(
+        f.apply(command(
+            &f.authority,
+            &f.guest,
+            Operation::OwnerUpdate {
+                proposal: encoded(&proposal),
+                credentials: vec![],
+            },
+        ))
+        .is_err()
+    );
+    f.refresh();
+    assert_eq!(f.authority.head_id(), head);
+
+    // Device rotation must be authorized by another active creator device,
+    // never by a coowner retaining only the creator's identity in the roster.
+    let companion_device = Device {
+        root: f.owner.root.clone(),
+        key: companion_key,
+        credential: companion.clone(),
+    };
+    config.controller_credential_id = companion.id();
+    config.action.actor_identity = companion.identity();
+    let proposal = config.sign(&companion_device.key).unwrap();
     f.apply(command(
         &f.authority,
-        &f.guest,
+        &companion_device,
         Operation::OwnerUpdate {
             proposal: encoded(&proposal),
             credentials: vec![],
         },
     ))
     .unwrap();
+    f.refresh();
+    let rotated_head = f.authority.head_id();
+    let mut reactivation = f.authority.head().unwrap().clone();
+    reactivation.sequence += 1;
+    reactivation.previous_config_id = rotated_head;
+    reactivation.witness_evidence = None;
+    reactivation.nonce = record::random_hex::<16>().unwrap();
+    reactivation.controller_credential_id = f.guest.credential.id();
+    reactivation.action.actor_identity = f.guest.credential.identity();
+    let primary = reactivation
+        .members
+        .iter_mut()
+        .find(|m| m.identity_id == companion.identity())
+        .unwrap();
+    primary.credential_ids.push(f.owner.credential.id());
+    primary.credential_ids.sort();
+    reactivation
+        .owner_credential_ids
+        .push(f.owner.credential.id());
+    reactivation.owner_credential_ids.sort();
+    assert!(
+        f.apply(command(
+            &f.authority,
+            &f.guest,
+            Operation::OwnerUpdate {
+                proposal: encoded(&reactivation.sign(&f.guest.key).unwrap()),
+                credentials: vec![],
+            },
+        ))
+        .is_err()
+    );
+    f.refresh();
+    assert_eq!(f.authority.head_id(), rotated_head);
     assert!(matches!(
         f.apply(serde_json::from_slice(&f.registration).unwrap()),
         Err(Error::Unauthorized)

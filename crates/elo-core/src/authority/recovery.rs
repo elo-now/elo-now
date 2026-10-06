@@ -241,6 +241,33 @@ impl Authority {
     }
     pub(super) fn validate_controller_transition(&self, c: &StreamConfig) -> Result<()> {
         let parent = c.previous_config_id.map(|id| self.config(id)).transpose()?;
+        if self.is_owner_managed()
+            && let Some(parent) = parent
+        {
+            let owners = |config: &StreamConfig| {
+                config
+                    .members
+                    .iter()
+                    .filter(|member| member.capabilities.contains(&Capability::Manage))
+                    .map(|member| member.identity_id)
+                    .collect::<BTreeSet<_>>()
+            };
+            let primary = self.primary_owner_identity()?;
+            let previous_primary = parent.members.iter().find(|m| m.identity_id == primary);
+            let next_primary = c.members.iter().find(|m| m.identity_id == primary);
+            // A coowner must not lock out the creator by replacing its devices
+            // or reactivate a retired creator credential. Pairing and rotation
+            // remain available to every active device of the creator identity.
+            // A witness signs ordering, not the creator's authorization.
+            if (owners(parent) != owners(c) || previous_primary != next_primary)
+                && (self.credential(c.controller_credential_id)?.identity() != primary
+                    || !parent
+                        .owner_credential_ids
+                        .contains(&c.controller_credential_id))
+            {
+                return Err(RecordError::Authority);
+            }
+        }
         if self.witness_pin().is_some() && c.sequence > 1 {
             return self.validate_witness_transition(c);
         }

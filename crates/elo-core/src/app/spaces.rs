@@ -232,6 +232,50 @@ impl ClientApp {
             |profile| profile.push_url.clone(),
         )
     }
+    pub(super) fn require_account_deletion_owner_policy(&self) -> Result<()> {
+        let Some(spaces) = &self.spaces else {
+            return Ok(());
+        };
+        for entry in spaces
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.status == "joined")
+        {
+            let Some(address) = &entry.address else {
+                continue;
+            };
+            let client = if entry.root {
+                self
+            } else {
+                spaces.children.get(&entry.id).ok_or("Space unavailable.")?
+            };
+            let authority = client
+                .authorities
+                .0
+                .iter()
+                .find(|authority| {
+                    authority.space() == address.scope.space
+                        && authority.stream() == address.scope.stream
+                })
+                .ok_or("General unavailable.")?;
+            if authority.is_owner_managed()
+                && authority.primary_owner_identity()? != self.identity_id()
+                && authority.head()?.members.iter().any(|member| {
+                    member.identity_id == self.identity_id()
+                        && member
+                            .capabilities
+                            .contains(&crate::authority::Capability::Manage)
+                })
+            {
+                return Err(
+                    "Ask the primary owner to remove your owner role before deleting your account."
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
     pub(super) fn account_hosts(&self) -> Result<BTreeSet<String>> {
         let mut hosts = BTreeSet::new();
         if let Some(spaces) = &self.spaces {
@@ -582,9 +626,26 @@ impl ClientApp {
         } else {
             None
         };
-        let child =
+        let mut child =
             ClientApp::open_session(path, self.password.clone(), self.allow_loopback, session)
                 .await?;
+        let inherited = match child.inherit_owner_grant_eligibility(&self.session) {
+            Ok(inherited) => inherited,
+            Err(error) => {
+                child.close().await?;
+                return Err(error);
+            }
+        };
+        let cache = if inherited {
+            let vault = vault::read_private(&child.directory.join("vault.age"))?;
+            Some(
+                child
+                    .session
+                    .cache_for_profile(&self.session, space, &vault)?,
+            )
+        } else {
+            cache
+        };
         // A missing/unwritable cache must never prevent an authenticated open.
         if let Some(cache) = cache {
             let _ = vault::write_private(&cache_path, &cache, true);
@@ -1337,12 +1398,8 @@ impl Spaces {
                     )
                     .await?
                 } else {
-                    ClientApp::open(
-                        directory.clone(),
-                        root.password.clone(),
-                        root.allow_loopback,
-                    )
-                    .await?
+                    root.open_space_child(directory.clone(), id.parse()?)
+                        .await?
                 };
                 let initialized: Result<()> = async {
                     if child.identity_id() != root.identity_id()
@@ -2476,6 +2533,9 @@ impl Spaces {
             | "space_attachment_retention"
             | "space_attachment_cleanup_preview"
             | "space_attachment_cleanup" => {
+                if op == "space_role_change" && v["body"]["kind"] == "transfer_primary" {
+                    return Err("Primary ownership cannot be transferred.".into());
+                }
                 let id = field(&v, "id")?;
                 let entry = self
                     .catalog

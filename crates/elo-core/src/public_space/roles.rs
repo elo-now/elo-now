@@ -85,10 +85,34 @@ impl Roles {
         });
         Ok(())
     }
-    pub fn retire_member(&mut self, identity: IdentityId) {
+    fn require_change_authority(
+        &self,
+        actor: IdentityId,
+        target: IdentityId,
+        kind: &str,
+    ) -> Result<()> {
+        if kind == "transfer_primary" {
+            return Err("Primary ownership cannot be transferred.".into());
+        }
+        if matches!(kind, "remove_owner" | "remove_member") && target == self.primary {
+            return Err("The primary owner cannot be removed.".into());
+        }
+        if (matches!(kind, "make_owner" | "remove_owner")
+            || (kind == "remove_member" && self.is_owner(target)))
+            && actor != self.primary
+        {
+            return Err("Only the primary owner can change Space owners.".into());
+        }
+        Ok(())
+    }
+    pub fn retire_member(&mut self, identity: IdentityId) -> Result<()> {
+        if identity == self.primary {
+            return Err("The primary owner cannot be removed.".into());
+        }
         self.owners.remove(&identity);
         self.pending
             .retain(|_, c| c.target != identity && c.requester != identity);
+        Ok(())
     }
     pub fn apply_with_id(
         &mut self,
@@ -96,8 +120,8 @@ impl Roles {
         action: &str,
         body: &Value,
         members: &[RoleMember],
-        current: u64,
-        request_id: &str,
+        _current: u64,
+        _request_id: &str,
     ) -> Result<Value> {
         if body["revision"].as_u64() != Some(self.revision) {
             return Err("Space roles have changed. Refresh and try again.".into());
@@ -117,19 +141,16 @@ impl Roles {
                 return Err("You cannot confirm this role change.".into());
             }
             if approve {
+                if change.primary != self.primary || !self.is_owner(actor) {
+                    return Err("You cannot confirm this role change.".into());
+                }
+                self.require_change_authority(actor, change.target, &change.kind)?;
                 if !members.iter().any(|m| m.identity == change.target) {
                     return Err("This person is no longer a Space member.".into());
                 }
                 match change.kind.as_str() {
                     "remove_owner" | "remove_member" => {
                         self.owners.remove(&change.target);
-                    }
-                    "transfer_primary" => {
-                        let email = field(body, "contact_email")?.trim();
-                        validate_contact_email(email)?;
-                        self.contact_email = Some(email.into());
-                        self.owners.insert(change.target);
-                        self.primary = change.target;
                     }
                     _ => return Err("Invalid role change.".into()),
                 }
@@ -144,11 +165,11 @@ impl Roles {
             return Err("Only a Space owner can change roles.".into());
         }
         let target: IdentityId = field(body, "target")?.parse()?;
-        let member = members
-            .iter()
-            .find(|m| m.identity == target)
-            .ok_or("Choose a current Space member.")?;
+        if !members.iter().any(|m| m.identity == target) {
+            return Err("Choose a current Space member.".into());
+        }
         let kind = field(body, "kind")?;
+        self.require_change_authority(actor, target, kind)?;
         match kind {
             "make_owner" => {
                 if self.is_owner(target) {
@@ -158,59 +179,128 @@ impl Roles {
                 self.changed()?;
                 Ok(json!({"status":"applied"}))
             }
-            "remove_owner" | "transfer_primary" | "remove_member" => {
-                if target == self.primary {
-                    return Err("The primary owner must transfer ownership first.".into());
-                }
-                if kind == "transfer_primary" && actor != self.primary {
-                    return Err("Only the primary owner can transfer ownership.".into());
-                }
+            "remove_owner" | "remove_member" => {
                 if kind == "remove_owner" && !self.is_owner(target) {
                     return Err("This person is not an owner.".into());
                 }
-                if (kind == "remove_owner" || kind == "remove_member")
-                    && (actor == self.primary || actor == target || !self.is_owner(target))
-                {
-                    self.owners.remove(&target);
-                    self.changed()?;
-                    return Ok(
-                        json!({"status":"applied","removed_identity":if kind == "remove_member" {Some(target)} else {None}}),
-                    );
-                }
-                if self
-                    .pending
-                    .values()
-                    .any(|c| c.target == target && c.kind == kind)
-                    || (kind == "transfer_primary" && self.pending.values().any(|c| c.kind == kind))
-                {
-                    return Err("A confirmation is already pending.".into());
-                }
-                if self.pending.len() >= record::MAX_CHAT_MEMBERS {
-                    return Err("Resolve pending role requests first.".into());
-                }
-                let id = request_id.to_owned();
-                self.pending.insert(
-                    id.clone(),
-                    Change {
-                        id,
-                        kind: kind.into(),
-                        target,
-                        target_name: member.name.clone(),
-                        requester: actor,
-                        requester_name: members
-                            .iter()
-                            .find(|m| m.identity == actor)
-                            .unwrap()
-                            .name
-                            .clone(),
-                        created_at: current,
-                        primary: self.primary,
-                    },
-                );
+                self.owners.remove(&target);
                 self.changed()?;
-                Ok(json!({"status":"pending"}))
+                Ok(
+                    json!({"status":"applied","removed_identity":if kind == "remove_member" {Some(target)} else {None}}),
+                )
             }
             _ => Err("Choose a valid role change.".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn identity(n: u8) -> IdentityId {
+        format!("{n:02x}").repeat(32).parse().unwrap()
+    }
+    fn members() -> Vec<RoleMember> {
+        (1..=4)
+            .map(|n| RoleMember {
+                identity: identity(n),
+                name: format!("Person {n}"),
+                role: "member".into(),
+            })
+            .collect()
+    }
+    fn change(roles: &mut Roles, actor: u8, target: u8, kind: &str) -> Result<Value> {
+        roles.apply_with_id(
+            identity(actor),
+            "role_change",
+            &json!({"revision":roles.revision,"target":identity(target),"kind":kind}),
+            &members(),
+            1,
+            "signed-request",
+        )
+    }
+    fn historic_request(roles: &mut Roles, kind: &str) {
+        roles.pending.insert(
+            "historic".into(),
+            Change {
+                id: "historic".into(),
+                kind: kind.into(),
+                target: identity(3),
+                target_name: "Person 3".into(),
+                requester: identity(2),
+                requester_name: "Person 2".into(),
+                created_at: 1,
+                primary: identity(1),
+            },
+        );
+    }
+    fn decide(roles: &mut Roles, actor: u8, approve: bool) -> Result<Value> {
+        roles.apply_with_id(
+            identity(actor),
+            "role_decide",
+            &json!({"revision":roles.revision,"request_id":"historic","approve":approve}),
+            &members(),
+            2,
+            "signed-request",
+        )
+    }
+    #[test]
+    fn only_primary_changes_owner_identities_and_primary_cannot_be_removed() {
+        let mut roles = Roles::bootstrap(&[identity(1), identity(2), identity(3)]).unwrap();
+        for (actor, target, kind) in [
+            (2, 4, "make_owner"),
+            (2, 3, "remove_owner"),
+            (2, 2, "remove_owner"),
+            (2, 3, "remove_member"),
+            (4, 3, "remove_member"),
+            (1, 1, "remove_owner"),
+            (1, 1, "remove_member"),
+        ] {
+            let before = serde_json::to_value(&roles).unwrap();
+            assert!(change(&mut roles, actor, target, kind).is_err());
+            assert_eq!(serde_json::to_value(&roles).unwrap(), before);
+        }
+        assert!(roles.retire_member(identity(1)).is_err());
+        assert!(roles.is_owner(identity(1)));
+        change(&mut roles, 1, 4, "make_owner").unwrap();
+        change(&mut roles, 1, 3, "remove_owner").unwrap();
+        assert!(roles.is_owner(identity(4)));
+        assert!(!roles.is_owner(identity(3)));
+        let restored: Roles =
+            serde_json::from_value(serde_json::to_value(&roles).unwrap()).unwrap();
+        assert_eq!(restored.primary, identity(1));
+        assert_eq!(restored.role(identity(1)), "primary_owner");
+    }
+    #[test]
+    fn coowner_still_removes_ordinary_members() {
+        let mut roles = Roles::bootstrap(&[identity(1), identity(2)]).unwrap();
+        let removed = change(&mut roles, 2, 4, "remove_member").unwrap();
+        assert_eq!(removed["removed_identity"], json!(identity(4)));
+        assert_eq!(roles.owners, BTreeSet::from([identity(1), identity(2)]));
+    }
+    #[test]
+    fn transfers_are_disabled_but_historical_requests_can_be_declined() {
+        let mut roles = Roles::bootstrap(&[identity(1), identity(2), identity(3)]).unwrap();
+        for actor in [1, 2, 3] {
+            assert!(change(&mut roles, actor, 4, "transfer_primary").is_err());
+        }
+        historic_request(&mut roles, "transfer_primary");
+        assert!(decide(&mut roles, 3, true).is_err());
+        assert_eq!(roles.primary, identity(1));
+        assert_eq!(decide(&mut roles, 3, false).unwrap()["status"], "declined");
+        assert!(roles.pending.is_empty());
+    }
+    #[test]
+    fn historical_owner_removal_cannot_bypass_primary_authorization() {
+        for kind in ["remove_owner", "remove_member"] {
+            let mut roles = Roles::bootstrap(&[identity(1), identity(2), identity(3)]).unwrap();
+            historic_request(&mut roles, kind);
+            assert!(decide(&mut roles, 2, true).is_err());
+            assert!(decide(&mut roles, 3, true).is_err());
+            assert!(roles.is_owner(identity(3)));
+            decide(&mut roles, 1, true).unwrap();
+            assert!(!roles.is_owner(identity(3)));
+            assert!(roles.is_owner(identity(1)));
         }
     }
 }

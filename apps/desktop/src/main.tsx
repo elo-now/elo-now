@@ -92,6 +92,7 @@ import { useExpiringView } from "./useMessageExpiry";
 import { ThreadView } from "./ThreadView";
 import { MessageBubble, ThreadLink } from "./MessageBubble";
 import { UnavailableMessage } from "./UnavailableMessage";
+import { retrieveUnavailableMessage } from "./messageRetrieval";
 import {
   AttachmentButton,
   attachmentFailure,
@@ -1596,9 +1597,16 @@ function App() {
           realtime.value.now,
         ).length
       : 0;
+  const retrievalScope =
+    messagesActive || threadActive
+      ? JSON.stringify([conversationScope, threadActive ? threadRoot : null])
+      : undefined;
+  const currentRetrievalScope = useRef(retrievalScope);
+  currentRetrievalScope.current = retrievalScope;
   const {
     request: requestSync,
     requestRemote,
+    requestRetrieval,
     progress: syncProgress,
   } = useLiveSync(
     view,
@@ -1607,18 +1615,35 @@ function App() {
     (result) => receiveSync(result, true),
     () => isOpeningPush() || (visibleHistory.enabled && !visibleHistory.ready),
     realtime.connectedSpaces,
+    retrievalScope,
   );
   remoteSync.current = requestRemote;
   const requestUnavailableMessage = async (row: MessageRow) => {
-    if (!stream || !row.body.locator)
+    if (!view || !stream || !row.body.locator || !retrievalScope)
       throw new Error("Message locator missing.");
-    await call({
-      op: "request_message",
-      space: stream.space,
-      stream: stream.stream,
-      locator: row.id,
+    return retrieveUnavailableMessage({
+      identity: view.identity,
+      space: view.active_space,
+      scope: retrievalScope,
+      currentScope: () => currentRetrievalScope.current,
+      request: () =>
+        invoke<{ view?: View }>("operate", {
+          request: {
+            op: "request_message",
+            space: stream.space,
+            stream: stream.stream,
+            locator: row.id,
+            expected_identity: view.identity,
+            expected_space: view.active_space,
+          },
+        }),
+      updateView: setView,
+      receive: () =>
+        requestRetrieval(
+          stream.space_context ?? view.active_space ?? undefined,
+          retrievalScope,
+        ),
     });
-    requestSync(true);
   };
   const {
     settings: pushSettings,
@@ -2635,6 +2660,7 @@ function App() {
                             </p>
                           ) : r.body.kind === "unavailable" ? (
                             <UnavailableMessage
+                              active={messagesActive}
                               disabled={busy}
                               onRequest={() => requestUnavailableMessage(r)}
                               onUnavailable={() =>

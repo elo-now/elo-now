@@ -394,9 +394,19 @@ impl ClientApp {
         identity: IdentityId,
     ) -> Result<()> {
         if self.account_membership(config, identity)?["primary"] == true {
-            return Err("Transfer primary ownership before deleting your account.".into());
+            return Err("Delete your Spaces before deleting your account.".into());
         }
         let mut state = self.service_state()?;
+        if state
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.is_owner(identity))
+        {
+            return Err(
+                "Ask the primary owner to remove your owner role before deleting your account."
+                    .into(),
+            );
+        }
         if state.erased_accounts.insert(identity) {
             let epoch = state
                 .removals
@@ -411,7 +421,7 @@ impl ClientApp {
             .applicants
             .retain(|_, applicant| applicant.identity != identity);
         if let Some(roles) = state.roles.as_mut() {
-            roles.retire_member(identity);
+            roles.retire_member(identity)?;
         }
         state.replies.clear();
         self.save_service_state(&state)?;
@@ -1319,7 +1329,7 @@ impl ClientApp {
                         applicant.status = "removed".into();
                         applicant.note.clear();
                     }
-                    state.roles.as_mut().unwrap().retire_member(target);
+                    state.roles.as_mut().unwrap().retire_member(target)?;
                     // Commit the revocation before rotating General. Every subsequent
                     // request finishes interrupted rotations before granting enrollment.
                     self.save_service_state(state)?;

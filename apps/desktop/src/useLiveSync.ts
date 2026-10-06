@@ -12,6 +12,7 @@ export function useLiveSync(
   onResult: (result: SyncResult) => void,
   suspended: () => boolean = () => false,
   connectedSpaces: readonly string[] = [],
+  retrievalScope?: string,
 ) {
   const restricted = useUpdateRequired();
   const [progress, setProgress] = useState<SyncProgress>(null);
@@ -22,8 +23,12 @@ export function useLiveSync(
       )
       .map((space) => space.id) ?? [];
   const pendingSpaceKey = pendingSpaces.join(",");
-  const joinedSpaces = view?.spaces?.filter((space) => space.status === "joined") ?? [];
-  const realtimeConnected = joinedSpaces.length > 0 && joinedSpaces.every((space) => connectedSpaces.includes(space.id)) && (view?.counts.pending ?? 0) === 0;
+  const joinedSpaces =
+    view?.spaces?.filter((space) => space.status === "joined") ?? [];
+  const realtimeConnected =
+    joinedSpaces.length > 0 &&
+    joinedSpaces.every((space) => connectedSpaces.includes(space.id)) &&
+    (view?.counts.pending ?? 0) === 0;
   const latest = useRef({
     view,
     conversation,
@@ -32,6 +37,7 @@ export function useLiveSync(
     suspended,
     pendingSpaces,
     realtimeConnected,
+    retrievalScope,
   });
   latest.current = {
     view,
@@ -41,6 +47,7 @@ export function useLiveSync(
     suspended,
     pendingSpaces,
     realtimeConnected,
+    retrievalScope,
   };
   useEffect(() => {
     if (!view) return;
@@ -80,6 +87,7 @@ export function useLiveSync(
           !!latest.current.view?.spaces?.length,
         pendingSpaces: latest.current.pendingSpaces,
         realtimeConnected: latest.current.realtimeConnected,
+        retrievalScope: latest.current.retrievalScope,
       }),
       (op, force = false, receiveOnly = false, targetSpace?: string) =>
         invoke<SyncResult>("operate", {
@@ -91,7 +99,8 @@ export function useLiveSync(
             ...(receiveOnly
               ? {
                   receive_only: true,
-                  target_space: targetSpace ?? latest.current.view?.active_space,
+                  target_space:
+                    targetSpace ?? latest.current.view?.active_space,
                   expected_space: latest.current.view?.active_space,
                 }
               : {}),
@@ -115,6 +124,7 @@ export function useLiveSync(
     view?.spaces?.length,
     pendingSpaceKey,
     realtimeConnected,
+    retrievalScope,
   ]);
   // This also covers reactions/pins committed through shared message actions.
   const pending = useRef(view?.counts.pending ?? 0);
@@ -126,8 +136,32 @@ export function useLiveSync(
   return {
     progress,
     request: (membership = false) => worker.current?.request(membership),
+    requestRetrieval: (
+      space: string | undefined,
+      scope: string | undefined,
+    ) => {
+      if (!scope || scope !== latest.current.retrievalScope) return;
+      if (
+        space &&
+        !latest.current.view?.spaces?.some(
+          (candidate) =>
+            candidate.id === space && candidate.status === "joined",
+        )
+      )
+        return;
+      // Keep the existing authenticated request/discovery path. The extra
+      // receives start only if its originating conversation is still open.
+      worker.current?.request(true);
+      return space ? worker.current?.requestRetrieval(space) : undefined;
+    },
     requestRemote: (space: string) => {
-      if (latest.current.view?.spaces?.some((candidate) => candidate.id === space && candidate.status === "joined")) worker.current?.requestRemote(space);
+      if (
+        latest.current.view?.spaces?.some(
+          (candidate) =>
+            candidate.id === space && candidate.status === "joined",
+        )
+      )
+        worker.current?.requestRemote(space);
     },
   };
 }

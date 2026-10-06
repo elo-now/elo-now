@@ -234,7 +234,11 @@ pub fn verify_owner_policy(
         return Err("Space administration history was omitted or changed.".into());
     }
     let commitment = journal_commitment(&journal)?;
-    let mut roles = Roles::bootstrap(&[creator.identity()])?;
+    let primary = authority.primary_owner_identity()?;
+    if primary != creator.identity() {
+        return Err("Space primary owner does not match its signed creation.".into());
+    }
+    let mut roles = Roles::bootstrap(&[primary])?;
     let mut invitations = BTreeMap::from([(
         creation_command.request_id.clone(),
         Invitation {
@@ -292,12 +296,12 @@ pub fn verify_owner_policy(
                     enrolled_at(authority, head, signer.id())?
                 })
                 || revoked.contains(&signer.id())
-                || roles.primary == signer.identity()
+                || roles.is_owner(signer.identity())
             {
                 return Err("Invalid signed account deletion intent.".into());
             }
             removals.insert(signer.identity(), (index, None));
-            roles.retire_member(signer.identity());
+            roles.retire_member(signer.identity())?;
             continue;
         }
         let command: Command = record.decode()?;
@@ -555,7 +559,7 @@ fn replay_role(
     if let Some(identity) = result["removed_identity"].as_str() {
         let identity = identity.parse()?;
         removals.insert(identity, (index, Some(head)));
-        roles.retire_member(identity);
+        roles.retire_member(identity)?;
     }
     Ok(())
 }
@@ -843,12 +847,15 @@ mod tests {
     }
 
     #[test]
-    fn role_replay_requires_an_owner_and_preserves_transfer_consent_across_commits() {
+    fn role_replay_requires_primary_for_owner_changes_and_preserves_member_management() {
         let (owner, mut authority, creation) = fixture();
         let guest = Session::create().unwrap().0;
-        authority.add_credential(guest.credential().clone());
+        let member = Session::create().unwrap().0;
+        for session in [&guest, &member] {
+            authority.add_credential(session.credential().clone());
+        }
         let mut members = authority.head().unwrap().members.clone();
-        members.push(guest_member(&guest));
+        members.extend([guest_member(&guest), guest_member(&member)]);
         commit(&mut authority, &owner, &[], Some(members));
         let forged = intent(
             &authority,
@@ -870,53 +877,69 @@ mod tests {
             "role_change",
             json!({"revision":0,"kind":"make_owner","target":guest.identity_id()}),
         );
-        let transfer = intent(
-            &authority,
-            &owner,
-            "role_change",
-            json!({"revision":1,"kind":"transfer_primary","target":guest.identity_id()}),
-        );
-        let confirmation = intent(
-            &authority,
-            &guest,
-            "role_decide",
-            json!({"revision":2,"request_id":evidence(&transfer).unwrap().0.id(),"approve":true,"contact_email":"new@example.test"}),
-        );
-        let removal = intent(
-            &authority,
-            &owner,
-            "role_change",
-            json!({"revision":3,"kind":"remove_member","target":owner.identity_id()}),
-        );
-        let journal = vec![promote, transfer, confirmation, removal];
-        let policy = verify_owner_policy(
-            &authority,
-            &status(&authority, &creation, &[], &journal, vec![]),
-            1000,
-        )
-        .unwrap();
-        assert_eq!(
-            policy.owner_identities,
-            BTreeSet::from([guest.identity_id()])
-        );
-        assert!(policy.removed.contains(&owner.identity_id()));
-        let mut member = guest_member(&guest);
-        member.capabilities = vec![
+        let committed = vec![promote];
+        let mut members = authority.head().unwrap().members.clone();
+        members
+            .iter_mut()
+            .find(|m| m.identity_id == guest.identity_id())
+            .unwrap()
+            .capabilities = vec![
             Capability::Read,
             Capability::Post,
             Capability::ShareHistory,
             Capability::Manage,
         ];
-        commit(&mut authority, &owner, &journal, Some(vec![member]));
+        commit(&mut authority, &owner, &committed, Some(members));
         let policy = verify_owner_policy(
             &authority,
-            &status(&authority, &creation, &journal, &journal, vec![]),
+            &status(&authority, &creation, &committed, &committed, vec![]),
             1000,
         )
         .unwrap();
         assert_eq!(
             policy.owner_identities,
-            BTreeSet::from([guest.identity_id()])
+            BTreeSet::from([owner.identity_id(), guest.identity_id()])
+        );
+        for (actor, kind, target) in [
+            (&guest, "make_owner", member.identity_id()),
+            (&guest, "remove_owner", owner.identity_id()),
+            (&guest, "remove_member", guest.identity_id()),
+            (&owner, "remove_member", owner.identity_id()),
+            (&owner, "transfer_primary", guest.identity_id()),
+        ] {
+            let mut journal = committed.clone();
+            journal.push(intent(
+                &authority,
+                actor,
+                "role_change",
+                json!({"revision":1,"kind":kind,"target":target}),
+            ));
+            assert!(
+                verify_owner_policy(
+                    &authority,
+                    &status(&authority, &creation, &committed, &journal, vec![]),
+                    1000
+                )
+                .is_err()
+            );
+        }
+        let mut journal = committed.clone();
+        journal.push(intent(
+            &authority,
+            &guest,
+            "role_change",
+            json!({"revision":1,"kind":"remove_member","target":member.identity_id()}),
+        ));
+        let policy = verify_owner_policy(
+            &authority,
+            &status(&authority, &creation, &committed, &journal, vec![]),
+            1000,
+        )
+        .unwrap();
+        assert!(policy.removed.contains(&member.identity_id()));
+        assert_eq!(
+            policy.owner_identities,
+            BTreeSet::from([owner.identity_id(), guest.identity_id()])
         );
     }
 

@@ -124,6 +124,14 @@ const known: Record<string, MessageKey> = {
   "Revoke an unused invitation first.": "error.spaceInvitationLimit",
   "Only the Space owner can manage invitations.": "error.notAllowed",
   "Only a Space owner can change roles.": "error.notAllowed",
+  "Only the primary owner can change Space owners.":
+    "error.spaceOwnersPrimaryOnly",
+  "The primary owner cannot be removed.": "error.spacePrimaryProtected",
+  "Primary ownership cannot be transferred.": "error.spacePrimaryFixed",
+  "Ask the primary owner to remove your owner role before deleting your account.":
+    "error.spaceOwnerDeleteAccount",
+  "Delete your Spaces before deleting your account.":
+    "error.spacePrimaryDeleteAccount",
   "Only the primary owner can confirm deleting this Space.": "error.notAllowed",
   "You do not have permission to manage these attachments.": "error.notAllowed",
   "Join this Space using an invitation first.": "error.joinSpaceFirst",

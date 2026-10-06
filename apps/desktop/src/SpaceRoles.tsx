@@ -1,5 +1,4 @@
 import { useDesktopLayout } from "./PageSurface";
-import { SpaceContactInput } from "./SpaceContact";
 import { FloatingSearch, SearchField } from "./Search";
 import { Icon } from "./Icon";
 import { OnlineIndicator } from "./useRealtime";
@@ -35,8 +34,7 @@ export type SpaceManagement = {
     reserved_bytes: number;
   };
 };
-type Kind =
-  "make_owner" | "remove_owner" | "transfer_primary" | "remove_member";
+type Kind = "make_owner" | "remove_owner" | "remove_member";
 const roleLabel = (role: Member["role"]) =>
   t(
     role === "primary_owner"
@@ -84,6 +82,15 @@ export function SpaceMembers({
   const primary = management.primary_owner === identity;
   const confirm = async () => {
     if (!change || busy) return;
+    const member = management.members.find(
+      (candidate) => candidate.identity === change.member.identity,
+    );
+    if (!member || member.role === "primary_owner") return;
+    if (
+      !primary &&
+      (change.kind !== "remove_member" || member.role !== "member")
+    )
+      return;
     setBusy(true);
     try {
       const reply = await invoke<{ view: View }>("operate", {
@@ -151,23 +158,27 @@ export function SpaceMembers({
                   {roleLabel(member.role)}
                 </span>
               </span>
-              {member.role !== "primary_owner" && (
-                <button
-                  type="button"
-                  className="icon"
-                  disabled={busy}
-                  aria-label={t("spaces.memberActions", { name: member.name })}
-                  aria-haspopup="menu"
-                  onClick={(event) =>
-                    setMenu({
-                      identity: member.identity,
-                      anchor: event.currentTarget.getBoundingClientRect(),
-                    })
-                  }
-                >
-                  <Icon name="more" />
-                </button>
-              )}
+              {member.role !== "primary_owner" &&
+                (primary || member.role === "member") &&
+                member.identity !== identity && (
+                  <button
+                    type="button"
+                    className="icon"
+                    disabled={busy}
+                    aria-label={t("spaces.memberActions", {
+                      name: member.name,
+                    })}
+                    aria-haspopup="menu"
+                    onClick={(event) =>
+                      setMenu({
+                        identity: member.identity,
+                        anchor: event.currentTarget.getBoundingClientRect(),
+                      })
+                    }
+                  >
+                    <Icon name="more" />
+                  </button>
+                )}
             </div>
           </li>
         ))}
@@ -182,7 +193,7 @@ export function SpaceMembers({
           title={t("spaces.memberActions", { name: menuMember.name })}
           onClose={() => setMenu(undefined)}
         >
-          {menuMember.role === "member" && (
+          {primary && menuMember.role === "member" && (
             <button
               role="menuitem"
               onClick={() => {
@@ -193,7 +204,7 @@ export function SpaceMembers({
               {t("spaces.makeOwner")}
             </button>
           )}
-          {menuMember.role === "owner" && (
+          {primary && menuMember.role === "owner" && (
             <button
               role="menuitem"
               onClick={() => {
@@ -204,18 +215,8 @@ export function SpaceMembers({
               {t("spaces.removeOwner")}
             </button>
           )}
-          {primary && menuMember.identity !== identity && (
-            <button
-              role="menuitem"
-              onClick={() => {
-                setMenu(undefined);
-                setChange({ member: menuMember, kind: "transfer_primary" });
-              }}
-            >
-              {t("spaces.transferPrimary")}
-            </button>
-          )}
           {menuMember.role !== "primary_owner" &&
+            (primary || menuMember.role === "member") &&
             menuMember.identity !== identity && (
               <button
                 role="menuitem"
@@ -253,9 +254,7 @@ export function SpaceMembers({
               ? "spaces.removeMemberTitle"
               : change.kind === "make_owner"
                 ? "spaces.makeOwnerTitle"
-                : change.kind === "remove_owner"
-                  ? "spaces.removeOwnerTitle"
-                  : "spaces.transferTitle",
+                : "spaces.removeOwnerTitle",
             { name: change.member.name },
           )}
           onClose={() => {
@@ -265,16 +264,10 @@ export function SpaceMembers({
           <p className="muted">
             {t(
               change.kind === "remove_member"
-                ? change.member.role === "owner" && !primary
-                  ? "spaces.removeMemberApprovalHelp"
-                  : "spaces.removeMemberHelp"
+                ? "spaces.removeMemberHelp"
                 : change.kind === "make_owner"
                   ? "spaces.makeOwnerHelp"
-                  : change.kind === "transfer_primary"
-                    ? "spaces.transferHelp"
-                    : primary || change.member.identity === identity
-                      ? "spaces.removeOwnerHelp"
-                      : "spaces.requestRemovalHelp",
+                  : "spaces.removeOwnerHelp",
             )}
           </p>
           <div className="space-choice">
@@ -313,15 +306,19 @@ export function SpaceRoleRequests({
   const [busy, setBusy] = useState(false);
   const alive = useRef(true);
   const { reportError } = useToast();
+  const canApprove = (item: SpaceRoleRequest) =>
+    item.request.kind !== "transfer_primary" &&
+    view.spaces?.find((space) => space.id === item.space_id)?.role ===
+      "primary_owner";
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
     };
   }, []);
-  const [contactEmail, setContactEmail] = useState("");
   const confirm = async () => {
     if (!decision || busy) return;
+    if (decision.approve && !canApprove(decision.item)) return;
     setBusy(true);
     const item = decision.item;
     try {
@@ -334,10 +331,6 @@ export function SpaceRoleRequests({
             revision: item.revision,
             request_id: item.request.id,
             approve: decision.approve,
-            contact_email:
-              decision.approve && item.request.kind === "transfer_primary"
-                ? contactEmail.trim()
-                : undefined,
           },
         },
       });
@@ -385,13 +378,12 @@ export function SpaceRoleRequests({
               )}
             </p>
             <div className="space-choice">
-              {[true, false].map((approve) => (
+              {(canApprove(item) ? [true, false] : [false]).map((approve) => (
                 <button
                   key={String(approve)}
                   className={approve ? "" : "secondary"}
                   disabled={busy}
                   onClick={() => {
-                    setContactEmail("");
                     setDecision({ item, approve });
                   }}
                 >
@@ -418,19 +410,9 @@ export function SpaceRoleRequests({
                 ? "spaces.declineRoleHelp"
                 : decision.item.request.kind === "remove_member"
                   ? "spaces.removeMemberHelp"
-                  : decision.item.request.kind === "transfer_primary"
-                    ? "spaces.acceptPrimaryHelp"
-                    : "spaces.removeOwnerHelp",
+                  : "spaces.removeOwnerHelp",
             )}
           </p>
-          {decision.approve &&
-            decision.item.request.kind === "transfer_primary" && (
-              <SpaceContactInput
-                value={contactEmail}
-                onChange={setContactEmail}
-                disabled={busy}
-              />
-            )}
           <div className="space-choice">
             <button
               className="secondary"
@@ -440,12 +422,7 @@ export function SpaceRoleRequests({
               {t("invite.cancel")}
             </button>
             <button
-              disabled={
-                busy ||
-                (decision.approve &&
-                  decision.item.request.kind === "transfer_primary" &&
-                  !contactEmail.trim())
-              }
+              disabled={busy}
               aria-busy={busy}
               onClick={() => void confirm()}
             >

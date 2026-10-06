@@ -114,6 +114,30 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 impl ClientApp {
+    /// Carry the authenticated profile's provenance to a matching compartment
+    /// opened after live pairing. This grants no Space control: a fresh General
+    /// membership must still authorize the exact device before activation.
+    pub(super) fn inherit_owner_grant_eligibility(&mut self, profile: &Session) -> Result<bool> {
+        if self.session.identity_id() != profile.identity_id()
+            || self.session.credential().id() != profile.credential().id()
+        {
+            return Err("Space profile identity mismatch.".into());
+        }
+        if !profile.owner_grant_eligible
+            || profile.controller_mode() == vault::ControllerMode::Retired
+            || self.session.owner_grant_eligible
+            || self.session.controller_mode() == vault::ControllerMode::Retired
+        {
+            return Ok(false);
+        }
+        self.session.allow_live_owner_grants()?;
+        if let Err(error) = self.persist_vault() {
+            self.session.owner_grant_eligible = false;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     /// Called exclusively after a completed, authenticated live pairing import.
     /// Ordinary backup import intentionally leaves every compartment a follower.
     pub(super) fn activate_linked_owner_controls(&mut self) -> Result<()> {

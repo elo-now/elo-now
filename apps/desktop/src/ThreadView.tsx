@@ -97,7 +97,7 @@ export function ThreadView({
   onRetry?: () => Promise<void>;
   newMessage?: { id: string; key: number };
   onJumpToLatest?: (id: string) => void;
-  onRequestMessage: (row: MessageRow) => Promise<void>;
+  onRequestMessage: (row: MessageRow) => Promise<void | (() => void)>;
   onUnavailable: () => void;
 }) {
   const [seen, setSeen] = useState(new Set<string>());
@@ -335,7 +335,7 @@ function ThreadMessage({
   attachmentProgress?: AttachmentProgress;
   serverState?: AttachmentUnavailable;
   onCancelAttachment: () => void;
-  onRequestMessage: (row: MessageRow) => Promise<void>;
+  onRequestMessage: (row: MessageRow) => Promise<void | (() => void)>;
   onUnavailable: () => void;
 }) {
   return (

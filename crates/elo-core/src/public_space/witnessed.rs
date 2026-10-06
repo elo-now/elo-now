@@ -204,11 +204,19 @@ impl PublicSpaceService {
             })
             .map(|m| m.identity_id)
             .collect::<Vec<_>>();
-        if let Some(primary) = state.roles.as_ref().map(|r| r.primary)
-            && let Some(index) = owners.iter().position(|id| *id == primary)
+        let primary = next.primary_owner_identity()?;
+        if state
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.primary != primary)
         {
-            owners.swap(0, index);
+            return Err("Space primary owner does not match its signed creation.".into());
         }
+        let index = owners
+            .iter()
+            .position(|id| *id == primary)
+            .ok_or("The primary owner cannot be removed.")?;
+        owners.swap(0, index);
         let mut roles = Roles::bootstrap(&owners)?;
         roles.contact_email = state
             .roles

@@ -357,17 +357,45 @@ fn owner_signature_cannot_remove_another_owner_or_member_without_an_accepted_int
         coowner.identity_id(),
         guest.identity_id(),
     ] {
-        let forged = next(
-            &admitted,
-            &coowner,
-            members
-                .iter()
-                .filter(|m| m.identity_id != victim)
-                .cloned()
-                .collect(),
-            &[],
+        // Construct the hostile wire proof directly. A local Authority must
+        // already reject owner removals before the proof reaches the API.
+        let mut config = admitted.head().unwrap().clone();
+        config.nonce = record::random_hex::<16>().unwrap();
+        config.sequence += 1;
+        config.previous_config_id = admitted.head_id();
+        config.controller_credential_id = coowner.credential().id();
+        config.members.retain(|member| member.identity_id != victim);
+        config.owner_credential_ids = config
+            .members
+            .iter()
+            .filter(|member| member.capabilities.contains(&Capability::Manage))
+            .flat_map(|member| member.credential_ids.iter().copied())
+            .collect();
+        config.owner_credential_ids.sort();
+        config.action = ConfigAction {
+            operation: "replace".into(),
+            actor_identity: coowner.identity_id(),
+            request_record_id: None,
+        };
+        let mut forged = admitted.call_proof().unwrap();
+        forged
+            .configs
+            .push(STANDARD.encode(config.sign(coowner.signing_key()).unwrap().bytes()));
+        if victim == guest.identity_id() {
+            assert!(forged.verify(admitted.space(), admitted.stream()).is_ok());
+        } else {
+            assert!(forged.verify(admitted.space(), admitted.stream()).is_err());
+        }
+        assert!(
+            service
+                .publish_authority(
+                    &mut state,
+                    coowner.credential(),
+                    &json!({"expected_head":admitted.head_id(),"proof":forged}),
+                    None
+                )
+                .is_err()
         );
-        assert!(service.publish_authority(&mut state, coowner.credential(), &json!({"expected_head":admitted.head_id(),"proof":forged.call_proof().unwrap()}), None).is_err());
         assert_eq!(service.authorities.0[0].head_id(), admitted.head_id());
     }
     for capabilities in [
@@ -403,4 +431,72 @@ fn owner_signature_cannot_remove_another_owner_or_member_without_an_accepted_int
             None,
         )
         .unwrap();
+}
+
+#[test]
+fn public_service_rejects_mutable_primary_and_missing_role_state_without_resetting() {
+    let directory = tempfile::tempdir().unwrap();
+    let (service, _, owner) = fixture(directory.path());
+    let other = Session::create().unwrap().0;
+    let original = service.service_state().unwrap();
+    for roles in [
+        None,
+        Some(Roles::bootstrap(&[other.identity_id(), owner.identity_id()]).unwrap()),
+    ] {
+        let mut state: ServiceState =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        state.roles = roles;
+        service.save_service_state(&state).unwrap();
+        let before = std::fs::read(directory.path().join("state.json")).unwrap();
+        assert!(service.service_state().is_err());
+        assert!(PublicSpaceService::open(directory.path(), true).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("state.json")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn coowner_account_deletion_is_rejected_before_any_persisted_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut service, config, owner) = fixture(directory.path());
+    let coowner = Session::create().unwrap().0;
+    let authority = &mut service.authorities.0[0];
+    authority.add_credential(coowner.credential().clone());
+    let mut next = authority.head().unwrap().clone();
+    next.sequence += 1;
+    next.previous_config_id = authority.head_id();
+    next.nonce = record::random_hex::<16>().unwrap();
+    let mut member = next.members[0].clone();
+    member.identity_id = coowner.identity_id();
+    member.root_public_key = field(coowner.credential().record().body(), "root_public_key")
+        .unwrap()
+        .into();
+    member.credential_ids = vec![coowner.credential().id()];
+    next.members.push(member);
+    next.members.sort_by_key(|m| m.identity_id);
+    next.owner_credential_ids.push(coowner.credential().id());
+    next.owner_credential_ids.sort();
+    next.action.operation = "replace".into();
+    authority
+        .apply_config(next.sign(owner.signing_key()).unwrap())
+        .unwrap();
+    let mut state = service.service_state().unwrap();
+    state.proof = service.authorities.0[0].call_proof().unwrap();
+    state.roles = Some(Roles::bootstrap(&[owner.identity_id(), coowner.identity_id()]).unwrap());
+    service.save_service_state(&state).unwrap();
+    let before = std::fs::read(directory.path().join("state.json")).unwrap();
+    let error = service
+        .validate_account_deletion(&config, coowner.identity_id(), None)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Ask the primary owner to remove your owner role before deleting your account."
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("state.json")).unwrap(),
+        before
+    );
+    assert!(service.service_state().unwrap().erased_accounts.is_empty());
 }

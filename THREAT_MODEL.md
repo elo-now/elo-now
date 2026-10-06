@@ -133,11 +133,17 @@ limits. Approval-required invitations and readmission need explicit owner approv
 An open policy can therefore admit a new participant while the owner is offline.
 A witness signature alone cannot authorize an arbitrary owner or reader change.
 
-An active owner credential can authorize a membership proposal in version 4.
-The protocol does not require a separate primary-owner co-signature when such a
-proposal changes the owner set. Primary-owner restrictions in the management UI
-do not add that cryptographic approval. Treat co-owners as trusted membership
-administrators; stronger primary-owner protection requires a protocol change.
+In owner-managed General (versions 2 and 4), the signed genesis fixes the
+creator's identity as the primary owner. That identity must remain an owner in
+every configuration. Adding or removing an owner identity requires a signature
+from a currently admitted device of the primary owner; a co-owner or witness
+signature cannot substitute for it. Changing the primary owner’s device set or
+capabilities requires the same authorization, preventing a co-owner from locking
+out the creator while leaving its identity listed. Co-owners can administer
+ordinary members. Pairing and revoking devices follow their existing authenticated device rules;
+they do not transfer primary ownership. A normal backup does not grant control.
+Primary ownership cannot be transferred, and losing all admitted primary-owner
+devices still has no automatic recovery path.
 
 Short invitations store an encrypted, owner-signed descriptor on the API. Their
 URL fragment carries the seed used to decrypt it and derive an admission signing

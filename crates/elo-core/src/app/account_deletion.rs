@@ -267,6 +267,7 @@ pub fn seal(
 
 impl ClientApp {
     pub async fn delete_account(&self, host: &str, wake: &str, submit: bool) -> Result<Outcome> {
+        self.require_account_deletion_owner_policy()?;
         let mut endpoints = self.account_hosts()?;
         endpoints.insert(endpoint(host, self.allow_loopback)?);
         let relay = wake_endpoint(wake, self.allow_loopback)?;

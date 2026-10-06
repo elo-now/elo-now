@@ -3648,6 +3648,14 @@ mod tests {
         owner.operate(json!({"op":"space_role_change","id":space,"body":{"revision":0,"kind":"make_owner","target":guest.identity_id()}})).await.unwrap();
         guest.operate(json!({"op":"space_refresh"})).await.unwrap();
         assert_eq!(guest.view().await.unwrap()["spaces"][0]["role"], "owner");
+        assert_eq!(
+            guest
+                .delete_account("invalid-host", "invalid-wake", false)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Ask the primary owner to remove your owner role before deleting your account."
+        );
         // A promoted owner from another profile must publish admission without
         // requiring the original owner to come online or refresh its General.
         let mut third = profile(&temp.path().join("third")).await;
@@ -3687,11 +3695,9 @@ mod tests {
             "the promoted owner independently admits the third profile to General"
         );
         third.close().await.unwrap();
-        owner.operate(json!({"op":"space_role_change","id":space,"body":{"revision":1,"kind":"transfer_primary","target":guest.identity_id()}})).await.unwrap();
-        let status = guest.operate(json!({"op":"space_refresh"})).await.unwrap();
-        let request = &status["view"]["space_role_requests"][0];
-        assert_eq!(request["request"]["kind"], "transfer_primary");
-        assert!(guest.operate(json!({"op":"space_role_decide","id":space,"body":{"revision":2,"request_id":request["request"]["id"],"approve":true}})).await.is_err());
+        assert!(owner.operate(json!({"op":"space_role_change","id":space,"body":{"revision":1,"kind":"transfer_primary","target":guest.identity_id()}})).await.is_err());
+        assert!(guest.operate(json!({"op":"space_role_change","id":space,"body":{"revision":1,"kind":"remove_owner","target":owner.identity_id()}})).await.is_err());
+        assert!(guest.operate(json!({"op":"space_contact_update","id":space,"body":{"revision":1,"contact_email":"wrong-owner@example.test"}})).await.is_err());
         assert_eq!(
             owner
                 .operate(json!({"op":"space_contact","id":space,"body":{}}))
@@ -3699,19 +3705,7 @@ mod tests {
                 .unwrap()["result"]["contact_email"],
             "current@example.test"
         );
-        guest.operate(json!({"op":"space_role_decide","id":space,"body":{"revision":2,"request_id":request["request"]["id"],"approve":true,"contact_email":"new-owner@example.test"}})).await.unwrap();
-        assert_eq!(
-            owner
-                .operate(json!({"op":"space_contact","id":space,"body":{}}))
-                .await
-                .unwrap()["result"]["contact_email"],
-            "new-owner@example.test"
-        );
-        assert!(owner.operate(json!({"op":"space_contact_update","id":space,"body":{"revision":3,"contact_email":"old-owner@example.test"}})).await.is_err());
-        assert_eq!(
-            guest.view().await.unwrap()["spaces"][0]["role"],
-            "primary_owner"
-        );
+        assert_eq!(guest.view().await.unwrap()["spaces"][0]["role"], "owner");
         let other=guest.operate(json!({"op":"space_create","contact_email":"owner@example.test","host":format!("{base}/spaces/v1/create"),"message_lifetime_seconds":86400,"name":"Friends"})).await.unwrap();
         assert_ne!(other["view"]["active_space"], space);
         let mailboxes: Vec<_> = host
@@ -3739,8 +3733,8 @@ mod tests {
             .find(|(_, s)| s.config.address.scope.space.to_string() == space)
             .map(|(id, s)| (id.clone(), s.config.peer.clone()))
             .unwrap();
-        let delete = json!({"op":"space_delete","id":space,"body":{"revision":3,"name":"Family","confirmed":true}});
-        assert!(owner.operate(delete.clone()).await.is_err());
+        let delete = json!({"op":"space_delete","id":space,"body":{"revision":1,"name":"Family","confirmed":true}});
+        assert!(guest.operate(delete.clone()).await.is_err());
         let original_mailbox = MailboxDescriptor {
             mailbox_id: peer.mailbox_id,
             read_token: peer.read_token.clone().unwrap(),
@@ -3792,7 +3786,7 @@ mod tests {
         // deletion acknowledgement or repeat requests for its signed receipt.
         let creation = host.creation.lock().await;
         let cleanup = host.deletion_cleanup.lock().await;
-        tokio::time::timeout(Duration::from_secs(3), guest.operate(delete))
+        tokio::time::timeout(Duration::from_secs(3), owner.operate(delete))
             .await
             .unwrap()
             .unwrap();

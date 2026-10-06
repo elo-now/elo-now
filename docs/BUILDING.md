@@ -37,6 +37,20 @@ The Tauri configuration creates native desktop packages for the current host.
 The Desktop release workflow packages macOS (`.dmg` for Apple Silicon and Intel), Windows (x64 NSIS installer) and Linux (x64 `.deb` and AppImage) builds as workflow artifacts. Only successful builds are attached to a release. Distribution signing and notarization still require the publisher's
 platform credentials and must stay outside the repository.
 
+For a test candidate, the workflow accepts paired version/build overrides and
+public API, witness and storage settings. Supply the witness URL, signing public
+key and key generation together; never enter storage credentials in these
+fields. The workflow validates the configuration before compiling and retains
+the selected public settings with its source revision. With no overrides it uses
+the publisher's repository variables. Before publishing a GitHub release, the
+source version must match the candidate version: the separate publication
+workflow deliberately validates it against `tauri.conf.json`.
+
+Windows and Linux candidates also install the final package and require a
+visible application window that stays alive for ten seconds. This checks startup
+only; it does not verify profile unlocking, messaging, notifications or calls.
+A runner without a graphical session cannot pass that check.
+
 The download workflow applies an ad hoc signature to the complete macOS app
 bundle and verifies its resource seal from the final, read-only mounted DMG. This is an integrity
 check, not Developer ID signing or notarization. A local equivalent is

@@ -27,6 +27,8 @@ export type SyncProgress = {
   received: number;
 } | null;
 
+export const RETRIEVE_WINDOW_MS = 90_000;
+
 export type LiveContext = {
   conversation: boolean;
   busy: boolean;
@@ -34,6 +36,7 @@ export type LiveContext = {
   invitations: boolean;
   pendingSpaces?: readonly string[];
   realtimeConnected?: boolean;
+  retrievalScope?: string;
 };
 
 /** One foreground worker for both delivery loops. Native code owns durable
@@ -66,6 +69,22 @@ export function startLiveSync(
   let lastMessage = true;
   let progress: SyncProgress = null;
   const remoteSpaces = new Set<string>();
+  let retrievalScope = context().retrievalScope;
+  const retrievals = new Map<
+    string,
+    { requests: Map<symbol, number>; next: number; failures: number }
+  >();
+  const pruneRetrievals = () => {
+    const scope = context().retrievalScope;
+    if (scope !== retrievalScope) retrievals.clear();
+    retrievalScope = scope;
+    const now = Date.now();
+    for (const [space, retrieval] of retrievals) {
+      for (const [request, deadline] of retrieval.requests)
+        if (deadline <= now) retrieval.requests.delete(request);
+      if (!retrieval.requests.size) retrievals.delete(space);
+    }
+  };
   const publish = (next: SyncProgress) => {
     progress = next;
     if (active) onProgress(next);
@@ -97,6 +116,7 @@ export function startLiveSync(
       return;
     }
     const current = context();
+    pruneRetrievals();
     if (current.busy || backgroundSyncPaused()) {
       schedule(500);
       return;
@@ -104,15 +124,25 @@ export function startLiveSync(
     const now = Date.now();
     const messageDue = current.messages ? nextMessage : Infinity;
     const invitationDue = current.invitations ? nextInvitation : Infinity;
+    const retrieval = current.messages
+      ? [...retrievals].sort((a, b) => a[1].next - b[1].next)[0]
+      : undefined;
+    const retrievalDue = retrieval?.[1].next ?? Infinity;
+    const retrieving =
+      retrievalDue <= now && retrievalDue < Math.min(messageDue, invitationDue);
     // Apply queued membership changes before uploading messages after resume.
     // A repeated push/status hint may make both loops due while discovery is
     // running. Always give message delivery a turn before another such pass.
     const bothDue = messageDue <= now && invitationDue <= now;
-    const remoteSpace = remoteSpaces.values().next().value as string | undefined;
-    const receiving = (receiveFirst || remoteSpace !== undefined) && messageDue <= now;
+    const remoteSpace = remoteSpaces.values().next().value as
+      string | undefined;
+    const receiving =
+      !retrieving &&
+      (receiveFirst || remoteSpace !== undefined) &&
+      messageDue <= now;
     const message =
       receiving || (bothDue ? !lastMessage : messageDue < invitationDue);
-    const due = Math.min(messageDue, invitationDue);
+    const due = Math.min(messageDue, invitationDue, retrievalDue);
     if (!Number.isFinite(due)) return;
     if (due > now) {
       schedule(due - now);
@@ -121,39 +151,49 @@ export function startLiveSync(
     running = true;
     if (receiving) receiveFirst = false;
     if (receiving && remoteSpace) remoteSpaces.delete(remoteSpace);
-    lastMessage = message;
+    if (!retrieving) lastMessage = message;
     const started = requests;
     const invitationStarted = invitationRequests;
-    const force = !message && forceInvitation;
-    if (!message) forceInvitation = false;
+    const force = !retrieving && !message && forceInvitation;
+    if (!retrieving && !message) forceInvitation = false;
     let failed = false;
     let more = false;
     let remainingSpaces = false;
     let discoveryProgressed = false;
     try {
-      const op = message ? "sync_live" : "invitation_sync";
-      const result = await (receiving
-        ? remoteSpace ? deliver(op, false, true, remoteSpace) : deliver(op, false, true)
-        : force
-          ? deliver(op, true)
-          : deliver(op));
+      const op = retrieving || message ? "sync_live" : "invitation_sync";
+      const result = await (retrieving
+        ? deliver("sync_live", false, true, retrieval![0])
+        : receiving
+          ? remoteSpace
+            ? deliver(op, false, true, remoteSpace)
+            : deliver(op, false, true)
+          : force
+            ? deliver(op, true)
+            : deliver(op));
       failed =
-        ((message ? result.result?.retry : result.delivery?.retry) ?? 0) > 0;
+        ((retrieving || message
+          ? result.result?.retry
+          : result.delivery?.retry) ?? 0) > 0;
       if (
         active &&
         (result.view
           ? result.view.identity === identity
           : result.identity === identity)
       ) {
-        more = message
-          ? result.result?.more === true
-          : result.delivery?.more === true;
-        remainingSpaces = message
-          ? result.result?.remaining_spaces === true
-          : result.delivery?.remaining_spaces === true;
-        discoveryProgressed = !message && result.delivery?.progressed === true;
-        if (!message && (result.delivery?.received ?? 0) > 0) nextMessage = 0;
-        if (message) {
+        more =
+          retrieving || message
+            ? result.result?.more === true
+            : result.delivery?.more === true;
+        remainingSpaces =
+          retrieving || message
+            ? result.result?.remaining_spaces === true
+            : result.delivery?.remaining_spaces === true;
+        discoveryProgressed =
+          !retrieving && !message && result.delivery?.progressed === true;
+        if (!retrieving && !message && (result.delivery?.received ?? 0) > 0)
+          nextMessage = 0;
+        if (retrieving || message) {
           const catching = result.result?.catching_up ?? more;
           if (catching || (failed && progress))
             publish({
@@ -171,15 +211,32 @@ export function startLiveSync(
       if (progress) publish({ ...progress, phase: "waiting" });
     } finally {
       running = false;
-      if (message) {
+      if (retrieving) {
+        // Share one bounded, receive-only pass per Space. Retrieval never
+        // changes the ordinary sync or invitation cadence for other Spaces.
+        const currentRetrieval = retrievals.get(retrieval![0]);
+        if (currentRetrieval === retrieval![1]) {
+          currentRetrieval.failures = failed
+            ? Math.min(currentRetrieval.failures + 1, 3)
+            : 0;
+          currentRetrieval.next =
+            Date.now() +
+            Math.min(2_000 * 2 ** currentRetrieval.failures, 10_000);
+        }
+      } else if (message) {
         // Cold starts and wakes may race the connection becoming usable. Retry
         // receiving twice promptly, then return to the normal bounded backoff.
         const retryReceive = receiving && failed && receiveRetries < 2;
         receiveRetries = retryReceive ? receiveRetries + 1 : 0;
         if (retryReceive) receiveFirst = true;
         messageFailures = failed ? Math.min(messageFailures + 1, 5) : 0;
-        if (remoteSpace && (more || retryReceive)) remoteSpaces.add(remoteSpace);
-        const base = context().realtimeConnected ? 60_000 : context().conversation ? 4_000 : 20_000;
+        if (remoteSpace && (more || retryReceive))
+          remoteSpaces.add(remoteSpace);
+        const base = context().realtimeConnected
+          ? 60_000
+          : context().conversation
+            ? 4_000
+            : 20_000;
         nextMessage =
           Date.now() +
           (retryReceive
@@ -192,7 +249,8 @@ export function startLiveSync(
                   ? 250
                   : base) +
           Math.random() * 1_000;
-        if (requests !== started || (!failed && !more && remoteSpaces.size > 0)) nextMessage = 0;
+        if (requests !== started || (!failed && !more && remoteSpaces.size > 0))
+          nextMessage = 0;
       } else {
         invitationFailures =
           failed && !discoveryProgressed
@@ -216,6 +274,7 @@ export function startLiveSync(
     clear();
     wasOnline = navigator.onLine !== false;
     if (!visible()) {
+      if (!foreground()) retrievals.clear();
       if (progress) publish({ ...progress, phase: "waiting" });
       if (foreground()) schedule(2_000);
       return;
@@ -238,6 +297,25 @@ export function startLiveSync(
   window.addEventListener("focus", resume);
   schedule(250);
   return {
+    /** The caller releases its lease when the placeholder resolves or leaves. */
+    requestRetrieval(space: string) {
+      pruneRetrievals();
+      if (!active || !space || !retrievalScope || !visible()) return () => {};
+      const request = Symbol();
+      const retrieval = retrievals.get(space) ?? {
+        requests: new Map<symbol, number>(),
+        next: Date.now(),
+        failures: 0,
+      };
+      retrieval.requests.set(request, Date.now() + RETRIEVE_WINDOW_MS);
+      retrievals.set(space, retrieval);
+      if (!running) schedule(100);
+      return () => {
+        retrieval.requests.delete(request);
+        if (!retrieval.requests.size && retrievals.get(space) === retrieval)
+          retrievals.delete(space);
+      };
+    },
     /** WebSocket hints are coalesced by Space and only receive verified data. */
     requestRemote(space: string) {
       if (!space || remoteSpaces.has(space)) return;
@@ -258,6 +336,7 @@ export function startLiveSync(
       if (!running) schedule(100);
     },
     changed() {
+      pruneRetrievals();
       const nextPending = new Set(context().pendingSpaces ?? []);
       if ([...nextPending].some((id) => !pendingSpaces.has(id))) {
         // A newly submitted join must not inherit backoff from unreachable
@@ -269,11 +348,15 @@ export function startLiveSync(
       }
       pendingSpaces = nextPending;
       if (!context().realtimeConnected)
-        nextMessage = Math.min(nextMessage, Date.now() + (context().conversation ? 4_000 : 20_000));
+        nextMessage = Math.min(
+          nextMessage,
+          Date.now() + (context().conversation ? 4_000 : 20_000),
+        );
       if (!running) schedule(100);
     },
     stop() {
       active = false;
+      retrievals.clear();
       clear();
       document.removeEventListener("visibilitychange", resume);
       window.removeEventListener("online", resume);

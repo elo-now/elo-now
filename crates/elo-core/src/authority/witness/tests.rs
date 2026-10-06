@@ -37,6 +37,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_version(4)
+}
+
+fn fixture_version(version: u64) -> Fixture {
     let owner = device(1, 2);
     let guest = device(3, 4);
     let witness = SigningKey::from_bytes(&[5; 32]);
@@ -47,7 +51,7 @@ fn fixture() -> Fixture {
         key_generation: 1,
     };
     let genesis = SpaceGenesis {
-        v: 4,
+        v: version,
         kind: "space.genesis".into(),
         nonce: record::random_hex::<16>().unwrap(),
         issuer_identity: owner.credential.identity(),
@@ -56,7 +60,7 @@ fn fixture() -> Fixture {
             root_public_key: record::encode_hex(owner.root.verifying_key().as_bytes()),
         }],
         controller_credential_id: owner.credential.id(),
-        witness: Some(pin),
+        witness: (version == 4).then_some(pin),
     };
     let genesis = signed(&genesis, &owner.key);
     let mut authority = Authority::new(
@@ -69,7 +73,7 @@ fn fixture() -> Fixture {
     .unwrap();
     authority.add_credential(guest.credential.clone());
     let config = StreamConfig {
-        v: 4,
+        v: version,
         kind: "stream.config".into(),
         nonce: record::random_hex::<16>().unwrap(),
         space_id: authority.space(),
@@ -724,29 +728,306 @@ fn witness_equivocation_forks_authority_and_stops_further_signing() {
     );
 }
 
+fn owner_member(device: &Device) -> Member {
+    Member {
+        identity_id: device.credential.identity(),
+        identity_type: "HUMAN".into(),
+        root_public_key: record::encode_hex(device.root.verifying_key().as_bytes()),
+        capabilities: vec![
+            Capability::Read,
+            Capability::Post,
+            Capability::ShareHistory,
+            Capability::Manage,
+        ],
+        credential_ids: vec![device.credential.id()],
+        external: false,
+    }
+}
+
+fn owner_credentials(config: &mut StreamConfig) {
+    config.members.sort_by_key(|m| m.identity_id);
+    config.owner_credential_ids = config
+        .members
+        .iter()
+        .filter(|m| m.capabilities.contains(&Capability::Manage))
+        .flat_map(|m| m.credential_ids.iter().copied())
+        .collect();
+    config.owner_credential_ids.sort();
+}
+
+fn commit_owner_proposal(f: &mut Fixture, config: &StreamConfig, key: &SigningKey) {
+    let signed = config.sign(key).unwrap();
+    let committed = if f.authority.witness_pin().is_some() {
+        f.authority
+            .prepare_witness_owner_config(&signed, &f.witness)
+            .unwrap()
+    } else {
+        signed
+    };
+    assert_eq!(
+        f.authority.apply_config(committed).unwrap(),
+        ConfigAdmission::Applied
+    );
+}
+
+fn reject_owner_proposal(f: &Fixture, config: &StreamConfig, key: &SigningKey) {
+    let proposal = config.sign(key).unwrap();
+    let committed = if f.authority.witness_pin().is_some() {
+        assert!(
+            f.authority
+                .prepare_witness_owner_config(&proposal, &f.witness)
+                .is_err()
+        );
+        // Even a compromised witness cannot make clients accept an owner change
+        // lacking the active creator device's signature.
+        let mut forged = config.clone();
+        forged.witness_evidence = Some(WitnessConfigEvidence::OwnerProposal {
+            proposal: encoded(&proposal),
+        });
+        forged.sign(&f.witness).unwrap()
+    } else {
+        proposal
+    };
+    let mut client = f.authority.clone();
+    let head = client.head_id();
+    assert!(client.apply_config(committed.clone()).is_err());
+    assert_eq!(client.head_id(), head);
+
+    let verify = |proof: &CallAuthorityProof| match f.authority.witness_pin() {
+        Some(pin) => proof.verify_witnessed(f.authority.space(), f.authority.stream(), pin),
+        None => proof.verify(f.authority.space(), f.authority.stream()),
+    };
+    let mut proof = f.authority.call_proof().unwrap();
+    proof.configs.push(encoded(&committed));
+    assert!(verify(&proof).is_err());
+
+    // A malicious owner cannot skip the rejected transition by asserting only
+    // its final roster in a legacy compact checkpoint.
+    let ancestry = proof
+        .configs
+        .iter()
+        .map(|c| decode(c).unwrap().id())
+        .collect::<Vec<_>>();
+    let checkpoint = signed(
+        &serde_json::json!({
+            "v": 1,
+            "kind": "stream.checkpoint",
+            "space_id": f.authority.space(),
+            "stream_id": f.authority.stream(),
+            "controller_credential_id": config.controller_credential_id,
+            "config_id": committed.id(),
+            "sequence": config.sequence,
+            "ancestry": ancestry,
+            "recovery": [],
+        }),
+        key,
+    );
+    proof.v = 2;
+    proof.configs = vec![encoded(&committed)];
+    proof.checkpoint = Some(encoded(&checkpoint));
+    assert!(verify(&proof).is_err());
+}
+
 #[test]
-fn removing_and_regranting_owner_authority_does_not_reactivate_old_invitations() {
-    let mut f = fixture();
-    let invitation = policy(&f, false, 5);
-    let second_owner = device(10, 11);
-    f.authority.add_credential(second_owner.credential.clone());
-    let original_owner = f.authority.head().unwrap().members[0].clone();
-    let mut grant = next_owner_proposal(&f);
-    let mut added = original_owner.clone();
-    added.identity_id = second_owner.credential.identity();
-    added.root_public_key = record::encode_hex(second_owner.root.verifying_key().as_bytes());
-    added.credential_ids = vec![second_owner.credential.id()];
-    grant.members.push(added);
-    grant.members.sort_by_key(|member| member.identity_id);
-    grant
-        .owner_credential_ids
-        .push(second_owner.credential.id());
-    grant.owner_credential_ids.sort();
-    let committed = f
-        .authority
-        .prepare_witness_owner_config(&grant.sign(&f.owner.key).unwrap(), &f.witness)
+fn owner_identity_changes_require_an_active_creator_device_in_v2_and_v4() {
+    for version in [2, 4] {
+        let mut f = fixture_version(version);
+        let coowner = device(10, 11);
+        let retired = device(1, 13);
+        let paired_key = SigningKey::from_bytes(&[12; 32]);
+        let age = age::x25519::Identity::generate();
+        let paired = DeviceCredential::issue_companion(
+            &f.owner.credential,
+            &f.owner.key,
+            &paired_key.verifying_key(),
+            &age.to_public(),
+        )
         .unwrap();
-    f.authority.apply_config(committed).unwrap();
+        f.authority.add_credential(coowner.credential.clone());
+        f.authority.add_credential(paired.clone());
+        f.authority.add_credential(retired.credential.clone());
+        let primary_key = f.owner.key.clone();
+        let mut initial = next_owner_proposal(&f);
+        initial.members[0].credential_ids.push(paired.id());
+        initial.members[0]
+            .credential_ids
+            .push(retired.credential.id());
+        initial.members[0].credential_ids.sort();
+        initial.members.push(owner_member(&coowner));
+        let mut ordinary = owner_member(&f.guest);
+        ordinary.capabilities = vec![Capability::Read, Capability::Post];
+        initial.members.push(ordinary);
+        owner_credentials(&mut initial);
+        commit_owner_proposal(&mut f, &initial, &primary_key);
+        assert_eq!(
+            f.authority.primary_owner_identity().unwrap(),
+            f.owner.credential.identity()
+        );
+
+        // An admitted creator companion may rotate the creator's own devices.
+        let mut rotate = next_owner_proposal(&f);
+        rotate.controller_credential_id = paired.id();
+        rotate.action.actor_identity = paired.identity();
+        rotate
+            .members
+            .iter_mut()
+            .find(|m| m.identity_id == paired.identity())
+            .unwrap()
+            .credential_ids
+            .retain(|id| *id != retired.credential.id());
+        owner_credentials(&mut rotate);
+        commit_owner_proposal(&mut f, &rotate, &paired_key);
+        assert!(!f.authority.can_manage(retired.credential.id()));
+
+        let mut malicious = next_owner_proposal(&f);
+        malicious.controller_credential_id = coowner.credential.id();
+        malicious.action.actor_identity = coowner.credential.identity();
+        for kind in [
+            "promote",
+            "demote",
+            "remove_primary",
+            "demote_primary",
+            "remove_self",
+            "remove_primary_device",
+            "replace_primary_devices",
+            "reactivate_primary_device",
+            "change_primary_capabilities",
+        ] {
+            let mut forged = malicious.clone();
+            match kind {
+                "promote" => {
+                    forged
+                        .members
+                        .iter_mut()
+                        .find(|m| m.identity_id == f.guest.credential.identity())
+                        .unwrap()
+                        .capabilities = owner_member(&coowner).capabilities
+                }
+                "demote" => {
+                    forged
+                        .members
+                        .iter_mut()
+                        .find(|m| m.identity_id == coowner.credential.identity())
+                        .unwrap()
+                        .capabilities = vec![Capability::Read, Capability::Post]
+                }
+                "demote_primary" => {
+                    forged
+                        .members
+                        .iter_mut()
+                        .find(|m| m.identity_id == f.owner.credential.identity())
+                        .unwrap()
+                        .capabilities = vec![Capability::Read, Capability::Post]
+                }
+                "remove_primary" => forged
+                    .members
+                    .retain(|m| m.identity_id != f.owner.credential.identity()),
+                "remove_primary_device" => forged
+                    .members
+                    .iter_mut()
+                    .find(|m| m.identity_id == paired.identity())
+                    .unwrap()
+                    .credential_ids
+                    .retain(|id| *id != paired.id()),
+                "replace_primary_devices" => {
+                    forged
+                        .members
+                        .iter_mut()
+                        .find(|m| m.identity_id == paired.identity())
+                        .unwrap()
+                        .credential_ids = vec![retired.credential.id()]
+                }
+                "reactivate_primary_device" => {
+                    let primary = forged
+                        .members
+                        .iter_mut()
+                        .find(|m| m.identity_id == paired.identity())
+                        .unwrap();
+                    primary.credential_ids.push(retired.credential.id());
+                    primary.credential_ids.sort();
+                }
+                "change_primary_capabilities" => forged
+                    .members
+                    .iter_mut()
+                    .find(|m| m.identity_id == paired.identity())
+                    .unwrap()
+                    .capabilities
+                    .retain(|capability| *capability != Capability::ShareHistory),
+                _ => forged
+                    .members
+                    .retain(|m| m.identity_id != coowner.credential.identity()),
+            }
+            owner_credentials(&mut forged);
+            reject_owner_proposal(&f, &forged, &coowner.key);
+        }
+        // The creator cannot erase its own immutable identity either.
+        let mut erase = next_owner_proposal(&f);
+        erase
+            .members
+            .retain(|m| m.identity_id != f.owner.credential.identity());
+        owner_credentials(&mut erase);
+        reject_owner_proposal(&f, &erase, &primary_key);
+
+        // Ordinary member moderation remains available to a coowner.
+        let mut remove_member = malicious;
+        remove_member
+            .members
+            .retain(|m| m.identity_id != f.guest.credential.identity());
+        owner_credentials(&mut remove_member);
+        commit_owner_proposal(&mut f, &remove_member, &coowner.key);
+
+        // Any admitted companion of the creator can change the owner set.
+        let mut demote = next_owner_proposal(&f);
+        demote.controller_credential_id = paired.id();
+        demote.action.actor_identity = paired.identity();
+        demote
+            .members
+            .iter_mut()
+            .find(|m| m.identity_id == coowner.credential.identity())
+            .unwrap()
+            .capabilities = vec![Capability::Read, Capability::Post];
+        owner_credentials(&mut demote);
+        commit_owner_proposal(&mut f, &demote, &paired_key);
+        assert!(!f.authority.can_manage(coowner.credential.id()));
+
+        // A formerly admitted creator device has no special bypass.
+        let mut retire = next_owner_proposal(&f);
+        retire
+            .members
+            .iter_mut()
+            .find(|m| m.identity_id == paired.identity())
+            .unwrap()
+            .credential_ids
+            .retain(|id| *id != paired.id());
+        owner_credentials(&mut retire);
+        commit_owner_proposal(&mut f, &retire, &primary_key);
+        let mut replay = next_owner_proposal(&f);
+        replay.controller_credential_id = paired.id();
+        replay.action.actor_identity = paired.identity();
+        replay
+            .members
+            .iter_mut()
+            .find(|m| m.identity_id == coowner.credential.identity())
+            .unwrap()
+            .capabilities = owner_member(&coowner).capabilities;
+        owner_credentials(&mut replay);
+        reject_owner_proposal(&f, &replay, &paired_key);
+    }
+}
+
+#[test]
+fn removing_and_regranting_coowner_authority_does_not_reactivate_old_invitations() {
+    let mut f = fixture();
+    let coowner = device(10, 11);
+    f.authority.add_credential(coowner.credential.clone());
+    let primary_key = f.owner.key.clone();
+    let mut grant = next_owner_proposal(&f);
+    grant.members.push(owner_member(&coowner));
+    owner_credentials(&mut grant);
+    commit_owner_proposal(&mut f, &grant, &primary_key);
+    let mut invitation: WitnessInvitationPolicy = policy(&f, false, 5).decode().unwrap();
+    invitation.issuer_credential_id = coowner.credential.id();
+    let invitation = signed(&invitation, &coowner.key);
     assert!(
         f.authority
             .verify_witness_invitation(&invitation, 1_200)
@@ -755,26 +1036,14 @@ fn removing_and_regranting_owner_authority_does_not_reactivate_old_invitations()
     let mut remove = next_owner_proposal(&f);
     remove
         .members
-        .retain(|member| member.identity_id != f.owner.credential.identity());
-    remove.owner_credential_ids = vec![second_owner.credential.id()];
-    let committed = f
-        .authority
-        .prepare_witness_owner_config(&remove.sign(&f.owner.key).unwrap(), &f.witness)
-        .unwrap();
-    f.authority.apply_config(committed).unwrap();
+        .retain(|m| m.identity_id != coowner.credential.identity());
+    owner_credentials(&mut remove);
+    commit_owner_proposal(&mut f, &remove, &primary_key);
     let mut regrant = next_owner_proposal(&f);
-    regrant.controller_credential_id = second_owner.credential.id();
-    regrant.action.actor_identity = second_owner.credential.identity();
-    regrant.members.push(original_owner);
-    regrant.members.sort_by_key(|member| member.identity_id);
-    regrant.owner_credential_ids.push(f.owner.credential.id());
-    regrant.owner_credential_ids.sort();
-    let committed = f
-        .authority
-        .prepare_witness_owner_config(&regrant.sign(&second_owner.key).unwrap(), &f.witness)
-        .unwrap();
-    f.authority.apply_config(committed).unwrap();
-    assert!(f.authority.can_manage(f.owner.credential.id()));
+    regrant.members.push(owner_member(&coowner));
+    owner_credentials(&mut regrant);
+    commit_owner_proposal(&mut f, &regrant, &primary_key);
+    assert!(f.authority.can_manage(coowner.credential.id()));
     assert!(
         f.authority
             .verify_witness_invitation(&invitation, 1_200)

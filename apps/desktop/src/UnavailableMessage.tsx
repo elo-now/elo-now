@@ -1,40 +1,57 @@
 import { useEffect, useRef, useState } from "react";
 import { t } from "./i18n";
-
-const REQUEST_TIMEOUT_MS = 55_000;
+import { RETRIEVE_WINDOW_MS } from "./liveSync";
 
 export function UnavailableMessage({
+  active = true,
   disabled,
   onRequest,
   onUnavailable,
 }: {
+  active?: boolean;
   disabled: boolean;
-  onRequest: () => Promise<void>;
+  onRequest: () => Promise<void | (() => void)>;
   onUnavailable: () => void;
 }) {
   const [requesting, setRequesting] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const mounted = useRef(true);
-  useEffect(
-    () => () => {
-      mounted.current = false;
-      clearTimeout(timer.current);
-    },
-    [],
-  );
+  const stopRequest = useRef<(() => void) | undefined>(undefined);
+  const generation = useRef(0);
+  const stop = () => {
+    clearTimeout(timer.current);
+    timer.current = undefined;
+    stopRequest.current?.();
+    stopRequest.current = undefined;
+  };
+  useEffect(() => {
+    if (!active) setRequesting(false);
+    return () => {
+      generation.current++;
+      stop();
+    };
+  }, [active]);
   const request = async () => {
-    if (disabled || requesting) return;
+    if (!active || disabled || timer.current !== undefined) return;
+    const current = ++generation.current;
     setRequesting(true);
+    timer.current = setTimeout(() => {
+      if (generation.current !== current) return;
+      generation.current++;
+      stop();
+      setRequesting(false);
+      onUnavailable();
+    }, RETRIEVE_WINDOW_MS);
     try {
-      await onRequest();
-      if (!mounted.current) return;
-      timer.current = setTimeout(() => {
-        if (!mounted.current) return;
-        setRequesting(false);
-        onUnavailable();
-      }, REQUEST_TIMEOUT_MS);
+      const release = await onRequest();
+      if (generation.current !== current) {
+        release?.();
+        return;
+      }
+      stopRequest.current = release || undefined;
     } catch {
-      if (!mounted.current) return;
+      if (generation.current !== current) return;
+      generation.current++;
+      stop();
       setRequesting(false);
       onUnavailable();
     }
@@ -52,7 +69,7 @@ export function UnavailableMessage({
         <button
           type="button"
           aria-label={t("messageUnavailable.requestLabel")}
-          disabled={disabled || requesting}
+          disabled={!active || disabled || requesting}
           onClick={() => void request()}
         >
           {t("messageUnavailable.request")}

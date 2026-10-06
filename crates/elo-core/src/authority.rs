@@ -247,6 +247,14 @@ impl Authority {
     pub fn is_owner_managed(&self) -> bool {
         matches!(self.body.v, 2 | 4)
     }
+    /// The creator is bound by the verified genesis signature, never by a
+    /// mutable transport role or the ordering of the current owner list.
+    pub fn primary_owner_identity(&self) -> Result<IdentityId> {
+        if !self.is_owner_managed() {
+            return Err(RecordError::Authority);
+        }
+        Ok(self.body.issuer_identity)
+    }
     /// This is authority permission, independent of a device's local vault mode.
     pub fn can_manage(&self, credential: RecordId) -> bool {
         !self.is_forked()
@@ -417,6 +425,10 @@ impl Authority {
                 .collect::<Result<Vec<_>>>()?
         };
         if owner_members.is_empty()
+            || (self.is_owner_managed()
+                && !owner_members
+                    .iter()
+                    .any(|member| member.identity_id == self.body.issuer_identity))
             || (self.is_owner_managed()
                 && c.sequence == 1
                 && c.members.iter().any(|m| {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   acceptView,
+  RETRIEVE_WINDOW_MS,
   startLiveSync,
   type LiveContext,
   type SyncResult,
@@ -77,13 +78,22 @@ test("realtime bursts coalesce by Space and always request receive-only delivery
   await vi.advanceTimersByTimeAsync(100);
   await vi.advanceTimersByTimeAsync(1);
   expect(deliver).toHaveBeenNthCalledWith(2, "sync_live", false, true, "work");
-  expect(deliver).toHaveBeenNthCalledWith(3, "sync_live", false, true, "friends");
+  expect(deliver).toHaveBeenNthCalledWith(
+    3,
+    "sync_live",
+    false,
+    true,
+    "friends",
+  );
   await vi.advanceTimersByTimeAsync(10_000);
   expect(deliver).toHaveBeenCalledTimes(3);
 });
 
 test("a signalled Space backlog remains targeted with bounded catch-up pacing", async () => {
-  const deliver = vi.fn(async () => ({ ...result(), result: { more: deliver.mock.calls.length === 2 } }));
+  const deliver = vi.fn(async () => ({
+    ...result(),
+    result: { more: deliver.mock.calls.length === 2 },
+  }));
   worker = startLiveSync("alice", () => context, deliver, vi.fn());
   await vi.advanceTimersByTimeAsync(250);
   worker.requestRemote("work");
@@ -93,6 +103,141 @@ test("a signalled Space backlog remains targeted with bounded catch-up pacing", 
   expect(deliver).toHaveBeenCalledTimes(2);
   await vi.advanceTimersByTimeAsync(1);
   expect(deliver).toHaveBeenNthCalledWith(3, "sync_live", false, true, "work");
+});
+
+test("Retrieve coalesces placeholders in one Space without shortening ordinary sync", async () => {
+  context.realtimeConnected = true;
+  context.retrievalScope = "work:chat";
+  const deliver = vi.fn(async () => result());
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  const first = worker.requestRetrieval("work");
+  const second = worker.requestRetrieval("work");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(deliver).toHaveBeenNthCalledWith(2, "sync_live", false, true, "work");
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(deliver).toHaveBeenCalledTimes(3);
+  first();
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(deliver).toHaveBeenCalledTimes(4);
+  second();
+  await vi.advanceTimersByTimeAsync(55_899);
+  expect(deliver).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenCalledTimes(5);
+  expect(deliver).toHaveBeenLastCalledWith("sync_live");
+});
+
+test("Retrieve stops after its deadline even when no placeholder releases it", async () => {
+  context.realtimeConnected = true;
+  context.retrievalScope = "work:chat";
+  const receivedAt: number[] = [];
+  const deliver = vi.fn(async (_op, _force, _receiveOnly, space) => {
+    if (space) receivedAt.push(Date.now());
+    return result();
+  });
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  const started = Date.now();
+  worker.requestRetrieval("work");
+  await vi.advanceTimersByTimeAsync(RETRIEVE_WINDOW_MS);
+  const attempts = receivedAt.length;
+  expect(attempts).toBeGreaterThan(1);
+  expect(attempts).toBeLessThanOrEqual(45);
+  expect(receivedAt.every((time) => time < started + RETRIEVE_WINDOW_MS)).toBe(
+    true,
+  );
+  await vi.advanceTimersByTimeAsync(RETRIEVE_WINDOW_MS);
+  expect(receivedAt).toHaveLength(attempts);
+});
+
+test("Retrieve keeps network failures bounded with backoff", async () => {
+  context.realtimeConnected = true;
+  context.retrievalScope = "work:chat";
+  const deliver = vi.fn(async (_op, _force, _receiveOnly, space) => {
+    if (space) throw new Error("Offline");
+    return result();
+  });
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  worker.requestRetrieval("work");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(3_999);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(7_999);
+  expect(deliver).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(9_999);
+  expect(deliver).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(deliver).toHaveBeenCalledTimes(5);
+});
+
+test.each([undefined, "work:another-chat", "work:chat:thread", "friends:chat"])(
+  "leaving the Retrieve screen for %s cancels its extra receives",
+  async (nextScope) => {
+    context.realtimeConnected = true;
+    context.retrievalScope = "work:chat";
+    const deliver = vi.fn(async () => result());
+    worker = startLiveSync("alice", () => context, deliver, vi.fn());
+    await vi.advanceTimersByTimeAsync(250);
+    worker.requestRetrieval("work");
+    await vi.advanceTimersByTimeAsync(100);
+    context.retrievalScope = nextScope;
+    worker.changed();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(deliver).toHaveBeenCalledTimes(2);
+  },
+);
+
+test("hiding the app discards Retrieve work instead of restarting it on resume", async () => {
+  context.realtimeConnected = true;
+  context.retrievalScope = "work:chat";
+  const deliver = vi.fn(async () => result());
+  worker = startLiveSync("alice", () => context, deliver, vi.fn());
+  await vi.advanceTimersByTimeAsync(250);
+  worker.requestRetrieval("work");
+  await vi.advanceTimersByTimeAsync(100);
+  page.visibilityState = "hidden";
+  page.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  page.visibilityState = "visible";
+  page.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(deliver).toHaveBeenCalledTimes(3);
+  expect(deliver).toHaveBeenLastCalledWith("sync_live", false, true);
+});
+
+test("Retrieve shares the in-flight worker and stops publishing after profile lock", async () => {
+  context.realtimeConnected = true;
+  context.retrievalScope = "work:chat";
+  let complete!: (value: SyncResult) => void;
+  const deliver = vi.fn(async (_op, _force, _receiveOnly, space) =>
+    space
+      ? new Promise<SyncResult>((resolve) => {
+          complete = resolve;
+        })
+      : result(),
+  );
+  const update = vi.fn();
+  worker = startLiveSync("alice", () => context, deliver, update);
+  await vi.advanceTimersByTimeAsync(250);
+  worker.requestRetrieval("work");
+  await vi.advanceTimersByTimeAsync(100);
+  worker.requestRetrieval("work");
+  worker.request();
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  worker.stop();
+  complete(result());
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  expect(update).toHaveBeenCalledTimes(1);
 });
 
 test("a foreground priority operation holds queued discovery until it finishes", async () => {

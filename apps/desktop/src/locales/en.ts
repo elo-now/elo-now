@@ -224,7 +224,7 @@ export const en = {
     "Could not connect to the account service. Your profile has been kept. Check your connection and try again.",
   "accountDeletion.retry": "Try again",
   "accountDeletion.transferFirst":
-    "You are the primary owner of {name}. Transfer primary ownership in Spaces and wait for the new owner to accept, then return here.",
+    "You are the primary owner of {name}. Before deleting your account, remove the other members and delete this Space in its settings. Primary ownership cannot be transferred.",
   "accountDeletion.deleteSpaceFirst":
     "You are the only member of {name}. Open Spaces, tap its settings icon, then choose Details → Delete Space. Return to Legal to delete your account.",
   "accountDeletion.close": "Close",
@@ -545,7 +545,7 @@ export const en = {
   "spaces.refresh": "Check for approval",
   "spaces.membersTitle": "Members ({count})",
   "spaces.rolesHelp":
-    "Owners manage invitations and roles. The primary owner can confirm ownership changes.",
+    "Owners manage invitations and members. Only the primary owner can add or remove owners. Primary ownership cannot be transferred.",
   "spaces.role.primary": "Primary owner",
   "spaces.role.owner": "Owner",
   "spaces.role.member": "Member",
@@ -557,9 +557,9 @@ export const en = {
   "spaces.removeOwnerTitle": "Remove {name}’s owner role?",
   "spaces.transferTitle": "Transfer ownership to {name}?",
   "spaces.makeOwnerHelp":
-    "This person will be able to manage invitations and other members’ roles.",
+    "This person will be able to manage invitations and ordinary members. Only the primary owner can change owner roles.",
   "spaces.removeOwnerHelp":
-    "This person will become a member and stay in the Space. They will no longer manage invitations or roles.",
+    "This person will become a member and stay in the Space. They will no longer manage invitations or members.",
   "spaces.requestRemovalHelp":
     "This person or the primary owner must approve the change in Notifications. Until then, their owner role stays active.",
   "spaces.transferHelp":
@@ -567,7 +567,7 @@ export const en = {
   "spaces.confirm": "Confirm",
   "spaces.roleRequests": "Ownership requests",
   "spaces.transferRequest":
-    "{requester} wants to make you the primary owner of {space}.",
+    "Primary ownership cannot be transferred for {space}. Decline this request.",
   "spaces.removalRequest":
     "{requester} asks to remove {target}’s owner role in {space}.",
   "spaces.confirmRole": "Approve this role change?",
@@ -1299,6 +1299,14 @@ export const en = {
     "This invitation expired or was revoked. Ask the Space owner for a new one.",
   "error.spaceInvitationMissing":
     "This invitation is unavailable. Ask for a new one.",
+  "error.spaceOwnersPrimaryOnly":
+    "Only the primary owner can add or remove owners.",
+  "error.spacePrimaryProtected": "The primary owner cannot be removed.",
+  "error.spacePrimaryFixed": "Primary ownership cannot be transferred.",
+  "error.spaceOwnerDeleteAccount":
+    "Ask the primary owner to remove your owner role before deleting your account.",
+  "error.spacePrimaryDeleteAccount":
+    "Delete your Spaces before deleting your account.",
   "error.spaceRolesChanged":
     "Space permissions changed. Refresh before continuing.",
   "error.spaceRequestHandled":

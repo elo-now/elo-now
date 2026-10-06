@@ -302,15 +302,11 @@ impl PublicSpaceService {
     /// Host-local inspection for a verified account-deletion request.
     pub fn account_membership(
         &self,
-        config: &ServiceConfig,
+        _config: &ServiceConfig,
         identity: IdentityId,
     ) -> Result<Value> {
         let state = self.service_state()?;
-        let primary = state
-            .roles
-            .as_ref()
-            .map(|r| r.primary)
-            .or_else(|| config.owners.first().copied());
+        let primary = Some(self.authorities.0[0].primary_owner_identity()?);
         let members: BTreeSet<_> = state
             .applicants
             .values()
@@ -340,7 +336,24 @@ impl PublicSpaceService {
         evidence: Option<&AdminEvidence>,
     ) -> Result<(ServiceState, bool)> {
         if self.account_membership(config, identity)?["primary"] == true {
-            return Err("Transfer primary ownership before deleting your account.".into());
+            return Err("Delete your Spaces before deleting your account.".into());
+        }
+        let state = self.service_state()?;
+        if state
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.is_owner(identity))
+            || self.authorities.0[0].head()?.members.iter().any(|member| {
+                member.identity_id == identity
+                    && member
+                        .capabilities
+                        .contains(&crate::authority::Capability::Manage)
+            })
+        {
+            return Err(
+                "Ask the primary owner to remove your owner role before deleting your account."
+                    .into(),
+            );
         }
         let evidence = evidence.ok_or("Missing signed account deletion request.")?;
         let signed = decode_record(&evidence.record)?;
@@ -417,7 +430,7 @@ impl PublicSpaceService {
             .retain(|_, applicant| applicant.identity != identity);
         state.notes.remove(&identity);
         if let Some(roles) = state.roles.as_mut() {
-            roles.retire_member(identity);
+            roles.retire_member(identity)?;
         }
         state.replies.clear();
         self.save_service_state(&state)?;
@@ -1291,7 +1304,7 @@ impl PublicSpaceService {
                         applicant.status = "removed".into();
                         applicant.note.clear();
                     }
-                    state.roles.as_mut().unwrap().retire_member(target);
+                    state.roles.as_mut().unwrap().retire_member(target)?;
                     // Transport denies the removed member immediately. An admitted
                     // owner device must publish the signed General update.
                     self.save_service_state(state)?;
@@ -1441,7 +1454,10 @@ impl PublicSpaceService {
         creation: Option<AdminEvidence>,
         trusted_witness: Option<WitnessPin>,
     ) -> Result<Self> {
-        verify_general_authority(&proof, trusted_witness.as_ref())?;
+        let authority = verify_general_authority(&proof, trusted_witness.as_ref())?;
+        if owners.first().copied() != Some(authority.primary_owner_identity()?) {
+            return Err("Space primary owner does not match its signed creation.".into());
+        }
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory)?;
         #[cfg(unix)]
@@ -1520,6 +1536,12 @@ impl PublicSpaceService {
         }
         let state: ServiceState = serde_json::from_slice(&bytes)?;
         let authority = verify_general_authority(&state.proof, trusted_witness.as_ref())?;
+        if state.roles.as_ref().is_none_or(|roles| {
+            authority.primary_owner_identity().ok() != Some(roles.primary)
+                || !roles.is_owner(roles.primary)
+        }) {
+            return Err("Space primary owner does not match its signed creation.".into());
+        }
         if !authority.is_owner_managed()
             || authority
                 .head()?
@@ -1575,7 +1597,14 @@ impl PublicSpaceService {
         if bytes.len() > STATE_LIMIT {
             return Err("Space state is too large.".into());
         }
-        Ok(serde_json::from_slice(&bytes)?)
+        let state: ServiceState = serde_json::from_slice(&bytes)?;
+        if state.roles.as_ref().is_none_or(|roles| {
+            self.authorities.0[0].primary_owner_identity().ok() != Some(roles.primary)
+                || !roles.is_owner(roles.primary)
+        }) {
+            return Err("Space primary owner does not match its signed creation.".into());
+        }
+        Ok(state)
     }
     fn save_service_state(&self, state: &ServiceState) -> Result<()> {
         let bytes = serde_json::to_vec(state)?;

@@ -33,6 +33,20 @@ owner device can revoke a lost one and authorize a replacement. Importing an old
 backup alone does not activate management. There is no automatic failover or
 recovery after losing every admitted owner device in owner-managed General.
 
+The primary owner of version-2 and version-4 General is the creator identity in
+the verified genesis, not an editable role in the hosting database. It cannot be
+removed or transferred. A change to the set of owner identities must be signed
+by a currently admitted device of that primary identity. The same signature is
+required to change the primary owner’s devices or capabilities. Co-owners may manage
+ordinary members, but cannot promote, demote or remove owners. Before deleting
+their own account, a co-owner must have the primary owner remove their owner
+role; a primary owner must delete their Spaces first.
+
+Authenticated live pairing records device eligibility even when a Space is
+unreachable. When that Space becomes reachable, fresh verified membership must
+admit the exact paired device before management is activated. Eligibility alone,
+an ordinary backup or a retired device cannot confer this authority.
+
 ## Configuration and capabilities
 
 `StreamConfig` is a signed snapshot containing its version, nonce, Space/Stream,
