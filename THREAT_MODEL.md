@@ -154,10 +154,23 @@ the full link remains a bearer of that invitation. Public policy, admission,
 contact and membership evidence is still processed by the services; this is not
 metadata-free enrollment.
 
+V3 invitations can introduce a previously unknown hosting configuration without
+a separate hosting import. The owner-signed encrypted descriptor binds the
+configuration to the link's ciphertext digest, hosting identifier and HTTPS
+origin. Existing device, Space and built-in pins take precedence and cannot be
+replaced. Discovery sends only the ciphertext locator, follows no redirects and
+does not send profile credentials. Preview does not persist the configuration;
+joining saves it only for that Space. First-use trust is in the person supplying
+the invitation, not in an independent operator signature. Someone who replaces
+the entire link can invite the recipient into a different, attacker-controlled
+Space; these checks do not establish that it is the Space the person intended.
+
 This separation limits an API-only compromise, not a compromised endpoint,
 stolen invitation/owner key, compromised witness signer, or control of both hosts.
-Clients must receive the witness pin independently of the API, and the services
-must not share private keys or writable authorization state. A shared provider
+The witness pin comes from native provisioning, an explicitly approved hosting
+configuration, or the authenticated invitation obtained from a trusted inviter;
+it is not accepted from an unauthenticated API response. The services must not
+share private keys or writable authorization state. A shared provider
 account remains a common compromise and recovery boundary. Every witness restart
 is sealed until an operator checks an independently retained latest journal
 position. State digests detect inconsistent partial restores, but a coherent

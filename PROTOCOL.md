@@ -177,10 +177,17 @@ giving the API an invitation private key or authority to invent an owner decisio
 The short `https://elo.now/join#...` link carries a ciphertext identifier and a
 secret seed in its fragment. The API stores a bounded encrypted owner-signed
 descriptor; clients use the seed locally to decrypt it and derive an admission
-key. Only the ciphertext identifier is sent for retrieval. A descriptor cannot
-supply a new trusted witness or API origin: both must match native provisioning.
+key. Only the ciphertext identifier is sent for retrieval. V1 uses the native
+deployment; v2 selects an already known hosting identifier. V3 additionally
+carries a bounded canonical HTTPS origin and binds a public hosting profile
+inside the encrypted owner-signed descriptor. Its first-use trust comes from
+the invitation's owner. The client checks that profile against existing device,
+Space and built-in pins; an invitation cannot replace them. Preview is temporary,
+and Join persists the profile only with that Space, not in the creation catalog.
 Possessing the full link remains a bearer capability; encryption does not make a
-leaked invitation safe. See [the codec](crates/elo-core/src/witness/link.rs).
+leaked invitation safe or authenticate a wholly substituted link as the intended
+Space. See [the codec](crates/elo-core/src/witness/link.rs) and
+[hosting trust](docs/SELF_HOSTING.md).
 
 Native clients obtain nonce-bound freshness directly from their pinned witness,
 with a maximum 30-second lease and a persisted observed journal floor. The API
