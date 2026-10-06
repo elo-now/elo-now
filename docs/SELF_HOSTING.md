@@ -83,11 +83,29 @@ appropriately authorized delivery service; this package does not implement a
 cross-project gateway. Never distribute the publisher's service-account key
 with a hosting profile.
 
-Private-host invitation links carry a compact hosting identifier in addition
-to the invitation capability. Recipients must import that hosting's configuration
-before opening its invitation; an invitation cannot supply or replace a trusted
-witness key. The full invitation fragment remains on the client. The server
-receives only the ciphertext locator and signed admission requests.
+Private-host Space invitations in format v3 carry a bounded HTTPS origin and
+hosting identifier alongside the invitation capability. The encrypted,
+owner-signed descriptor contains the public hosting configuration. Recipients
+scan or paste one invitation and choose **Join**; they do not import a separate
+hosting QR. Preview does not persist that configuration. Joining saves it only
+with the Space, without adding a provider to the Create Space catalog.
+
+The client checks the ciphertext digest, authenticated encryption, owner
+signature, invitation policy and witness proof before using the embedded
+configuration. This first-use trust comes from the invitation's owner, not an
+independent operator signature. Obtain the invitation from someone you trust;
+replacing the entire link can point to a different Space. Existing device and
+Space pins cannot be replaced by an invitation, including pins for hidden
+hosting entries and the built-in deployment. Subsequent admission still
+requires a fresh response from the pinned witness.
+
+The routing origin is visible in the link, but the decryption seed and full
+fragment stay on the client. Discovery sends only the ciphertext locator to
+that origin, without account credentials or redirects. Older v2 links contain
+only a hosting identifier and still require the matching local configuration;
+the issuing device can re-share its saved invitation in v3 without extending
+its expiry or admission budget. Already distributed links are not revoked by
+that conversion.
 
 The server's `allowed_message_retentions` is authoritative. Omission retains the
 public policies `[21600,43200,86400]` (6/12/24 hours). A private operator may use

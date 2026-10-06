@@ -10,6 +10,7 @@
 use crate::{
     app::space_service::SpaceAddress,
     authority::{Authority, CallAuthorityProof, WitnessInvitationPolicy, WitnessPin},
+    hosting_profile::HostingProfile,
     record::{self, RecordError, SignedRecord},
 };
 use base64::{
@@ -39,6 +40,8 @@ pub type Result<T> = std::result::Result<T, LinkError>;
 pub const PREFIX: &str = "https://elo.now/join#";
 pub const FRAGMENT_LENGTH: usize = 87;
 pub const MAX_CIPHERTEXT_BYTES: usize = record::MAX_RECORD + 1 + 24 + 16;
+pub const MAX_HOSTING_ORIGIN_BYTES: usize = 2048;
+const MAX_LINK_BYTES: usize = 97 + MAX_HOSTING_ORIGIN_BYTES;
 const VERSION: u8 = 1;
 const SALT: &[u8] = b"elo.now/witness-invitation/seed/v1";
 const ENCRYPTION_INFO: &[u8] = b"elo.now/witness-invitation/descriptor-key/v1";
@@ -78,12 +81,13 @@ pub struct InvitationLink {
     ciphertext_id: [u8; 32],
     seed: InvitationSeed,
     hosting_id: Option<String>,
+    hosting_origin: Option<String>,
 }
 
 impl InvitationLink {
     pub fn parse(value: &str) -> Result<Self> {
         let fragment = value.strip_prefix(PREFIX).ok_or(RecordError::Framing)?;
-        if !matches!(fragment.len(), FRAGMENT_LENGTH | 130) {
+        if fragment.len() > MAX_LINK_BYTES.div_ceil(3) * 4 {
             return Err(RecordError::Framing.into());
         }
         let bytes = Zeroizing::new(
@@ -95,23 +99,30 @@ impl InvitationLink {
         if canonical.as_str() != fragment {
             return Err(RecordError::Framing.into());
         }
-        if !matches!((bytes.first(), bytes.len()), (Some(1), 65) | (Some(2), 97)) {
-            return Err(RecordError::Unsupported.into());
-        }
+        let hosting_origin = match (bytes.first(), bytes.len()) {
+            (Some(1), 65) | (Some(2), 97) => None,
+            (Some(3), length) if (98..=MAX_LINK_BYTES).contains(&length) => {
+                let value = std::str::from_utf8(&bytes[97..]).map_err(|_| RecordError::Framing)?;
+                crate::hosting_profile::endpoint(value, "/")?;
+                Some(value.to_owned())
+            }
+            _ => return Err(RecordError::Unsupported.into()),
+        };
         let mut seed = Zeroizing::new([0; 32]);
         seed.copy_from_slice(&bytes[33..65]);
         Ok(Self {
             ciphertext_id: bytes[1..33].try_into().map_err(|_| RecordError::Framing)?,
             seed: InvitationSeed(seed),
-            hosting_id: (bytes.len() == 97).then(|| record::encode_hex(&bytes[65..])),
+            hosting_id: (bytes.len() >= 97).then(|| record::encode_hex(&bytes[65..97])),
+            hosting_origin,
         })
     }
 
     pub fn ciphertext_id(&self) -> String {
         record::encode_hex(&self.ciphertext_id)
     }
-    /// A selector for a previously approved local hosting profile, never a URL
-    /// or a new trust anchor. Unknown IDs must fail before any network request.
+    /// A hosting selector, never itself a trust anchor. Legacy v2 selectors
+    /// require a previously approved local profile before any network request.
     pub fn hosting_id(&self) -> Option<&str> {
         self.hosting_id.as_deref()
     }
@@ -119,13 +130,37 @@ impl InvitationLink {
     pub fn with_hosting(mut self, id: &str) -> Result<Self> {
         record::hex::<32>(id)?;
         self.hosting_id = Some(id.to_owned());
+        self.hosting_origin = None;
+        Ok(self)
+    }
+
+    /// Untrusted routing hint for fetching only the bounded ciphertext by ID.
+    /// It becomes bound to a hosting profile only after descriptor verification.
+    pub fn hosting_origin(&self) -> Option<&str> {
+        self.hosting_origin.as_deref()
+    }
+
+    pub fn with_hosting_origin(mut self, id: &str, origin: &str) -> Result<Self> {
+        record::hex::<32>(id)?;
+        crate::hosting_profile::endpoint(origin, "/")?;
+        self.hosting_id = Some(id.to_owned());
+        self.hosting_origin = Some(origin.to_owned());
         Ok(self)
     }
 
     /// Explicit secret export for sharing or QR rendering; never use in logs.
     pub fn to_url(&self) -> Zeroizing<String> {
-        let mut bytes = Zeroizing::new(vec![0; if self.hosting_id.is_some() { 97 } else { 65 }]);
-        bytes[0] = if self.hosting_id.is_some() {
+        let base = if self.hosting_id.is_some() { 97 } else { 65 };
+        let mut bytes = Zeroizing::new(vec![
+            0;
+            base + self
+                .hosting_origin
+                .as_ref()
+                .map_or(0, String::len)
+        ]);
+        bytes[0] = if self.hosting_origin.is_some() {
+            3
+        } else if self.hosting_id.is_some() {
             2
         } else {
             VERSION
@@ -133,7 +168,10 @@ impl InvitationLink {
         bytes[1..33].copy_from_slice(&self.ciphertext_id);
         bytes[33..65].copy_from_slice(self.seed.0.as_ref());
         if let Some(id) = &self.hosting_id {
-            bytes[65..].copy_from_slice(&record::hex::<32>(id).expect("validated hosting ID"));
+            bytes[65..97].copy_from_slice(&record::hex::<32>(id).expect("validated hosting ID"));
+        }
+        if let Some(origin) = &self.hosting_origin {
+            bytes[97..].copy_from_slice(origin.as_bytes());
         }
         let mut url = Zeroizing::new(String::from(PREFIX));
         URL_SAFE_NO_PAD.encode_string(bytes.as_slice(), &mut url);
@@ -148,6 +186,93 @@ impl InvitationLink {
         configured_witness: &WitnessPin,
         now_ms: u64,
     ) -> Result<VerifiedDescriptor> {
+        let signed = self.decrypt(ciphertext)?;
+        let verified = verify_descriptor(
+            &signed,
+            &self.seed,
+            configured_api_origin,
+            configured_witness,
+            now_ms,
+        )?;
+        self.verify_hosting_binding(verified.descriptor())?;
+        Ok(verified)
+    }
+
+    /// Verify the owner-bound deployment contained in a v3 invitation. The
+    /// caller must still apply its local trust/import policy before admission.
+    /// No network-supplied profile or routing hint is trusted on its own.
+    pub fn open_with_embedded_hosting(
+        &self,
+        ciphertext: &[u8],
+        now_ms: u64,
+    ) -> Result<(VerifiedDescriptor, HostingProfile)> {
+        let signed = self.decrypt(ciphertext)?;
+        let descriptor: Descriptor = signed.decode()?;
+        let profile = descriptor
+            .hosting_profile
+            .as_ref()
+            .ok_or(RecordError::Authority)?;
+        profile.validate()?;
+        let origin = self.hosting_origin().ok_or(RecordError::Authority)?;
+        self.verify_hosting_binding(&descriptor)?;
+        let verified = verify_descriptor(&signed, &self.seed, origin, &profile.witness, now_ms)?;
+        Ok((verified, profile.clone()))
+    }
+
+    /// Re-sign an existing, still-valid invitation without extending its policy
+    /// or allocating new invitation uses. Old links retain their original bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reseal_with_hosting(
+        &self,
+        ciphertext: &[u8],
+        profile: &HostingProfile,
+        owner_key: &SigningKey,
+        configured_api_origin: &str,
+        configured_witness: &WitnessPin,
+        now_ms: u64,
+    ) -> Result<EncryptedInvitation> {
+        let verified = self.open(
+            ciphertext,
+            configured_api_origin,
+            configured_witness,
+            now_ms,
+        )?;
+        let id = profile.id();
+        if self.hosting_id().is_some_and(|old| old != id) {
+            return Err(RecordError::Authority.into());
+        }
+        let mut descriptor = verified.descriptor().clone();
+        descriptor.hosting_profile = Some(profile.clone());
+        let origin = hosting_origin(profile)?;
+        let mut encrypted = seal(
+            &descriptor,
+            owner_key,
+            InvitationSeed(Zeroizing::new(*self.seed.0)),
+            configured_api_origin,
+            configured_witness,
+            now_ms,
+        )?;
+        encrypted.link = encrypted.link.with_hosting_origin(&id, &origin)?;
+        Ok(encrypted)
+    }
+
+    fn verify_hosting_binding(&self, descriptor: &Descriptor) -> Result<()> {
+        if let Some(profile) = &descriptor.hosting_profile {
+            if self.hosting_id().is_some_and(|id| id != profile.id()) {
+                return Err(RecordError::Authority.into());
+            }
+            if let Some(origin) = self.hosting_origin()
+                && hosting_origin(profile)? != origin
+            {
+                return Err(RecordError::Authority.into());
+            }
+        } else if self.hosting_origin.is_some() {
+            return Err(RecordError::Authority.into());
+        }
+        Ok(())
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<SignedRecord> {
         if ciphertext.len() > MAX_CIPHERTEXT_BYTES {
             return Err(LinkError::DescriptorTooLarge);
         }
@@ -172,14 +297,7 @@ impl InvitationLink {
                 )
                 .map_err(|_| RecordError::Signature)?,
         );
-        let signed = SignedRecord::parse(&plain)?;
-        verify_descriptor(
-            &signed,
-            &self.seed,
-            configured_api_origin,
-            configured_witness,
-            now_ms,
-        )
+        Ok(SignedRecord::parse(&plain)?)
     }
 }
 
@@ -196,6 +314,8 @@ pub struct Descriptor {
     pub proof: CallAuthorityProof,
     pub policy: String,
     pub invitation_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosting_profile: Option<HostingProfile>,
 }
 
 pub struct VerifiedDescriptor {
@@ -296,6 +416,7 @@ fn encrypt_signed(signed: &SignedRecord, seed: InvitationSeed) -> Result<Encrypt
             ciphertext_id,
             seed,
             hosting_id: None,
+            hosting_origin: None,
         },
         ciphertext,
     })
@@ -353,6 +474,14 @@ fn verify_descriptor_with_key(
     {
         return Err(RecordError::Authority.into());
     }
+    if let Some(profile) = &descriptor.hosting_profile {
+        profile.validate()?;
+        if profile.witness != descriptor.witness
+            || hosting_origin(profile)? != format!("{}/", api.origin().ascii_serialization())
+        {
+            return Err(RecordError::Authority.into());
+        }
+    }
     let scope = &descriptor.address.scope;
     let hosted = address
         .path()
@@ -394,6 +523,12 @@ fn verify_descriptor_with_key(
         policy,
         invitation_signing_key,
     })
+}
+
+fn hosting_origin(profile: &HostingProfile) -> Result<String> {
+    profile.validate()?;
+    let url = reqwest::Url::parse(&profile.create_url).map_err(|_| RecordError::Authority)?;
+    Ok(format!("{}/", url.origin().ascii_serialization()))
 }
 
 #[cfg(test)]

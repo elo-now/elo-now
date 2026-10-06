@@ -132,6 +132,7 @@ fn fixture() -> Fixture {
         proof: authority.call_proof().unwrap(),
         policy: STANDARD.encode(policy.bytes()),
         invitation_public_key,
+        hosting_profile: None,
     };
     Fixture {
         owner,
@@ -146,6 +147,274 @@ fn encrypted(f: &Fixture) -> EncryptedInvitation {
 
 fn unchecked(f: &Fixture, descriptor: &Descriptor) -> EncryptedInvitation {
     encrypt_signed(&signed(descriptor, &f.owner), seed()).unwrap()
+}
+
+fn hosting(f: &Fixture) -> HostingProfile {
+    HostingProfile {
+        v: 1,
+        kind: "hosting.configuration".into(),
+        revision: 1,
+        name: "Private test hosting".into(),
+        signing_public_key: record::encode_hex(
+            SigningKey::from_bytes(&[11; 32]).verifying_key().as_bytes(),
+        ),
+        create_url: format!("{API}/spaces/v1/create"),
+        witness: f.pin.clone(),
+        storage: None,
+        push_url: Some(format!("{API}/")),
+        call_url: Some(format!("{API}/calls/v1")),
+        message_lifetimes: vec![crate::message_retention::MessageRetention::Hours6],
+        default_message_lifetime: crate::message_retention::MessageRetention::Hours6,
+    }
+}
+
+fn self_contained(f: &Fixture) -> EncryptedInvitation {
+    let mut descriptor = f.descriptor.clone();
+    let profile = hosting(f);
+    descriptor.hosting_profile = Some(profile.clone());
+    let mut invitation = seal(&descriptor, &f.owner, seed(), API, &f.pin, NOW).unwrap();
+    invitation.link = invitation
+        .link
+        .with_hosting_origin(&profile.id(), &format!("{API}/"))
+        .unwrap();
+    invitation
+}
+
+#[test]
+fn v3_roundtrip_verifies_owner_bound_hosting_without_local_configuration() {
+    let f = fixture();
+    let invitation = self_contained(&f);
+    let url = invitation.link.to_url();
+    let bytes = URL_SAFE_NO_PAD.decode(&url[PREFIX.len()..]).unwrap();
+    assert_eq!(bytes[0], 3);
+    assert_eq!(bytes.len(), 97 + format!("{API}/").len());
+    let parsed = InvitationLink::parse(&url).unwrap();
+    assert_eq!(parsed.hosting_origin(), Some(format!("{API}/").as_str()));
+    let (verified, profile) = parsed
+        .open_with_embedded_hosting(&invitation.ciphertext, NOW)
+        .unwrap();
+    assert_eq!(profile, hosting(&f));
+    assert_eq!(parsed.hosting_id(), Some(profile.id().as_str()));
+    assert_eq!(
+        verified.descriptor().hosting_profile.as_ref(),
+        Some(&profile)
+    );
+    assert!(
+        parsed
+            .open(&invitation.ciphertext, API, &f.pin, NOW)
+            .is_ok()
+    );
+    assert!(
+        parsed
+            .open(
+                &invitation.ciphertext,
+                "https://other.example/",
+                &f.pin,
+                NOW
+            )
+            .is_err()
+    );
+    assert!(
+        parsed
+            .open_with_embedded_hosting(&invitation.ciphertext, 10_000)
+            .is_err()
+    );
+}
+
+#[test]
+fn v3_routing_selectors_and_embedded_profile_cannot_be_substituted() {
+    let f = fixture();
+    let invitation = self_contained(&f);
+    for (id, origin) in [
+        (record::encode_hex(&[17; 32]), format!("{API}/")),
+        (hosting(&f).id(), "https://other.example/".into()),
+    ] {
+        let parsed = InvitationLink::parse(&invitation.link.to_url())
+            .unwrap()
+            .with_hosting_origin(&id, &origin)
+            .unwrap();
+        assert!(
+            parsed
+                .open_with_embedded_hosting(&invitation.ciphertext, NOW)
+                .is_err()
+        );
+        assert!(
+            parsed
+                .open(&invitation.ciphertext, API, &f.pin, NOW)
+                .is_err()
+        );
+    }
+    for case in 0..5 {
+        let mut descriptor = f.descriptor.clone();
+        let mut profile = hosting(&f);
+        match case {
+            0 => profile.create_url = "https://other.example/spaces/v1/create".into(),
+            1 => {
+                profile.witness.public_key =
+                    record::encode_hex(SigningKey::from_bytes(&[12; 32]).verifying_key().as_bytes())
+            }
+            2 => {
+                profile.signing_public_key =
+                    record::encode_hex(SigningKey::from_bytes(&[12; 32]).verifying_key().as_bytes())
+            }
+            3 => profile.revision = 0,
+            _ => (),
+        }
+        descriptor.hosting_profile = (case != 4).then_some(profile);
+        let mut forged = unchecked(&f, &descriptor);
+        forged.link = forged
+            .link
+            .with_hosting_origin(&hosting(&f).id(), &format!("{API}/"))
+            .unwrap();
+        assert!(
+            forged
+                .link
+                .open_with_embedded_hosting(&forged.ciphertext, NOW)
+                .is_err()
+        );
+        assert!(
+            forged
+                .link
+                .open(&forged.ciphertext, API, &f.pin, NOW)
+                .is_err()
+        );
+    }
+
+    // Knowing the seed permits encryption but never an owner-authorized change
+    // to the deployment (including services outside the API origin).
+    let mut descriptor = f.descriptor.clone();
+    let mut profile = hosting(&f);
+    profile.call_url = Some("https://attacker.example/calls/v1".into());
+    descriptor.hosting_profile = Some(profile);
+    let mut forged =
+        encrypt_signed(&signed(&descriptor, &seed().signing_key().unwrap()), seed()).unwrap();
+    forged.link = forged
+        .link
+        .with_hosting_origin(&hosting(&f).id(), &format!("{API}/"))
+        .unwrap();
+    assert!(
+        forged
+            .link
+            .open_with_embedded_hosting(&forged.ciphertext, NOW)
+            .is_err()
+    );
+}
+
+#[test]
+fn v3_origin_encoding_is_bounded_canonical_and_not_an_arbitrary_url() {
+    let f = fixture();
+    for origin in [
+        "https://api.example.test",
+        "https://API.example.test/",
+        "https://api.example.test:443/",
+        "http://api.example.test/",
+        "https://user@api.example.test/",
+        "https://api.example.test/path",
+        "https://api.example.test/?query=x",
+        "https://api.example.test/#fragment",
+        "https://api.example.test/\n",
+    ] {
+        assert!(
+            encrypted(&f)
+                .link
+                .with_hosting_origin(&hosting(&f).id(), origin)
+                .is_err()
+        );
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(&self_contained(&f).link.to_url()[PREFIX.len()..])
+            .unwrap();
+        bytes.truncate(97);
+        bytes.extend_from_slice(origin.as_bytes());
+        assert!(
+            InvitationLink::parse(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))).is_err()
+        );
+    }
+    for suffix in [vec![], vec![0xff], vec![b'a'; MAX_HOSTING_ORIGIN_BYTES + 1]] {
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(&self_contained(&f).link.to_url()[PREFIX.len()..])
+            .unwrap();
+        bytes.truncate(97);
+        bytes.extend(suffix);
+        assert!(
+            InvitationLink::parse(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))).is_err()
+        );
+    }
+    let mut invitation = self_contained(&f);
+    invitation.ciphertext[30] ^= 1;
+    assert!(
+        invitation
+            .link
+            .open_with_embedded_hosting(&invitation.ciphertext, NOW)
+            .is_err()
+    );
+    invitation.link.ciphertext_id = Sha256::digest(&invitation.ciphertext).into();
+    assert!(
+        invitation
+            .link
+            .open_with_embedded_hosting(&invitation.ciphertext, NOW)
+            .is_err()
+    );
+    assert!(matches!(
+        invitation
+            .link
+            .open_with_embedded_hosting(&vec![0; MAX_CIPHERTEXT_BYTES + 1], NOW),
+        Err(LinkError::DescriptorTooLarge)
+    ));
+}
+
+#[test]
+fn resealing_legacy_offers_preserves_policy_seed_and_the_old_usable_link() {
+    let f = fixture();
+    let profile = hosting(&f);
+    for version in [1, 2] {
+        let mut old = encrypted(&f);
+        if version == 2 {
+            old.link = old.link.with_hosting(&profile.id()).unwrap();
+        }
+        let old_url = old.link.to_url();
+        assert!(old.link.hosting_origin().is_none());
+        assert!(
+            old.link
+                .open_with_embedded_hosting(&old.ciphertext, NOW)
+                .is_err()
+        );
+        let upgraded = old
+            .link
+            .reseal_with_hosting(&old.ciphertext, &profile, &f.owner, API, &f.pin, NOW)
+            .unwrap();
+        let (verified, attached) = upgraded
+            .link
+            .open_with_embedded_hosting(&upgraded.ciphertext, NOW)
+            .unwrap();
+        assert_eq!(attached, profile);
+        assert_eq!(verified.descriptor().policy, f.descriptor.policy);
+        assert_eq!(verified.policy().expires_at_ms, 10_000);
+        assert_eq!(verified.policy().max_uses, 3);
+        assert_eq!(
+            verified.invitation_signing_key().verifying_key(),
+            seed().invitation_public_key().unwrap()
+        );
+        assert_ne!(upgraded.link.ciphertext_id(), old.link.ciphertext_id());
+        assert_eq!(old.link.to_url().as_str(), old_url.as_str());
+        assert!(old.link.open(&old.ciphertext, API, &f.pin, NOW).is_ok());
+        assert!(
+            old.link
+                .reseal_with_hosting(
+                    &old.ciphertext,
+                    &profile,
+                    &SigningKey::from_bytes(&[25; 32]),
+                    API,
+                    &f.pin,
+                    NOW
+                )
+                .is_err()
+        );
+        assert!(
+            old.link
+                .reseal_with_hosting(&old.ciphertext, &profile, &f.owner, API, &f.pin, 10_000)
+                .is_err()
+        );
+    }
 }
 
 #[test]

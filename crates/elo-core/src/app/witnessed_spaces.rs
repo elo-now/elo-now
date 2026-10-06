@@ -23,6 +23,8 @@ struct Offer {
     require_approval: bool,
     revoked: bool,
     published: bool,
+    #[serde(default)]
+    hosting_upgrade_pending: bool,
 }
 
 impl ClientApp {
@@ -74,7 +76,36 @@ impl ClientApp {
             .witness_pin
             .as_ref()
             .ok_or("Invitation service is unavailable in this build.")?;
-        let endpoint = reqwest::Url::parse(self.invitation_origin()?)?
+        let ciphertext = self
+            .fetch_witnessed_invitation(&invitation, self.invitation_origin()?)
+            .await?;
+        Ok(invitation.open(
+            &ciphertext,
+            self.invitation_origin()?,
+            pin,
+            now()?.as_millis() as u64,
+        )?)
+    }
+
+    pub(super) async fn open_hosted_invitation(
+        &self,
+        invitation: &InvitationLink,
+    ) -> Result<(VerifiedDescriptor, crate::hosting_profile::HostingProfile)> {
+        let origin = invitation
+            .hosting_origin()
+            .ok_or("Invalid Space invitation.")?;
+        let ciphertext = self.fetch_witnessed_invitation(invitation, origin).await?;
+        Ok(invitation.open_with_embedded_hosting(&ciphertext, now()?.as_millis() as u64)?)
+    }
+
+    async fn fetch_witnessed_invitation(
+        &self,
+        invitation: &InvitationLink,
+        origin: &str,
+    ) -> Result<Vec<u8>> {
+        // Only the ciphertext digest reaches the host. The seed, profile and
+        // current user's credentials never accompany this unauthenticated GET.
+        let endpoint = reqwest::Url::parse(origin)?
             .join(&format!("invitations/v1/{}", invitation.ciphertext_id()))?;
         let mut response = self
             .invitation_http()?
@@ -92,12 +123,7 @@ impl ClientApp {
             }
             ciphertext.extend_from_slice(&chunk);
         }
-        Ok(invitation.open(
-            &ciphertext,
-            self.invitation_origin()?,
-            pin,
-            now()?.as_millis() as u64,
-        )?)
+        Ok(ciphertext)
     }
 
     fn witnessed_offers(&self) -> Result<Vec<Offer>> {
@@ -205,6 +231,7 @@ impl ClientApp {
                 v: 1,
                 kind: "witness.invitation.descriptor".into(),
                 name: name.into(),
+                hosting_profile: self.hosting_services.active.clone(),
                 address: address.clone(),
                 witness: pin.clone(),
                 proof: authority.call_proof()?,
@@ -220,7 +247,9 @@ impl ClientApp {
                 current,
             )?;
             let invitation_link = match self.current_hosting_id() {
-                Some(id) => encrypted.link.with_hosting(&id)?,
+                Some(id) => encrypted
+                    .link
+                    .with_hosting_origin(&id, self.invitation_origin()?)?,
                 None => encrypted.link,
             };
             offers.push(Offer {
@@ -234,6 +263,7 @@ impl ClientApp {
                 require_approval,
                 revoked: false,
                 published: false,
+                hosting_upgrade_pending: false,
             });
             self.save_witnessed_offers(&offers)?;
             offers.len() - 1
@@ -243,6 +273,72 @@ impl ClientApp {
             .await?;
         // A fresh proof is also imported into hosting before its upload gate.
         self.sync_witnessed_host(address, &authority).await?;
+        self.publish_witnessed_offer(&authority, offer).await?;
+        offers[index].published = true;
+        offers[index].hosting_upgrade_pending = false;
+        self.save_witnessed_offers(&offers)?;
+        Ok(offers[index].link.clone())
+    }
+
+    /// Repackage a saved invitation without changing its admission policy, expiry
+    /// or use budget. Previously distributed links remain valid until expiry.
+    pub(super) async fn upgrade_witnessed_offers(
+        &mut self,
+        authority: &Authority,
+        address: &SpaceAddress,
+    ) -> Result<()> {
+        let Some(profile) = self.hosting_services.active.clone() else {
+            return Ok(());
+        };
+        let current = now()?.as_millis() as u64;
+        let mut offers = self.witnessed_offers()?;
+        for index in 0..offers.len() {
+            let offer = &offers[index];
+            if offer.revoked
+                || offer.expires_at <= current
+                || offer.address.scope.space != address.scope.space
+                || (!offer.published && !offer.hosting_upgrade_pending)
+            {
+                continue;
+            }
+            let policy_record = decode_record(&offer.policy)?;
+            let Ok(policy) = authority.verify_witness_invitation(&policy_record, current) else {
+                continue;
+            };
+            if policy.issuer_credential_id != self.session.credential().id() {
+                continue;
+            }
+            let link = InvitationLink::parse(&offer.link)?;
+            if link.hosting_origin().is_none() {
+                let upgraded = link.reseal_with_hosting(
+                    &STANDARD.decode(&offer.ciphertext)?,
+                    &profile,
+                    self.session.signing_key(),
+                    self.invitation_origin()?,
+                    &profile.witness,
+                    current,
+                )?;
+                offers[index].link = upgraded.link.to_url().to_string();
+                offers[index].ciphertext = STANDARD.encode(&upgraded.ciphertext);
+                offers[index].published = false;
+                offers[index].hosting_upgrade_pending = true;
+                // Persist before I/O so an uncertain upload retries the same
+                // ciphertext rather than consuming another descriptor slot.
+                self.save_witnessed_offers(&offers)?;
+            }
+            if !offers[index].published {
+                self.publish_witnessed_offer(authority, &offers[index])
+                    .await?;
+                offers[index].published = true;
+                offers[index].hosting_upgrade_pending = false;
+                self.save_witnessed_offers(&offers)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_witnessed_offer(&self, authority: &Authority, offer: &Offer) -> Result<()> {
+        let address = &offer.address;
         let invitation = InvitationLink::parse(&offer.link)?;
         let mut endpoint = reqwest::Url::parse(&address.url)?;
         let prefix = endpoint
@@ -283,9 +379,7 @@ impl ClientApp {
         {
             return Err("Invalid invitation response.".into());
         }
-        offers[index].published = true;
-        self.save_witnessed_offers(&offers)?;
-        Ok(offers[index].link.clone())
+        Ok(())
     }
 
     pub(super) async fn revoke_witnessed_offer(

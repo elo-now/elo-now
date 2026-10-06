@@ -213,6 +213,25 @@ impl Drop for Scope<'_> {
 }
 
 impl ClientApp {
+    pub(super) fn check_default_invitation_hosting(
+        &mut self,
+        profile: &HostingProfile,
+    ) -> Result<()> {
+        let defaults = self.default_hosting_context();
+        let candidate = Context::profile(profile)?;
+        let same_origin = defaults.invitation == candidate.invitation;
+        let same_witness_address = defaults
+            .witness
+            .as_ref()
+            .is_some_and(|pin| pin.url == profile.witness.url);
+        if (same_origin && !self.hosting_services.profiles.contains_key(&profile.id()))
+            || (same_witness_address && defaults.witness != candidate.witness)
+        {
+            return Err("Hosting configuration cannot replace an approved trust anchor.".into());
+        }
+        Ok(())
+    }
+
     /// Native trust decision only. Renderer/network payloads cannot register pins.
     pub fn configure_hosting_profile(&mut self, profile: HostingProfile) -> Result<()> {
         profile.validate()?;

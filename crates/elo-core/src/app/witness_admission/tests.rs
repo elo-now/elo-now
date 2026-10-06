@@ -363,6 +363,7 @@ async fn fixture(approval: bool) -> Fixture {
     let descriptor = Descriptor {
         v: 1,
         kind: "witness.invitation.descriptor".into(),
+        hosting_profile: None,
         name: "Test Space".into(),
         address: space_service::SpaceAddress {
             url: format!(

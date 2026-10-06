@@ -2287,11 +2287,25 @@ impl Spaces {
     }
     pub(super) async fn operate(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
         self.configure_children(root)?;
-        let context = self.operation_context(root, &v)?;
+        if v.get("expected_identity")
+            .is_some_and(|id| id != &json!(root.identity_id()))
+        {
+            return Err("The open profile has changed.".into());
+        }
+        let prepared = self.prepare_hosted_invitation(root, &v).await?;
+        let (context, invitation) = match prepared {
+            Some((context, invitation)) => (context, Some(Box::new(invitation))),
+            None => (self.operation_context(root, &v)?, None),
+        };
         let mut scope = hosting_services::Scope::new(root, context);
-        Box::pin(self.operate_scoped(&mut scope, v)).await
+        Box::pin(self.operate_scoped(&mut scope, v, invitation)).await
     }
-    async fn operate_scoped(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+    async fn operate_scoped(
+        &mut self,
+        root: &mut ClientApp,
+        v: Value,
+        invitation: Option<Box<crate::witness::link::VerifiedDescriptor>>,
+    ) -> Result<Value> {
         // Inner operations only mutate/report. Build one combined snapshot at
         // the Space boundary, or return the affected chat's partial snapshot.
         let _root_view = root.presentation.defer_view();
@@ -2348,12 +2362,17 @@ impl Spaces {
                     | "view"
             )
         {
-            Box::pin(self.operate_space(root, v)).await
+            Box::pin(self.operate_space(root, v, invitation)).await
         } else {
             Box::pin(self.operate_selected(root, v)).await
         }
     }
-    async fn operate_space(&mut self, root: &mut ClientApp, v: Value) -> Result<Value> {
+    async fn operate_space(
+        &mut self,
+        root: &mut ClientApp,
+        v: Value,
+        invitation: Option<Box<crate::witness::link::VerifiedDescriptor>>,
+    ) -> Result<Value> {
         let op = field(&v, "op")?;
         let mut result = json!({});
         match op {
@@ -2419,12 +2438,18 @@ impl Spaces {
                 self.disconnect(root, field(&v, "id")?).await?;
             }
             "space_preview" if field(&v, "link")?.starts_with(crate::witness::link::PREFIX) => {
-                let invite = root.open_witnessed_invitation(field(&v, "link")?).await?;
+                let invite = match invitation {
+                    Some(invite) => invite,
+                    None => Box::new(root.open_witnessed_invitation(field(&v, "link")?).await?),
+                };
                 result["preview"] = json!({"name":invite.descriptor().name,"require_approval":invite.policy().require_approval,
                     "expires_at":invite.policy().expires_at_ms,"message_lifetime_seconds":invite.descriptor().address.message_lifetime_seconds});
             }
             "space_join" if field(&v, "link")?.starts_with(crate::witness::link::PREFIX) => {
-                let invite = root.open_witnessed_invitation(field(&v, "link")?).await?;
+                let invite = match invitation {
+                    Some(invite) => invite,
+                    None => Box::new(root.open_witnessed_invitation(field(&v, "link")?).await?),
+                };
                 let existing_id = invite.descriptor().address.scope.space.to_string();
                 if self
                     .catalog
@@ -2587,6 +2612,7 @@ impl Spaces {
                                 root.call_space(&address, "manage", json!({})).await?;
                             management["attachment_storage_available"] =
                                 json!(root.attachment_storage_endpoint.is_some());
+                            root.upgrade_witnessed_offers(&current, &address).await?;
                             management["offers"] = root.witnessed_offer_list(&address)?;
                             if let Some(entry) =
                                 self.catalog.entries.iter_mut().find(|entry| entry.id == id)
@@ -3194,6 +3220,8 @@ impl ClientApp {
 #[cfg(test)]
 mod restore_tests;
 
+mod invitation_hosting;
+
 #[cfg(test)]
 mod tests {
     use super::super::space_service::ServiceConfig;
@@ -3736,6 +3764,7 @@ mod tests {
         let descriptor = Descriptor {
             v: 1,
             kind: "witness.invitation.descriptor".into(),
+            hosting_profile: None,
             name: "Recovery Space".into(),
             address: SpaceAddress {
                 url: format!("{origin}/spaces/{}/team/v1/spaces", "86".repeat(32)),

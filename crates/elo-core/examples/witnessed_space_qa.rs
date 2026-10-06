@@ -4,6 +4,8 @@
 //! only the synthetic owner's public identity for operator allowlists. Optional
 //! hosting_profile_file/hosting_profile_link explicitly approve a signed hosting
 //! configuration bound to CONFIG's independently supplied host and witness pin.
+//! Only the owner imports that configuration. Guests discover it from the Space
+//! invitation, with a different built-in origin and no prior hosting registry.
 //! managed_attachment tests a synthetic file. own_storage_file can supply a
 //! private limited-provider configuration, which is never printed or archived.
 //! Failed runs retain their profiles; --cleanup only deletes that run's Space.
@@ -22,6 +24,7 @@ const PASSWORD: &str = "Synthetic EU acceptance profile 2026 only";
 const SPACE_NAME: &str = "Witnessed acceptance";
 const CLEANUP_FILE: &str = "created-space.json";
 const PREPARED_FILE: &str = "prepared-owner.json";
+const GUEST_DEFAULT_HOST: &str = "https://unused-default.example.invalid/spaces/v1/create";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -330,9 +333,16 @@ async fn open(config: &Config, name: &str, fresh: bool) -> Result<ClientApp> {
     } else {
         ClientApp::open(path, PASSWORD.into(), false).await?
     };
-    app.configure_invitation_host(&config.host)?;
+    let discover_hosting = config.profile.is_some() && name != "Owner";
+    app.configure_invitation_host(if discover_hosting {
+        GUEST_DEFAULT_HOST
+    } else {
+        &config.host
+    })?;
     app.configure_witness_pin(Some(config.witness.clone()))?;
-    if let Some(profile) = &config.profile {
+    if let Some(profile) = &config.profile
+        && !discover_hosting
+    {
         app.configure_hosting_profile(profile.clone())?;
         app.select_creation_hosting(Some(profile.clone()))?;
     }
@@ -484,10 +494,19 @@ async fn main() -> Result<()> {
         invitation.hosting_id(),
         config.profile.as_ref().map(HostingProfile::id).as_deref()
     );
-    assert_eq!(
-        link.len(),
-        elo_core::witness::link::PREFIX.len() + if config.profile.is_some() { 130 } else { 87 }
-    );
+    if let Some(profile) = &config.profile {
+        let origin = format!(
+            "{}/",
+            reqwest::Url::parse(&profile.create_url)?
+                .origin()
+                .ascii_serialization()
+        );
+        assert_eq!(invitation.hosting_origin(), Some(origin.as_str()));
+        assert!(link.len() <= elo_core::witness::link::PREFIX.len() + 2860);
+    } else {
+        assert!(invitation.hosting_origin().is_none());
+        assert_eq!(link.len(), elo_core::witness::link::PREFIX.len() + 87);
+    }
     assert_eq!(space(&created["view"], &id)?["role"], "primary_owner");
     assert_eq!(
         space(&created["view"], &id)?["message_lifetime_seconds"],
@@ -520,6 +539,16 @@ async fn main() -> Result<()> {
     owner.close().await?;
     // There is deliberately no live owner while the candidate is admitted.
     let mut guest = open(&config, "Guest", true).await?;
+    let catalog_path = config.root.join("Guest").join("spaces.age");
+    let preview_snapshot = if config.profile.is_some() {
+        Some((guest.view().await?, std::fs::read(&catalog_path)?))
+    } else {
+        None
+    };
+    if let Some(profile) = &config.profile {
+        assert!(guest.hosting_profile_for_id(&profile.id()).is_none());
+        assert!(guest.current_hosting_id().is_none());
+    }
     let preview = checked(
         &mut guest,
         json!({"op":"space_preview","link":link}),
@@ -528,6 +557,33 @@ async fn main() -> Result<()> {
     .await?;
     assert_eq!(preview["preview"]["name"], "Witnessed acceptance");
     assert_eq!(preview["preview"]["require_approval"], false);
+    if let (Some(profile), Some((before_preview, catalog_before_preview))) =
+        (&config.profile, &preview_snapshot)
+    {
+        assert!(guest.hosting_profile_for_id(&profile.id()).is_none());
+        assert!(guest.current_hosting_id().is_none());
+        let after_preview = guest.view().await?;
+        assert_eq!(after_preview["spaces"], before_preview["spaces"]);
+        assert_eq!(
+            after_preview["active_space"],
+            before_preview["active_space"]
+        );
+        assert_eq!(
+            after_preview["space_creation"],
+            before_preview["space_creation"]
+        );
+        assert!(std::fs::read(&catalog_path)?.as_slice() == catalog_before_preview.as_slice());
+        // Closing instead of joining models cancelling the preview. Reopening
+        // must not turn its temporary verification context into an import.
+        guest.close().await?;
+        guest = open(&config, "Guest", false).await?;
+        assert!(guest.hosting_profile_for_id(&profile.id()).is_none());
+        assert!(guest.current_hosting_id().is_none());
+        let cancelled = guest.view().await?;
+        assert_eq!(cancelled["spaces"], before_preview["spaces"]);
+        assert_eq!(cancelled["active_space"], before_preview["active_space"]);
+        println!("PASS invitation preview and cancellation leave hosting unimported");
+    }
     let joined = checked(
         &mut guest,
         json!({"op":"space_join","link":link}),
@@ -551,6 +607,11 @@ async fn main() -> Result<()> {
     }
     guest.close().await?;
     guest = open(&config, "Guest", false).await?;
+    if let Some(profile) = &config.profile {
+        assert_eq!(guest.hosting_profile_for_id(&profile.id()), Some(profile));
+        assert!(guest.current_hosting_id().is_none());
+        println!("PASS joined Space restores all hosting pins without a separate import");
+    }
     let refreshed = checked(
         &mut guest,
         json!({"op":"space_refresh"}),
@@ -558,6 +619,15 @@ async fn main() -> Result<()> {
     )
     .await?;
     assert_eq!(space(&refreshed["view"], &id)?["status"], "joined");
+    if let Some(expected) = &config.expected_call_url {
+        let endpoint = checked(
+            &mut guest,
+            json!({"op":"call_endpoint","hosting_space_id":id,"target_space":id}),
+            "restarted member resolves the invitation's call endpoint",
+        )
+        .await?;
+        assert_eq!(endpoint["url"], *expected);
+    }
     checked(
         &mut guest,
         json!({"op":"space_join","link":link}),

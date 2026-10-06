@@ -151,6 +151,14 @@ fn parse_link(link: &str) -> Result<HostingProfile, String> {
 }
 
 impl Catalog {
+    fn approved_profiles(&self) -> Result<Vec<HostingProfile>, String> {
+        // Removal hides a creation choice; it does not revoke its saved pins.
+        self.profiles
+            .iter()
+            .map(|stored| parse_link(&stored.link))
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.v != 1 || self.profiles.len() > MAX_PROFILES {
             return Err("Invalid hosting catalog.".into());
@@ -416,10 +424,16 @@ fn invitation_profile(
     let link = elo_core::witness::link::InvitationLink::parse(link)
         .map_err(|_| "Invalid Space invitation.")?;
     match link.hosting_id() {
-        Some(id) => lookup(id)?
-            .and_then(|selected| selected.profile)
-            .map(Some)
-            .ok_or_else(|| MISSING_HOSTING.into()),
+        Some(id) => match lookup(id)? {
+            Some(selected) => selected
+                .profile
+                .map(Some)
+                .ok_or_else(|| MISSING_HOSTING.into()),
+            // V3 supplies only a bootstrap address here. Core must authenticate
+            // its encrypted descriptor and embedded profile before using pins.
+            None if link.hosting_origin().is_some() => Ok(None),
+            None => Err(MISSING_HOSTING.into()),
+        },
         None => Ok(None),
     }
 }
@@ -456,6 +470,27 @@ pub(crate) fn prepare_operation(
         let link = request["link"]
             .as_str()
             .ok_or("Invalid Space invitation.")?;
+        if link.starts_with(elo_core::witness::link::PREFIX)
+            && elo_core::witness::link::InvitationLink::parse(link)
+                .map_err(|_| "Invalid Space invitation.")?
+                .hosting_origin()
+                .is_some()
+        {
+            let profiles = {
+                let _guard = CATALOG_LOCK
+                    .lock()
+                    .map_err(|_| "The hosting catalog is unavailable.")?;
+                load(&catalog_path(app)?)?.approved_profiles()?
+            };
+            for profile in profiles {
+                client
+                    .configure_hosting_profile(profile)
+                    .map_err(|error| error.to_string())?;
+            }
+            // Core authenticates V3 into an invitation-only scope. Neither a
+            // preview nor joining changes the user's choice for Space creation.
+            return Ok(());
+        }
         invitation_profile(link, |id| selected(app, id))?
     };
     client
@@ -767,6 +802,63 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn self_contained_invitation_defers_unknown_host_trust_to_core_but_keeps_known_pins() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let session = Session::create().unwrap().0;
+        let profile = profile(&session);
+        let legacy = format!(
+            "{}{}",
+            elo_core::witness::link::PREFIX,
+            URL_SAFE_NO_PAD.encode([1_u8; 65])
+        );
+        let invitation = elo_core::witness::link::InvitationLink::parse(&legacy)
+            .unwrap()
+            .with_hosting_origin(&profile.id(), "https://api.example.test/")
+            .unwrap()
+            .to_url();
+        assert!(
+            invitation_profile(&invitation, |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            invitation_profile(&invitation, |id| {
+                assert_eq!(id, profile.id());
+                Ok(Some(profile.clone().into()))
+            })
+            .unwrap(),
+            Some(profile)
+        );
+        assert!(
+            invitation_profile(&invitation, |_| Err("Invalid hosting catalog.".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn invitation_trust_registration_includes_removed_hosts_without_reenabling_them() {
+        let session = Session::create().unwrap().0;
+        let removed = profile(&session);
+        let other_session = Session::create().unwrap().0;
+        let mut enabled = profile(&other_session);
+        enabled.create_url = "https://other.example.test/spaces/v1/create".into();
+        let mut catalog = Catalog::default();
+        catalog.add(&link(&removed, &session)).unwrap();
+        catalog.add(&link(&enabled, &other_session)).unwrap();
+        catalog.remove(&removed.id()).unwrap();
+        assert_eq!(
+            catalog.approved_profiles().unwrap(),
+            vec![removed.clone(), enabled.clone()]
+        );
+        assert!(
+            catalog
+                .selected(&removed.id(), fixture_builtin())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(catalog.entries(&fixture_builtin()).unwrap().len(), 2);
     }
 
     #[test]

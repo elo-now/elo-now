@@ -5,14 +5,40 @@ export const SPACE_PREFIX = "elo://space/v1#";
 export const SHORT_SPACE_PREFIX = "https://elo.now/join#";
 export type InvitationLink = { kind: "space" | "exchange"; link: string };
 
+// V3 carries a bounded HTTPS origin after the fixed 97-byte invitation fields.
+// This only recognizes transport framing; Rust authenticates the descriptor and
+// checks its hosting profile against every previously approved trust anchor.
+function hasBootstrapOrigin(bytes: string) {
+  if (bytes.length < 98 || bytes.length > 2145) return false;
+  try {
+    const origin = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(Uint8Array.from(bytes.slice(97), (byte) => byte.charCodeAt(0)));
+    const url = new URL(origin);
+    return (
+      url.href === origin &&
+      `${url.origin}/` === origin &&
+      url.protocol === "https:" &&
+      !!url.hostname &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.pathname === "/"
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Classification never fetches a URL or extracts a seed for another consumer.
 // Rust remains responsible for verifying the invitation and deployment pins.
 export function normalizeInvitationLink(value: string): InvitationLink | null {
   const link = value.trim();
   if (link.startsWith(SHORT_SPACE_PREFIX)) {
     const fragment = link.slice(SHORT_SPACE_PREFIX.length);
-    if (!/^(?:[A-Za-z0-9_-]{87}|[A-Za-z0-9_-]{130})$/.test(fragment))
-      return null;
+    if (!/^[A-Za-z0-9_-]{87,2860}$/.test(fragment)) return null;
     try {
       const bytes = atob(
         fragment.replace(/-/g, "+").replace(/_/g, "/") +
@@ -25,7 +51,8 @@ export function normalizeInvitationLink(value: string): InvitationLink | null {
       if (
         !(
           (bytes.length === 65 && bytes.charCodeAt(0) === 1) ||
-          (bytes.length === 97 && bytes.charCodeAt(0) === 2)
+          (bytes.length === 97 && bytes.charCodeAt(0) === 2) ||
+          (bytes.charCodeAt(0) === 3 && hasBootstrapOrigin(bytes))
         ) ||
         canonical !== fragment
       )
