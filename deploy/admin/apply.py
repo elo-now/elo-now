@@ -201,12 +201,13 @@ class Worker:
         self.compose(['restart', service])
         url = (self.api_health_url if self.role == 'api'
                else 'http://127.0.0.1:17846/health')
+        expected_status = 200 if self.role == 'api' else 204
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
                 with opener.open(url, timeout=2) as reply:
-                    if reply.status == 200:
+                    if reply.status == expected_status:
                         return
             except OSError:
                 pass

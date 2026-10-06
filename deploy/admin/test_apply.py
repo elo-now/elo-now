@@ -310,6 +310,41 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'invalid_health_endpoint'):
                 worker_module.Worker(self.settings | {'api_health_url': wrong})
 
+    def test_restart_requires_the_health_status_defined_by_each_service(self):
+        class Response:
+            def __init__(self, status):
+                self.status = status
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        for role, status, accepted in (('api', 200, True), ('witness', 204, True),
+                                       ('api', 204, False), ('witness', 200, False),
+                                       ('api', 503, False), ('witness', 503, False)):
+            with self.subTest(role=role, status=status):
+                worker = worker_module.Worker(self.settings | {'role': role})
+                commands, requests = [], []
+                worker.compose = lambda arguments: commands.append(arguments)
+                class Opener:
+                    def open(self, target, timeout):
+                        requests.append((target, timeout))
+                        return Response(status)
+                # One failed probe reaches the deadline without a real wait.
+                with patch.object(worker_module.urllib.request, 'build_opener', return_value=Opener()), \
+                        patch.object(worker_module.time, 'monotonic', side_effect=[0, 0, 31]), \
+                        patch.object(worker_module.time, 'sleep'):
+                    if accepted:
+                        worker.restart()
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'service_health_failed'):
+                            worker.restart()
+                service = 'api' if role == 'api' else 'storage'
+                url = (worker.api_health_url if role == 'api'
+                       else 'http://127.0.0.1:17846/health')
+                self.assertEqual(commands, [['restart', service]])
+                self.assertEqual(requests, [(url, 2)])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -12,6 +12,14 @@ included in a hosting link or returned by the configuration API. Leaving both
 credential fields blank preserves a saved connection for the same provider.
 Changing provider requires new credentials; it does not migrate existing files.
 
+Managed credentials are copied into an encrypted, versioned configuration when
+a Space owner configures managed attachments. Changing the panel's connection
+affects subsequent configurations; existing Spaces continue uploading to their
+previous folder until their owner reconfigures them. Existing attachments retain
+their storage revision for downloads and expiry cleanup. Saving this panel does
+not delete those files. Keep the old folder and access available while those
+Spaces or attachments still use it.
+
 ## Install
 
 First initialize the two hosts with the [container deployment](../containers/README.md).
