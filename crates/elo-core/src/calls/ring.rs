@@ -36,7 +36,7 @@ fn cipher(scope_key: &str, route: &str) -> Result<XChaCha20Poly1305> {
     Hkdf::<Sha256>::new(Some(DOMAIN), secret.as_ref())
         .expand(route.as_bytes(), key.as_mut())
         .map_err(|_| RecordError::Json)?;
-    Ok(XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| RecordError::Json)?)
+    XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| RecordError::Json)
 }
 fn validate(target: &RingTarget, now: u64) -> Result<()> {
     record::hex::<16>(&target.call_id)?;

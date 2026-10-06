@@ -191,8 +191,8 @@ impl Registry {
             call.participants
                 .values()
                 .find(|participant| participant.credential_id == command.credential_id)
-        }) {
-            if participant.delegation.as_deref() != delegation
+        })
+            && participant.delegation.as_deref() != delegation
                 && !matches!(
                     command.operation,
                     Operation::Subscribe | Operation::Decline { .. }
@@ -209,9 +209,8 @@ impl Registry {
                             | Operation::Media { .. }
                             | Operation::Invite { .. }
                     ))
-            {
-                return Err(CallError::AlreadyJoined);
-            }
+        {
+            return Err(CallError::AlreadyJoined);
         }
         let delegation_expires_at = delegation
             .map(|encoded| {
@@ -242,10 +241,10 @@ impl Registry {
                 participant.delegation_expires_at = delegation_expires_at;
             }
             for event in &mut events {
-                if let Event::Presence { call } = event {
-                    if let Some(current) = self.rooms.get(&scope) {
-                        *call = current.clone();
-                    }
+                if let Event::Presence { call } = event
+                    && let Some(current) = self.rooms.get(&scope)
+                {
+                    *call = current.clone();
                 }
             }
         }
@@ -422,10 +421,10 @@ impl Registry {
                             );
                             call.key_epoch += 1;
                         }
-                        if let Some(joined) = call.participants.get_mut(&identity) {
-                            if invitation_id.is_some() {
-                                joined.accepted_invitation_id.clone_from(invitation_id);
-                            }
+                        if let Some(joined) = call.participants.get_mut(&identity)
+                            && invitation_id.is_some()
+                        {
+                            joined.accepted_invitation_id.clone_from(invitation_id);
                         }
                         call.invitations.remove(&identity);
                         if call.kind == CallKind::Direct && identity != call.started_by {

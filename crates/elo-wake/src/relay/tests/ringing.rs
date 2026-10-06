@@ -286,7 +286,7 @@ async fn apns_environments_are_bound_per_installation_and_update_without_changin
         let route = format!("{index:032x}");
         let token = format!("synthetic-installation-{index}");
         let session = elo_core::vault::Session::create().unwrap().0;
-        register(
+        let _ = register(
             State(relay.clone()),
             Path(route.clone()),
             headers(&owner),
@@ -302,7 +302,7 @@ async fn apns_environments_are_bound_per_installation_and_update_without_changin
             Notice::Challenge { challenge, .. } => challenge.clone(),
             _ => panic!("expected installation challenge"),
         };
-        confirm(
+        let _ = confirm(
             State(relay.clone()),
             Path(route.clone()),
             headers(&owner),
