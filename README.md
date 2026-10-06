@@ -34,8 +34,9 @@ hosting configuration by QR or link. The hosting catalog stays on your device;
 each Space uses its selected services and supported retention policy. Private
 operators can offer 24 hours, 48 hours or no automatic server expiry, and managed
 attachment storage without putting storage credentials in the QR. See
-[hosting profiles](docs/SELF_HOSTING.md#imported-hosting-profiles) and the
-[two-host Docker installer](deploy/containers/README.md) for installation,
+[hosting profiles](docs/SELF_HOSTING.md#imported-hosting-profiles),
+[two-host Docker installer](deploy/containers/README.md) and
+[hosting administration panel](deploy/admin/README.md) for installation,
 supported services and trust boundaries.
 
 ## Work together

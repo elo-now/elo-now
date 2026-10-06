@@ -471,3 +471,9 @@ old elo state. A service health response alone does not establish acceptance.
 Do not delete certificates, SFTP data or previous backups as a side effect of
 clearing old Spaces. After any state is acknowledged, preserve and update the
 external witness anchor; an empty-boot anchor cannot be reused after a reset.
+
+## Hosting administration
+
+The optional [administration panel](../admin/README.md) edits hosting policies,
+generates a signed import QR and configures managed attachment storage on the
+separate witness host. Space creation remains in the app.

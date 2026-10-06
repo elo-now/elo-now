@@ -121,6 +121,25 @@ test("hosting failures explain trust conflicts without exposing raw native data"
   );
 });
 
+test("built-in hosting imports explain selection or restoration without claiming to import the link", () => {
+  expect(
+    hostingErrorMessage(
+      "This hosting address is already included in the app.",
+      "hosting.previewFailed",
+    ),
+  ).toBe(
+    "This is the public elo.now hosting already included in the app. Choose elo.now from the hosting list.",
+  );
+  expect(
+    hostingErrorMessage(
+      "This hosting address is included in the app but was removed from this device.",
+      "hosting.previewFailed",
+    ),
+  ).toBe(
+    "This is the public elo.now hosting included in the app. Choose Restore elo.now in the hosting list to use it again.",
+  );
+});
+
 test("preview presents the host address, advertised lifetimes and attachment capability", () => {
   const html = renderToStaticMarkup(<HostingPreview host={customHost} />);
   expect(html).toContain("Company");

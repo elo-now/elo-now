@@ -494,6 +494,10 @@ export const en = {
     "This hosting link is too large. Ask the hosting administrator for a new link.",
   "hosting.trustConflict":
     "This link conflicts with the hosting configuration saved on this device. Ask the hosting administrator to check it.",
+  "hosting.alreadyIncluded":
+    "This is the public elo.now hosting already included in the app. Choose elo.now from the hosting list.",
+  "hosting.restoreIncluded":
+    "This is the public elo.now hosting included in the app. Choose Restore elo.now in the hosting list to use it again.",
   "hosting.catalogFull":
     "This device has reached its hosting configuration limit. You can restore a previously removed hosting configuration.",
   "hosting.previewFailed":

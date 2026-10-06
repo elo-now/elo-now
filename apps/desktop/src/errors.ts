@@ -69,6 +69,10 @@ const known: Record<string, MessageKey> = {
     "hosting.trustConflict",
   "This hosting address already has an approved configuration.":
     "hosting.trustConflict",
+  "This hosting address is already included in the app.":
+    "hosting.alreadyIncluded",
+  "This hosting address is included in the app but was removed from this device.":
+    "hosting.restoreIncluded",
   "Hosting configuration cannot replace an approved trust anchor.":
     "hosting.trustConflict",
   "This device has reached its hosting configuration limit.":

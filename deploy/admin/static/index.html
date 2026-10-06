@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
+    <title>elo · Hosting administration</title>
+    <link rel="stylesheet" href="./style.css">
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main id="app" aria-busy="true">
+      <header class="page-heading">
+        <p class="brand" aria-label="elo">elo</p>
+        <h1 id="page-title">Hosting administration</h1>
+        <p id="page-intro" class="muted"></p>
+        <a id="related-panel" class="text-link" hidden></a>
+      </header>
+      <p id="status" class="status" role="status" aria-live="polite">Loading configuration…</p>
+      <p id="error" class="error" role="alert" hidden></p>
+      <div id="content" class="layout" hidden>
+        <section class="panel" aria-labelledby="settings-title">
+          <h2 id="settings-title">Configuration</h2>
+          <form id="settings-form" autocomplete="off">
+            <div id="fields"></div>
+            <div class="save-row">
+              <button id="save" class="primary" type="submit">Save configuration</button>
+              <span id="save-hint" class="muted"></span>
+            </div>
+          </form>
+        </section>
+        <aside id="hosting-panel" class="panel hosting-panel" aria-labelledby="hosting-title" hidden>
+          <h2 id="hosting-title">Add this hosting to elo</h2>
+          <p id="hosting-instructions" class="muted"></p>
+          <div id="hosting-details"></div>
+          <div class="qr-frame"><img id="hosting-qr" alt="" width="360" height="360"></div>
+          <button id="copy-link" class="secondary" type="button">Copy configuration link</button>
+          <label id="configuration-link-label" class="link-label" for="configuration-link">Configuration link</label>
+          <textarea id="configuration-link" rows="3" readonly spellcheck="false" autocapitalize="off"></textarea>
+          <p id="qr-hint" class="muted small"></p>
+          <details id="key-details" hidden><summary id="key-details-title">Public keys</summary><pre id="public-keys"></pre></details>
+        </aside>
+      </div>
+      <noscript>This administration panel requires JavaScript.</noscript>
+    </main>
+  </body>
+</html>

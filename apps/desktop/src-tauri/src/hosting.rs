@@ -308,14 +308,14 @@ fn handle(path: &Path, request: Request, builtin: Selection) -> Result<Reply, St
         Request::Preview { link } => {
             let (profile, _) = catalog.checked_import(&link)?;
             if profile.create_url == builtin.create_url {
-                return Err("This hosting address already has an approved configuration.".into());
+                return Err(builtin_import_error(catalog.builtin_enabled).into());
             }
             preview = Some(Selection::from(profile).summary());
             changed = false;
         }
         Request::Add { link } => {
             if parse_link(&link)?.create_url == builtin.create_url {
-                return Err("This hosting address already has an approved configuration.".into());
+                return Err(builtin_import_error(catalog.builtin_enabled).into());
             }
             catalog.add(&link)?;
         }
@@ -329,6 +329,14 @@ fn handle(path: &Path, request: Request, builtin: Selection) -> Result<Reply, St
         entries: catalog.entries(&builtin)?,
         preview,
     })
+}
+
+fn builtin_import_error(enabled: bool) -> &'static str {
+    if enabled {
+        "This hosting address is already included in the app."
+    } else {
+        "This hosting address is included in the app but was removed from this device."
+    }
 }
 
 #[tauri::command]
@@ -792,6 +800,39 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn builtin_import_explains_selection_or_restoration_without_accepting_new_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hosting-catalog.json");
+        let session = Session::create().unwrap().0;
+        let mut profile = profile(&session);
+        profile.create_url = fixture_builtin().create_url;
+        let link = link(&profile, &session);
+
+        for enabled in [true, false] {
+            if !enabled {
+                handle(
+                    &path,
+                    Request::Remove {
+                        id: BUILTIN_ID.into(),
+                    },
+                    fixture_builtin(),
+                )
+                .unwrap();
+            }
+            for request in [
+                Request::Preview { link: link.clone() },
+                Request::Add { link: link.clone() },
+            ] {
+                let error = handle(&path, request, fixture_builtin()).err().unwrap();
+                assert_eq!(error, builtin_import_error(enabled));
+                let catalog = load(&path).unwrap();
+                assert_eq!(catalog.builtin_enabled, enabled);
+                assert!(catalog.profiles.is_empty());
+            }
+        }
     }
 
     #[cfg(unix)]

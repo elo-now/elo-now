@@ -124,6 +124,7 @@ jobs:
       - run: python3 -m unittest discover -s deploy/hosting -v
       - run: python3 -m unittest discover -s deploy/storage -v
       - run: python3 -m unittest discover -s deploy/containers -v
+      - run: python3 -m unittest discover -s deploy/admin -v
 
   containers:
     if: github.event_name != 'schedule'
