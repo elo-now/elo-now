@@ -95,6 +95,7 @@ jobs:
         run: |
           # A patched dependency is not a workspace member. Its isolated tests
           # use the vendored Cargo.lock, including upstream dev dependencies.
+          test -s vendor/glib/Cargo.lock || { echo "The vendored GLib test lockfile must be included in the release source." >&2; exit 1; }
           cp -R vendor/glib "$RUNNER_TEMP/elo-glib-test"
           printf '\n[workspace]\n' >> "$RUNNER_TEMP/elo-glib-test/Cargo.toml"
           cargo test --locked --manifest-path "$RUNNER_TEMP/elo-glib-test/Cargo.toml" --lib variant_iter::tests
