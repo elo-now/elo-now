@@ -8,24 +8,25 @@ const base = process.env.ELO_QA_URL || 'http://127.0.0.1:1420';
 try {
   const page = await browser.newPage({ viewport: { width: 393, height: 852 } });
   const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.route('**/*', route => new URL(route.request().url()).origin === new URL(base).origin ? route.continue() : route.abort());
   await page.goto(base + '/tests/calls.html');
   await page.waitForFunction(() => window.callQA);
   const result = await page.evaluate(async () => {
     const { NativePeer } = await import('/src/calls/nativePeer.ts');
     const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
     const tick = () => new Promise(r => setTimeout(r, 10));
-    const access = { ice_servers: [] }, calls = [], updates = [], sent = [];
+    const calls = [], updates = [], presence = [];
     let failures = 0, connected = 0;
     const start = deferred(), firstPoll = deferred();
-    const old = new NativePeer(access, 'self', 'peer', 'profile', async v => sent.push(v), v => updates.push(v), () => failures++, () => connected++, async v => {
+    const old = new NativePeer('self', 'profile', v => updates.push(v), () => failures++, () => connected++, v => presence.push(v), async v => {
       calls.push(v); if (v.op === 'start') return start.promise; return {};
     });
-    const offer = old.offer();
+    const pendingUpdate = old.update({ audio_muted: false, video_published: false, screen_published: false });
     const stopped = old.stop();
-    start.resolve({}); await stopped; await offer;
-    if (calls.some(v => ['offer', 'poll', 'update'].includes(v.op))) throw Error('Late start revived a stopped peer');
+    start.resolve({}); await stopped; await pendingUpdate;
+    if (calls.some(v => ['poll', 'update'].includes(v.op))) throw Error('Late start revived a stopped peer');
     const liveCalls = [];
-    const peer = new NativePeer(access, 'self', 'peer', 'profile', async v => sent.push(v), v => updates.push(v), () => failures++, () => connected++, async v => {
+    const peer = new NativePeer('self', 'profile', v => updates.push(v), () => failures++, () => connected++, v => presence.push(v), async v => {
       liveCalls.push(v);
       if (v.op === 'poll') return firstPoll.promise;
       return {};
@@ -35,23 +36,25 @@ try {
     await peer.setSpeakerMuted(true);
     await peer.stop();
     const count = updates.length;
-    firstPoll.resolve({ connection: 'connected', revision: 1, signals: [{ type: 'offer', sdp: 'fictional' }], tracks: [{ id: 'remote-camera', source: 'camera', local: false }] });
+    firstPoll.resolve({ connection: 'connected', revision: 1, call: { call_id: 'stale' }, remote: 'peer', tracks: [{ id: 'remote-camera', source: 'camera', local: false }] });
     await tick();
-    if (updates.length !== count || sent.length || connected || failures) throw Error('A stopped poll leaked media/signals/callbacks');
+    if (updates.length !== count || presence.length || connected || failures) throw Error('A stopped poll leaked media/presence/callbacks');
     if (!liveCalls.some(v => v.op === 'speaker' && v.muted)) throw Error('Speaker mute did not reach native media');
-    // SDP changes must be serialized while stop remains immediate.
-    const signal = deferred(), serial = [];
-    const p = new NativePeer(access, 'self', 'peer', 'profile', async () => {}, () => {}, () => {}, () => {}, async v => {
+    // Media updates must be serialized while stop remains immediate. Native
+    // owns SDP/ICE; the WebView sends only capture/control changes now.
+    const update = deferred(), serial = [];
+    const p = new NativePeer('self', 'profile', () => {}, () => {}, () => {}, () => {}, async v => {
       serial.push(v.op);
-      if (v.op === 'poll') return { connection: 'new', revision: 0, signals: [], tracks: [] };
-      if (v.op === 'signal') return signal.promise;
+      if (v.op === 'poll') return { connection: 'new', revision: 0, tracks: [] };
+      if (v.op === 'update') return update.promise;
       return {};
     });
-    const s = p.signal({ type: 'offer', sdp: 'fictional' });
-    const o = p.offer(); await tick();
-    if (serial.includes('offer')) throw Error('Offer raced unfinished remote SDP');
-    await p.stop(); signal.resolve({}); await s; await o;
-    if (serial.includes('offer')) throw Error('Queued offer survived cancellation');
+    const first = p.update({ audio_muted: true, video_published: false, screen_published: false });
+    const second = p.update({ audio_muted: false, video_published: false, screen_published: false });
+    await tick();
+    if (serial.filter(op => op === 'update').length !== 1) throw Error('Media updates raced each other');
+    await p.stop(); update.resolve({}); await first; await second;
+    if (serial.filter(op => op === 'update').length !== 1) throw Error('Queued media update survived cancellation');
     const { Calls } = await import('/src/calls/controller.ts');
     const controller = new Calls(), stopping = deferred();
     controller.adapter = { stop: () => stopping.promise };
@@ -64,24 +67,24 @@ try {
     return { stoppedStarts: calls.filter(v => v.op === 'stop').length, stalePollIgnored: true, serialized: true };
   });
   assert.ok(result.stoppedStarts >= 1); assert.ok(result.stalePollIgnored && result.serialized);
-  console.log('PASS native media: late start/poll cancellation, serialized signaling, speaker mute');
+  console.log('PASS native media: late start/poll cancellation, serialized media updates, speaker mute');
   await page.evaluate(() => {
-    callQA.picker(false); callQA.start();
+    callQA.start();
     const calls = callQA.calls, state = calls.getSnapshot();
     window.nativeFrames = [];
     window.releaseNativeRender = undefined;
-    calls.isNativeDirect = () => true;
+    calls.isNativeMedia = () => true;
     const active = structuredClone(state.active);
     active.participants.remote.media.video_published = true;
     active.participants.local.media.video_published = true;
     calls.change({ active, tiles: ['remote', 'local'].map(who => ({ id: who + '-camera', credential: who + '-device', local: who === 'local', source: 'camera', stream: new MediaStream(), native: {
-      session: 'fictional-session', track: who + '-camera', render: async frames => {
+      session: 'fictional-session', revision: 1, track: who + '-camera', render: async frames => {
         nativeFrames.push(frames);
         if (frames.length && window.delayNativeRender) await new Promise(resolve => { window.releaseNativeRender = resolve; });
       },
     } })) });
   });
-  await page.locator('.call-dock-title').click();
+  await page.locator('.call-widget').getByRole('button', { name: 'Open call', exact: true }).click();
   await page.waitForFunction(() => document.documentElement.classList.contains('native-call-video'));
   assert.equal(await page.locator('.call-native-video').count(), 2);
   const frames = await page.evaluate(() => nativeFrames.at(-1));
@@ -105,7 +108,10 @@ try {
   const preview = await page.locator('.call-self-preview .native-video-frame').boundingBox();
   const pixel = PNG.sync.read(await page.screenshot());
   const offset = (Math.floor(preview.y + preview.height / 2) * pixel.width + Math.floor(preview.x + preview.width / 2)) * 4;
-  assert.deepEqual([...pixel.data.subarray(offset, offset + 3)], [231, 17, 203], 'Audio-only main tile obscured native self video');
+  const visiblePixel = [...pixel.data.subarray(offset, offset + 3)];
+  // Chromium color conversion can round a channel by one byte. The vivid
+  // underlay must still be visible, rather than the opaque placeholder.
+  assert.ok(visiblePixel.every((channel, index) => Math.abs(channel - [231, 17, 203][index]) <= 2), `Audio-only main tile obscured native self video: ${visiblePixel}`);
   const repeatedWrites = await page.evaluate(async () => {
     let writes = 0;
     const observer = new MutationObserver(records => { writes += records.length; });
@@ -131,12 +137,12 @@ try {
   });
   await page.waitForFunction(() => nativeFrames.at(-1)?.length === 2);
   console.log('PASS audio to video: self preview pixels visible above remote initials; camera-off restores placeholder');
-  await page.getByRole('button', { name: 'Collapse call', exact: true }).click();
+  await page.getByRole('button', { name: 'Collapse session', exact: true }).click();
   await page.waitForFunction(() => !document.documentElement.classList.contains('native-call-video') && nativeFrames.at(-1)?.length === 0);
   await page.evaluate(() => { window.delayNativeRender = true; });
-  await page.locator('.call-dock-title').click();
+  await page.locator('.call-widget').getByRole('button', { name: 'Open call', exact: true }).click();
   await page.waitForFunction(() => window.releaseNativeRender);
-  await page.getByRole('button', { name: 'Collapse call', exact: true }).click();
+  await page.getByRole('button', { name: 'Collapse session', exact: true }).click();
   await page.evaluate(() => releaseNativeRender());
   await page.waitForFunction(() => nativeFrames.at(-1)?.length === 0);
   assert.equal(await page.evaluate(() => document.documentElement.classList.contains('native-call-video')), false);

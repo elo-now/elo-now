@@ -3,24 +3,69 @@
   gap: 12px;
   margin-top: 20px;
 }
-.call-header-slot:empty {
+.call-widget-layer {
+  position: fixed;
+  z-index: 60;
+  top: calc(
+    var(--app-viewport-top, 0px) + max(12px, env(safe-area-inset-top, 0px))
+  );
+  left: max(12px, env(safe-area-inset-left, 0px));
+  right: max(12px, env(safe-area-inset-right, 0px));
+  height: calc(
+    var(--app-viewport-height, 100dvh) -
+      max(12px, env(safe-area-inset-top, 0px)) -
+      max(
+        12px,
+        var(--app-content-bottom-inset, env(safe-area-inset-bottom, 0px))
+      )
+  );
+  pointer-events: none;
+}
+.call-widget {
+  position: absolute;
+  width: min(288px, 100%);
+  box-sizing: border-box;
+  visibility: hidden;
+  padding: 8px;
+  color: var(--elo-text);
+  background: var(--elo-surface);
+  border: 1px solid var(--elo-line);
+  border-radius: 18px;
+  box-shadow:
+    0 8px 28px #0003,
+    0 2px 6px #0002;
+  pointer-events: auto;
+}
+.call-widget[hidden] {
   display: none;
 }
-.call-header-slot {
-  flex: 0 0 auto;
-  min-width: 0;
-}
-.call-strip {
+.call-widget-header {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
-  min-height: 52px;
-  padding: 4px var(--elo-page-inset, 12px);
-  background: var(--elo-surface);
-  border-bottom: 1px solid var(--elo-line);
 }
-.call-strip-title,
+.call-widget-grip {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--elo-muted);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.call-widget-grip:active {
+  cursor: grabbing;
+  background: transparent;
+  color: var(--elo-text);
+}
+.call-widget-title,
 .call-list-chat {
   display: flex;
   align-items: center;
@@ -33,40 +78,76 @@
   color: var(--elo-text);
   text-align: left;
 }
-.call-strip-title > svg {
-  flex: 0 0 auto;
-  color: var(--elo-accent);
+.call-widget-title {
+  min-height: 44px;
 }
-.call-strip-title > span {
+.call-widget-avatar {
   display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  height: 32px;
+  border-radius: 10px;
+  color: var(--elo-accent);
+  background: color-mix(in srgb, var(--elo-accent) 12%, transparent);
+}
+.call-widget-heading {
+  display: grid;
+  flex: 1;
   min-width: 0;
 }
-.call-strip-title strong,
-.call-strip-title small {
+.call-widget-heading strong,
+.call-widget-heading small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.call-strip-title strong {
+.call-widget-heading strong {
   font-size: var(--elo-type-label);
 }
-.call-strip-title small {
+.call-widget-heading small {
   color: var(--elo-muted);
   font-size: var(--elo-type-caption);
+  font-weight: 400;
 }
-.call-strip > .icon {
-  flex: 0 0 40px;
-  width: 40px;
-  min-width: 40px;
-  height: 44px;
-  min-height: 44px;
-  padding: 9px;
-}
-.call-strip-more,
-.call-strip-join {
+.call-widget-expand {
   flex: 0 0 auto;
-  padding: 8px;
+  color: var(--elo-muted);
+  margin-inline: 2px;
+}
+.call-widget-controls {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.call-widget-controls > .icon {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
   min-height: 44px;
+  padding: 10px;
+  border-radius: 12px;
+}
+.call-widget-controls > .call-leave {
+  background: color-mix(in srgb, #b33333 12%, var(--elo-surface));
+  border-color: color-mix(in srgb, #b33333 25%, var(--elo-line));
+}
+.call-widget-more {
+  margin-right: auto;
+  padding: 6px;
+  min-height: 44px;
+  font-size: var(--elo-type-label);
+}
+.call-widget-join {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 18px;
+  border-radius: 12px;
   font-size: var(--elo-type-label);
 }
 .call-list {
@@ -95,43 +176,6 @@
   color: var(--elo-muted);
   font-size: var(--elo-type-label);
 }
-.active-sessions {
-  display: grid;
-  gap: 8px;
-}
-.active-sessions > h2 {
-  margin: 0;
-  color: var(--elo-muted);
-  font-size: var(--elo-type-label);
-  font-weight: 600;
-}
-.active-session-row,
-.active-session-join {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  padding: 12px;
-  color: var(--elo-text);
-  background: var(--elo-surface);
-  border: 1px solid var(--elo-line);
-  border-radius: 12px;
-  text-align: left;
-}
-.active-session-row {
-  width: 100%;
-}
-.active-session-row.desktop-nav-item {
-  gap: 8px;
-  padding: 8px;
-  border: 0;
-  background: transparent;
-}
-.active-session-row > svg,
-.active-session-join > svg {
-  flex-shrink: 0;
-  color: var(--elo-accent);
-}
 .active-session-details {
   display: grid;
   flex: 1;
@@ -153,17 +197,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.active-session-dot {
-  flex: 0 0 7px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #d94343;
-}
-.active-session-join > button {
-  flex-shrink: 0;
-  min-height: 44px;
 }
 .call-choice button {
   display: flex;
@@ -198,43 +231,6 @@
   border-top: 1px solid var(--elo-line);
   margin-top: 16px;
   padding-top: 16px;
-}
-.call-dock {
-  position: fixed;
-  z-index: 35;
-  left: 12px;
-  right: 12px;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 82px);
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 8px;
-  border: 1px solid var(--elo-line);
-  border-radius: 18px;
-  background: var(--elo-surface);
-  box-shadow: 0 4px 20px #0002;
-}
-.call-dock-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1;
-  min-width: 0;
-  text-align: left;
-  background: transparent;
-  color: inherit;
-  font-size: var(--elo-type-label);
-  padding: 4px;
-  border: 0;
-}
-.call-dock-title span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.call-dock-title small {
-  display: block;
-  font-size: var(--elo-type-caption);
-  font-weight: 400;
 }
 .call-leave {
   color: #b33333 !important;
@@ -520,11 +516,6 @@
   right: 4px;
 }
 @media (min-width: 800px) {
-  .call-dock {
-    left: auto;
-    width: 400px;
-    bottom: 20px;
-  }
   .call-participant-strip > button {
     flex-basis: 25vw;
     width: 25vw;
@@ -568,8 +559,7 @@
   color: var(--elo-onButton);
 }
 
-.call-controls > .icon,
-.call-dock > .icon {
+.call-controls > .icon {
   flex: 0 0 44px;
   width: 44px;
   min-width: 44px;

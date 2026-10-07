@@ -361,7 +361,6 @@ export function MessageStream({
       aria-label={t("nav.stream")}
     >
       <ScreenHeader
-        callSlot="call-strip-buzz"
         title={t("nav.stream")}
         actions={!mobile && <RefreshButton onRefresh={onRefresh} />}
       />

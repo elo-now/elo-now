@@ -2381,7 +2381,6 @@ function App() {
                 {t("nav.stream")}
               </button>
               <ScreenHeader
-                callSlot="call-strip-messages"
                 title={t("nav.chats")}
                 actions={
                   <>
@@ -2625,7 +2624,6 @@ function App() {
               </div>
             )}
             <ScreenHeader
-              callSlot="call-strip-conversation"
               title={stream?.name ?? t("channel.start")}
               search={
                 <SearchField
@@ -3428,21 +3426,6 @@ function App() {
             calls={calls}
             view={view}
             currentChat={messagesActive || threadActive ? stream : undefined}
-            stripTarget={
-              settingsOpen || invitationRoute || desktopProfileEditing
-                ? undefined
-                : threadActive
-                  ? "call-strip-thread"
-                  : contactsActive
-                    ? "call-strip-contacts"
-                    : streamActive
-                      ? "call-strip-buzz"
-                      : messagesActive
-                        ? "call-strip-conversation"
-                        : chatsActive && !desktopLayout
-                          ? "call-strip-messages"
-                          : undefined
-            }
             onShowCalls={() => {
               openHome("stream");
               setCallsTabRequest((value) => value + 1);

@@ -1035,16 +1035,6 @@ body:has(.shell[data-mobile="false"]) .toast {
   min-width: 0;
   margin-inline-end: calc(8px * var(--desktop-density));
 }
-.shell[data-mobile="false"] .call-dock {
-  left: 12px;
-  right: auto;
-  bottom: 16px;
-  width: calc(var(--desktop-sidebar-width, 286px) - 24px);
-}
-.shell[data-mobile="false"]:has(.call-dock) .desktop-sidebar-scroll {
-  padding-bottom: 100px;
-}
-
 /* Action providers can render outside the shell. Keep their menus at the same
    density as menus mounted inside the desktop page. */
 :root[data-ui-scale="compact"] .dialog[data-desktop="true"] {

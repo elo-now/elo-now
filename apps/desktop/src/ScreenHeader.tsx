@@ -17,7 +17,6 @@ export function ScreenHeader({
   titleRef,
   participants,
   desktopRoot = false,
-  callSlot,
 }: {
   title: string;
   participants?: string[];
@@ -28,8 +27,6 @@ export function ScreenHeader({
   titleRef?: RefObject<HTMLHeadingElement | null>;
   /** Menu destinations use the persistent desktop navigation instead of Back. */
   desktopRoot?: boolean;
-  /** The persistent media host portals one strip into the visible screen. */
-  callSlot?: string;
 }) {
   const desktop = useDesktopLayout();
   const header = useRef<HTMLElement>(null);
@@ -47,39 +44,36 @@ export function ScreenHeader({
       : undefined;
   useBackSwipe(header, back);
   return (
-    <>
-      <header ref={header} className="screen-header">
-        <div className="screen-header-start">
-          {back && (
-            <button
-              type="button"
-              className="icon"
-              data-system-back
-              aria-label={backLabel ?? t("onboarding.back")}
-              onClick={back}
-            >
-              <Icon name="back" />
-            </button>
+    <header ref={header} className="screen-header">
+      <div className="screen-header-start">
+        {back && (
+          <button
+            type="button"
+            className="icon"
+            data-system-back
+            aria-label={backLabel ?? t("onboarding.back")}
+            onClick={back}
+          >
+            <Icon name="back" />
+          </button>
+        )}
+      </div>
+      <div className="screen-header-title">
+        <h2 ref={titleRef} tabIndex={titleRef ? -1 : undefined}>
+          {participants?.length ? (
+            <ParticipantTitle names={participants} />
+          ) : (
+            title
           )}
-        </div>
-        <div className="screen-header-title">
-          <h2 ref={titleRef} tabIndex={titleRef ? -1 : undefined}>
-            {participants?.length ? (
-              <ParticipantTitle names={participants} />
-            ) : (
-              title
-            )}
-          </h2>
-        </div>
-        <div className="screen-header-actions">
-          {desktop && search && (
-            <div className="desktop-header-search">{search}</div>
-          )}
-          {actions}
-        </div>
-        <UpdateBanner />
-      </header>
-      {callSlot && <div id={callSlot} className="call-header-slot" />}
-    </>
+        </h2>
+      </div>
+      <div className="screen-header-actions">
+        {desktop && search && (
+          <div className="desktop-header-search">{search}</div>
+        )}
+        {actions}
+      </div>
+      <UpdateBanner />
+    </header>
   );
 }

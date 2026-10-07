@@ -162,6 +162,9 @@ export const en = {
   "calls.otherSessions": "{count} other calls",
   "calls.dismissSession": "Dismiss this session",
   "calls.open": "Open call",
+  "calls.moveControls": "Move call controls",
+  "calls.moveControlsHelp": "Drag to move, or use the arrow keys.",
+  "calls.widgetStatus": "{status} · {space}",
   "calls.none": "No active calls.",
   "calls.invitePeople": "Invite to call",
   "calls.inviteHelp":
@@ -1245,6 +1248,8 @@ export const en = {
   "groups.change": "Change group",
   "groups.none": "None",
   "groups.new": "New group",
+  "groups.name": "Name",
+  "groups.create": "Add",
   "groups.save": "Save",
   "groups.empty": "No chats yet",
   "groups.noDms": "No direct messages yet",

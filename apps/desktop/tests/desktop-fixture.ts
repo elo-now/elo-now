@@ -515,6 +515,12 @@ mockIPC(
           makeChat(request.name || "Maya, Sam", created, request.chat_kind),
         );
       }
+      if (request.op === "create_group") {
+        view.groups ??= [];
+        view.groups.push({ id: `group-${sequence++}`, name: request.name.trim() });
+      }
+      if (request.op === "set_chat_group" && stream)
+        stream.group = request.group || null;
       if (request.op === "contact_open") created = "dm-maya";
       if (request.op === "send" && stream) {
         sent = { id: `sent-${sequence++}`, logical_time: Date.now() };

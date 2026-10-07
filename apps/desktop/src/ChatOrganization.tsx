@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Icon } from "./Icon";
 import { DirectOnlineIndicator } from "./useRealtime";
 import { EmptyState } from "./EmptyState";
@@ -6,6 +6,7 @@ import { t } from "./i18n";
 import { chatSections, chatIconName } from "./chatGroups";
 import type { ChatGroup, Stream, View } from "./model";
 import { SwipeChatRow } from "./SwipeChatRow";
+import { ChatGroupDialog } from "./ChatGroupDialog";
 
 export function ChatGroupsBar({
   view,
@@ -206,96 +207,46 @@ export function ChatGroupField({
   showLabel?: boolean;
 }) {
   const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("");
-  const input = useRef<HTMLInputElement>(null);
+  const selectId = useId();
   const edit = (active: boolean) => {
     setCreating(active);
     onEditing(active);
   };
-  useEffect(() => {
-    if (creating) input.current?.focus();
-  }, [creating]);
-  const create = async () => {
-    if (disabled || !name.trim()) return;
-    const group = await onCreate(name);
-    if (group) {
-      onChange(group.id);
-      setName("");
-      edit(false);
-    }
-  };
   return (
     <div className="chat-group-field">
-      {creating ? (
-        <>
-          <label htmlFor="new-group-name">{t("groups.new")}</label>
-          <div className="chat-group-row">
-            <input
-              ref={input}
-              id="new-group-name"
-              value={name}
-              disabled={disabled}
-              placeholder={t("field.channelName")}
-              autoComplete="off"
-              onChange={(event) => setName(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void create();
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  edit(false);
-                }
-              }}
-            />
-            <button
-              type="button"
-              disabled={disabled || !name.trim()}
-              onClick={() => void create()}
-            >
-              {t("action.createSpace.submit")}
-            </button>
-            <button
-              type="button"
-              className="secondary group-cancel"
-              disabled={disabled}
-              aria-label={t("dialog.close")}
-              onClick={() => edit(false)}
-            >
-              <Icon name="close" />
-            </button>
-          </div>
-        </>
-      ) : (
-        <>
-          {showLabel && <label htmlFor="chat-group">{t("groups.field")}</label>}
-          <div className="chat-group-row">
-            <select
-              id="chat-group"
-              aria-label={showLabel ? undefined : t("groups.field")}
-              value={value}
-              disabled={disabled}
-              onChange={(event) => onChange(event.target.value)}
-            >
-              <option value="">{t("groups.none")}</option>
-              {groups.map((group) => (
-                <option key={group.id} value={group.id}>
-                  {group.name}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              className="secondary"
-              disabled={disabled}
-              aria-label={t("groups.new")}
-              onClick={() => edit(true)}
-            >
-              <Icon name="plus" />
-            </button>
-          </div>
-        </>
+      {showLabel && <label htmlFor={selectId}>{t("groups.field")}</label>}
+      <div className="chat-group-row">
+        <select
+          id={selectId}
+          aria-label={showLabel ? undefined : t("groups.field")}
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          <option value="">{t("groups.none")}</option>
+          {groups.map((group) => (
+            <option key={group.id} value={group.id}>
+              {group.name}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="secondary"
+          disabled={disabled}
+          aria-label={t("groups.new")}
+          onClick={() => edit(true)}
+        >
+          <Icon name="plus" />
+        </button>
+      </div>
+      {creating && (
+        <ChatGroupDialog
+          disabled={disabled}
+          onCreate={onCreate}
+          onAdded={(group) => onChange(group.id)}
+          onClose={() => edit(false)}
+        />
       )}
     </div>
   );

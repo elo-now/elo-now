@@ -37,7 +37,6 @@ export function Contacts({
   return (
     <section className="contacts-page content-pane">
       <ScreenHeader
-        callSlot="call-strip-contacts"
         title={t("nav.contacts")}
         search={
           <SearchField

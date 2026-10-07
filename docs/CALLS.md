@@ -45,7 +45,9 @@ participant explicitly selects a person with **Invite to call** to ring them.
 The signed conversation kind, not its current participant count or title,
 determines the behavior.
 
-The interface presents one compact active-call strip across navigation. Other
+The interface presents one compact, draggable floating call widget across the
+unlocked app, including More and settings. It overlays the current screen without
+changing the header or message-list layout. Other
 available sessions belong in Calls rather than additional persistent control bars.
 An incoming invitation names its conversation and Space. **End & answer** first
 validates the incoming invitation, ends the current local call and then answers;
@@ -334,7 +336,7 @@ not embedded IP addresses or a fallback to official infrastructure. A future
 multi-node deployment can change the provider endpoint behind the same API.
 
 The shared app includes conversation call actions, the Calls filter in Buzz,
-one persistent compact strip and an expanded participant/video view. Calls continue
+one persistent compact floating widget and an expanded participant/video view. Calls continue
 across navigation; answering another call uses the explicit switch flow. Direct
 calls authenticate SDP/ICE through elo's signed encrypted signals. Group calls use
 LiveKit with a fresh 256-bit key per membership epoch: the desktop adapter uses its

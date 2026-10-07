@@ -4,9 +4,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-  useLayoutEffect,
 } from "react";
-import { createPortal } from "react-dom";
 import {
   Phone,
   PhoneOff,
@@ -23,6 +21,7 @@ import {
   VolumeOff,
   X,
   UserPlus,
+  Maximize2,
 } from "lucide-react";
 import { useDesktopLayout } from "../PageSurface";
 import { ActionDialog } from "../ActionDialog";
@@ -43,6 +42,7 @@ import {
   playNotificationSound,
   stopNotificationSound,
 } from "../notificationSounds";
+import { FloatingCall } from "./FloatingCall";
 import { SessionDialogs } from "./SessionDialogs";
 import { incomingStatus, listenIncomingCalls } from "./incomingNative";
 import {
@@ -295,13 +295,11 @@ function ParticipantVisual({
 export function CallSurface({
   calls,
   view,
-  stripTarget,
   currentChat,
   onShowCalls,
 }: {
   calls: Calls;
   view: View;
-  stripTarget?: string;
   currentChat?: Stream;
   onShowCalls: () => void;
 }) {
@@ -342,12 +340,8 @@ export function CallSurface({
   const expanded = state.expanded === true;
   const setExpanded = (value: boolean) =>
     value ? calls.expand() : calls.collapse();
-  const [stripHost, setStripHost] = useState<HTMLElement | null>(null);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviting, setInviting] = useState(false);
-  useLayoutEffect(() => {
-    setStripHost(stripTarget ? document.getElementById(stripTarget) : null);
-  }, [stripTarget]);
   const [selected, setSelected] = useState<string>();
   const [pinned, setPinned] = useState<string>();
   const [mutedPeople, setMutedPeople] = useState<Set<string>>(() => new Set());
@@ -627,42 +621,54 @@ export function CallSurface({
   const activeSpace = view.spaces?.find(
     (space) => space.id === active?.scope.hosting_space_id,
   );
-  const strip =
+  const status = !active
+    ? t("calls.establishing")
+    : active.phase === "ringing"
+      ? t("calls.ringing")
+      : connectionStatus;
+  const more = otherCount > 0 && (
+    <button
+      type="button"
+      className="quiet call-widget-more"
+      onClick={onShowCalls}
+      aria-label={t("calls.otherSessions", { count: otherCount })}
+    >
+      +{otherCount}
+    </button>
+  );
+  const widget =
     active || state.phase === "connecting" ? (
-      <section
-        className="call-strip"
-        aria-label={t("calls.active")}
-        key={active?.call_id ?? "connecting"}
-      >
-        <button
-          type="button"
-          className="call-strip-title"
-          disabled={!active}
-          onClick={calls.expand}
-        >
-          <Phone size={18} aria-hidden="true" />
-          <span>
-            <strong>{state.chat?.name ?? t("calls.establishing")}</strong>
-            <small>
-              {!active
-                ? t("calls.establishing")
-                : state.phase === "reconnecting"
-                  ? t("calls.reconnecting")
-                  : active.phase === "ringing"
-                    ? t("calls.ringing")
-                    : t("calls.inSpace", { name: activeSpace?.name ?? "" })}
-            </small>
-          </span>
-        </button>
-        {otherCount > 0 && (
+      <FloatingCall
+        label={t("calls.active")}
+        hidden={expanded}
+        title={
           <button
-            className="quiet call-strip-more"
-            onClick={onShowCalls}
-            aria-label={t("calls.otherSessions", { count: otherCount })}
+            type="button"
+            className="call-widget-title"
+            disabled={!active}
+            onClick={calls.expand}
+            aria-label={t("calls.open")}
           >
-            +{otherCount}
+            <span className="call-widget-avatar" aria-hidden="true">
+              <Phone size={18} />
+            </span>
+            <span className="call-widget-heading">
+              <strong>{state.chat?.name ?? t("calls.establishing")}</strong>
+              <small>
+                {activeSpace?.name
+                  ? t("calls.widgetStatus", { status, space: activeSpace.name })
+                  : status}
+              </small>
+            </span>
+            <Maximize2
+              size={16}
+              className="call-widget-expand"
+              aria-hidden="true"
+            />
           </button>
-        )}
+        }
+      >
+        {more}
         {active ? (
           controls(false)
         ) : (
@@ -675,43 +681,38 @@ export function CallSurface({
             <PhoneOff />
           </button>
         )}
-      </section>
+      </FloatingCall>
     ) : selectedSession ? (
-      <section
-        className="call-strip"
-        aria-label={t("calls.activeSessions")}
-        key={selectedSession.call.call_id}
-      >
-        <button
-          type="button"
-          className="call-strip-title"
-          onClick={onShowCalls}
-        >
-          <Phone size={18} aria-hidden="true" />
-          <span>
-            <strong>{selectedSession.chat.name}</strong>
-            <small>
-              {t("calls.inSpace", { name: selectedSession.spaceName })}
-            </small>
-          </span>
-        </button>
-        {otherCount > 0 && (
+      <FloatingCall
+        label={t("calls.activeSessions")}
+        title={
           <button
-            className="quiet call-strip-more"
+            type="button"
+            className="call-widget-title"
             onClick={onShowCalls}
-            aria-label={t("calls.otherSessions", { count: otherCount })}
           >
-            +{otherCount}
+            <span className="call-widget-avatar" aria-hidden="true">
+              <Phone size={18} />
+            </span>
+            <span className="call-widget-heading">
+              <strong>{selectedSession.chat.name}</strong>
+              <small>
+                {t("calls.inSpace", { name: selectedSession.spaceName })}
+              </small>
+            </span>
           </button>
-        )}
+        }
+      >
+        {more}
         <button
           type="button"
-          className="quiet call-strip-join"
+          className="call-widget-join"
           disabled={state.answering}
           onClick={() =>
             calls.requestStart(selectedSession.chat, selectedSession.call)
           }
         >
+          <Phone size={18} aria-hidden="true" />
           {t(
             selectedSession.call.kind === "direct" &&
               selectedSession.call.phase === "ringing"
@@ -729,11 +730,11 @@ export function CallSurface({
             <X size={18} />
           </button>
         )}
-      </section>
+      </FloatingCall>
     ) : null;
   return (
     <>
-      {stripHost && strip && createPortal(strip, stripHost)}
+      {widget}
       <SessionDialogs calls={calls} view={view} />
       {active && outputOpen && (
         <AudioOutputMenu

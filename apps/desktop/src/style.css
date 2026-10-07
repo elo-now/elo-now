@@ -1943,7 +1943,6 @@ nav button {
   align-items: center;
   gap: 8px;
 }
-:is(.dialog, .desktop-page) .chat-group-row input,
 :is(.dialog, .desktop-page) .chat-group-row select {
   flex: 1;
   width: 0;
@@ -1956,9 +1955,6 @@ nav button {
   min-height: 44px;
   margin: 0;
   padding: 6px 10px;
-}
-.chat-group-row .group-cancel {
-  font-size: var(--elo-type-title);
 }
 .channel-glyph {
   flex-shrink: 0;

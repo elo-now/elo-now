@@ -90,6 +90,7 @@ function ModalActionDialog({
       aria-label={title}
       onCancel={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         onClose();
       }}
       onClick={(event) => {
