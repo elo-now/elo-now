@@ -1089,7 +1089,8 @@ h2 {
   color: var(--elo-accent);
   font-size: var(--elo-type-label);
 }
-.security-settings > button {
+.security-settings > button,
+.diagnostics-test-button {
   width: 100%;
   margin-top: 12px;
 }

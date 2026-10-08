@@ -20,6 +20,10 @@ export const brandIntroFrames = [
 export const en = {
   "diagnostics.help":
     "In this beta build, Debug also sends crash reports, error codes, operation stages, app version and device information to Google Firebase Crashlytics. Messages, passwords, keys and invitation links are excluded from custom reports. Reports are sent on the next launch while Debug is enabled. Turning it off discards pending reports; it does not delete reports already sent.",
+  "diagnostics.liveHelp":
+    "In this beta build, Debug sends error codes, operation stages, app version and a random installation ID to elo’s diagnostic server in the EU without restarting. Offline reports retry while elo is running; up to 64 reports wait for up to 7 days. Server reports are kept for up to 14 days. Firebase Crashlytics separately collects crash reports and device information, normally sent on the next launch. Neither channel includes message content, passwords, keys or invitation links. Turning Debug off discards pending reports; it does not delete reports already sent.",
+  "diagnostics.liveQueued":
+    "Test report queued for delivery now. No restart is needed for the admin Logs panel. If offline, elo will retry when it can connect. The separate Crashlytics copy is sent on the next launch.",
   "diagnostics.supportId": "Diagnostic installation ID: {id}",
   "diagnostics.test": "Queue test report",
   "diagnostics.testQueued":

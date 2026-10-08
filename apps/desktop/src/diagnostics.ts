@@ -41,6 +41,7 @@ export function diagnosticErrorMessage(message: string) {
 
 export type DiagnosticStatus = {
   available: boolean;
+  live_available?: boolean;
   enabled: boolean;
   installation?: string;
 };

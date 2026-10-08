@@ -87,6 +87,7 @@ jobs:
           cargo test --locked -p elo-desktop --lib push::
           cargo test --locked -p elo-desktop --lib result_metadata_tests::
           cargo test --locked -p elo-desktop --lib release_policy::tests::
+          cargo test --locked -p elo-desktop --lib diagnostics::
       - name: Native call lifecycle and protected admission
         run: |
           cargo test --locked -p elo-desktop --lib native_session::
@@ -144,6 +145,7 @@ jobs:
       - run: python3 -m unittest discover -s deploy/storage -v
       - run: python3 -m unittest discover -s deploy/containers -v
       - run: python3 -m unittest discover -s deploy/admin -v
+      - run: python3 -m unittest discover -s deploy/diagnostics -v
 
   containers:
     if: github.event_name != 'schedule'

@@ -183,7 +183,28 @@ class AdminState:
             hosting = {"link": hosting["link"], "qr_url": qr, "revision": revision}
         return {"role": self.role, "csrf_token": self.csrf,
                 "configuration": public_configuration(self.role, saved.get("configuration")),
-                "hosting": hosting, "related_admin_url": self.related}
+                "hosting": hosting, "related_admin_url": self.related,
+                "logs_available": (self.root / "diagnostics-read-key").is_file()}
+
+    def logs(self, query):
+        # This credential never enters the browser. The public proxy exposes only
+        # the collector's exact POST route; all reads retain admin VPN and auth.
+        key = read_file(self.root / "diagnostics-read-key", 128).decode("ascii").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", key):
+            raise ValidationError("Invalid diagnostic reader configuration.")
+        connection = http.client.HTTPConnection("127.0.0.1", 17930, timeout=5)
+        try:
+            connection.request("GET", "/reports" + ("?" + query if query else ""),
+                               headers={"Authorization": "Bearer " + key})
+            response = connection.getresponse()
+            body = response.read(1024 * 1024 + 1)
+            if response.status == 400:
+                return 400, {"error": "Invalid log filters."}
+            if response.status != 200 or len(body) > 1024 * 1024:
+                raise OSError("Diagnostic reader unavailable")
+            return 200, decode(body)
+        finally:
+            connection.close()
 
 
 class HeaderReader:
@@ -258,6 +279,9 @@ class Handler(BaseHTTPRequestHandler):
             path = self.path
             if path == "/admin/api/state":
                 self.reply(200, self.server.state.public_state())
+            elif urlsplit(path).path == "/admin/api/logs":
+                status, value = self.server.state.logs(urlsplit(path).query)
+                self.reply(status, value)
             elif path.startswith("/admin/api/jobs/") and JOB_ID.fullmatch(path[len("/admin/api/jobs/"):]):
                 value = self.server.state.job(path[len("/admin/api/jobs/"):])
                 self.reply(200 if value is not None else 404, value or {"error": "Job not found."})
@@ -267,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, body=body, content_type=content_type)
             else:
                 self.reply(404, {"error": "Not found."})
-        except (OSError, ValidationError, KeyError, TypeError):
+        except (OSError, http.client.HTTPException, UnicodeError, ValidationError, KeyError, TypeError):
             self.reply(503, {"error": "Administration state is unavailable."})
 
     def do_POST(self):

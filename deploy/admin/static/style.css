@@ -84,6 +84,15 @@ button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: .
 details { margin-top: 16px; }
 summary { cursor: pointer; }
 pre { max-width: 100%; overflow: auto; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.panel-tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+.logs-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; align-items: end; margin: 24px 0; }
+.logs-filters label { font-size: 14px; margin: 0; }
+.logs-filters input, .logs-filters select { margin-top: 6px; }
+.log-report { border-top: 1px solid var(--border); padding: 14px 0; margin: 0; }
+.log-report summary { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; }
+.log-code { overflow-wrap: anywhere; }
+.log-report pre { background: var(--input); border-radius: 8px; padding: 14px; }
+#logs-more { margin-top: 16px; }
 @media (max-width: 760px) {
   main { padding: 24px 16px 40px; }
   .layout { grid-template-columns: minmax(0, 1fr); gap: 18px; }

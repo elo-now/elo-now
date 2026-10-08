@@ -1,0 +1,35 @@
+[Unit]
+Description=elo opt-in live beta diagnostics
+After=network.target
+
+[Service]
+User=elo-diagnostics
+Group=elo-diagnostics
+ExecStart=/usr/bin/python3 /opt/elo-diagnostics/collector.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=/srv/elo-diagnostics
+CapabilityBoundingSet=
+TasksMax=16
+MemoryMax=128M
+CPUQuota=25%
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

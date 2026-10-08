@@ -302,6 +302,8 @@
     else renderWitness(state.configuration);
     renderHosting(state.configuration, role === "api" ? state.hosting : null);
     document.getElementById("content").hidden = false;
+    document.getElementById("panel-tabs").hidden = !state.logs_available;
+    if (state.logs_available) prepareLogs();
     app.setAttribute("aria-busy", "false");
     dirty = false;
     setBusy(false);
@@ -444,6 +446,101 @@
       status.textContent = "";
       app.setAttribute("aria-busy", "false");
       setBusy(false);
+    }
+  }
+
+  let logsReady = false, logsActive = false, logsBusy = false, logsNext = null;
+  let logsQuery = "", logsGeneration = 0;
+  const logsPanel = document.getElementById("logs-panel");
+  const logsResults = document.getElementById("logs-results");
+  const logsError = document.getElementById("logs-error");
+  const logsStatus = document.getElementById("logs-status");
+
+  function prepareLogs() {
+    if (logsReady) return;
+    logsReady = true;
+    for (const [id, key] of [["configuration-tab", "settings.title"], ["logs-tab", "logs.title"],
+      ["logs-title", "logs.title"], ["logs-help", "logs.help"], ["logs-more", "logs.more"]]) {
+      document.getElementById(id).textContent = t(key);
+    }
+    const filters = document.getElementById("logs-filters");
+    for (const name of ["platform", "version", "build", "code", "installation"]) {
+      const label = element("label", t(`logs.${name}`));
+      let input;
+      if (name === "platform") {
+        input = document.createElement("select");
+        for (const value of ["", "ios", "android", "macos"]) {
+          const option = element("option", t(`logs.platform.${value || "all"}`));
+          option.value = value; input.append(option);
+        }
+      } else {
+        input = document.createElement("input");
+        input.type = "text"; input.autocomplete = "off"; input.spellcheck = false;
+        input.maxLength = name === "installation" ? 32 : name === "code" ? 160 : 16;
+      }
+      input.name = name; label.append(input); filters.append(label);
+    }
+    const refresh = element("button", t("logs.refresh"), "secondary");
+    refresh.type = "submit"; filters.append(refresh);
+    filters.addEventListener("submit", event => {
+      event.preventDefault();
+      const params = new URLSearchParams();
+      for (const [key, value] of new FormData(filters)) if (String(value).trim()) params.set(key, String(value).trim());
+      logsQuery = params.toString(); logsGeneration++; loadLogs(false);
+    });
+    for (const id of ["configuration-tab", "logs-tab"]) {
+      document.getElementById(id).addEventListener("click", () => {
+        logsActive = id === "logs-tab";
+        logsPanel.hidden = !logsActive;
+        document.getElementById("content").hidden = logsActive;
+        for (const tab of ["configuration-tab", "logs-tab"]) {
+          const selected = tab === id, button = document.getElementById(tab);
+          button.className = selected ? "primary" : "secondary";
+          button.setAttribute("aria-pressed", String(selected));
+        }
+        if (logsActive) loadLogs(false);
+      });
+    }
+    document.getElementById("logs-more").addEventListener("click", () => loadLogs(true));
+    // Auto refresh only the newest page; leave expanded reports undisturbed.
+    setInterval(() => {
+      if (logsActive && !document.hidden && !logsResults.querySelector("details[open]") && !logsResults.dataset.older) loadLogs(false);
+    }, 10000);
+  }
+
+  async function loadLogs(older) {
+    if (logsBusy) return;
+    logsBusy = true;
+    const generation = logsGeneration;
+    logsPanel.setAttribute("aria-busy", "true");
+    logsError.hidden = true;
+    const params = new URLSearchParams(logsQuery);
+    if (older && logsNext) params.set("before", String(logsNext));
+    try {
+      const result = await request(`./api/logs${params.size ? `?${params}` : ""}`);
+      if (generation !== logsGeneration) return;
+      if (!Array.isArray(result.reports)) throw new Error(t("logs.unavailable"));
+      if (!older) { logsResults.replaceChildren(); delete logsResults.dataset.older; }
+      else logsResults.dataset.older = "true";
+      for (const report of result.reports) {
+        const row = element("details", undefined, "log-report");
+        const summary = document.createElement("summary");
+        const when = new Date(report.received_at * 1000).toLocaleString();
+        summary.append(element("strong", report.report.event.code, "log-code"),
+          element("span", `${when} · ${report.platform} · ${report.version} (${report.build})`, "muted small"));
+        row.append(summary);
+        const content = element("pre", JSON.stringify(report, null, 2));
+        row.append(content); logsResults.append(row);
+      }
+      logsNext = result.next;
+      document.getElementById("logs-more").hidden = !logsNext;
+      logsStatus.textContent = logsResults.children.length
+        ? t("logs.updated", { count: logsResults.children.length, time: new Date().toLocaleTimeString() }) : t("logs.empty");
+    } catch (failure) {
+      logsError.textContent = failure.message || t("logs.unavailable"); logsError.hidden = false;
+    } finally {
+      logsBusy = false; logsPanel.setAttribute("aria-busy", "false");
+      if (generation !== logsGeneration && logsActive) loadLogs(false);
     }
   }
 

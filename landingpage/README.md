@@ -87,4 +87,6 @@ are sufficient to serve the generated site.
 Each page has a title, description, canonical URL, Open Graph and Twitter
 large-card metadata, and JSON-LD. Light/dark variants canonicalize to the main
 homepage. The sitemap lists six canonical URLs; the social preview is 1200×630.
-No ratings or reviews are invented in the structured data.
+Application features, screenshot URLs and the 9bits managed hosting service
+are included in the structured data. No ratings or reviews are invented.
+Canonical variants follow [Google’s duplicate URL guidance](https://developers.google.com/search/docs/crawling-indexing/consolidate-duplicate-urls).

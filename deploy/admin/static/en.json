@@ -74,5 +74,21 @@
   "error.identities": "Enter public profile identity IDs as 64 hexadecimal characters, one per line.",
   "error.allowlist": "Add at least one allowed profile identity, or allow anyone to create Spaces.",
   "error.credentials": "Complete the credential fields for the selected provider.",
-  "error.qr": "The configuration is saved, but its QR code could not be loaded. You can copy the link instead."
+  "error.qr": "The configuration is saved, but its QR code could not be loaded. You can copy the link instead.",
+  "logs.title": "Logs",
+  "logs.help": "Live beta errors from devices with Debug enabled. Reports are kept for up to 14 days (10,000 newest reports). This list refreshes every 10 seconds. Crashlytics remains separate. Installation IDs identify app installations, not verified users.",
+  "logs.platform": "Platform",
+  "logs.platform.all": "All platforms",
+  "logs.platform.ios": "iOS",
+  "logs.platform.android": "Android",
+  "logs.platform.macos": "macOS",
+  "logs.version": "App version",
+  "logs.build": "Build",
+  "logs.code": "Error code",
+  "logs.installation": "Installation ID",
+  "logs.more": "Load older reports",
+  "logs.refresh": "Refresh",
+  "logs.empty": "No reports match these filters.",
+  "logs.updated": "Reports shown: {count} · Updated {time}",
+  "logs.unavailable": "Could not load reports. Try again."
 }

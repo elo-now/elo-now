@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import schema
@@ -113,7 +114,7 @@ class HTTPTests(unittest.TestCase):
         return self.request("POST", "/admin/api/config", json.dumps(api_configuration() if value is None else value).encode(), headers)
 
     def test_proxy_authentication_applies_to_api_assets_and_unknown_routes(self):
-        for path in ["/admin/", "/admin/style.css", "/admin/app.js", "/admin/en.json", "/admin/api/state", "/admin/api/config", "/unknown"]:
+        for path in ["/admin/", "/admin/style.css", "/admin/app.js", "/admin/en.json", "/admin/api/state", "/admin/api/config", "/admin/api/logs", "/unknown"]:
             self.assertEqual(self.request(path=path, headers={})[0], 403)
             self.assertEqual(self.request(path=path, headers={"X-Elo-Admin-Proxy-Key": "wrong"})[0], 403)
         status, body, headers = self.request()
@@ -123,6 +124,23 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertEqual(self.request(path="/admin/en.json")[0], 200)
+
+    def test_logs_use_private_proxy_boundary_and_never_expose_reader_key(self):
+        path = self.root / "diagnostics-read-key"
+        path.write_text("r" * 40); path.chmod(0o600)
+        status, body, _ = self.request()
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["logs_available"])
+        self.assertNotIn(b"r" * 40, body)
+        with patch.object(self.state, "logs", return_value=(200, {"reports": [], "next": None})) as logs:
+            self.assertEqual(self.request(path="/admin/api/logs?platform=ios", headers={})[0], 403)
+            logs.assert_not_called()
+            self.assertEqual(self.request(path="/admin/api/logs?platform=ios")[0], 200)
+            logs.assert_called_once_with("platform=ios")
+        with patch.object(self.state, "logs", side_effect=OSError("private details")):
+            status, body, _ = self.request(path="/admin/api/logs")
+            self.assertEqual(status, 503)
+            self.assertNotIn(b"private details", body)
 
     def test_origin_and_csrf_are_required_before_any_enqueue(self):
         for key, value in [("Origin", None), ("Origin", "null"), ("Origin", "https://attacker.example"), ("X-CSRF-Token", None), ("X-CSRF-Token", "stale")]:

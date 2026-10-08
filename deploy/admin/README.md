@@ -1,5 +1,10 @@
 # Hosting administration
 
+Optional [live beta diagnostics](../diagnostics/README.md) add a **Logs** tab to
+this panel. It uses the same VPN and login protection; no log-reading endpoint
+is exposed publicly. The tab is shown only when a local diagnostics reader is
+configured.
+
 This optional administration service configures an initialized elo deployment.
 The API panel edits the hosting name, available message lifetimes, default
 lifetime, Space creator allowlist and managed attachment provider. It publishes

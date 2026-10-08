@@ -42,7 +42,10 @@ to add hosting separately. See
 supported services and trust boundaries.
 The optional panel is restricted to a configured WireGuard client and also
 requires an HTTPS Basic Auth password. It manages hosting policy and storage;
-users still create their Spaces in the app.
+users still create their Spaces in the app. The optional **Logs** view shows
+allowlisted error reports from opt-in beta builds without restarting the app.
+See [live beta diagnostics](deploy/diagnostics/README.md) for collection,
+retention and deployment details.
 
 ## Work together
 
@@ -50,13 +53,13 @@ users still create their Spaces in the app.
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Spaces**                       | Keep organizations and projects separate, invite people by link or QR, and choose whether an invitation requires owner approval.                                                               |
 | **Conversations**                | Use General, named chats, one-to-one and group DMs; reply in threads, mention teammates, edit your text, react, pin and search available messages.                                             |
-| **Buzz**                         | Catch up through **All**, **Mentions** and **Threads**. Follow a thread or mute a conversation to control your attention.                                                                      |
+| **Buzz**                         | Catch up through **All**, **Mentions**, **Threads** and **Calls**. Follow a thread or mute a conversation to control your attention.                                                                      |
 | **Notes and drafts**             | Send notes and files to yourself in a private conversation shared with your admitted devices. Unsent drafts stay encrypted on the device where you write them.                                 |
 | **Attachments**                  | Share encrypted photos and files, paste image bytes or drop a file into a desktop chat, and view downloaded images in the conversation.                                                        |
 | **Audio and video**              | Call a contact or join a group session from a chat. Answer or decline incoming calls, use full-screen video, choose the audio output on mobile and share your screen on desktop. Find active sessions in Buzz → Calls. |
 | **Devices and recovery**         | Link and approve devices, manage registered access, unlock with a password or supported biometrics, and export encrypted backups of supported profile and chat data.                           |
 | **Notifications and appearance** | Use optional system notifications, unread indicators and desktop notification sounds; choose Dark, Auto or Light, interface size and background motifs.                                        |
-| **Retention**                    | Choose the Space's server message lifetime, set **Keep** on individual text messages and set a separate attachment expiry policy.                                                              |
+| **Retention**                    | Choose the Space's server message lifetime, set **Expiry** on individual text messages and set a separate attachment expiry policy.                                                              |
 
 Live synchronization uses authenticated WebSocket connections. Typing indicators,
 online status and upload previews provide context while connected; ordinary

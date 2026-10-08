@@ -241,6 +241,10 @@ See [wake setup](SELF_HOSTING.md#6-firebase-apns-and-the-wake-service).
 
 ### Optional beta diagnostics
 
+The standard desktop release workflow does not enable this optional feature
+or bundle the publisher’s Firebase configuration. Locally distributed beta
+builds can enable it explicitly as described below.
+
 Build with `beta-diagnostics` to enable the diagnostic controls on iOS, Android
 and macOS. Mobile builds also need `mobile-push` and the Firebase client
 configuration above. Windows and Linux do not send these reports. Collection
@@ -248,6 +252,21 @@ is off by default; the existing **Settings → Debug** switch enables it and
 **Queue test report** queues a non-fatal test event. Restart with Debug still
 enabled to send pending reports, then verify the platform and build number in
 your Firebase project's Crashlytics console.
+
+For live beta errors without restarting, also set these compile-time values:
+
+```sh
+export TAURI_ELO_LIVE_DIAGNOSTICS_URL=https://your-api.example/diagnostics/v1/errors
+export TAURI_ELO_DIAGNOSTICS_BUILD=1180
+```
+
+Use the [live diagnostics receiver](../deploy/diagnostics/README.md) and its
+VPN-protected admin **Logs** view. This is a separate channel, not a way to
+force Crashlytics to flush its current session. With Debug enabled, errors
+retry while the app runs; the local queue holds at most 64 reports for seven
+days. Turning Debug off clears it. Builds without an endpoint retain the
+Crashlytics-only behavior. Do not configure an endpoint you do not operate or
+silently point a self-hosted build at the publisher's diagnostic service.
 
 On macOS, bundle your app's `GoogleService-Info.plist` as a resource and include
 the privacy bundles staged in `apps/desktop/src-tauri/macos/DiagnosticsResources`

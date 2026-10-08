@@ -1,4 +1,5 @@
 //! Beta diagnostics: no payloads, identities, URLs or arbitrary error strings.
+mod live;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -28,6 +29,7 @@ struct Policy {
 }
 
 fn send(value: Value) {
+    live::record(&value);
     if let Some(sender) = SENDER.get() {
         let _ = sender.try_send(value);
     }
@@ -57,7 +59,7 @@ pub fn setup(app: &tauri::AppHandle) {
                 installation: bytes.iter().map(|b| format!("{b:02x}")).collect(),
             }
         });
-    if std::fs::create_dir_all(directory).is_err() {
+    if std::fs::create_dir_all(&directory).is_err() {
         return;
     }
     let Ok(bytes) = serde_json::to_vec(&choice) else {
@@ -66,6 +68,12 @@ pub fn setup(app: &tauri::AppHandle) {
     if std::fs::write(&path, bytes).is_err() {
         return;
     }
+    live::setup(
+        directory,
+        choice.enabled,
+        choice.installation.clone(),
+        app.package_info().version.to_string(),
+    );
     let (sender, receiver) = mpsc::sync_channel::<Value>(64);
     if SENDER.set(sender).is_err() {
         return;
@@ -199,13 +207,14 @@ pub async fn diagnostic_task(request: Value) -> Result<Value, String> {
                 let bytes = serde_json::to_vec(&choice).map_err(|_| "Diagnostics unavailable")?;
                 std::fs::write(&policy.path, bytes).map_err(|_| "Diagnostics unavailable")?;
                 policy.choice = choice;
+                live::configure(enabled);
                 if let Some(sender) = SENDER.get() {
                     sender.send(json!({"op":"configure","enabled":enabled,"installation":policy.choice.installation}))
                         .map_err(|_| "Diagnostics unavailable")?;
                 }
             }
             Ok(
-                json!({"available":SUPPORTED,"enabled":policy.choice.enabled,"installation":policy.choice.installation}),
+                json!({"available":SUPPORTED,"enabled":policy.choice.enabled,"installation":policy.choice.installation,"live_available":live::available()}),
             )
         }
         _ => Err("Invalid diagnostics operation".into()),

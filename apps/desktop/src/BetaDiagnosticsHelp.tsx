@@ -22,7 +22,7 @@ export function BetaDiagnosticsHelp({ enabled }: { enabled: boolean }) {
   if (!status?.available) return null;
   return (
     <>
-      <p className="muted">{t("diagnostics.help")}</p>
+      <p className="muted">{t(status.live_available ? "diagnostics.liveHelp" : "diagnostics.help")}</p>
       {enabled && (
         <>
           <p className="muted">
@@ -30,7 +30,7 @@ export function BetaDiagnosticsHelp({ enabled }: { enabled: boolean }) {
           </p>
           <button
             type="button"
-            className="secondary"
+            className="secondary diagnostics-test-button"
             disabled={sent}
             onClick={() => {
               diagnostic("error", "test", "diagnostics_test");
@@ -41,7 +41,7 @@ export function BetaDiagnosticsHelp({ enabled }: { enabled: boolean }) {
           </button>
           {sent && (
             <p role="status" className="muted">
-              {t("diagnostics.testQueued")}
+              {t(status.live_available ? "diagnostics.liveQueued" : "diagnostics.testQueued")}
             </p>
           )}
         </>

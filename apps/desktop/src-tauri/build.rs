@@ -47,6 +47,28 @@ fn main() {
         "cargo:rustc-env=ELO_CONFIGURED_WITNESS={}",
         witness.map(|pin| pin.to_string()).unwrap_or_default()
     );
+    println!("cargo:rerun-if-env-changed=TAURI_ELO_LIVE_DIAGNOSTICS_URL");
+    println!("cargo:rerun-if-env-changed=TAURI_ELO_DIAGNOSTICS_BUILD");
+    if let Ok(value) = std::env::var("TAURI_ELO_LIVE_DIAGNOSTICS_URL") {
+        let url = url::Url::parse(&value).expect("Invalid live diagnostics URL");
+        assert!(
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "Live diagnostics requires a fixed HTTPS endpoint"
+        );
+        println!("cargo:rustc-env=ELO_LIVE_DIAGNOSTICS_URL={value}");
+    }
+    if let Ok(value) = std::env::var("TAURI_ELO_DIAGNOSTICS_BUILD") {
+        assert!(
+            !value.is_empty() && value.len() <= 16 && value.bytes().all(|b| b.is_ascii_digit()),
+            "Invalid diagnostic build number"
+        );
+        println!("cargo:rustc-env=ELO_DIAGNOSTICS_BUILD={value}");
+    }
     configure_team_replica();
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[

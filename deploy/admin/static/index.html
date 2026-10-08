@@ -19,6 +19,19 @@
       </header>
       <p id="status" class="status" role="status" aria-live="polite">Loading configuration…</p>
       <p id="error" class="error" role="alert" hidden></p>
+      <nav id="panel-tabs" class="panel-tabs" aria-label="Administration" hidden>
+        <button id="configuration-tab" class="primary" type="button" aria-pressed="true">Configuration</button>
+        <button id="logs-tab" class="secondary" type="button" aria-pressed="false">Logs</button>
+      </nav>
+      <section id="logs-panel" class="panel" aria-labelledby="logs-title" hidden>
+        <h2 id="logs-title">Logs</h2>
+        <p id="logs-help" class="muted"></p>
+        <form id="logs-filters" class="logs-filters"></form>
+        <p id="logs-status" class="muted" role="status" aria-live="polite"></p>
+        <p id="logs-error" class="error" role="alert" hidden></p>
+        <div id="logs-results"></div>
+        <button id="logs-more" class="secondary" type="button" hidden>Load older reports</button>
+      </section>
       <div id="content" class="layout" hidden>
         <section class="panel" aria-labelledby="settings-title">
           <h2 id="settings-title">Configuration</h2>
