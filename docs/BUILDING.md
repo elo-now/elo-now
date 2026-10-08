@@ -51,6 +51,12 @@ visible application window that stays alive for ten seconds. This checks startup
 only; it does not verify profile unlocking, messaging, notifications or calls.
 A runner without a graphical session cannot pass that check.
 
+macOS CI runs on an Intel macOS runner. The release workflow also cross-compiles
+its Apple silicon build there using the explicit `aarch64-apple-darwin` target.
+It checks the executable architecture and bundle signature inside each final
+DMG. These checks do not substitute for running the ARM application on an
+Apple silicon Mac.
+
 The download workflow applies an ad hoc signature to the complete macOS app
 bundle and verifies its resource seal from the final, read-only mounted DMG. This is an integrity
 check, not Developer ID signing or notarization. A local equivalent is

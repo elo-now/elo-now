@@ -40,13 +40,17 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
+          # Cross-compile on Intel to avoid the limited hosted ARM runner pool.
+          # The final DMG is checked for the requested Mach-O architecture below.
           - name: macos-arm64
-            os: macos-latest
+            os: macos-15-intel
             target: aarch64-apple-darwin
+            macos_arch: arm64
             bundles: dmg
           - name: macos-x64
             os: macos-15-intel
             target: x86_64-apple-darwin
+            macos_arch: x86_64
             bundles: dmg
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -142,6 +146,8 @@ jobs:
           trap 'hdiutil detach "$mount_point"; rmdir "$mount_point"' EXIT
           hdiutil attach "${installers[0]}" -readonly -nobrowse -mountpoint "$mount_point"
           codesign --verify --deep --strict "$mount_point/elo.now.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mount_point/elo.now.app/Contents/Info.plist")
+          test "$(lipo -archs "$mount_point/elo.now.app/Contents/MacOS/$executable")" = "${{ matrix.macos_arch }}"
       - name: Preserve public configuration and startup-smoke evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
