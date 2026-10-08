@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { floatingAnchor, floatingPosition } from "./floatingPosition";
+import {
+  floatingAnchor,
+  floatingPosition,
+  floatingReleaseAnchor,
+} from "./floatingPosition";
 
 describe("floating call placement", () => {
   const size = { width: 288, height: 112 };
@@ -40,5 +44,129 @@ describe("floating call placement", () => {
       x: 0,
       y: 0,
     });
+  });
+
+  it("docks vertical swipes to the nearest top or bottom corner", () => {
+    expect(
+      floatingReleaseAnchor(
+        screen,
+        size,
+        { x: 40, y: 250 },
+        { x: 5, y: -70, duration: 100 },
+      ),
+    ).toEqual({ x: 0, y: 0 });
+    expect(
+      floatingReleaseAnchor(
+        screen,
+        size,
+        { x: 70, y: 400 },
+        { x: -5, y: 70, duration: 100 },
+      ),
+    ).toEqual({ x: 1, y: 1 });
+  });
+
+  it("docks horizontal swipes to an edge without changing their height", () => {
+    const point = { x: 50, y: 300 };
+    expect(
+      floatingPosition(
+        screen,
+        size,
+        floatingReleaseAnchor(screen, size, point, {
+          x: -80,
+          y: 5,
+          duration: 100,
+        }),
+      ),
+    ).toEqual({ x: 12, y: 300 });
+    expect(
+      floatingPosition(
+        screen,
+        size,
+        floatingReleaseAnchor(screen, size, point, {
+          x: 80,
+          y: -5,
+          duration: 100,
+        }),
+      ),
+    ).toEqual({ x: 90, y: 300 });
+  });
+
+  it("docks diagonal swipes in the intended corner", () => {
+    expect(
+      floatingReleaseAnchor(
+        screen,
+        size,
+        { x: 40, y: 300 },
+        { x: 60, y: -65, duration: 100 },
+      ),
+    ).toEqual({ x: 1, y: 0 });
+    expect(
+      floatingReleaseAnchor(
+        screen,
+        size,
+        { x: 60, y: 300 },
+        { x: -65, y: 60, duration: 100 },
+      ),
+    ).toEqual({ x: 0, y: 1 });
+  });
+
+  it("keeps a deliberate slow drag where it was released, with a small edge magnet", () => {
+    const point = { x: 50, y: 300 };
+    expect(
+      floatingPosition(
+        screen,
+        size,
+        floatingReleaseAnchor(screen, size, point, {
+          x: -40,
+          y: -100,
+          duration: 600,
+        }),
+      ),
+    ).toEqual(point);
+    expect(
+      floatingReleaseAnchor(
+        screen,
+        size,
+        { x: 20, y: 92 },
+        { x: 0, y: 0, duration: 400 },
+      ),
+    ).toEqual({ x: 0, y: 0 });
+  });
+
+  it("does not turn a short tap jitter or release after a pause into a swipe", () => {
+    const point = { x: 50, y: 300 };
+    for (const motion of [
+      { x: 4, y: 4, duration: 2 },
+      { x: -70, y: -20, duration: 300 },
+      { x: 0, y: 0, duration: 0 },
+    ]) {
+      expect(
+        floatingPosition(
+          screen,
+          size,
+          floatingReleaseAnchor(screen, size, point, motion),
+        ),
+      ).toEqual(point);
+    }
+  });
+
+  it("keeps both edges reachable on narrow phones", () => {
+    const narrow = { ...screen, width: 296 };
+    expect(
+      floatingReleaseAnchor(
+        narrow,
+        size,
+        { x: 20, y: 300 },
+        { x: 0, y: 0, duration: 200 },
+      ).x,
+    ).toBe(1);
+    expect(
+      floatingReleaseAnchor(
+        narrow,
+        size,
+        { x: 16, y: 300 },
+        { x: 0, y: 0, duration: 200 },
+      ).x,
+    ).toBe(0.5);
   });
 });

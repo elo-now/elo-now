@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import type { Stream, View } from "./model";
 import { senderName } from "./model";

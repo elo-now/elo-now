@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.FrameLayout
@@ -77,8 +78,16 @@ internal object NativeMedia {
             }
             if (op == "health") { completed(JSObject().put("live", currentId == id)); return }
             if (op in listOf("end_call", "stop")) { stop(id); completed(JSObject()); return }
+            // The first group epoch clears any previous room before group_start
+            // creates a native media owner. There is nothing to reset yet.
+            if (op == "group_reset" && !request.has("key") && currentId == null) {
+                completed(JSObject()); return
+            }
             if (op == "start" || op == "group_start") {
-                check(currentId == null) { "unavailable" }
+                // An epoch reset closes the room but retains this session's
+                // owner and key policy. Resume it without replacing that policy.
+                val resumingGroup = op == "group_start" && currentId == id && group != null
+                check(currentId == null || resumingGroup) { "unavailable" }
                 check(granted(activity, false)) { "NotAllowedError" }
                 val incoming = IncomingCalls.authorizedMedia(id)
                 val outgoing = OutgoingCalls.authorizedMedia(id)
@@ -86,7 +95,7 @@ internal object NativeMedia {
                 check(foreground(activity) || incoming || outgoing) { "NotAllowedError" }
                 if (incoming) IncomingCallService.authorizeCapture(activity, id, false)
                 if (op == "start") require(request.getJSONArray("ice_servers").length() <= 16)
-                currentId = id; generation += 1
+                if (!resumingGroup) { currentId = id; generation += 1 }
             } else check(currentId == id) { "ended" }
             if (op == "update") {
                 val video = request.getJSONObject("state").optBoolean("video_published")
@@ -100,7 +109,7 @@ internal object NativeMedia {
             val token = generation
             val systemMuted = OutgoingCalls.muted(id) || IncomingCalls.muted(id)
             val approvedMuteRevision = request.optLong("system_mute_revision", -1)
-            if (op == "group_start") group = NativeGroup(id, activity.applicationContext) { currentId == id && generation == token }.also {
+            if (op == "group_start" && group == null) group = NativeGroup(id, activity.applicationContext) { currentId == id && generation == token }.also {
                 it.attach(webView)
                 it.muteMicrophone(systemMuted || systemMute.blocked(id))
             }
@@ -162,7 +171,11 @@ internal object NativeMedia {
                     main.post { completed(failure(error)) }
                 }
             }
-        } catch (error: Exception) { completed(failure(error)) }
+        } catch (error: Exception) {
+            if (request.optString("op").startsWith("group_"))
+                Log.w("EloNativeMedia", "Group command rejected (${error.javaClass.simpleName})")
+            completed(failure(error))
+        }
     }
     private fun failure(error: Exception) = JSObject().put("error", when (error.message) { "NotAllowedError" -> "NotAllowedError"; "ended" -> "ended"; else -> "unavailable" })
     private fun render(frames: JSONArray, tracks: Map<String, VideoTrack>, peer: NativePeer) {

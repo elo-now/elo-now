@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { useLayoutEffect, useState, useSyncExternalStore } from "react";
 import type { SetStateAction } from "react";
 import type { MessageExpiryHours } from "./messageExpiry";

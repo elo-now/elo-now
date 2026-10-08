@@ -16,12 +16,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_witness(None)
+    }
+    fn with_witness(witness: Option<elo_core::authority::WitnessPin>) -> Self {
+        let version = if witness.is_some() { 4 } else { 1 };
         let (owner, recovery) = Session::create().unwrap();
         let peer = Session::create().unwrap().0;
         let root = recovery.recover_root(owner.identity_id()).unwrap();
         let genesis = SpaceGenesis {
-            witness: None,
-            v: 1,
+            witness,
+            v: version,
             kind: "space.genesis".into(),
             nonce: random_hex::<16>().unwrap(),
             issuer_identity: owner.identity_id(),
@@ -31,7 +35,12 @@ impl Fixture {
             }],
             controller_credential_id: owner.credential().id(),
         };
-        let signed = SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), &root).unwrap();
+        let key = if version == 4 {
+            owner.signing_key()
+        } else {
+            &root
+        };
+        let signed = SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), key).unwrap();
         let mut authority = Authority::new(
             signed.bytes(),
             signed.id().to_string().parse().unwrap(),
@@ -67,7 +76,7 @@ impl Fixture {
         members.sort_by_key(|member| member.identity_id);
         let config = StreamConfig {
             witness_evidence: None,
-            v: 1,
+            v: version,
             kind: "stream.config".into(),
             nonce: random_hex::<16>().unwrap(),
             space_id: authority.space(),
@@ -82,7 +91,11 @@ impl Fixture {
                 actor_identity: owner.identity_id(),
                 request_record_id: None,
             },
-            chat_kind: Some(ChatKind::Direct),
+            chat_kind: Some(if version == 4 {
+                ChatKind::Chat
+            } else {
+                ChatKind::Direct
+            }),
             recovery: None,
         };
         authority
@@ -117,6 +130,7 @@ impl Fixture {
                 stream_id: self.authority.stream(),
             },
             config_id: self.authority.head_id().unwrap(),
+            witness: self.authority.witness_pin().cloned(),
             proof: self
                 .authority
                 .call_proof_signed(self.peer.signing_key())
@@ -358,6 +372,186 @@ async fn cold_decline_rejects_other_actions_and_unknown_routes_before_network_ac
 }
 
 #[test]
+fn native_ui_ownership_uses_only_live_locally_verified_exact_identity_hints() {
+    let fixture = Fixture::new();
+    let route = elo_core::app::push::Route {
+        endpoint: "https://wake.example.test/".into(),
+        id: "55".repeat(16),
+        notify_key: "66".repeat(32),
+        scope_key: "77".repeat(32),
+        since: fixture.now,
+    };
+    let target = fixture.target();
+    let encoded = calls::ring::seal(&route.scope_key, &route.id, &target, fixture.now).unwrap();
+    let bytes = serde_json::to_vec(&Enrollment {
+        bindings: vec![fixture.binding()],
+        routes: vec![route.clone().into()],
+        ..Enrollment::default()
+    })
+    .unwrap();
+    let hint = json!({"registration":route.id,"target":encoded,"callId":target.call_id,
+        "invitationId":target.invitation_id,"expires":target.expires});
+    let identity = fixture.peer.identity_id().to_string();
+    let read =
+        |snapshot: Value, who: &str, now| presentation::verified_hints(&bytes, &snapshot, who, now);
+    assert_eq!(
+        read(json!({"presentationHints":[hint]}), &identity, fixture.now),
+        vec![json!({"call_id":target.call_id,"invitation_id":target.invitation_id})]
+    );
+    assert!(
+        read(
+            json!({"presentationHints":[hint]}),
+            &fixture.owner.identity_id().to_string(),
+            fixture.now
+        )
+        .is_empty()
+    );
+    // A queued incoming event is not evidence that native UI is still showing.
+    assert!(
+        read(
+            json!({"presentationHints":[],"pending":[hint]}),
+            &identity,
+            fixture.now
+        )
+        .is_empty()
+    );
+    assert!(
+        read(
+            json!({"presentationHints":[hint]}),
+            &identity,
+            target.expires
+        )
+        .is_empty()
+    );
+    for field in ["callId", "invitationId", "registration", "target"] {
+        let mut swapped = hint.clone();
+        swapped[field] = "99".repeat(16).into();
+        assert!(
+            read(
+                json!({"presentationHints":[swapped]}),
+                &identity,
+                fixture.now
+            )
+            .is_empty(),
+            "{field}"
+        );
+    }
+    let mut fence = presentation::Fence::default();
+    let mut ended = hint.clone();
+    ended["action"] = "decline".into();
+    fence.observe(&ended, fixture.now);
+    let dismissed = fence.dismissed(fixture.now);
+    assert_eq!(
+        read(
+            json!({"presentationHints":dismissed}),
+            &identity,
+            fixture.now
+        )
+        .len(),
+        1
+    );
+    assert!(
+        read(
+            json!({"presentationHints":dismissed}),
+            &fixture.owner.identity_id().to_string(),
+            fixture.now
+        )
+        .is_empty()
+    );
+    assert!(fence.dismissed(target.expires).is_empty());
+}
+
+#[test]
+fn native_terminal_fence_blocks_delayed_admission_but_allows_the_explicit_decline() {
+    let mut fence = presentation::Fence::default();
+    let now = 1_000;
+    let mut event = json!({"callId":"11".repeat(16),"invitationId":"22".repeat(16),"expires":now+45,"action":"incoming"});
+    let incoming = fence.observe(&event, now).unwrap();
+    assert!(fence.ringing(&incoming, now));
+    event["action"] = "answer".into();
+    let answer = fence.observe(&event, now + 1).unwrap();
+    assert!(!fence.ringing(&incoming, now + 1));
+    assert!(fence.permits(&answer, now + 1));
+    event["action"] = "decline".into();
+    let decline = fence.observe(&event, now + 2).unwrap();
+    assert!(!fence.permits(&incoming, now + 2));
+    assert!(!fence.permits(&answer, now + 2));
+    assert!(fence.current(&decline, now + 2));
+    event["action"] = "incoming".into();
+    let delayed = fence.observe(&event, now + 3).unwrap();
+    assert!(!fence.permits(&delayed, now + 3));
+    event["invitationId"] = "33".repeat(16).into();
+    let other = fence.observe(&event, now + 3).unwrap();
+    assert!(fence.permits(&other, now + 3));
+    assert!(!fence.current(&decline, now + 45));
+}
+
+#[test]
+fn native_logout_fences_inflight_prepare_status_and_stale_enrollment() {
+    let mut fence = presentation::Fence::default();
+    let event = json!({"callId":"11".repeat(16),"invitationId":"22".repeat(16),"expires":1045,"action":"incoming"});
+    let old = fence.observe(&event, 1000).unwrap();
+    let old_epoch = fence.epoch();
+    let old_snapshot = fence.snapshot();
+    fence.suspend();
+    assert!(!fence.permits(&old, 1000));
+    assert_ne!(fence.snapshot(), old_snapshot);
+    fence.resume(old_epoch);
+    assert!(fence.snapshot().is_none());
+    fence.resume(fence.epoch());
+    assert!(fence.snapshot().is_some());
+    assert!(!fence.permits(&old, 1000));
+    let fresh = fence.observe(&event, 1000).unwrap();
+    assert!(fence.permits(&fresh, 1000));
+}
+
+#[test]
+fn native_failure_releases_ui_ownership_but_user_dismissal_is_stable_on_event_replay() {
+    let now = 1_000;
+    let base = json!({"callId":"11".repeat(16),"invitationId":"22".repeat(16),
+        "registration":"33".repeat(16),"target":"x".repeat(100),"expires":now+45});
+    for (action, reason) in [
+        ("ended", None),
+        ("decline", Some("unavailable")),
+        ("decline", Some("busy")),
+        ("end", Some("disabled")),
+        ("end", Some("process_restarted")),
+    ] {
+        let mut fence = presentation::Fence::default();
+        let mut event = base.clone();
+        event["action"] = action.into();
+        event["reason"] = reason.into();
+        let ticket = fence.observe(&event, now).unwrap();
+        assert!(!fence.permits(&ticket, now));
+        assert!(fence.dismissed(now).is_empty(), "{action}: {reason:?}");
+    }
+    for (action, reason) in [
+        ("decline", None),
+        ("decline", Some("declined")),
+        ("end", None),
+        ("end", Some("local")),
+    ] {
+        let mut fence = presentation::Fence::default();
+        let mut event = base.clone();
+        event["action"] = action.into();
+        event["reason"] = reason.into();
+        fence.observe(&event, now);
+        let snapshot = fence.snapshot();
+        let dismissed = fence.dismissed(now);
+        assert_eq!(dismissed.len(), 1);
+        fence.observe(&event, now + 1);
+        assert_eq!(fence.snapshot(), snapshot);
+        assert_eq!(fence.dismissed(now + 1), dismissed);
+        // The subsequent native teardown does not undo an explicit rejection.
+        event["action"] = "ended".into();
+        fence.observe(&event, now + 2);
+        assert_eq!(fence.snapshot(), snapshot);
+        assert_eq!(fence.dismissed(now + 2), dismissed);
+        assert!(fence.dismissed(now + 45).is_empty());
+    }
+}
+
+#[test]
 fn protected_routes_keep_only_receive_capability_and_discard_legacy_send_keys() {
     let old = json!({"endpoint":"https://wake.example.test/","id":"55".repeat(16),
         "scope_key":"77".repeat(32),"notify_key":"66".repeat(32),"since":123});
@@ -437,4 +631,23 @@ fn leave_fences_are_bounded_without_evicting_live_guards_and_prune_passively() {
     assert!(saved.begin_leave(leave(33, 221), 160).is_err());
     saved.begin_leave(leave(33, 220), 160).unwrap();
     assert_eq!(saved.pending_leaves.len(), 1);
+}
+
+#[test]
+fn protected_general_binding_requires_its_separately_pinned_witness() {
+    let pin = elo_core::authority::WitnessPin {
+        url: "https://witness.example.test/witness/v1".into(),
+        public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+        key_generation: 1,
+    };
+    let f = Fixture::with_witness(Some(pin));
+    let encoded = serde_json::to_vec(&f.binding()).unwrap();
+    let restored = serde_json::from_slice(&encoded).unwrap();
+    assert!(Prepared::load(restored, f.now).is_ok());
+    let mut missing = f.binding();
+    missing.witness = None;
+    assert!(Prepared::load(missing, f.now).is_err());
+    let mut changed = f.binding();
+    changed.witness.as_mut().unwrap().key_generation += 1;
+    assert!(Prepared::load(changed, f.now).is_err());
 }

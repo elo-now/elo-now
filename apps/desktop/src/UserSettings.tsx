@@ -1,3 +1,4 @@
+import { BetaDiagnosticsHelp } from "./BetaDiagnosticsHelp";
 import { PasswordInput } from "./PasswordInput";
 import { ChangePassword } from "./ChangePassword";
 import {
@@ -9,7 +10,7 @@ import {
   type ReactNode,
   type CSSProperties,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { Icon, NewIndicator, type IconName } from "./Icon";
 import {
   ProfileAvatar,
@@ -399,6 +400,7 @@ export function UserSettings({
               <span>{t("view.enableDebug")}</span>
             </label>
             <p className="muted">{t("view.help")}</p>
+            <BetaDiagnosticsHelp enabled={mode === "expert"} />
           </section>
           {mode === "expert" && (
             <section className="profile-identifiers muted">
@@ -611,14 +613,16 @@ function Segmented<T extends string>({
   selected,
   labels,
   onSelect,
+  label,
 }: {
   values: readonly T[];
   selected: T;
   labels: string[];
   onSelect: (value: T) => void;
+  label?: string;
 }) {
   return (
-    <div className="appearance" role="group">
+    <div className="appearance" role="group" aria-label={label}>
       {values.map((value, index) => (
         <button
           key={value}
@@ -648,7 +652,6 @@ function AppearanceSettings({
   onTheme: (theme: ThemePreference) => void;
   onChange: (preferences: UserPreferences) => void;
 }) {
-  const index = scaleValues.indexOf(preferences.uiScale);
   const [editingColor, setEditingColor] = useState<PaletteKey | null>(null);
   const palette = {
     ...colorSchemes[preferences.colorScheme][theme],
@@ -658,10 +661,19 @@ function AppearanceSettings({
     <div className="settings-page appearance-page">
       <h3>{t("theme.mode")}</h3>
       <Segmented
+        label={t("theme.mode")}
         values={["dark", "auto", "light"]}
         selected={themePreference}
         labels={[t("theme.dark"), t("theme.auto"), t("theme.light")]}
         onSelect={onTheme}
+      />
+      <h3>{t("scale.label")}</h3>
+      <Segmented
+        label={t("scale.label")}
+        values={scaleValues}
+        selected={preferences.uiScale}
+        labels={[t("scale.compact"), t("scale.system"), t("scale.large")]}
+        onSelect={(uiScale) => onChange({ ...preferences, uiScale })}
       />
       <button
         type="button"
@@ -694,78 +706,59 @@ function AppearanceSettings({
           <span />
         </span>
       </button>
-      {soundSettings}
-      <h3>{t("scale.label")}</h3>
-      <input
-        className="scale-slider"
-        data-scale={preferences.uiScale}
-        type="range"
-        min="0"
-        max="2"
-        step="1"
-        value={index}
-        aria-label={t("scale.label")}
-        aria-valuetext={t(`scale.${preferences.uiScale}` as "scale.system")}
-        onChange={(event) =>
-          onChange({
-            ...preferences,
-            uiScale: scaleValues[Number(event.target.value)],
-          })
-        }
-      />
-      <div className="scale-labels" aria-hidden="true">
-        <span>{t("scale.compact")}</span>
-        <span>{t("scale.system")}</span>
-        <span>{t("scale.large")}</span>
+      <h3 id="appearance-motif-label">{t("motif.label")}</h3>
+      <div className="motif-settings-row">
+        <MotifPicker
+          value={preferences.motif}
+          onChange={(motif) => onChange(selectMotif(preferences, motif))}
+          drawing={preferences.customMotif}
+          onDrawing={(customMotif) => {
+            const next = {
+              ...preferences,
+              motif: "custom" as const,
+              customMotif,
+            };
+            // Do not discard user-created artwork when storage is unavailable.
+            if (!savePreferences(next)) return false;
+            onChange(next);
+            return true;
+          }}
+        />
+        <div className="motif-opacity-control">
+          <input
+            id="motif-opacity"
+            className="scale-slider motif-opacity-slider"
+            style={
+              {
+                "--scale-fill": `${(preferences.motifOpacity / 0.3) * 100}%`,
+              } as CSSProperties
+            }
+            type="range"
+            min="0"
+            max="30"
+            step="1"
+            value={Math.round(preferences.motifOpacity * 100)}
+            disabled={preferences.motif === "none"}
+            aria-valuetext={t("motif.percent", {
+              value: Math.round(preferences.motifOpacity * 100),
+            })}
+            onChange={(event) =>
+              onChange({
+                ...preferences,
+                motifOpacity: Number(event.target.value) / 100,
+              })
+            }
+          />
+          <label className="motif-opacity-label" htmlFor="motif-opacity">
+            <span>{t("motif.opacity")}</span>
+            <span>
+              {t("motif.percent", {
+                value: Math.round(preferences.motifOpacity * 100),
+              })}
+            </span>
+          </label>
+        </div>
       </div>
-      <MotifPicker
-        value={preferences.motif}
-        onChange={(motif) => onChange(selectMotif(preferences, motif))}
-        drawing={preferences.customMotif}
-        onDrawing={(customMotif) => {
-          const next = {
-            ...preferences,
-            motif: "custom" as const,
-            customMotif,
-          };
-          // Do not discard user-created artwork when storage is unavailable.
-          if (!savePreferences(next)) return false;
-          onChange(next);
-          return true;
-        }}
-      />
-      <input
-        id="motif-opacity"
-        className="scale-slider motif-opacity-slider"
-        style={
-          {
-            "--scale-fill": `${(preferences.motifOpacity / 0.3) * 100}%`,
-          } as CSSProperties
-        }
-        type="range"
-        min="0"
-        max="30"
-        step="1"
-        value={Math.round(preferences.motifOpacity * 100)}
-        disabled={preferences.motif === "none"}
-        aria-valuetext={t("motif.percent", {
-          value: Math.round(preferences.motifOpacity * 100),
-        })}
-        onChange={(event) =>
-          onChange({
-            ...preferences,
-            motifOpacity: Number(event.target.value) / 100,
-          })
-        }
-      />
-      <label className="motif-opacity-label" htmlFor="motif-opacity">
-        <span>{t("motif.opacity")}</span>
-        <span>
-          {t("motif.percent", {
-            value: Math.round(preferences.motifOpacity * 100),
-          })}
-        </span>
-      </label>
       <h3>{t("scheme.label")}</h3>
       <div className="scheme-grid">
         {(Object.keys(colorSchemes) as ColorScheme[]).map((scheme) => (
@@ -804,6 +797,7 @@ function AppearanceSettings({
           </button>
         ))}
       </div>
+      {soundSettings}
       {editingColor && (
         <ColorPicker
           label={t(`color.${editingColor}` as "color.text")}

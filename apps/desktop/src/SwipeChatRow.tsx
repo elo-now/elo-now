@@ -29,12 +29,16 @@ export function SwipeChatRow({
   revealed,
   onReveal,
   onRequestDelete,
+  deleteLabel,
+  allowMouse = false,
 }: {
   children: ReactElement<ButtonHTMLAttributes<HTMLButtonElement>>;
   chatName: string;
   revealed: boolean;
   onReveal: (open: boolean) => void;
   onRequestDelete: () => void;
+  deleteLabel?: string;
+  allowMouse?: boolean;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const gesture = useRef<Gesture | null>(null);
@@ -80,7 +84,7 @@ export function SwipeChatRow({
       data-dragging={dragOffset !== null || undefined}
       onPointerDown={(event) => {
         if (
-          event.pointerType === "mouse" ||
+          (event.pointerType === "mouse" && !allowMouse) ||
           event.button !== 0 ||
           !event.isPrimary ||
           !(event.target instanceof Element) ||
@@ -141,7 +145,7 @@ export function SwipeChatRow({
         <button
           type="button"
           className="swipe-chat-delete"
-          aria-label={t("chat.deleteLocalLabel", { name: chatName })}
+          aria-label={deleteLabel ?? t("chat.deleteLocalLabel", { name: chatName })}
           aria-hidden={!revealed}
           tabIndex={revealed ? 0 : -1}
           onClick={(event) => {

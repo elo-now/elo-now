@@ -72,6 +72,8 @@ pub(super) struct ResponseEntry {
     joined: bool,
     #[serde(default)]
     pub(super) seen: bool,
+    #[serde(default)]
+    pub(super) dismissed: bool,
 }
 #[derive(Default, Serialize)]
 struct Report {
@@ -373,7 +375,12 @@ impl ClientApp {
             .count();
         let received_activity = self.received_offer_activity(&state)?;
         let received = received_activity.len();
-        let responses = state.responses.values().filter(|e| !e.seen).count() + received;
+        let responses = state
+            .responses
+            .iter()
+            .filter(|(id, e)| !e.seen && !e.dismissed && !state.dismissed_notices.contains(id))
+            .count()
+            + received;
         let actionable = pending
             + received
             + state
@@ -389,7 +396,7 @@ impl ClientApp {
             + state
                 .responses
                 .values()
-                .filter(|e| !e.seen && matches!(e.packet, Packet::Declined { .. }))
+                .filter(|e| !e.seen && !e.dismissed && matches!(e.packet, Packet::Declined { .. }))
                 .count();
         let unseen = self
             .invitation_attention_with_received(&state, &received_activity)?
@@ -440,7 +447,9 @@ impl ClientApp {
                         .any(|m| m.identity_id == self.session.identity_id())
                 {
                     let id = format!("removed:{cursor}");
-                    notices.push(json!({"id":id,"kind":"removed","name":pin.name,"stream":pin.stream,"seen":state.seen_notices.contains(&id)}));
+                    if !state.dismissed_notices.contains(&id) {
+                        notices.push(json!({"id":id,"kind":"removed","name":pin.name,"stream":pin.stream,"seen":state.seen_notices.contains(&id)}));
+                    }
                     break;
                 }
                 cursor = previous;
@@ -489,6 +498,11 @@ impl ClientApp {
             } else {
                 "manual"
             };
+            if state.dismissed_notices.contains(id)
+                || (status == "declined" && response.is_some_and(|r| r.dismissed))
+            {
+                continue;
+            }
             outgoing.push(json!({"id":id,"name":offer.name,"stream":bundle.stream,"status":status,
                 "seen":response.is_none_or(|r|r.seen),"link":response.map(|r|encode(&r.packet)).transpose()?,"request_link":encode(packet)?}));
         }
@@ -787,6 +801,7 @@ impl ClientApp {
                                     packet,
                                     joined,
                                     seen: joined,
+                                    dismissed: false,
                                 },
                             );
                             report.received += 1;
@@ -848,6 +863,7 @@ impl ClientApp {
                     packet,
                     joined: true,
                     seen: true,
+                    dismissed: false,
                 },
             );
         }

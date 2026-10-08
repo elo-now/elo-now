@@ -40,8 +40,8 @@ seamless live migration.
 
 Direct conversations support ringing calls with **Answer**, **Decline** and
 **Cancel call**. Group sessions remain joinable from the conversation or the
-**Calls** filter in Buzz. Starting a group does not ring every member: a joined
-participant explicitly selects a person with **Invite to call** to ring them.
+**Calls** filter in Buzz. Starting a group does not ring its members. Members join from the conversation
+or **Buzz → Calls**; there is no invitation picker in the call interface.
 The signed conversation kind, not its current participant count or title,
 determines the behavior.
 
@@ -49,10 +49,16 @@ The interface presents one compact, draggable floating call widget across the
 unlocked app, including More and settings. It overlays the current screen without
 changing the header or message-list layout. Other
 available sessions belong in Calls rather than additional persistent control bars.
-An incoming invitation names its conversation and Space. **End & answer** first
-validates the incoming invitation, ends the current local call and then answers;
-declining the incoming invitation leaves the current call running. Expanded video,
-participant controls and desktop screen sharing remain available.
+An incoming invitation uses this same widget, with its caller/conversation, Space,
+**Answer** and **Decline**. It does not open a second, automatic incoming-call
+dialog. A matching CallKit or Telecom presentation takes precedence over the
+in-app invitation controls and ringtone; another ongoing call remains available.
+System-presentation hints are matched to the exact invitation and local profile,
+independently of the network admission check. They never authorize media.
+Answering while another call is active requires an explicit **End & answer**
+confirmation. Admission is validated before ending the current local call;
+declining the incoming invitation leaves it running. Expanded video, participant
+controls and desktop screen sharing remain available.
 
 The initiating participant must acquire media permission and receive acceptance of
 its signed Media command before a new session is advertised as ready. This sets

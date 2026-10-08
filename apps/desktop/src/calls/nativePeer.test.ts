@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { NativePeer, type NativeRequest } from "./nativePeer";
 import type { MediaTile } from "./types";
+import pendingGroup from "./fixtures/native-group-pending.json";
 
 function setup() {
   vi.useFakeTimers();
@@ -88,6 +89,32 @@ it("leaves transient disconnect recovery to native and reports terminal failure"
   f.setState({ connection: "failed" });
   await vi.advanceTimersByTimeAsync(150);
   expect(f.failed).toHaveBeenCalledOnce();
+  await f.peer.stop();
+});
+
+it("waits for group capture and survives a reset without ending the call", async () => {
+  const f = setup();
+  f.setState(pendingGroup);
+  await vi.advanceTimersByTimeAsync(1500);
+  expect(f.failed).not.toHaveBeenCalled();
+  expect(f.connected).not.toHaveBeenCalled();
+  const active = {
+    connection: "connected",
+    revision: 0,
+    tracks: [{ id: "local", local: true, source: "camera" }],
+  };
+  f.setState(active);
+  await vi.advanceTimersByTimeAsync(150);
+  expect(f.connected).toHaveBeenCalledOnce();
+  expect(f.tiles.mock.lastCall?.[0]).toHaveLength(1);
+  f.setState(pendingGroup);
+  await vi.advanceTimersByTimeAsync(150);
+  expect(f.tiles.mock.lastCall?.[0]).toEqual([]);
+  f.setState(active);
+  await vi.advanceTimersByTimeAsync(150);
+  expect(f.tiles.mock.lastCall?.[0]).toHaveLength(1);
+  expect(f.failed).not.toHaveBeenCalled();
+  expect(f.transport.mock.calls.some(([request]) => request.op === "stop")).toBe(false);
   await f.peer.stop();
 });
 

@@ -147,7 +147,13 @@ project. All other artifacts above come from Maven Central. Direct and group
 WebRTC use separate Java packages and native library names. Their ARM64 and x86_64
 ELF load segments, including LiveKit UniFFI, have 16 KB alignment; the final APK's
 ZIP alignment still needs the normal release check. Runtime JNI classes have
-explicit consumer R8 keep rules. License notices are included in
+explicit consumer R8 keep rules, including `org.jni_zero` and
+`livekit.org.jni_zero`: native library initialization looks these classes up by
+name even when no Java code references them. Before delivery, inspect each final
+minified APK and AAB with `python3 tools/check_android_jni.py PATH_TO_ARTIFACT`.
+The check fails if R8 removes or renames required runtime classes or their static
+entry points. It does not replace a direct/group call check on a physical device.
+License notices are included in
 [Call media](../apps/desktop/public/licenses/calls.txt).
 
 Review the resulting diff before building: retain the checked-in camera/biometry permissions, notification integration, TLS verifier integration, launch resources and native source customizations. The iOS `project.yml` is the source for the Xcode project. Its app target uses `TARGETED_DEVICE_FAMILY: "1"` (iPhone only); preserve this setting when regenerating the Xcode project. Set your own Apple development team locally; use your own identifiers if distributing a fork. Android release signing is supplied separately.
@@ -228,10 +234,39 @@ The `team-test-replica` feature embeds the selected client access capabilities i
 
 A Firebase service-account key belongs only on the wake-service host. APNs keys belong in your notification-provider configuration. Neither belongs in the application, repository or release resources. Do not commit environment files, `.p8`, `.p12`, keystores, provisioning profiles or personal test profiles.
 
-iOS uses the Push Notifications entitlement for ordinary messages and the audio
-background mode for an explicitly joined session. CallKit, PushKit and the former
-VoIP-token App Attest enrollment are not part of the session model.
+iOS uses the Push Notifications entitlement for ordinary messages, PushKit and
+CallKit for incoming direct calls, and the audio background mode for a joined
+session. The wake service needs the matching APNs environment and VoIP topic.
 See [wake setup](SELF_HOSTING.md#6-firebase-apns-and-the-wake-service).
+
+### Optional beta diagnostics
+
+Build with `beta-diagnostics` to enable the diagnostic controls on iOS, Android
+and macOS. Mobile builds also need `mobile-push` and the Firebase client
+configuration above. Windows and Linux do not send these reports. Collection
+is off by default; the existing **Settings → Debug** switch enables it and
+**Queue test report** queues a non-fatal test event. Restart with Debug still
+enabled to send pending reports, then verify the platform and build number in
+your Firebase project's Crashlytics console.
+
+On macOS, bundle your app's `GoogleService-Info.plist` as a resource and include
+the privacy bundles staged in `apps/desktop/src-tauri/macos/DiagnosticsResources`
+by the matching SDK build. Use a signing profile and Keychain access group for
+your own application identifier. The publisher's profiles and Firebase client
+files are not included in this repository.
+
+Keep symbols from each exact build: Apple dSYM UUIDs must match the installed
+binary; Android native symbols must match its ELF build IDs and R8 mapping.
+Check Android artifacts with `tools/check_android_symbols.py`. Generate the
+macOS dSYM from the unstripped Cargo executable before discarding build output;
+the bundled executable may no longer retain all debug information. Upload
+symbols only to the Firebase project configured in that build. Successful
+upload alone does not prove symbolication of a real native crash.
+
+Custom events use bounded error codes, stages and timing, without request
+payloads, message text, credentials or invitation links. Native crash reports
+are produced by the SDK. See the [privacy policy](../landingpage/privacy/index.html)
+for the distinction between diagnostics and Space data processing.
 
 ## Single-VPS setup
 

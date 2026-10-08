@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import {
   scan,
   cancel,
@@ -267,8 +267,13 @@ export function Spaces({
   const [approval, setApproval] = useState(true);
   const [lifetime, setLifetime] = useState(86400);
   const [busy, setBusy] = useState(false);
+  const [checkingSpace, setCheckingSpace] = useState<string>();
   const [switching, setSwitching] = useState<string>();
   const [scanning, setScanning] = useState(false);
+  const pendingSpaceIds = spaces
+    .filter((space) => space.status === "pending" || space.status === "checking")
+    .map((space) => space.id)
+    .join(",");
   useEffect(() => {
     setRevokingInvitation(undefined);
   }, [page, selected?.id]);
@@ -283,6 +288,31 @@ export function Spaces({
   const scanningRef = useRef(false);
   const scanGeneration = useRef(0);
   const mounted = useRef(true);
+  const backgroundApprovalCheck = useRef(false);
+  useEffect(() => {
+    if (page !== "list" || !pendingSpaceIds) return;
+    const identity = view.identity;
+    const ids = pendingSpaceIds.split(",");
+    const check = async () => {
+      if (document.hidden || backgroundApprovalCheck.current) return;
+      backgroundApprovalCheck.current = true;
+      try {
+        for (const id of ids) {
+          const reply = await invoke<Reply>("operate", {
+            request: { op: "space_refresh", id, expected_identity: identity },
+          });
+          if (!mounted.current) return;
+          onView(reply.view);
+        }
+      } catch {
+        // Keep the explicit retry button available when a host is unreachable.
+      } finally {
+        backgroundApprovalCheck.current = false;
+      }
+    };
+    const timer = window.setInterval(() => void check(), 15000);
+    return () => window.clearInterval(timer);
+  }, [page, pendingSpaceIds, view.identity]);
   useEffect(() => {
     if (page === "join" || page === "create") return pauseBackgroundSync();
   }, [page]);
@@ -531,6 +561,31 @@ export function Spaces({
                             }}
                           >
                             <Icon name="settings" />
+                          </button>
+                        )}
+                        {(space.status === "pending" ||
+                          space.status === "checking") && (
+                          <button
+                            type="button"
+                            className="icon"
+                            disabled={busy}
+                            aria-busy={checkingSpace === space.id}
+                            aria-label={t("spaces.refreshNamed", {
+                              name: space.name,
+                            })}
+                            title={t("spaces.refresh")}
+                            onClick={() =>
+                              void perform(async () => {
+                                setCheckingSpace(space.id);
+                                try {
+                                  await call({ op: "space_refresh", id: space.id });
+                                } finally {
+                                  setCheckingSpace(undefined);
+                                }
+                              })
+                            }
+                          >
+                            <Icon name="sync" />
                           </button>
                         )}
                         <button

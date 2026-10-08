@@ -207,6 +207,67 @@ fn durable_owner_approval_survives_one_hour_and_witness_restart() {
 }
 
 #[test]
+fn durable_owner_approval_survives_another_members_admission() {
+    let mut f = Fixture::new();
+    let policy = f.durable_policy(true, 3);
+    let first_request = f.durable_request(&policy);
+    let first_approval = f.durable_approval(&first_request);
+    let first_guest = std::mem::replace(&mut f.guest, device(11));
+    let second_request = f.durable_request(&policy);
+    let second_approval = f.durable_approval(&second_request);
+
+    let second_guest = std::mem::replace(&mut f.guest, first_guest);
+    let first = f.durable_evidence(first_request, Some(first_approval), NOW);
+    let admit = f.durable_admit(first, NOW);
+    f.apply(admit).unwrap();
+    f.refresh();
+
+    f.guest = second_guest;
+    let second = f.durable_evidence(second_request, Some(second_approval), NOW + 1);
+    let admit = f.durable_admit(second, NOW + 1);
+    f.engine
+        .apply(admit, "127.0.0.1".parse().unwrap(), NOW + 1)
+        .unwrap();
+    f.refresh();
+    assert!(require_read(&f.authority, f.guest.credential.id()).is_ok());
+}
+
+#[test]
+fn durable_linked_device_can_be_first_for_an_invited_identity() {
+    let mut f = Fixture::new();
+    let parent = std::mem::replace(&mut f.guest, device(11));
+    let age = age::x25519::Identity::generate();
+    f.guest.credential = DeviceCredential::issue_companion(
+        &parent.credential,
+        &parent.key,
+        &f.guest.key.verifying_key(),
+        &age.to_public(),
+    )
+    .unwrap();
+    let policy = f.durable_policy(true, 2);
+    let request = f.durable_request(&policy);
+    let approval = f.durable_approval(&request);
+    let evidence = f.durable_evidence(request, Some(approval), NOW);
+    let admit = f.durable_admit(evidence, NOW);
+    f.apply(admit).unwrap();
+    f.refresh();
+    assert!(require_read(&f.authority, f.guest.credential.id()).is_ok());
+    assert!(require_read(&f.authority, parent.credential.id()).is_err());
+
+    // API, media services and other clients reconstruct authority from this
+    // serialized proof rather than reusing the witness's in-memory state.
+    let proof: elo_core::authority::CallAuthorityProof =
+        serde_json::from_slice(&serde_json::to_vec(&f.authority.call_proof().unwrap()).unwrap())
+            .unwrap();
+    let imported = proof
+        .verify_witnessed(f.authority.space(), f.authority.stream(), &f.pin)
+        .unwrap();
+    assert_eq!(imported.head_id(), f.authority.head_id());
+    assert!(require_read(&imported, f.guest.credential.id()).is_ok());
+    assert!(require_read(&imported, parent.credential.id()).is_err());
+}
+
+#[test]
 fn durable_two_challenges_consume_one_request_once_across_restart() {
     let mut f = Fixture::new();
     let policy = f.durable_policy(false, 3);

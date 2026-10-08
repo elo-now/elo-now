@@ -62,6 +62,13 @@ class IncomingCallArgs { var payload: String = "" }
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
     private val bindingsWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Command
+    fun diagnostics(invoke: Invoke) {
+        val payload = invoke.parseArgs(IncomingCallArgs::class.java).payload
+        if (payload.toByteArray(Charsets.UTF_8).size > 2048) { invoke.reject("invalid"); return }
+        runCatching { BetaDiagnostics.command(activity, JSONObject(payload)) }
+            .onSuccess { invoke.resolve() }.onFailure { invoke.reject("diagnostics_unavailable") }
+    }
+    @Command
     fun deviceModel(invoke: Invoke) {
         val result = JSObject()
         result.put("model", Build.MODEL)
@@ -80,6 +87,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         GoogleApiAvailabilityLight.getInstance().isGooglePlayServicesAvailable(activity) == ConnectionResult.SUCCESS
     override fun load(webView: WebView) {
         super.load(webView)
+        ForegroundRingtone.attach(activity)
         NativeMedia.attach(webView)
         prefs.registerOnSharedPreferenceChangeListener(statusChanged)
         if (Build.VERSION.SDK_INT >= 26) {
@@ -92,6 +100,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); onIntent(intent) }
     override fun onWebViewDestroyed() {
+        ForegroundRingtone.stop()
         NativeMedia.attach(null)
         ChatSessions.detach(activity)
         statusChannel = null
@@ -99,6 +108,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
         super.onWebViewDestroyed()
     }
     override fun onDestroy(activity: AppCompatActivity) {
+        ForegroundRingtone.stop()
         ChatSessions.detach(activity)
         prefs.unregisterOnSharedPreferenceChangeListener(statusChanged)
         statusChannel = null
@@ -108,6 +118,25 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     fun statusListener(invoke: Invoke) {
         statusChannel = invoke.parseArgs(StatusListenerArgs::class.java).channel
         invoke.resolve()
+    }
+    @Command
+    fun foregroundRingtone(invoke: Invoke) {
+        val payload = invoke.parseArgs(IncomingCallArgs::class.java).payload
+        activity.runOnUiThread {
+            try {
+                require(payload.length <= 1024)
+                val request = JSONObject(payload)
+                val epoch = request.getLong("epoch")
+                if (request.optBoolean("stopAll")) ForegroundRingtone.shutdown(epoch)
+                else {
+                    val token = request.getString("token")
+                    require(java.util.UUID.fromString(token).toString() == token)
+                    ForegroundRingtone.update(activity, epoch, token, request.getLong("revision"),
+                        request.getBoolean("active"), request.getLong("expires"))
+                }
+                invoke.resolve()
+            } catch (_: Exception) { invoke.reject("ringtone_unavailable") }
+        }
     }
     @Command
     fun incomingListener(invoke: Invoke) {
@@ -153,7 +182,7 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
                     if (NativeMedia.granted(activity, video)) invoke.resolve(JSObject())
                     else requestPermissionForAliases(if (video) arrayOf("microphone", "camera") else arrayOf("microphone"), invoke, "nativeMediaPermissionResult")
                 } else NativeMedia.command(activity, request) { invoke.resolve(it) }
-            } catch (_: Exception) { invoke.resolve(JSObject().put("error", "NotAllowedError")) }
+            } catch (error: Exception) { BetaDiagnostics.mediaFailure(error, "command_failed"); invoke.resolve(JSObject().put("error", "NotAllowedError")) }
         }
     }
     @PermissionCallback

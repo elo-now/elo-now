@@ -89,6 +89,7 @@ pub fn stage() -> io::Result<()> {
         }
     }
     for name in [
+        "Firebase_FirebaseCrashlytics",
         "Firebase_FirebaseCore",
         "Firebase_FirebaseMessaging",
         "Firebase_FirebaseInstallations",

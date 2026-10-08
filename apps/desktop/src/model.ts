@@ -190,6 +190,12 @@ export type View = {
   active_space?: string | null;
   spaces?: SpaceSummary[];
   space_requests?: number;
+  space_join_notices?: {
+    id: string;
+    space_id: string;
+    name: string;
+    seen: boolean;
+  }[];
   all_streams?: Stream[];
   all_invitations?: {
     actionable: number;
@@ -273,6 +279,7 @@ export function invitationCount(view: View): number {
 }
 export function notificationCount(view: View): number {
   return (
+    (view.space_join_notices?.filter((notice) => !notice.seen).length ?? 0) +
     (view.space_role_requests?.length ?? 0) +
     (view.all_invitations?.notifications ??
       view.invitations?.notifications ??

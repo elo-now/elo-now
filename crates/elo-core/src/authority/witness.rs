@@ -446,7 +446,13 @@ impl Authority {
         }) {
             return Err(RecordError::Authority);
         }
-        if let Some(authorizer) = candidate.authorizing_device()
+        // A linked device may be the first device of its identity invited to
+        // this Space. Its credential chain proves identity, while the invitation
+        // and optional owner approval grant Space access. When the identity is
+        // already a member, require the authorizer to remain admitted here so
+        // a removed device cannot add another companion through an old link.
+        if current_member.is_some()
+            && let Some(authorizer) = candidate.authorizing_device()
             && !parent.members.iter().any(|member| {
                 member.identity_id == candidate.identity()
                     && member.credential_ids.contains(&authorizer)

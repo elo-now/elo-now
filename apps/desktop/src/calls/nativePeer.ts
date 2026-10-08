@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "../diagnosticInvoke";
 import type { ActiveCall, MediaAdapter, MediaState, MediaTile } from "./types";
 
 export const usesNativePeer = () =>

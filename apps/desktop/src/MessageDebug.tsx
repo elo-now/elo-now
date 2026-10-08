@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { ActionDialog } from "./ActionDialog";
 import { formatTimestamp, t, type MessageKey } from "./i18n";
 import { statusText } from "./model";

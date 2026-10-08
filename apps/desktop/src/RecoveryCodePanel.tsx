@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { t } from "./i18n";
 import { useToast } from "./Toast";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 
 /** The same recovery material layout during registration and in settings. */
 export function RecoveryCodePanel({

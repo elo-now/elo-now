@@ -175,6 +175,7 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual((self.root / "api/config/call-admission.key").read_bytes(), secrets[0])
         call = json.loads((self.root / "calls/config/config.json").read_text())
         self.assertEqual(call["admission_url"], "http://127.0.0.1:18901/internal/calls/admission")
+        self.assertEqual(call["witness"], pin)
         media = json.loads((self.root / "media/config/livekit.yaml").read_text())
         self.assertEqual(media["keys"]["elo-private"], secrets[1].decode())
         self.assertEqual(media["rtc"]["turn_servers"][0]["secret"], secrets[2].decode())

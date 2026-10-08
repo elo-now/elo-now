@@ -1,6 +1,6 @@
 import { updateRequired, subscribeUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import type { Stream, View } from "./model";
 import { invitationCount, notificationCount } from "./model";

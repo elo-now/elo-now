@@ -81,8 +81,10 @@ export type Snapshot = {
   available: Record<string, ActiveCall>;
   incoming?: ActiveCall[];
   dismissed?: string[];
+  /** The hidden widget's session, or a pending start scope before admission. */
+  minimized?: string;
   expanded?: boolean;
-  joinRequest?: { chat: Stream; call?: ActiveCall };
+  joinRequest?: { chat: Stream; call?: ActiveCall; invitation_id?: string };
   answering?: boolean;
   nativePresented?: { call_id: string; invitation_id: string }[];
 };

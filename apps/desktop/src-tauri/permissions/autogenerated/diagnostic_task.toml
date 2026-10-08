@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-diagnostic-task"
+description = "Enables the diagnostic_task command without any pre-configured scope."
+commands.allow = ["diagnostic_task"]
+
+[[permission]]
+identifier = "deny-diagnostic-task"
+description = "Denies the diagnostic_task command without any pre-configured scope."
+commands.deny = ["diagnostic_task"]

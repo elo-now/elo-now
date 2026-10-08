@@ -63,7 +63,11 @@ def validate_profile(
         expiry = expiry.replace(tzinfo=timezone.utc)
     if not isinstance(expiry, datetime) or expiry <= now:
         raise ValueError("The provisioning profile is expired or has no expiration date")
-    if entitlements.get("get-task-allow", entitlements.get("com.apple.security.get-task-allow")) is not True:
+    # Current macOS development profiles may omit the debugging entitlement.
+    # The installed Apple Development identity and exact provisioned Mac are
+    # validated independently; this app never requests debugging permission.
+    debugging = entitlements.get("get-task-allow", entitlements.get("com.apple.security.get-task-allow"))
+    if debugging is False:
         raise ValueError("A development profile is required for this local test overlay")
     if not device or device not in profile.get("ProvisionedDevices", []):
         raise ValueError("The development profile does not include this Mac")

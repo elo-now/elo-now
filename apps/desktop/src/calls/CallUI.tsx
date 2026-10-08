@@ -20,8 +20,8 @@ import {
   Volume2,
   VolumeOff,
   X,
-  UserPlus,
-  Maximize2,
+  ChevronUp,
+  Minus,
 } from "lucide-react";
 import { useDesktopLayout } from "../PageSurface";
 import { ActionDialog } from "../ActionDialog";
@@ -34,14 +34,14 @@ import "./calls.css";
 import { NativeVideo } from "./NativeVideo";
 import { listenNativeSessionEnd } from "./sessionActivity";
 import { useAudioOutput } from "./audioOutput";
-import { activeSessions, type SessionStarted } from "./sessionPresence";
-import { sessionKey, isRingingFor, invitationKey } from "./attention";
-import { appHasAttention } from "../useActivityNotifications";
+import { CallAudioPlayback } from "./audioPlayback";
 import {
-  readNotificationSound,
-  playNotificationSound,
-  stopNotificationSound,
-} from "../notificationSounds";
+  activeSessions,
+  type ActiveSession,
+  type SessionStarted,
+} from "./sessionPresence";
+import { sessionKey, isRingingFor, invitationKey } from "./attention";
+import { useIncomingRingtone } from "./useIncomingRingtone";
 import { FloatingCall } from "./FloatingCall";
 import { SessionDialogs } from "./SessionDialogs";
 import { incomingStatus, listenIncomingCalls } from "./incomingNative";
@@ -88,7 +88,10 @@ export function useCalls(view: View | null | undefined) {
     )
       .then((unlisten) => {
         if (disposed) unlisten();
-        else stop = unlisten;
+        else {
+          stop = unlisten;
+          void refresh().catch(() => {});
+        }
       })
       .catch(() => {});
     void refresh().catch(() => {});
@@ -128,23 +131,35 @@ export function useSessionStarted(
 }
 export function CallButton({ calls, chat }: { calls: Calls; chat: Stream }) {
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
-  const existing = state.available[scopeKey(chat)];
+  const existing =
+    state.active && callKey(state.active) === scopeKey(chat)
+      ? state.active
+      : state.available[scopeKey(chat)];
   const availableGroup =
     existing?.kind === "group" &&
     !(
       state.active?.call_id === existing.call_id &&
       callKey(state.active) === callKey(existing)
     );
+  const minimized =
+    (existing && state.minimized === sessionKey(existing)) ||
+    state.minimized === `pending:${scopeKey(chat)}`;
   return (
     <button
       type="button"
       className="icon call-trigger"
       aria-label={t(
-        availableGroup ? "calls.open" : existing ? "calls.join" : "calls.start",
+        availableGroup || minimized
+          ? "calls.open"
+          : existing
+            ? "calls.join"
+            : "calls.start",
       )}
       disabled={!chat.can_post || state.answering}
       onClick={() =>
-        availableGroup ? calls.reveal(chat) : calls.requestStart(chat, existing)
+        availableGroup || minimized
+          ? calls.reveal(chat)
+          : calls.requestStart(chat, existing)
       }
     >
       <Phone size={22} />
@@ -156,24 +171,28 @@ function Tile({
   tile,
   name,
   muted = false,
+  playback,
 }: {
   tile: MediaTile;
   name: string;
   muted?: boolean;
+  playback?: CallAudioPlayback;
 }) {
   // Native audio already plays in the SDK; only video needs a render surface.
   if (tile.native && tile.source === "audio") return null;
   if (tile.native) return <NativeVideo tile={tile} name={name} />;
-  return <WebTile tile={tile} name={name} muted={muted} />;
+  return <WebTile tile={tile} name={name} muted={muted} playback={playback} />;
 }
 function WebTile({
   tile,
   name,
   muted,
+  playback,
 }: {
   tile: MediaTile;
   name: string;
   muted: boolean;
+  playback?: CallAudioPlayback;
 }) {
   const media = useRef<HTMLVideoElement>(null);
   const [tap, setTap] = useState(false);
@@ -183,12 +202,25 @@ function WebTile({
     if (!element) return;
     if (tile.attach) tile.attach(element);
     else element.srcObject = tile.stream;
-    void element.play().catch(() => setTap(true));
+    let disposed = false;
+    setTap(false);
+    const detachPlayback = playback?.attach(element);
+    if (!playback)
+      void element.play().catch((error: unknown) => {
+        if (
+          !disposed &&
+          error instanceof Error &&
+          error.name === "NotAllowedError"
+        )
+          setTap(true);
+      });
     return () => {
+      disposed = true;
+      detachPlayback?.();
       tile.detach?.(element);
       element.srcObject = null;
     };
-  }, [tile.stream]);
+  }, [tile.stream, playback]);
   useEffect(() => {
     // Media adapters may change element properties while attaching a new track.
     if (media.current) media.current.muted = tile.local || muted;
@@ -211,7 +243,10 @@ function WebTile({
         <button
           className="secondary"
           onClick={() => {
-            void media.current?.play().then(() => setTap(false));
+            void media.current?.play().then(
+              () => setTap(false),
+              () => {},
+            );
           }}
         >
           {t("calls.playAudio")}
@@ -292,6 +327,113 @@ function ParticipantVisual({
   );
 }
 
+export function IncomingCallWidget({
+  calls,
+  session,
+  identity,
+  answering,
+  currentCall,
+  hasCurrentCall,
+  hidden,
+  onOpen,
+  onHide,
+}: {
+  calls: Calls;
+  session: ActiveSession;
+  identity: string;
+  answering: boolean;
+  currentCall?: string;
+  hasCurrentCall: boolean;
+  hidden: boolean;
+  onOpen: () => void;
+  onHide: () => void;
+}) {
+  const invitation = session.call.invitations![identity];
+  return (
+    <FloatingCall
+      label={t("calls.incoming")}
+      hidden={hidden}
+      aboveCall
+      title={
+        <div className="call-widget-incoming-title">
+          <button
+            type="button"
+            className="call-widget-title call-widget-expand"
+            data-call-drag-toggle
+            aria-label={t("calls.open")}
+            title={t("calls.open")}
+            disabled={answering}
+            onClick={onOpen}
+          >
+            <span className="call-widget-heading">
+              <strong>{session.chat.name}</strong>
+              <small>
+                {t("calls.widgetStatus", {
+                  status: t("calls.incoming"),
+                  space: session.spaceName,
+                })}
+              </small>
+            </span>
+            <span className="call-widget-chevron" aria-hidden="true">
+              <ChevronUp size={20} />
+            </span>
+          </button>
+          <button
+            type="button"
+            className="icon call-widget-hide"
+            aria-label={t("calls.hide")}
+            title={t("calls.hide")}
+            disabled={answering}
+            onClick={onHide}
+          >
+            <Minus size={20} aria-hidden="true" />
+          </button>
+          {hasCurrentCall && (
+            <p className="call-widget-incoming-help">
+              {t("calls.answerEndsCurrent", {
+                chat: currentCall ?? t("calls.active"),
+              })}
+            </p>
+          )}
+        </div>
+      }
+    >
+      <button
+        type="button"
+        className="icon call-widget-join"
+        aria-label={t("calls.answer")}
+        title={t("calls.answer")}
+        disabled={answering}
+        onClick={() => {
+          if (answering) return;
+          if (hasCurrentCall) calls.requestStart(session.chat, session.call);
+          else
+            void calls.answer(
+              session.chat,
+              session.call,
+              false,
+              invitation.invitation_id,
+            );
+        }}
+      >
+        <Phone size={20} aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        className="icon call-leave"
+        aria-label={t("calls.decline")}
+        title={t("calls.decline")}
+        disabled={answering}
+        onClick={() => {
+          if (!answering) void calls.decline(session.call);
+        }}
+      >
+        <PhoneOff size={20} aria-hidden="true" />
+      </button>
+    </FloatingCall>
+  );
+}
+
 export function CallSurface({
   calls,
   view,
@@ -305,47 +447,27 @@ export function CallSurface({
 }) {
   const desktop = useDesktopLayout();
   const state = useSyncExternalStore(calls.subscribe, calls.getSnapshot);
-  const incoming = state.incoming?.find((call) =>
-    isRingingFor(call, view.identity),
-  );
-  const ringKey = incoming ? invitationKey(incoming, view.identity) : undefined;
-  const nativePresented =
-    incoming &&
+  const [hiddenIncoming, setHiddenIncoming] = useState<string>();
+  const nativeOwns = (call: ActiveSession["call"]) =>
     state.nativePresented?.some(
       (item) =>
-        item.call_id === incoming.call_id &&
-        item.invitation_id ===
-          incoming.invitations?.[view.identity]?.invitation_id,
-    );
-  useEffect(() => {
-    if (
-      !ringKey ||
-      nativePresented ||
-      state.answering ||
-      /Android|iPhone|iPad|iPod/.test(navigator.userAgent)
-    )
-      return;
-    const play = () => {
-      if (appHasAttention())
-        void playNotificationSound(readNotificationSound()).catch(() => {});
-    };
-    play();
-    const timer = setInterval(play, 8000);
-    return () => {
-      clearInterval(timer);
-      stopNotificationSound();
-    };
-  }, [ringKey, nativePresented, state.answering]);
+        item.call_id === call.call_id &&
+        item.invitation_id === call.invitations?.[view.identity]?.invitation_id,
+    ) === true;
 
   const expanded = state.expanded === true;
   const setExpanded = (value: boolean) =>
     value ? calls.expand() : calls.collapse();
-  const [inviteOpen, setInviteOpen] = useState(false);
-  const [inviting, setInviting] = useState(false);
   const [selected, setSelected] = useState<string>();
   const [pinned, setPinned] = useState<string>();
   const [mutedPeople, setMutedPeople] = useState<Set<string>>(() => new Set());
   const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [playback] = useState(() => new CallAudioPlayback());
+  const playbackBlocked = useSyncExternalStore(
+    playback.subscribe,
+    playback.getSnapshot,
+    () => false,
+  );
   const appliedPlayback = useRef({ speaker: false, people: new Set<string>() });
   const [outputOpen, setOutputOpen] = useState(false);
   const audio = useAudioOutput(calls.audioOutputContext());
@@ -367,6 +489,17 @@ export function CallSurface({
   };
   const controls = (full: boolean) => (
     <>
+      {playbackBlocked && !speakerMuted && (
+        <button
+          type="button"
+          className="icon call-media-control"
+          aria-label={t("calls.playAudio")}
+          title={t("calls.playAudio")}
+          onClick={playback.retry}
+        >
+          <Volume2 />
+        </button>
+      )}
       <button
         type="button"
         className="icon call-media-control"
@@ -524,7 +657,6 @@ export function CallSurface({
     setSpeakerMuted(false);
     appliedPlayback.current = { speaker: false, people: new Set() };
     setOutputOpen(false);
-    setInviteOpen(false);
   }, [active?.call_id]);
   useEffect(() => {
     if (!people.length) return;
@@ -601,9 +733,14 @@ export function CallSurface({
   };
   const sessions = activeSessions(view, state.available);
   const visibleSessions = sessions.filter(
-    (entry) => !(state.dismissed ?? []).includes(sessionKey(entry.call)),
+    (entry) =>
+      !(state.dismissed ?? []).includes(sessionKey(entry.call)) &&
+      !(isRingingFor(entry.call, view.identity) && nativeOwns(entry.call)),
   );
   const selectedSession =
+    visibleSessions.find(
+      (entry) => state.minimized === sessionKey(entry.call),
+    ) ??
     visibleSessions.find(
       (entry) =>
         currentChat &&
@@ -613,7 +750,41 @@ export function CallSurface({
             space_context:
               currentChat.space_context ?? view.active_space ?? undefined,
           }),
-    ) ?? visibleSessions[0];
+    ) ??
+    visibleSessions[0];
+  const incomingSessions = activeSessions(
+    view,
+    Object.fromEntries(
+      (state.incoming ?? []).map((call) => [sessionKey(call), call]),
+    ),
+  ).filter(
+    (entry) =>
+      isRingingFor(entry.call, view.identity) && !nativeOwns(entry.call),
+  );
+  const incomingSession =
+    incomingSessions[0] ??
+    (!active &&
+    state.phase === "idle" &&
+    selectedSession &&
+    isRingingFor(selectedSession.call, view.identity)
+      ? selectedSession
+      : undefined);
+  const incomingKey = incomingSession
+    ? invitationKey(incomingSession.call, view.identity)
+    : undefined;
+  const incomingHidden =
+    !!incomingSession &&
+    state.minimized === sessionKey(incomingSession.call) &&
+    hiddenIncoming === incomingKey;
+  useIncomingRingtone({
+    identity: view.identity,
+    // An available/reconnected session alone must not replay an old alert.
+    ringKey:
+      incomingSessions.length && !incomingHidden ? incomingKey : undefined,
+    expiresAt: incomingSession?.call.invitations?.[view.identity]?.expires_at,
+    answering: state.answering,
+    activeCall: !!active,
+  });
   const otherCount = sessions.filter(
     (entry) =>
       entry.call.call_id !== (active?.call_id ?? selectedSession?.call.call_id),
@@ -637,35 +808,71 @@ export function CallSurface({
     </button>
   );
   const widget =
-    active || state.phase === "connecting" ? (
+    incomingSession &&
+    (!incomingHidden || (!active && state.phase === "idle")) ? (
+      <IncomingCallWidget
+        calls={calls}
+        session={incomingSession}
+        identity={view.identity}
+        answering={state.answering === true}
+        currentCall={state.chat?.name}
+        hasCurrentCall={!!active || state.phase !== "idle"}
+        hidden={incomingHidden}
+        onOpen={() => {
+          calls.collapse();
+          onShowCalls();
+        }}
+        onHide={() => {
+          setHiddenIncoming(incomingKey);
+          calls.minimize(incomingSession.call);
+        }}
+      />
+    ) : active || state.phase === "connecting" ? (
       <FloatingCall
         label={t("calls.active")}
-        hidden={expanded}
+        hidden={
+          expanded ||
+          (active
+            ? state.minimized === sessionKey(active)
+            : !!state.chat &&
+              state.minimized === `pending:${scopeKey(state.chat)}`)
+        }
         title={
-          <button
-            type="button"
-            className="call-widget-title"
-            disabled={!active}
-            onClick={calls.expand}
-            aria-label={t("calls.open")}
-          >
-            <span className="call-widget-avatar" aria-hidden="true">
-              <Phone size={18} />
-            </span>
-            <span className="call-widget-heading">
-              <strong>{state.chat?.name ?? t("calls.establishing")}</strong>
-              <small>
-                {activeSpace?.name
-                  ? t("calls.widgetStatus", { status, space: activeSpace.name })
-                  : status}
-              </small>
-            </span>
-            <Maximize2
-              size={16}
-              className="call-widget-expand"
-              aria-hidden="true"
-            />
-          </button>
+          <>
+            <button
+              type="button"
+              className="call-widget-title call-widget-expand"
+              data-call-drag-toggle
+              aria-label={t("calls.open")}
+              title={t("calls.open")}
+              aria-disabled={!active}
+              onClick={() => active && calls.expand()}
+            >
+              <span className="call-widget-heading">
+                <strong>{state.chat?.name ?? t("calls.establishing")}</strong>
+                <small>
+                  {activeSpace?.name
+                    ? t("calls.widgetStatus", {
+                        status,
+                        space: activeSpace.name,
+                      })
+                    : status}
+                </small>
+              </span>
+              <span className="call-widget-chevron" aria-hidden="true">
+                <ChevronUp size={20} />
+              </span>
+            </button>
+            <button
+              type="button"
+              className="icon call-widget-hide"
+              aria-label={t("calls.hide")}
+              title={t("calls.hide")}
+              onClick={() => calls.minimize()}
+            >
+              <Minus size={20} aria-hidden="true" />
+            </button>
+          </>
         }
       >
         {more}
@@ -685,40 +892,59 @@ export function CallSurface({
     ) : selectedSession ? (
       <FloatingCall
         label={t("calls.activeSessions")}
+        hidden={state.minimized === sessionKey(selectedSession.call)}
         title={
-          <button
-            type="button"
-            className="call-widget-title"
-            onClick={onShowCalls}
-          >
-            <span className="call-widget-avatar" aria-hidden="true">
-              <Phone size={18} />
-            </span>
-            <span className="call-widget-heading">
-              <strong>{selectedSession.chat.name}</strong>
-              <small>
-                {t("calls.inSpace", { name: selectedSession.spaceName })}
-              </small>
-            </span>
-          </button>
+          <>
+            <button
+              type="button"
+              className="call-widget-title call-widget-expand"
+              data-call-drag-toggle
+              aria-label={t("calls.open")}
+              title={t("calls.open")}
+              onClick={onShowCalls}
+            >
+              <span className="call-widget-heading">
+                <strong>{selectedSession.chat.name}</strong>
+                <small>
+                  {t("calls.inSpace", { name: selectedSession.spaceName })}
+                </small>
+              </span>
+              <span className="call-widget-chevron" aria-hidden="true">
+                <ChevronUp size={20} />
+              </span>
+            </button>
+            <button
+              type="button"
+              className="icon call-widget-hide"
+              aria-label={t("calls.hide")}
+              title={t("calls.hide")}
+              onClick={() => calls.minimize(selectedSession.call)}
+            >
+              <Minus size={20} aria-hidden="true" />
+            </button>
+          </>
         }
       >
         {more}
         <button
           type="button"
-          className="call-widget-join"
+          className="icon call-widget-join"
           disabled={state.answering}
+          aria-label={t(
+            isRingingFor(selectedSession.call, view.identity)
+              ? "calls.answer"
+              : "calls.joinSession",
+          )}
+          title={t(
+            isRingingFor(selectedSession.call, view.identity)
+              ? "calls.answer"
+              : "calls.joinSession",
+          )}
           onClick={() =>
             calls.requestStart(selectedSession.chat, selectedSession.call)
           }
         >
-          <Phone size={18} aria-hidden="true" />
-          {t(
-            selectedSession.call.kind === "direct" &&
-              selectedSession.call.phase === "ringing"
-              ? "calls.answer"
-              : "calls.joinSession",
-          )}
+          <Phone size={20} aria-hidden="true" />
         </button>
         {selectedSession.call.kind === "group" && (
           <button
@@ -753,6 +979,7 @@ export function CallSurface({
               tile={tile}
               name={name(tile.credential)}
               muted={speakerMuted || mutedPeople.has(tile.credential)}
+              playback={playback}
             />
           ))}
       </div>
@@ -867,68 +1094,7 @@ export function CallSurface({
               </div>
             )}
           </div>
-          <div className="call-controls">
-            {controls(true)}
-            {active.kind === "group" && (
-              <button
-                type="button"
-                className="icon"
-                aria-label={t("calls.invitePeople")}
-                onClick={() => setInviteOpen(true)}
-              >
-                <UserPlus />
-              </button>
-            )}
-          </div>
-        </ActionDialog>
-      )}
-      {inviteOpen && active?.kind === "group" && (
-        <ActionDialog
-          title={t("calls.invitePeople")}
-          onClose={() => {
-            if (!inviting) setInviteOpen(false);
-          }}
-        >
-          <p>{t("calls.inviteHelp")}</p>
-          <div className="call-choice">
-            {state.chat?.members
-              .filter(
-                (member) =>
-                  member.identity_id !== view.identity &&
-                  member.capabilities.includes("POST") &&
-                  member.capabilities.includes("READ") &&
-                  !active.participants[member.identity_id],
-              )
-              .map((member) => (
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={
-                    inviting ||
-                    (active.invitations?.[member.identity_id]?.expires_at ??
-                      0) *
-                      1000 >
-                      Date.now()
-                  }
-                  key={member.identity_id}
-                  onClick={async () => {
-                    setInviting(true);
-                    try {
-                      await calls.invite(member.identity_id);
-                    } finally {
-                      setInviting(false);
-                      setInviteOpen(false);
-                    }
-                  }}
-                >
-                  {state.chat?.member_names?.[member.identity_id] ??
-                    view.contacts?.find(
-                      (person) => person.id === member.identity_id,
-                    )?.name ??
-                    t("calls.participant")}
-                </button>
-              ))}
-          </div>
+          <div className="call-controls">{controls(true)}</div>
         </ActionDialog>
       )}
       {state.error && (

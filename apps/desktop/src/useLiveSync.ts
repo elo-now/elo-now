@@ -1,6 +1,6 @@
 import { updateRequired, useUpdateRequired } from "./releasePolicy";
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import type { View } from "./model";
 import { startLiveSync, type SyncResult, type SyncProgress } from "./liveSync";

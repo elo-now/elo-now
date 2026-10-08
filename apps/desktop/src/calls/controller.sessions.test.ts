@@ -67,6 +67,7 @@ vi.mock("./peer", () => ({
 }));
 import { Calls } from "./controller";
 import { leaveBeforeLock } from "./leaveBeforeLock";
+import { sessionKey } from "./attention";
 
 const media: MediaState = {
   audio_muted: false,
@@ -148,6 +149,7 @@ function setup() {
     },
     participants: { me: participant("me", "a") },
   };
+  let starts = 0;
   const command = vi.fn(
     async (_chat: Stream, operation: Record<string, any>): Promise<any> => {
       if (operation.type === "connect_media")
@@ -168,6 +170,7 @@ function setup() {
       if (operation.type === "start")
         current = {
           ...current,
+          call_id: (++starts).toString(16).padStart(32, "c"),
           ready: false,
           participants: { me: { ...participant("me", "a"), ready: false } },
         };
@@ -195,9 +198,11 @@ function setup() {
         current = {
           ...current,
           key_epoch: current.key_epoch + 1,
-          participants,
+          participants: current.kind === "direct" ? {} : participants,
         };
-        return { call: Object.keys(participants).length ? current : null };
+        return {
+          call: Object.keys(current.participants).length ? current : null,
+        };
       }
       return { call: current };
     },
@@ -239,6 +244,169 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
+
+it.each([false, true])(
+  "minimizes and restores controls without touching media (native: %s)",
+  async (native) => {
+    runtime.native = native;
+    const f = setup();
+    await f.calls.start(f.chat);
+    await f.presence({
+      me: f.current().participants.me,
+      peer: participant("peer", "b"),
+    });
+    await vi.waitFor(() => expect(runtime.peers).toHaveLength(1));
+    if (!native) runtime.peers[0].args[5]();
+    await vi.waitFor(() => expect(f.calls.snapshot.phase).toBe("connected"));
+    const before = f.calls.snapshot;
+    const adapter = f.controller.adapter;
+    const capture = f.calls.localCapture();
+    f.command.mockClear();
+    runtime.activity.mockClear();
+    f.calls.expand();
+    f.calls.minimize();
+    expect(f.calls.snapshot.minimized).toBe(sessionKey(before.active!));
+    expect(f.calls.snapshot.expanded).toBe(false);
+    expect(f.calls.snapshot.active).toBe(before.active);
+    expect(f.calls.snapshot.media).toBe(before.media);
+    expect(f.calls.snapshot.tiles).toBe(before.tiles);
+    expect(f.calls.snapshot.phase).toBe("connected");
+    expect(f.calls.localCapture()).toBe(capture);
+    expect(f.controller.adapter).toBe(adapter);
+    expect(runtime.peers[0].stop).not.toHaveBeenCalled();
+    expect(f.audio.stop).not.toHaveBeenCalled();
+    expect(f.command).not.toHaveBeenCalled();
+    expect(runtime.activity).not.toHaveBeenCalled();
+    // Buzz Open restores the compact controls; expansion is a separate action.
+    f.calls.requestStart(f.chat, before.active);
+    expect(f.calls.snapshot.minimized).toBeUndefined();
+    expect(f.calls.snapshot.expanded).toBe(false);
+    expect(f.controller.adapter).toBe(adapter);
+    expect(f.command).not.toHaveBeenCalled();
+    f.calls.requestStart(f.chat, before.active);
+    expect(f.calls.snapshot.expanded).toBe(true);
+    f.calls.minimize();
+    await f.calls.leave();
+    expect(f.calls.snapshot.minimized).toBeUndefined();
+    f.calls.dispose();
+  },
+);
+
+it("keeps an in-flight start minimized after its session ID is assigned", async () => {
+  const f = setup();
+  let capture!: (value: typeof f.capture) => void;
+  f.getUserMedia.mockImplementationOnce(
+    () => new Promise((resolve) => (capture = resolve)),
+  );
+  const starting = f.calls.start(f.chat);
+  f.calls.minimize();
+  expect(f.calls.snapshot.minimized).toBe("pending:host:space:chat");
+  capture(f.capture);
+  await starting;
+  expect(f.calls.snapshot.minimized).toBe(sessionKey(f.current()));
+  f.calls.reveal(f.chat);
+  expect(f.calls.snapshot.minimized).toBeUndefined();
+  expect(f.calls.snapshot.expanded).not.toBe(true);
+  expect(f.getUserMedia).toHaveBeenCalledOnce();
+  await f.calls.leave();
+  f.calls.dispose();
+});
+
+it("hides a waiting invitation without closing the current fullscreen call", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active;
+  const capture = f.calls.localCapture();
+  const ring = { ...invited(f), call_id: "another-call" };
+  f.controller.change({ incoming: [ring] });
+  f.calls.expand();
+  f.command.mockClear();
+  f.calls.minimize(ring);
+  expect(f.calls.snapshot.minimized).toBe(sessionKey(ring));
+  expect(f.calls.snapshot.expanded).toBe(true);
+  expect(f.calls.snapshot.active).toBe(original);
+  expect(f.calls.localCapture()).toBe(capture);
+  expect(f.command).not.toHaveBeenCalled();
+  expect(f.audio.stop).not.toHaveBeenCalled();
+  f.controller.change({ incoming: [] });
+  expect(f.calls.snapshot.minimized).toBeUndefined();
+  expect(f.calls.snapshot.expanded).toBe(true);
+  f.calls.dispose();
+});
+
+it("minimizes an available group without dismissing, joining, or suppressing a fresh invitation", async () => {
+  const f = setup();
+  f.chat.chat_kind = "chat";
+  f.current().kind = "group";
+  await f.presence({ peer: participant("peer", "b") });
+  f.calls.minimize(f.current());
+  const key = sessionKey(f.current());
+  expect(f.calls.snapshot.minimized).toBe(key);
+  expect(f.calls.snapshot.dismissed ?? []).toEqual([]);
+  expect(f.calls.snapshot.active).toBeUndefined();
+  expect(f.getUserMedia).not.toHaveBeenCalled();
+  const incoming = invited(f);
+  await f.controller.presence(incoming, true);
+  expect(f.calls.snapshot.minimized).toBe(key);
+  expect(f.calls.snapshot.incoming).toEqual([incoming]);
+  f.command.mockClear();
+  f.calls.reveal(f.chat);
+  expect(f.calls.snapshot.minimized).toBeUndefined();
+  expect(f.calls.snapshot.active).toBeUndefined();
+  expect(f.command).not.toHaveBeenCalled();
+  f.calls.minimize(incoming);
+  await f.controller.event({
+    type: "ended",
+    call_id: incoming.call_id,
+    scope: incoming.scope,
+  });
+  expect(f.calls.snapshot.minimized).toBeUndefined();
+  f.calls.dispose();
+});
+
+it.each(["user", "native_end", "failure", "ended"])(
+  "removes a direct call before %s teardown and rejects stale presence without hiding a new call",
+  async (reason) => {
+    const f = setup();
+    await f.calls.start(f.chat);
+    const old = f.calls.snapshot.active!;
+    const snapshots: (typeof f.calls.snapshot)[] = [];
+    const stop = f.calls.subscribe(() => snapshots.push(f.calls.snapshot));
+    let finish!: (value: unknown) => void;
+    f.command.mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    const leaving =
+      reason === "ended"
+        ? f.controller.event({
+            type: "ended",
+            call_id: old.call_id,
+            scope: old.scope,
+          })
+        : f.calls.leave(reason);
+    expect(f.calls.snapshot.active).toBeUndefined();
+    expect(f.calls.snapshot.available["host:space:chat"]).toBeUndefined();
+    expect(
+      snapshots.some(
+        (snapshot) =>
+          !snapshot.active &&
+          snapshot.available["host:space:chat"]?.call_id === old.call_id,
+      ),
+    ).toBe(false);
+    await f.controller.presence(old, true);
+    expect(f.calls.snapshot.available["host:space:chat"]).toBeUndefined();
+    const fresh = { ...invited(f, "fresh"), call_id: "d".repeat(32) };
+    await f.controller.presence(fresh, true);
+    expect(f.calls.snapshot.available["host:space:chat"]).toBe(fresh);
+    expect(f.calls.snapshot.incoming).toEqual([fresh]);
+    finish({ call: old });
+    await leaving;
+    expect(f.calls.snapshot.available["host:space:chat"]).toBe(fresh);
+    expect(f.calls.snapshot.incoming).toEqual([fresh]);
+    stop();
+    f.calls.dispose();
+  },
+);
 
 it("releases capture immediately and locks within 400ms when signed Leave cannot reach the network", async () => {
   const f = setup();
@@ -388,9 +556,7 @@ it("joins explicitly, keeps camera and capture when the peer leaves, and negotia
     undefined,
   );
   await f.calls.leave();
-  expect(f.calls.snapshot.available["host:space:chat"]?.participants).toEqual({
-    peer: participant("peer", "b"),
-  });
+  expect(f.calls.snapshot.available["host:space:chat"]).toBeUndefined();
   f.calls.dispose();
 });
 
@@ -593,6 +759,8 @@ it("rejects old membership signals before decryption and validates the signed ep
 
 it("ignores an old native end event after rejoining the same ongoing session", async () => {
   const f = setup();
+  f.chat.chat_kind = "chat";
+  f.current().kind = "group";
   await f.calls.start(f.chat);
   const first = runtime.activity.mock.calls[0][0];
   await f.presence({
@@ -628,6 +796,8 @@ it("ignores an old native end event after rejoining the same ongoing session", a
 
 it("waits for pending Leave before refreshing and rejoining the same session", async () => {
   const f = setup();
+  f.chat.chat_kind = "chat";
+  f.current().kind = "group";
   await f.calls.start(f.chat);
   await f.presence({
     me: f.current().participants.me,
@@ -658,7 +828,7 @@ it("waits for pending Leave before refreshing and rejoining the same session", a
   f.calls.dispose();
 });
 
-it("rejoins after reporting a media teardown failure without retaining capture", async () => {
+it("starts a new direct call after a teardown failure without retaining capture", async () => {
   const f = setup();
   await f.presence({ peer: participant("peer", "b") });
   await f.calls.start(f.chat, f.current());
@@ -676,13 +846,17 @@ it("rejoins after reporting a media teardown failure without retaining capture",
 
   f.command.mockClear();
   await f.calls.start(f.chat, f.current());
+  await f.presence({
+    me: f.current().participants.me,
+    peer: participant("peer", "b"),
+  });
   await vi.waitFor(() => expect(runtime.peers).toHaveLength(2));
   runtime.peers[1].args[5]();
   expect(f.calls.snapshot.phase).toBe("connected");
   expect(f.calls.snapshot.error).toBeUndefined();
   expect(
     f.command.mock.calls.slice(0, 3).map(([, operation]) => operation.type),
-  ).toEqual(["subscribe", "join", "media"]);
+  ).toEqual(["subscribe", "start", "media"]);
   f.calls.dispose();
 });
 
@@ -1106,6 +1280,7 @@ it("requires explicit switching and validates a session before ending the curren
   const next = { ...invited(f), call_id: "another-call" };
   f.calls.requestStart(f.chat, next);
   expect(f.calls.snapshot.joinRequest?.call).toBe(next);
+  expect(f.calls.snapshot.joinRequest?.invitation_id).toBe("attempt");
   expect(f.calls.snapshot.active).toBe(original);
   expect(f.audio.stop).not.toHaveBeenCalled();
   f.calls.cancelJoin();
@@ -1116,6 +1291,27 @@ it("requires explicit switching and validates a session before ending the curren
   await f.calls.answer(f.chat, next, true, "attempt");
   expect(f.audio.stop).toHaveBeenCalled();
   expect(start).toHaveBeenCalledWith(f.chat, next, "attempt");
+  f.calls.dispose();
+});
+
+it("keeps an expired Answer intent but ignores expired invitations for ordinary Join", async () => {
+  const f = setup();
+  await f.calls.start(f.chat);
+  const original = f.calls.snapshot.active;
+  const next = {
+    ...invited(f),
+    call_id: "another-call",
+    kind: "group" as const,
+  };
+  f.calls.requestStart(f.chat, next);
+  expect(f.calls.snapshot.joinRequest?.invitation_id).toBe("attempt");
+  next.invitations.me.expires_at = 1;
+  expect(f.calls.snapshot.joinRequest?.invitation_id).toBe("attempt");
+  f.calls.cancelJoin();
+  f.calls.requestStart(f.chat, next);
+  expect(f.calls.snapshot.joinRequest?.invitation_id).toBeUndefined();
+  expect(f.calls.snapshot.active).toBe(original);
+  expect(f.audio.stop).not.toHaveBeenCalled();
   f.calls.dispose();
 });
 

@@ -13,6 +13,8 @@ use objc2_security::{
 };
 use serde::de::DeserializeOwned;
 use std::ffi::c_void;
+use std::process::Command;
+use std::sync::OnceLock;
 use tauri::{plugin::PluginApi, AppHandle, Runtime, WebviewWindow};
 
 use crate::error::{ErrorResponse, PluginInvokeError};
@@ -42,6 +44,27 @@ fn reject(code: &str, message: &str) -> crate::Error {
 fn cf_len(n: usize) -> crate::Result<CFIndex> {
     CFIndex::try_from(n)
         .map_err(|_| reject("internalError", "CF array length does not fit in CFIndex"))
+}
+
+fn has_signing_team() -> bool {
+    static SIGNED: OnceLock<bool> = OnceLock::new();
+    *SIGNED.get_or_init(|| {
+        let Ok(executable) = std::env::current_exe() else {
+            return false;
+        };
+        let Ok(output) = Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=2"])
+            .arg(executable)
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                line.strip_prefix("TeamIdentifier=")
+                    .is_some_and(|team| !team.is_empty() && team != "not set")
+            })
+    })
 }
 
 const fn la_error_to_string(error: LAError) -> &'static str {
@@ -77,8 +100,15 @@ impl<R: Runtime> Biometry<R> {
 
         let biometry_type = unsafe { context.biometryType() };
 
-        let is_available = can_evaluate.is_ok();
-        let (error_reason, error_code) = if let Err(error) = can_evaluate {
+        let is_available = can_evaluate.is_ok() && has_signing_team();
+        let (error_reason, error_code) = if can_evaluate.is_ok() && !is_available {
+            // Ad hoc builds can evaluate Touch ID but cannot persist the
+            // credential in the data-protection keychain. Do not offer setup.
+            (
+                Some("keychainUnavailable".to_string()),
+                Some("keychainUnavailable".to_string()),
+            )
+        } else if let Err(error) = can_evaluate {
             let ns_error = &*error;
             let description = ns_error.localizedDescription();
             let code = LAError(ns_error.code());
@@ -494,6 +524,11 @@ impl<R: Runtime> Biometry<R> {
 
             if status == errSecSuccess {
                 Ok(())
+            } else if status == errSecMissingEntitlement {
+                Err(reject(
+                    "keychainUnavailable",
+                    "This app signature cannot access the protected keychain",
+                ))
             } else {
                 Err(reject(
                     "keychainError",

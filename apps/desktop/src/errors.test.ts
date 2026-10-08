@@ -13,6 +13,11 @@ describe("native error presentation", () => {
       message: en["invite.qrImageTooLarge"],
     });
   });
+  it("explains an unavailable protected keychain in local Mac builds", () => {
+    expect(presentError(new Error("[keychainUnavailable]"))).toEqual({
+      message: en["error.biometricBuildUnavailable"],
+    });
+  });
   it("explains cleanup errors without implying that logout failed", () => {
     for (const [reason, key] of [
       [

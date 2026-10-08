@@ -1,3 +1,4 @@
+import EloDiagnostics
 import ObjectiveC
 import Darwin
 import WebKit
@@ -36,6 +37,15 @@ private struct PushStatus: Encodable {
 }
 
 final class EloPushPlugin: Plugin, MessagingDelegate {
+    @objc func diagnostics(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(NativeMediaArgs.self)
+        guard args.payload.utf8.count <= 2048,
+              let body = try JSONSerialization.jsonObject(with: Data(args.payload.utf8)) as? [String: Any] else {
+            invoke.reject("invalid"); return
+        }
+        EloDiagnostics.command(body)
+        invoke.resolve()
+    }
     @objc func deviceModel(_ invoke: Invoke) {
         var hardware = utsname()
         uname(&hardware)
@@ -67,6 +77,24 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
     @objc func incomingListener(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PushStatusListenerArgs.self)
         Task { @MainActor in IncomingCalls.shared.listen(args.channel); invoke.resolve() }
+    }
+    @objc func foregroundRingtone(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(IncomingCallArgs.self)
+        guard args.payload.utf8.count <= 1024,
+              let request = try JSONSerialization.jsonObject(with: Data(args.payload.utf8)) as? [String: Any] else {
+            invoke.reject("invalid"); return
+        }
+        Task { @MainActor in
+            guard let epoch = request["epoch"] as? NSNumber else { invoke.reject("invalid"); return }
+            if request["stopAll"] as? Bool == true { ForegroundRingtone.shared.shutdown(epoch: epoch.uint64Value); invoke.resolve(); return }
+            guard let token = request["token"] as? String, UUID(uuidString: token) != nil,
+                  let revision = request["revision"] as? NSNumber,
+                  let active = request["active"] as? Bool, let expires = request["expires"] as? NSNumber else {
+                invoke.reject("invalid"); return
+            }
+            ForegroundRingtone.shared.update(epoch: epoch.uint64Value, token: token, revision: revision.int64Value, enabled: active, expires: expires.doubleValue)
+            invoke.resolve()
+        }
     }
     @objc func incomingStatus(_ invoke: Invoke) {
         Task { @MainActor in invoke.resolve(IncomingCalls.shared.status()) }
@@ -109,7 +137,7 @@ final class EloPushPlugin: Plugin, MessagingDelegate {
             do { invoke.resolve(try await NativeMedia.shared.command(value)) }
             catch NativePeer.MediaError.permission { invoke.resolve(["error": "NotAllowedError"]) }
             catch NativePeer.MediaError.ended { invoke.resolve(["error": "ended"]) }
-            catch { invoke.resolve(["error": "unavailable"]) }
+            catch { EloDiagnostics.mediaFailure(error, stage: "command_failed"); invoke.resolve(["error": "unavailable"]) }
         }
     }
 

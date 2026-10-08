@@ -97,6 +97,17 @@ it("lists verified ready calls across Spaces without acquiring media", () => {
   expect(f.calls.start).not.toHaveBeenCalled();
 });
 
+it("omits the redundant Space name for a call in the selected Space", () => {
+  const f = fixture();
+  f.view.active_space = "other";
+  const markup = renderToStaticMarkup(
+    <CallList calls={f.calls} view={f.view} onOpen={vi.fn()} />,
+  );
+  expect(markup).toContain("Planning");
+  expect(markup).toContain("Alex");
+  expect(markup).not.toContain("in Team space");
+});
+
 it("hides unavailable, empty, stale, or inaccessible sessions", () => {
   const f = fixture();
   for (const call of [
@@ -126,7 +137,12 @@ it("keeps dismissed groups in Calls and opens their chat without joining", () =>
   );
   expect(onOpen).toHaveBeenCalledOnce();
   expect(f.calls.requestStart).not.toHaveBeenCalled();
-  row.props.children[1].props.onClick();
+  const join = row.props.children[1];
+  expect(join.props["aria-label"]).toBe("Join");
+  expect(join.props.className).toBe("call-list-open");
+  expect(renderToStaticMarkup(join)).toContain("<svg");
+  expect(renderToStaticMarkup(join)).not.toContain(">Join</button>");
+  join.props.onClick();
   expect(f.calls.requestStart).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({ space_context: "other", stream: "chat" }),
     f.call,
@@ -137,10 +153,13 @@ it("opens this device's call instead of offering a redundant Join", () => {
   const f = fixture();
   f.state.active = f.call;
   const list = CallList({ calls: f.calls, view: f.view, onOpen: vi.fn() });
-  expect(renderToStaticMarkup(list)).toContain("Open call");
+  const markup = renderToStaticMarkup(list);
+  expect(markup).toContain('aria-label="Open call"');
+  expect(markup).toContain('class="call-list-open"');
+  expect(markup).not.toContain(">Open call</button>");
   list.props.children[0].props.children[1].props.onClick();
-  expect(f.calls.expand).toHaveBeenCalledOnce();
-  expect(f.calls.requestStart).not.toHaveBeenCalled();
+  expect(f.calls.requestStart).toHaveBeenCalledExactlyOnceWith(f.chat, f.call);
+  expect(f.calls.expand).not.toHaveBeenCalled();
 });
 
 it("does not confuse identical call IDs from separate hostings", () => {
@@ -192,5 +211,40 @@ it("opens an already joined group but never confuses its ID with another hosting
   };
   CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
   expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(f.chat);
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
+});
+
+it.each(["direct", "group"] as const)(
+  "restores a minimized %s from the drawer without joining or expanding",
+  (kind) => {
+    const f = fixture();
+    f.call.kind = kind;
+    f.state.minimized = `${callKey(f.call)}:${f.call.call_id}`;
+    const phone = CallButton({ calls: f.calls, chat: f.chat });
+    expect(phone.props["aria-label"]).toBe("Open call");
+    phone.props.onClick();
+    expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(f.chat);
+    expect(f.calls.requestStart).not.toHaveBeenCalled();
+    expect(f.calls.expand).not.toHaveBeenCalled();
+    f.state.active = f.call;
+    CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+    expect(f.calls.reveal).toHaveBeenCalledTimes(2);
+    expect(f.calls.requestStart).not.toHaveBeenCalled();
+  },
+);
+
+it("restores a pending or newly admitted call before available presence arrives", () => {
+  const f = fixture();
+  f.state.available = {};
+  f.state.phase = "connecting";
+  f.state.chat = f.chat;
+  f.state.minimized = "pending:other:space:chat";
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.reveal).toHaveBeenCalledExactlyOnceWith(f.chat);
+  expect(f.calls.requestStart).not.toHaveBeenCalled();
+  f.state.active = f.call;
+  f.state.minimized = `${callKey(f.call)}:${f.call.call_id}`;
+  CallButton({ calls: f.calls, chat: f.chat }).props.onClick();
+  expect(f.calls.reveal).toHaveBeenCalledTimes(2);
   expect(f.calls.requestStart).not.toHaveBeenCalled();
 });

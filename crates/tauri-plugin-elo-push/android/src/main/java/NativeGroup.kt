@@ -3,6 +3,7 @@ package now.elo.push
 import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.Drawable
+import android.util.Log
 import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.FrameLayout
@@ -52,6 +53,7 @@ internal class NativeGroup(val id: String, private val context: Context, private
     private var oldBackground: Drawable? = null
     private val renderers = mutableMapOf<String, Pair<VideoTrack, TextureViewRenderer>>()
     private var lastTracks = ""
+    private var connectionStage = "idle"
     private fun live() { check(!stopped && authorized()) { "ended" } }
     fun attach(web: WebView?) { clearRenderers(); webView = web }
     fun muteMicrophone(muted: Boolean) { systemMuted = muted; room?.setMicrophoneMute(muted || media.optBoolean("audio_muted", true)) }
@@ -63,7 +65,19 @@ internal class NativeGroup(val id: String, private val context: Context, private
                 val result = operations.withLock {
                     live()
                     when (request.getString("op")) {
-                        "group_start", "group_reset" -> { connect(request); JSObject() }
+                        "group_start" -> { connect(request); JSObject() }
+                        "group_reset" -> {
+                            if (request.has("key")) connect(request)
+                            else {
+                                connectionStage = "reset"
+                                closeRoom()
+                                failure = null
+                                members = emptySet()
+                                mutedCredentials.clear()
+                                media = JSONObject().put("audio_muted", true)
+                            }
+                            JSObject()
+                        }
                         "poll", "snapshot" -> poll()
                         "update" -> { update(request.getJSONObject("state"), request.optBoolean("speaker_muted")); JSObject() }
                         "speaker" -> {
@@ -82,8 +96,11 @@ internal class NativeGroup(val id: String, private val context: Context, private
                 }
                 live(); resolve(result)
             } catch (error: Exception) {
+                BetaDiagnostics.mediaFailure(error, "group_command_failed")
                 if (error is CancellationException) resolve(JSObject().put("error", "ended"))
                 else {
+                    if (request.optString("op").startsWith("group_"))
+                        Log.w("EloNativeGroup", "Group command failed at $connectionStage (${error.javaClass.simpleName})")
                     if (request.optString("op") in listOf("group_start", "group_reset")) fail("unavailable")
                     resolve(JSObject().put("error", if (error.message == "ended") "ended" else "unavailable"))
                 }
@@ -92,6 +109,7 @@ internal class NativeGroup(val id: String, private val context: Context, private
         job.invokeOnCompletion { if (it != null) resolve(JSObject().put("error", "ended")) }
     }
     private suspend fun connect(request: JSONObject) {
+        connectionStage = "validation"
         val nextEpoch = request.getLong("epoch")
         val url = request.getString("url")
         val token = request.getString("token")
@@ -105,6 +123,7 @@ internal class NativeGroup(val id: String, private val context: Context, private
         closeRoom()
         epoch = nextEpoch; members = policy.members; failure = null
         mutedCredentials.retainAll(members)
+        connectionStage = "key_provider"
         LiveKit.init(context)
         val keyProvider = BaseKeyProvider(ratchetSalt = "LKFrameEncryptionKey", ratchetWindowSize = 8,
             enableSharedKey = true, failureTolerance = -1, discardFrameWhenCryptorNotReady = true,
@@ -112,6 +131,7 @@ internal class NativeGroup(val id: String, private val context: Context, private
         provider = keyProvider
         val bytes = ByteArray(32) { index -> secret.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
         try { check(keyProvider.rtcKeyProvider.setSharedKey(0, bytes)) } finally { bytes.fill(0) }
+        connectionStage = "room_creation"
         val current = LiveKit.create(context,
             RoomOptions(adaptiveStream = true, dynacast = true, e2eeOptions = E2EEOptions(keyProvider),
                 videoTrackPublishDefaults = VideoTrackPublishDefaults(simulcast = true, videoCodec = "vp8")),
@@ -135,7 +155,9 @@ internal class NativeGroup(val id: String, private val context: Context, private
         }
         // Inspect publication encryption and signed membership before enabling
         // subscription. A plaintext track must never play before an event check.
+        connectionStage = "signaling"
         withTimeout(15_000) { current.connect(url, token, ConnectOptions(autoSubscribe = false, audio = false, video = false)) }
+        connectionStage = "membership"
         live(); check(room === current && failure == null) { "ended" }
         check(current.localParticipant.identity?.value == policy.credential) { "unauthorized" }
         for (participant in current.remoteParticipants.values) {
@@ -143,6 +165,7 @@ internal class NativeGroup(val id: String, private val context: Context, private
             for (publication in participant.trackPublications.values) subscribe(current, participant, publication as? RemoteTrackPublication)
         }
         revision += 1
+        connectionStage = "connected"
     }
     private fun subscribe(current: Room, participant: Participant, publication: RemoteTrackPublication?) {
         if (publication == null) return

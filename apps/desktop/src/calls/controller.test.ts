@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Stream, View } from "../model";
-import type { ActiveCall, MediaState } from "./types";
+import { muted, type ActiveCall, type MediaState } from "./types";
 const controls = vi.hoisted(() => ({
   events: [] as ((event: Record<string, unknown>) => void)[],
 }));
@@ -41,6 +41,24 @@ const view = {
   spaces: [{ id: "host", managed: true, status: "joined" }],
   streams: [chat],
 } as unknown as View;
+function testCall(call_id = "test"): ActiveCall {
+  return {
+    call_id,
+    scope: {
+      hosting_space_id: "host",
+      conversation: { space_id: "space", stream_id: "chat" },
+    },
+    kind: "group",
+    initial_media: "audio",
+    config_id: "head",
+    participants: {
+      me: { identity_id: "me", credential_id: "device", media: { ...muted } },
+    },
+    key_epoch: 1,
+    started_by: "me",
+    started_at: 1,
+  };
+}
 function pendingCapture() {
   let resolve!: (stream: MediaStream) => void;
   const promise = new Promise<MediaStream>((r) => {
@@ -266,7 +284,7 @@ describe("capture ownership", () => {
       Object.assign(calls, { capture });
       calls.snapshot = {
         ...calls.snapshot,
-        active: { call_id: "test" } as ActiveCall,
+        active: testCall(),
         chat,
         phase: "connected",
       };
@@ -334,7 +352,7 @@ function screenCall() {
   });
   calls.snapshot = {
     ...calls.snapshot,
-    active: { call_id: "test" } as ActiveCall,
+    active: testCall(),
     chat,
     phase: "connected",
   };
@@ -574,7 +592,7 @@ it("required updates stop subscriptions and new calls without stopping active me
   connected.activate();
   const close = vi.fn();
   const unrelatedClose = vi.fn();
-  const active = { call_id: "ongoing" } as ActiveCall;
+  const active = testCall("ongoing");
   connected.snapshot = {
     ...connected.snapshot,
     active,

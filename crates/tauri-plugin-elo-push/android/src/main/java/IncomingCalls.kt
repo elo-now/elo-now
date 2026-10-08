@@ -37,6 +37,15 @@ internal object IncomingCalls {
     private var authorizedMedia: Pair<String, String>? = null
     private var activity = java.lang.ref.WeakReference<IncomingCallActivity>(null)
     private val expiry = Runnable { expire() }
+    private var presentationRevision = 0L
+    private var publishedPresentations = emptySet<String>()
+
+    fun hasRingingPresentation() = state.calls().any {
+        it.phase == IncomingCallState.Phase.RINGING && it.offer.key in presentedKeys
+    }
+    fun hasAnsweredPresentation() = state.calls().any {
+        it.phase != IncomingCallState.Phase.RINGING && it.offer.key in presentedKeys
+    }
 
     fun receive(context: Context, data: Map<String, String>) {
         if (data["elo_ring"] != "1") return
@@ -114,6 +123,7 @@ internal object IncomingCalls {
         val prefs = value.getSharedPreferences("elo-push", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("enabled", false) || !PushRegistrations.contains(prefs, offer.registration)) return
         if (state.receive(offer, System.currentTimeMillis())) {
+            ForegroundRingtone.pausePlayback()
             persist()
             submit(offer)
         }
@@ -153,6 +163,7 @@ internal object IncomingCalls {
         val call = state.matching(id, invitation) ?: return
         if (call.phase != IncomingCallState.Phase.RINGING || call.offer.key in presentedKeys) return
         presentedKeys += call.offer.key
+        ForegroundRingtone.pausePlayback()
         val value = checkNotNull(context)
         try {
             ContextCompat.startForegroundService(value, Intent(value, IncomingCallService::class.java).apply {
@@ -166,7 +177,10 @@ internal object IncomingCalls {
 
     fun answer(id: String, invitation: String, openApp: Boolean = true) {
         if (!state.answer(id, invitation, System.currentTimeMillis())) { render(); return }
-        // setActive is deliberately deferred until Rust confirms media readiness.
+        // Telecom must leave RINGING as soon as the user answers. This does not
+        // authorize capture: Rust admission and media authorization remain separate.
+        connections.values.firstOrNull { it.matches(id, invitation) }?.setActive()
+        ForegroundRingtone.stop()
         context?.let { IncomingCallService.silence(it) }
         render()
         if (openApp) openApplication()
@@ -289,8 +303,18 @@ internal object IncomingCalls {
         snapshot.waiting?.let { json.put("waiting", offerJson(it.offer).put("phase", it.phase.name).put("deadline", it.deadline)) }
         check(value.getSharedPreferences("elo-push", Context.MODE_PRIVATE).edit().putString(STORE, json.toString()).commit()) { "incoming_call_storage_unavailable" }
     }
-    private fun publish() { listener?.let { callback -> state.pending().forEach { callback(eventJson(it)) } } }
+    private fun publish() {
+        val current = state.calls().filter { it.offer.key in presentedKeys }.map { it.offer.key }.toSet()
+        if (current != publishedPresentations) {
+            publishedPresentations = current
+            presentationRevision += 1
+            listener?.invoke(JSObject().put("action", "presentation").put("eventId", java.util.UUID.randomUUID().toString()))
+        }
+        listener?.let { callback -> state.pending().forEach { callback(eventJson(it)) } }
+    }
     private fun statusValue(): JSObject = JSObject().put("pending", JSONArray(state.pending().map(::eventJson)))
+        .put("presentationRevision", presentationRevision)
+        .put("presentationHints", JSONArray(state.calls().filter { it.offer.key in presentedKeys }.map { offerJson(it.offer) }))
         .put("systemUi", state.active() != null).put("active", state.active()?.let {
             offerJson(it.offer).put("phase", it.phase.name.lowercase()).put("systemUi", true)
         } ?: JSONObject.NULL)

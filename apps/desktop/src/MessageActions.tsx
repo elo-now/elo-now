@@ -25,6 +25,7 @@ import {
 } from "./reminders";
 import "./messageActions.css";
 import { ActionDialog } from "./ActionDialog";
+import { ExpiryChoices } from "./ExpiryChoices";
 import { BlockingProvider, BlockUserAction } from "./BlockedUsers";
 import { MessageDebug } from "./MessageDebug";
 import { useExpiringRows } from "./useMessageExpiry";
@@ -406,7 +407,7 @@ export function MessageActionsProvider({
                     : panel === "delete"
                       ? "messageActions.deleteTitle"
                       : panel === "expiry"
-                        ? "messageActions.deleteAfter"
+                        ? "messageActions.expiry"
                         : panel === "edit"
                           ? "messageActions.edit"
                           : "messageActions.more",
@@ -460,7 +461,7 @@ export function MessageActionsProvider({
                       {currentRow.body.issuer_identity === view.identity &&
                         currentRow.body.kind === "chat.message" &&
                         menuItem(
-                          "messageActions.deleteAfter",
+                          "messageActions.expiry",
                           () => {
                             setExpiryHours(
                               currentRow.body.payload?.expiry_hours ?? null,
@@ -543,28 +544,11 @@ export function MessageActionsProvider({
               ) : panel === "expiry" ? (
                 <div className="message-expiry-picker">
                   <p>{t("messageActions.expiryDescription")}</p>
-                  <div
-                    className="message-expiry-options"
-                    role="group"
-                    aria-label={t("messageActions.deleteAfter")}
-                  >
-                    {([null, 1, 24] as const).map((hours) => (
-                      <button
-                        key={hours ?? "none"}
-                        type="button"
-                        className="secondary"
-                        disabled={busy}
-                        aria-pressed={expiryHours === hours}
-                        onClick={() =>
-                          setExpiryHours(expiryHours === hours ? null : hours)
-                        }
-                      >
-                        {hours === null
-                          ? t("messageActions.noExpiry")
-                          : t("composer.expiryHours", { hours })}
-                      </button>
-                    ))}
-                  </div>
+                  <ExpiryChoices
+                    value={expiryHours}
+                    onChange={setExpiryHours}
+                    disabled={busy}
+                  />
                   <div className="dialog-buttons">
                     <button
                       type="button"

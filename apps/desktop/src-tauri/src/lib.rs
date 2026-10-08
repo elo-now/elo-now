@@ -1,3 +1,4 @@
+mod diagnostics;
 mod witness;
 use elo_core::app::{ClientApp, ProfileDraft};
 use tauri::{Emitter, Manager};
@@ -21,6 +22,7 @@ mod device_name;
 mod download_protection;
 mod drafts;
 mod exchange;
+mod foreground_ringtone;
 mod hosting;
 mod incoming_calls;
 mod mail;
@@ -578,6 +580,8 @@ fn application_operation(op: &str) -> bool {
             | "space_join_demo"
             | "space_list"
             | "space_refresh"
+            | "space_join_notices_seen"
+            | "space_join_notice_dismiss"
             | "space_create"
             | "space_setup_done"
             | "space_select"
@@ -613,6 +617,7 @@ fn application_operation(op: &str) -> bool {
             | "invitation_activity"
             | "invitation_activity_seen"
             | "invitation_notifications_seen"
+            | "invitation_notification_dismiss"
             | "invitation_dismiss"
             | "invitation_create"
             | "invitation_list"
@@ -729,6 +734,9 @@ async fn operate(
     if !application_operation(request["op"].as_str().unwrap_or_default()) {
         return Err("Unsupported application operation.".into());
     }
+    let diagnostic_op = request["op"].as_str().unwrap_or_default().to_owned();
+    let diagnostic_started = std::time::Instant::now();
+    diagnostics::event("event", "core", &diagnostic_op, None);
     let navigation = NotificationNavigation::parse(&request)?;
     if let Some(navigation) = &navigation {
         navigation.remaining(notification_navigation_now()?)?;
@@ -815,6 +823,12 @@ async fn operate(
         serde_json::json!({"view":client.view().await.map_err(|e|e.to_string())?})
     } else {
         let outcome = client.operate(request).await.map_err(|e| e.to_string());
+        diagnostics::event(
+            if outcome.is_err() { "error" } else { "event" },
+            "core",
+            &diagnostic_op,
+            Some(diagnostic_started.elapsed().as_millis() as u64),
+        );
         realtime::refresh(&app, Some(client));
         if outcome.is_err() && preferences_changed {
             // A durable safety preference may have committed before a later
@@ -985,6 +999,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_decorations(false)?;
             }
+            diagnostics::setup(app.handle());
             release_policy::setup(app.handle());
             realtime::setup(app.handle());
             #[cfg(all(mobile, feature = "mobile-push"))]
@@ -1000,6 +1015,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            diagnostics::diagnostic_task,
             profile_environment,
             open_demo,
             prepare_profile,
@@ -1020,6 +1036,7 @@ pub fn run() {
             desktop_notifications::desktop_notification_task,
             native_media::native_call_media,
             incoming_calls::native_call_incoming,
+            foreground_ringtone::native_call_ringtone,
             native_media::native_call_state,
             native_media::native_call_audio,
             profiles::profile_task,
@@ -1206,6 +1223,9 @@ mod result_metadata_tests {
             "call_authorization",
             "invitation_activity_seen",
             "invitation_notifications_seen",
+            "invitation_notification_dismiss",
+            "space_join_notices_seen",
+            "space_join_notice_dismiss",
             "space_select",
             "delete_chat_local",
         ] {

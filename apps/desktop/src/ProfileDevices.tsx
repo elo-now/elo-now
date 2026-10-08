@@ -6,7 +6,7 @@ import { cancelProfileReminders } from "./reminders";
 import { PasswordInput } from "./PasswordInput";
 import { useEffect, useRef, useState } from "react";
 import { shareText } from "@choochmeque/tauri-plugin-sharekit-api";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { t } from "./i18n";
 import { Icon } from "./Icon";
 import { useToast } from "./Toast";

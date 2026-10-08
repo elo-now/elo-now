@@ -155,6 +155,10 @@ impl ClientApp {
                     },
                     config_id,
                     proof,
+                    witness: authority
+                        .witness_pin()
+                        .map(|_| client.trusted_witness(authority).cloned())
+                        .transpose()?,
                     delegate,
                 });
             }
@@ -278,8 +282,17 @@ impl ClientApp {
                     operation,
                     time,
                 )?;
+                let include_proof = request["include_proof"] == true;
+                // Native media consumes this fresh core result, never a pin
+                // supplied by WebView IPC or copied from an untrusted proof.
+                let trusted_witness = if include_proof && authority.witness_pin().is_some() {
+                    Some(self.trusted_witness(authority)?.clone())
+                } else {
+                    None
+                };
                 Ok(json!({"command":STANDARD.encode(signed.bytes()),
-                    "proof":if request["include_proof"] == true { Some(authority.call_proof_signed(self.session.signing_key())?) } else { None }}))
+                    "proof":if include_proof { Some(authority.call_proof_signed(self.session.signing_key())?) } else { None },
+                    "trusted_witness":trusted_witness}))
             }
             "call_encrypt_signal" => {
                 let payload: SignalPayload = serde_json::from_value(request["payload"].clone())?;

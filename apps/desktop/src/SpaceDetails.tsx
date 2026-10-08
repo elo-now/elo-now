@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { ActionDialog } from "./ActionDialog";
 import { SpaceContact } from "./SpaceContact";
 import { SpaceStorage } from "./SpaceStorage";

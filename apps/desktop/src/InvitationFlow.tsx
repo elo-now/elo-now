@@ -1,8 +1,16 @@
 import { invitationSeenRequest } from "./invitationAttention";
 import { RefreshButton } from "./RefreshButton";
 import { SpaceRoleRequests } from "./SpaceRoles";
-import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { SwipeChatRow } from "./SwipeChatRow";
+import { ActionDialog } from "./ActionDialog";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type ReactElement,
+} from "react";
+import { invoke } from "./diagnosticInvoke";
 import {
   scan,
   cancel,
@@ -154,6 +162,12 @@ export function InvitationFlow({
   const [activity, setActivity] = useState<Reply>({});
   const [loadedPage, setLoadedPage] = useState<string | null>(null);
   const [requestsRefresh, setRequestsRefresh] = useState(0);
+  const [revealedNotification, setRevealedNotification] = useState<string>();
+  const [deletingNotification, setDeletingNotification] = useState<{
+    id: string;
+    name: string;
+    source: "space" | "invitation";
+  }>();
   const [selected, setSelected] = useState<Entry | null>(null);
   const [disable, setDisable] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -259,6 +273,7 @@ export function InvitationFlow({
   }, [active]);
   const listContext = useRef("");
   const lastSeen = useRef("");
+  const lastSpaceSeen = useRef("");
   useEffect(() => {
     if (!active) return;
     const context = `${view.identity}:${view.active_space}:${page}:${stream?.stream}`;
@@ -311,6 +326,24 @@ export function InvitationFlow({
     view.identity,
     view.active_space,
   ]);
+  useEffect(() => {
+    if (!active || page !== "notifications") return;
+    const ids = (view.space_join_notices ?? [])
+      .filter((notice) => !notice.seen)
+      .map((notice) => notice.id);
+    if (!ids.length) return;
+    const key = `${view.identity}:${ids.join(",")}`;
+    const frame = requestAnimationFrame(() => {
+      if (document.visibilityState !== "visible" || lastSpaceSeen.current === key)
+        return;
+      lastSpaceSeen.current = key;
+      void call({ op: "space_join_notices_seen", ids }).catch((error) => {
+        lastSpaceSeen.current = "";
+        reportError(error);
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, page, view.identity, view.space_join_notices]);
   useEffect(() => {
     if (route.link) void perform(() => inspect(route.link!));
   }, [route.link]);
@@ -509,6 +542,26 @@ export function InvitationFlow({
       notificationsPage,
   );
   const notices = notificationsPage ? (activity.notices ?? []) : [];
+  const spaceNotices = notificationsPage ? (view.space_join_notices ?? []) : [];
+  const notificationRow = (
+    id: string,
+    name: string,
+    source: "space" | "invitation",
+    child: ReactElement<ButtonHTMLAttributes<HTMLButtonElement>>,
+  ) => (
+    <SwipeChatRow
+      chatName={name}
+      deleteLabel={t("notifications.deleteNamed", { name })}
+      allowMouse
+      revealed={revealedNotification === `${source}:${id}`}
+      onReveal={(open) =>
+        setRevealedNotification(open ? `${source}:${id}` : undefined)
+      }
+      onRequestDelete={() => setDeletingNotification({ id, name, source })}
+    >
+      {child}
+    </SwipeChatRow>
+  );
   return (
     <section
       className={inline ? "invitation-panel" : "invitation-page content-pane"}
@@ -925,6 +978,7 @@ export function InvitationFlow({
                 !incoming.length &&
                 !outgoing.length &&
                 !received.length &&
+                !spaceNotices.length &&
                 !notices.length && (
                   <EmptyState
                     message={t(
@@ -937,25 +991,63 @@ export function InvitationFlow({
                           : "invite.activity.empty",
                     )}
                   />
-                )}
+              )}
+              {!!spaceNotices.length && (
+                <ul className="member-list">
+                  {spaceNotices.map((entry) => (
+                    <li key={entry.id}>
+                      {notificationRow(
+                        entry.id,
+                        entry.name,
+                        "space",
+                        <button
+                          className="member-row"
+                          disabled={busy}
+                          onClick={() =>
+                            void perform(async () => {
+                              await call({
+                                op: "space_select",
+                                id: entry.space_id,
+                              });
+                              onClose();
+                            })
+                          }
+                        >
+                          <Icon name="spaces" />
+                          <span className="member-copy">
+                            <strong>{entry.name}</strong>
+                            <small>{t("notifications.spaceJoined")}</small>
+                          </span>
+                          <Icon name="next" />
+                        </button>,
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
               {!!notices.length && (
                 <ul className="member-list">
                   {notices.map((entry) => (
                     <li key={entry.id}>
-                      <button
-                        className="member-row"
-                        onClick={() => {
-                          onJoined(entry.stream);
-                          onClose();
-                        }}
-                      >
-                        <Icon name="bell" />
-                        <span className="member-copy">
-                          <strong>{entry.name}</strong>
-                          <small>{t("notifications.removed")}</small>
-                        </span>
-                        <Icon name="next" />
-                      </button>
+                      {notificationRow(
+                        entry.id,
+                        entry.name,
+                        "invitation",
+                        <button
+                          className="member-row"
+                          onClick={() => {
+                            onJoined(entry.stream);
+                            onClose();
+                          }}
+                        >
+                          <Icon name="bell" />
+                          <span className="member-copy">
+                            <strong>{entry.name}</strong>
+                            <small>{t("notifications.removed")}</small>
+                          </span>
+                          <Icon name="next" />
+                        </button>,
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -1035,8 +1127,8 @@ export function InvitationFlow({
                     <h3>{t("invite.activity.outgoing")}</h3>
                   )}
                   <ul className="member-list">
-                    {outgoing.map((entry) => (
-                      <li key={entry.id}>
+                    {outgoing.map((entry) => {
+                      const row = (
                         <button
                           className="member-row"
                           disabled={busy}
@@ -1069,8 +1161,20 @@ export function InvitationFlow({
                           </span>
                           <Icon name="next" />
                         </button>
-                      </li>
-                    ))}
+                      );
+                      return (
+                        <li key={entry.id}>
+                          {notificationsPage
+                            ? notificationRow(
+                                entry.id,
+                                entry.name,
+                                "invitation",
+                                row,
+                              )
+                            : row}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </>
               )}
@@ -1343,6 +1447,46 @@ export function InvitationFlow({
             </>
           )}
         </PullToRefresh>
+      )}
+      {deletingNotification && (
+        <ActionDialog
+          title={t("notifications.deleteTitle")}
+          onClose={() => !busy && setDeletingNotification(undefined)}
+        >
+          <p>{t("notifications.deleteConfirm", { name: deletingNotification.name })}</p>
+          <div className="space-choice">
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              onClick={() => setDeletingNotification(undefined)}
+            >
+              {t("dialog.cancel")}
+            </button>
+            <button
+              type="button"
+              className="danger"
+              disabled={busy}
+              onClick={() =>
+                void perform(async () => {
+                  await call({
+                    op:
+                      deletingNotification.source === "space"
+                        ? "space_join_notice_dismiss"
+                        : "invitation_notification_dismiss",
+                    id: deletingNotification.id,
+                  });
+                  if (deletingNotification.source === "invitation")
+                    await loadActivity();
+                  setDeletingNotification(undefined);
+                  setRevealedNotification(undefined);
+                })
+              }
+            >
+              {t("notifications.delete")}
+            </button>
+          </div>
+        </ActionDialog>
       )}
     </section>
   );

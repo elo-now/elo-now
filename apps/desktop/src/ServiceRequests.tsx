@@ -1,6 +1,6 @@
 import { shareText } from "@choochmeque/tauri-plugin-sharekit-api";
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { ActionDialog } from "./ActionDialog";
 import { t } from "./i18n";
 import { useToast } from "./Toast";

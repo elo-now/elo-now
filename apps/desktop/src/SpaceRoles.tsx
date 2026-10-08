@@ -6,7 +6,7 @@ import { EmptyState } from "./EmptyState";
 import "./contacts.css";
 import "./newChat.css";
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { ActionDialog } from "./ActionDialog";
 import { t } from "./i18n";
 import { useToast } from "./Toast";
@@ -378,7 +378,7 @@ export function SpaceRoleRequests({
               )}
             </p>
             <div className="space-choice">
-              {(canApprove(item) ? [true, false] : [false]).map((approve) => (
+              {(canApprove(item) ? [false, true] : [false]).map((approve) => (
                 <button
                   key={String(approve)}
                   className={approve ? "" : "secondary"}

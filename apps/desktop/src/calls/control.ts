@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../diagnosticInvoke";
 import type { Stream } from "../model";
 import type { ActiveCall, MediaAccess } from "./types";
 export type Result = {

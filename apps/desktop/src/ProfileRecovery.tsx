@@ -1,6 +1,6 @@
 import { PasswordInput } from "./PasswordInput";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import {
   RecoveryProgress,

@@ -330,6 +330,20 @@ describe("macOS biometric bridge", () => {
     expect(setData).not.toHaveBeenCalled();
   });
 
+  it("does not offer enrollment when native status detects an ad hoc app signature", async () => {
+    vi.mocked(checkStatus).mockResolvedValue({
+      isAvailable: false,
+      biometryType: BiometryType.TouchID,
+      error: "keychainUnavailable",
+    });
+    expect(await readBiometricState()).toMatchObject({
+      available: false,
+      enabled: false,
+      error: "keychainUnavailable",
+    });
+    expect(hasData).not.toHaveBeenCalled();
+  });
+
   it("preserves other keychain failures instead of treating them as missing enrollment", async () => {
     vi.mocked(hasData).mockRejectedValue(new Error("keychainError"));
     await expect(readBiometricState()).rejects.toThrow("keychainError");

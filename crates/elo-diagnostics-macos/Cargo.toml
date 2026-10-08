@@ -1,0 +1,14 @@
+[package]
+name = "elo-diagnostics-macos"
+links = "elo_diagnostics_macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+swift-rs = { version = "1.0.8", features = ["build"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

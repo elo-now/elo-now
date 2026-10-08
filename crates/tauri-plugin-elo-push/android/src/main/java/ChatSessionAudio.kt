@@ -84,6 +84,7 @@ internal object ChatSessionAudio {
         check(Looper.myLooper() == Looper.getMainLooper())
         check(sessionId == null || (sessionId == id && this.activation == activation))
         if (sessionId == id) return
+        ForegroundRingtone.stop()
         val audio = context.applicationContext.getSystemService(AudioManager::class.java)
         previousMode = audio.mode
         if (Build.VERSION.SDK_INT < 31) previousSpeaker = LegacyAudio.speaker(audio)

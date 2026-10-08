@@ -10,6 +10,8 @@ fn main() {
             .join("swift-rs/tauri-plugin-elo-push");
         globalize_xcode_27_bridge_symbols(&root);
         link_media_frameworks(&root);
+        // Crashlytics' native exception handler also enters Cargo's cdylib.
+        println!("cargo:rustc-link-lib=c++");
         println!("cargo:ios_resource_root={}", root.display());
     }
 }

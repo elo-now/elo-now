@@ -85,16 +85,21 @@ jobs:
         run: |
           cargo test --locked -p elo-desktop --lib hosting::tests
           cargo test --locked -p elo-desktop --lib push::
+          cargo test --locked -p elo-desktop --lib result_metadata_tests::
+          cargo test --locked -p elo-desktop --lib release_policy::tests::
       - name: Native call lifecycle and protected admission
         run: |
           cargo test --locked -p elo-desktop --lib native_session::
           cargo test --locked -p elo-desktop --lib incoming_calls::
           cargo test --locked -p elo-desktop --lib native_media::
+          cargo test --locked -p elo-desktop --lib foreground_ringtone::
       - name: iOS call and media policy
         if: runner.os == 'macOS'
         run: |
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/IncomingCallState.swift crates/tauri-plugin-elo-push/ios/Tests/IncomingCallStateTests.swift -o "$RUNNER_TEMP/elo-call-policy-tests"
           "$RUNNER_TEMP/elo-call-policy-tests"
+          xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/ForegroundRingtoneState.swift crates/tauri-plugin-elo-push/ios/Tests/ForegroundRingtoneStateTests.swift -o "$RUNNER_TEMP/elo-ringtone-policy-tests"
+          "$RUNNER_TEMP/elo-ringtone-policy-tests"
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/NativeGroupPolicy.swift crates/tauri-plugin-elo-push/ios/Tests/NativeGroupPolicyTests.swift -o "$RUNNER_TEMP/elo-group-policy-tests"
           "$RUNNER_TEMP/elo-group-policy-tests"
           xcrun swiftc crates/tauri-plugin-elo-push/ios/Sources/APNsEnvironment.swift crates/tauri-plugin-elo-push/ios/Tests/APNsEnvironmentTests.swift -o "$RUNNER_TEMP/elo-apns-environment-tests"

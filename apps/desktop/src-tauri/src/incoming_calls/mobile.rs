@@ -21,6 +21,7 @@ struct Offer {
     target: calls::ring::RingTarget,
     live: AtomicBool,
     answering: AtomicBool,
+    ticket: presentation::Ticket,
 }
 struct Active {
     offer: Arc<Offer>,
@@ -47,6 +48,7 @@ pub(crate) struct Incoming {
     enrollment: tokio::sync::Mutex<()>,
     channel: std::sync::OnceLock<tauri::ipc::Channel<Value>>,
     mute_generation: AtomicU64,
+    fence: Mutex<presentation::Fence>,
 }
 
 async fn plugin(
@@ -99,6 +101,7 @@ pub(crate) async fn enroll(
     routes: Vec<elo_core::app::push::Route>,
 ) -> Result<(), String> {
     let gate = app.state::<Incoming>();
+    let generation = gate.fence.lock().map_err(|_| "unavailable")?.epoch();
     let _guard = gate.enrollment.lock().await;
     let previous_bytes = load_bytes(app).await?;
     let mut previous: Enrollment = if previous_bytes.is_empty() {
@@ -116,7 +119,12 @@ pub(crate) async fn enroll(
         routes: routes.into_iter().map(RingRoute::from).collect(),
         pending_leaves: previous.pending_leaves,
     };
-    save_enrollment(app, &enrollment, &previous_bytes).await
+    save_enrollment(app, &enrollment, &previous_bytes).await?;
+    gate.fence
+        .lock()
+        .map_err(|_| "unavailable")?
+        .resume(generation);
+    Ok(())
 }
 async fn save_enrollment(
     app: &tauri::AppHandle,
@@ -222,8 +230,9 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
                         event["controlGeneration"] = generation.into();
                     }
                     let app = target.clone();
+                    let ticket = observe(&app, &event);
                     tauri::async_runtime::spawn(async move {
-                        handle(app, event).await;
+                        handle(app, event, ticket).await;
                     });
                 }
                 Ok(())
@@ -231,11 +240,32 @@ pub(crate) fn setup(app: &tauri::AppHandle) {
         });
         let _ = plugin(&app, "incomingListener", json!({"channel":channel})).await;
         if let Ok(status) = plugin(&app, "incomingStatus", json!({})).await {
-            for event in status["pending"].as_array().into_iter().flatten() {
-                handle(app.clone(), event.clone()).await;
+            let events: Vec<_> = status["pending"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|event| (event.clone(), observe(&app, event)))
+                .collect();
+            for (event, ticket) in events {
+                handle(app.clone(), event, ticket).await;
             }
         }
     });
+}
+
+fn observe(app: &tauri::AppHandle, event: &Value) -> Option<presentation::Ticket> {
+    app.state::<Incoming>()
+        .fence
+        .lock()
+        .ok()?
+        .observe(event, time())
+}
+
+fn permitted(app: &tauri::AppHandle, ticket: &presentation::Ticket) -> bool {
+    app.state::<Incoming>()
+        .fence
+        .lock()
+        .is_ok_and(|fence| fence.permits(ticket, time()))
 }
 
 fn uuid() -> Result<String, String> {
@@ -252,7 +282,23 @@ fn uuid() -> Result<String, String> {
 fn system(offer: &Offer, op: &str) -> Value {
     json!({"op":op,"callId":offer.target.call_id,"invitationId":offer.target.invitation_id})
 }
-async fn prepare(app: &tauri::AppHandle, event: &Value) -> Result<Arc<Offer>, String> {
+async fn prepare(
+    app: &tauri::AppHandle,
+    event: &Value,
+    ticket: presentation::Ticket,
+) -> Result<Arc<Offer>, String> {
+    let current = || {
+        app.state::<Incoming>().fence.lock().is_ok_and(|fence| {
+            if event["action"] == "decline" {
+                fence.current(&ticket, time())
+            } else {
+                fence.permits(&ticket, time())
+            }
+        })
+    };
+    if !current() {
+        return Err("ended".into());
+    }
     let enrollment = load(app).await?;
     let (prepared, target) =
         super::transport::lookup(enrollment, event, time()).map_err(str::to_owned)?;
@@ -261,11 +307,15 @@ async fn prepare(app: &tauri::AppHandle, event: &Value) -> Result<Arc<Offer>, St
     prepared
         .validate(&call["call"], &target, true)
         .map_err(str::to_owned)?;
+    if !current() {
+        return Err("ended".into());
+    }
     Ok(Arc::new(Offer {
         prepared,
         target,
         live: AtomicBool::new(true),
         answering: AtomicBool::new(false),
+        ticket,
     }))
 }
 
@@ -357,7 +407,7 @@ async fn watch(app: tauri::AppHandle, offer: Arc<Offer>) {
     }
 }
 
-async fn handle(app: tauri::AppHandle, event: Value) {
+async fn handle(app: tauri::AppHandle, event: Value, ticket: Option<presentation::Ticket>) {
     let Some(event_id) = event["eventId"].as_str().filter(|id| id.len() <= 64) else {
         return;
     };
@@ -374,8 +424,17 @@ async fn handle(app: tauri::AppHandle, event: Value) {
         }
     }
     let action = event["action"].as_str().unwrap_or("");
+    if action == "presentation" {
+        let _ = app.emit("elo-call-presentation", json!({}));
+        return;
+    }
     let id = event["invitationId"].as_str().unwrap_or("");
     let gate = app.state::<Incoming>();
+    if matches!(action, "decline" | "end" | "ended") {
+        // The status path verifies this terminal hint locally and suppresses
+        // only its exact invitation while the signed close travels separately.
+        let _ = app.emit("elo-call-presentation", json!({}));
+    }
     // Push delivery and an immediate system answer can arrive concurrently.
     // Publish one verified Offer before either callback may act on it.
     let offer = {
@@ -389,10 +448,23 @@ async fn handle(app: tauri::AppHandle, event: Value) {
         if let Some(offer) = previous {
             Ok(offer)
         } else if matches!(action, "incoming" | "answer" | "decline") {
-            let result = prepare(&app, &event).await;
+            let mut result = match ticket.clone() {
+                Some(ticket) => prepare(&app, &event, ticket).await,
+                None => Err("invalid".into()),
+            };
             if let Ok(offer) = &result {
-                if let Ok(mut offers) = gate.offers.lock() {
-                    offers.insert(id.into(), offer.clone());
+                if action != "decline" {
+                    if let Ok(fence) = gate.fence.lock() {
+                        if fence.permits(&offer.ticket, time()) {
+                            if let Ok(mut offers) = gate.offers.lock() {
+                                offers.insert(id.into(), offer.clone());
+                            }
+                        } else {
+                            result = Err("ended".into());
+                        }
+                    } else {
+                        result = Err("unavailable".into());
+                    }
                 }
             }
             result
@@ -402,8 +474,13 @@ async fn handle(app: tauri::AppHandle, event: Value) {
     };
     if let Ok(offer) = offer {
         if action == "incoming" {
-            if let Ok(mut offers) = app.state::<Incoming>().offers.lock() {
-                offers.insert(id.into(), offer.clone());
+            if !gate
+                .fence
+                .lock()
+                .is_ok_and(|fence| fence.ringing(&offer.ticket, time()))
+            {
+                let _ = native(&app, json!({"op":"ack","eventId":event_id})).await;
+                return;
             }
             let mut update = system(&offer, "update");
             update["name"] = offer.prepared.binding.name.clone().into();
@@ -592,10 +669,16 @@ async fn system_mute(
 async fn answer(app: &tauri::AppHandle, offer: Arc<Offer>) -> Result<(), String> {
     let gate = app.state::<Incoming>();
     let _guard = gate.transition.lock().await;
+    if !offer.live.load(Ordering::SeqCst) || !permitted(app, &offer.ticket) {
+        return Err("ended".into());
+    }
     if offer.answering.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
     let current = command(&offer.prepared, Operation::Subscribe).await?;
+    if !permitted(app, &offer.ticket) {
+        return Err("ended".into());
+    }
     offer
         .prepared
         .validate(&current["call"], &offer.target, true)
@@ -611,6 +694,9 @@ async fn answer(app: &tauri::AppHandle, offer: Arc<Offer>) -> Result<(), String>
     shutdown_active(app).await;
     crate::native_media::end_for_replacement(app).await?;
     require_settled_leave(app, &offer).await?;
+    if !permitted(app, &offer.ticket) {
+        return Err("ended".into());
+    }
     let joined = command(
         &offer.prepared,
         Operation::Join {
@@ -619,6 +705,10 @@ async fn answer(app: &tauri::AppHandle, offer: Arc<Offer>) -> Result<(), String>
         },
     )
     .await?;
+    if !permitted(app, &offer.ticket) {
+        let _ = leave(app, &offer).await;
+        return Err("ended".into());
+    }
     if let Err(error) = offer
         .prepared
         .validate(&joined["call"], &offer.target, false)
@@ -662,9 +752,21 @@ async fn answer(app: &tauri::AppHandle, offer: Arc<Offer>) -> Result<(), String>
         system_mute_revision: Mutex::new(None),
         speaker_muted: AtomicBool::new(false),
     });
-    *gate.active.lock().map_err(|_| "unavailable")? = Some(active.clone());
+    let installed = {
+        let fence = gate.fence.lock().map_err(|_| "unavailable")?;
+        if fence.permits(&offer.ticket, time()) {
+            *gate.active.lock().map_err(|_| "unavailable")? = Some(active.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if !installed {
+        let _ = leave(app, &offer).await;
+        return Err("ended".into());
+    }
     let capture = async {
-    if !offer.live.load(Ordering::SeqCst) {return Err("ended".into());}
+    if !offer.live.load(Ordering::SeqCst) || !permitted(app,&offer.ticket) {return Err("ended".into());}
     offer.prepared.validate(&joined["call"],&offer.target,false).map_err(str::to_owned)?;
     if joined["call"]["participants"][offer.prepared.binding.identity.to_string()]["delegation"]!=STANDARD.encode(offer.prepared.delegate.certificate().bytes()) {return Err("unauthorized".into());}
     let mut authorization=system(&offer,"authorize");authorization["mediaId"]=active.id.clone().into();
@@ -674,7 +776,7 @@ async fn answer(app: &tauri::AppHandle, offer: Arc<Offer>) -> Result<(), String>
     crate::native_media::dispatch(app.clone(),json!({"op":"start","id":active.id,"ice_servers":[]})).await?;
     crate::native_media::dispatch(app.clone(),json!({"op":"update","id":active.id,"state":{"audio_muted":false,"video_published":false,"screen_published":false},"speaker_muted":false})).await?;
     }
-    if !offer.live.load(Ordering::SeqCst) {return Err("ended".into());}
+    if !offer.live.load(Ordering::SeqCst) || !permitted(app,&offer.ticket) {return Err("ended".into());}
     Ok::<(),String>(())
     }.await;
     if let Err(error) = capture {
@@ -773,11 +875,55 @@ impl crate::native_session::Driver for Driver {
     }
 }
 
+async fn native_presented(app: &tauri::AppHandle, identity: &str) -> Result<Vec<Value>, String> {
+    let gate = app.state::<Incoming>();
+    // One retry covers an answer/end arriving during local verification. No
+    // socket, signed Subscribe, or network-backed Offer is used for UI ownership.
+    for _ in 0..2 {
+        let (generation, dismissed) = {
+            let fence = gate.fence.lock().map_err(|_| "unavailable")?;
+            let Some(generation) = fence.snapshot() else {
+                return Ok(Vec::new());
+            };
+            (generation, fence.dismissed(time()))
+        };
+        let snapshot = plugin(app, "incomingStatus", json!({})).await?;
+        let bytes = load_bytes(app).await?;
+        let mut hints: Vec<_> = snapshot["presentationHints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(4)
+            .cloned()
+            .collect();
+        // An OS decline must not briefly become an in-app Answer while its
+        // signed network operation is pending. These hints are still verified
+        // locally and expire with the original invitation, never after it.
+        hints.extend(dismissed);
+        let presented = presentation::verified_hints(
+            &bytes,
+            &json!({"presentationHints":hints}),
+            identity,
+            time(),
+        );
+        let current = plugin(app, "incomingStatus", json!({})).await?;
+        if snapshot["presentationRevision"].as_u64().is_some()
+            && snapshot["presentationRevision"] == current["presentationRevision"]
+            && gate
+                .fence
+                .lock()
+                .is_ok_and(|fence| fence.snapshot() == Some(generation))
+        {
+            return Ok(presented);
+        }
+    }
+    Ok(Vec::new())
+}
+
 pub(crate) async fn status(app: &tauri::AppHandle, identity: &str) -> Result<Value, String> {
     let gate = app.state::<Incoming>();
+    let presented = native_presented(app, identity).await?;
     let active = gate.active.lock().map_err(|_| "unavailable")?.clone();
-    let presented:Vec<_>=gate.offers.lock().map_err(|_|"unavailable")?.values().filter(|offer|offer.live.load(Ordering::SeqCst)
-        && offer.prepared.binding.identity.to_string()==identity).map(|offer|json!({"call_id":offer.target.call_id,"invitation_id":offer.target.invitation_id})).collect();
     let active=active.filter(|active|active.live.load(Ordering::SeqCst) && active.offer.prepared.binding.identity.to_string()==identity).map(|active| {
         let call=active.call.lock().map(|call|call.clone()).unwrap_or(Value::Null);
         json!({"identity":identity,"call":call,"session_id":active.id,"activation":active.activation,
@@ -936,6 +1082,10 @@ pub(crate) async fn end_active(
     }
 }
 pub(crate) async fn shutdown(app: &tauri::AppHandle) {
+    if let Ok(mut fence) = app.state::<Incoming>().fence.lock() {
+        fence.suspend();
+    }
+    let _ = app.emit("elo-call-presentation", json!({}));
     shutdown_active(app).await;
     let offers = app
         .state::<Incoming>()

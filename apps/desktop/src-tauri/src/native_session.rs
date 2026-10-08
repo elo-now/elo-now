@@ -1,5 +1,5 @@
 //! Direct mobile sessions share one native signaling owner per admitted call.
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -7,16 +7,95 @@ use std::{
     time::Duration,
 };
 use tokio_tungstenite::{
-    connect_async_with_config,
+    client_async_tls_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type Result<T> = std::result::Result<T, &'static str>;
+
+// Tokio's string-address connect tries DNS answers sequentially. A mobile
+// network may advertise IPv6 without a working route, so race complete TLS and
+// WebSocket handshakes while retaining the original hostname for verification.
+async fn connect_control_socket(url: &str, config: WebSocketConfig) -> Result<Socket> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid")?;
+    // The protocol harness uses a local in-process peer. This branch is absent
+    // from application builds, which always require authenticated TLS below.
+    #[cfg(test)]
+    if parsed.scheme() == "ws" && parsed.host_str() == Some("127.0.0.1") {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], parsed.port().ok_or("invalid")?));
+        return connect_control_addresses(url, config, [address]).await;
+    }
+    if parsed.scheme() != "wss"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("unauthorized");
+    }
+    let host = parsed.host_str().ok_or("invalid")?;
+    let port = parsed.port_or_known_default().ok_or("invalid")?;
+    diagnostic(c"socket:before_dns");
+    let addresses = tokio::net::lookup_host((host, port)).await.map_err(|_| {
+        diagnostic(c"socket:dns_failed");
+        "unavailable"
+    })?;
+    let addresses = addresses.take(8).collect::<Vec<_>>();
+    diagnostic(c"socket:after_dns");
+    connect_control_addresses(url, config, addresses).await
+}
+
+async fn connect_control_addresses(
+    url: &str,
+    config: WebSocketConfig,
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<Socket> {
+    let mut attempts = FuturesUnordered::new();
+    for address in addresses {
+        let request = url.to_owned();
+        attempts.push(async move {
+            diagnostic(if address.is_ipv4() {
+                c"socket:before_tcp_v4"
+            } else {
+                c"socket:before_tcp_v6"
+            });
+            let stream = tokio::net::TcpStream::connect(address).await.map_err(|_| {
+                diagnostic(c"socket:tcp_failed");
+                "unavailable"
+            })?;
+            diagnostic(c"socket:after_tcp");
+            stream.set_nodelay(true).map_err(|_| "unavailable")?;
+            let (socket, _) = client_async_tls_with_config(request, stream, Some(config), None)
+                .await
+                .map_err(|error| {
+                    use tokio_tungstenite::tungstenite::Error;
+                    diagnostic(match error {
+                        Error::Tls(_) => c"socket:tls_failed",
+                        Error::Http(_) => c"socket:http_failed",
+                        Error::Io(_) => c"socket:io_failed",
+                        _ => c"socket:handshake_failed",
+                    });
+                    "unavailable"
+                })?;
+            diagnostic(c"socket:after_handshake");
+            Ok::<Socket, &'static str>(socket)
+        });
+    }
+    while let Some(result) = attempts.next().await {
+        if let Ok(socket) = result {
+            return Ok(socket);
+        }
+    }
+    Err("unavailable")
+}
 const QUEUE_LIMIT: usize = 128;
 const QUEUE_BYTES: usize = 2 * 1024 * 1024;
 mod group;
+
+pub(crate) fn diagnostic(stage: &'static std::ffi::CStr) {
+    crate::diagnostics::event("event", "session", &stage.to_string_lossy(), None);
+}
 
 pub(crate) trait Driver: Send {
     fn operation(&mut self, op: &str, fields: Value) -> impl Future<Output = Result<Value>> + Send;
@@ -80,7 +159,9 @@ impl Target {
     }
 }
 /// Derive a public, immutable admission context from a fresh operation of the
-/// currently unlocked profile. IPC supplies routing only, never membership.
+/// currently unlocked profile. `signed` must be the fresh Rust core operation
+/// result, including its independently pinned witness. IPC supplies routing only,
+/// never membership or witness trust.
 pub(crate) fn verified_context(context: &Value, signed: &Value) -> Result<Value> {
     use elo_core::{
         authority::{CallAuthorityProof, ChatKind},
@@ -99,7 +180,13 @@ pub(crate) fn verified_context(context: &Value, signed: &Value) -> Result<Value>
         .ok_or("invalid")?
         .parse()
         .map_err(|_| "invalid")?;
-    let authority = proof.verify(space, stream).map_err(|_| "unauthorized")?;
+    let pin: Option<elo_core::authority::WitnessPin> =
+        serde_json::from_value(signed["trusted_witness"].clone()).map_err(|_| "invalid")?;
+    let authority = match pin.as_ref() {
+        Some(pin) => proof.verify_witnessed(space, stream, pin),
+        None => proof.verify(space, stream),
+    }
+    .map_err(|_| "unauthorized")?;
     let credential = command.body()["credential_id"]
         .as_str()
         .ok_or("invalid")?
@@ -211,7 +298,10 @@ impl Control {
                 let event = self.receive().await?;
                 match event["type"].as_str() {
                     Some("result") => return Ok(event),
-                    Some("error" | "access_revoked") => return Err("unauthorized"),
+                    Some("error" | "access_revoked") => {
+                        diagnostic(c"command:server_error");
+                        return Err("unauthorized");
+                    }
                     _ => {
                         let size = event.to_string().len();
                         if self.pending.len() >= QUEUE_LIMIT
@@ -230,12 +320,14 @@ impl Control {
     }
     async fn command(&mut self, driver: &mut impl Driver, operation: Value) -> Result<Value> {
         tokio::time::timeout(Duration::from_secs(12), async {
+            diagnostic(c"command:before_sign");
             let signed = driver
                 .operation(
                     "call_authorization",
                     json!({"include_proof":false,"operation":operation}),
                 )
                 .await?;
+            diagnostic(c"command:after_sign");
             self.signed(signed).await
         })
         .await
@@ -293,9 +385,11 @@ async fn connected(
     target: &Target,
     group_state: &mut group::State,
 ) -> Result<()> {
+    diagnostic(c"connected:entered");
     // A reconnect must complete before the server's 30-second participant
     // lease expires. Signing, TLS and first admission share one deadline.
     let (mut control, first) = tokio::time::timeout(Duration::from_secs(12), async {
+        diagnostic(c"connected:before_sign");
         let signed = driver
             .operation(
                 "call_authorization",
@@ -303,22 +397,25 @@ async fn connected(
             "operation":{"type":"heartbeat","call_id":target.call_id}}),
             )
             .await?;
+        diagnostic(c"connected:after_sign");
         let config = WebSocketConfig::default()
             .max_message_size(Some(QUEUE_BYTES))
             .max_frame_size(Some(QUEUE_BYTES));
-        let (socket, _) = connect_async_with_config(&target.url, Some(config), true)
-            .await
-            .map_err(|_| "unavailable")?;
+        diagnostic(c"connected:before_socket");
+        let socket = connect_control_socket(&target.url, config).await?;
+        diagnostic(c"connected:after_socket");
         let mut control = Control {
             socket,
             pending: VecDeque::new(),
             bytes: 0,
         };
         let first = control.signed(signed).await?;
+        diagnostic(c"connected:after_first");
         Ok::<_, &'static str>((control, first))
     })
     .await
     .map_err(|_| "unavailable")??;
+    diagnostic(c"connected:before_maintain");
     let result = maintain(
         driver,
         target,
@@ -558,6 +655,35 @@ fn accept_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn control_socket_uses_working_address_when_another_handshake_stalls() {
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_address = stalled.local_addr().unwrap();
+        let ready_address = ready.local_addr().unwrap();
+        let stalled_task = tokio::spawn(async move {
+            let (_stream, _) = stalled.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let ready_task = tokio::spawn(async move {
+            let (stream, _) = ready.accept().await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        });
+        let url = format!("ws://localhost:{}/calls/v1/connect", ready_address.port());
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_control_addresses(
+                &url,
+                WebSocketConfig::default(),
+                [stalled_address, ready_address],
+            ),
+        )
+        .await;
+        assert!(matches!(connected, Ok(Ok(_))));
+        stalled_task.abort();
+        ready_task.abort();
+    }
+
     fn target() -> Target {
         Target {
             url: String::new(),
@@ -673,6 +799,102 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn witnessed_general_requires_the_independent_core_pin() {
+        use base64::Engine;
+        use elo_core::{authority::*, ids::StreamId, record, vault::Session};
+        let (owner, recovery) = Session::create().unwrap();
+        let root = recovery.recover_root(owner.identity_id()).unwrap();
+        let root_key = record::encode_hex(root.verifying_key().as_bytes());
+        let witness = elo_core::identity::generate_signing_key().unwrap();
+        let pin = WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(witness.verifying_key().as_bytes()),
+            key_generation: 1,
+        };
+        let genesis = record::SignedRecord::sign(
+            &serde_json::to_vec(&SpaceGenesis {
+                v: 4,
+                kind: "space.genesis".into(),
+                nonce: record::random_hex::<16>().unwrap(),
+                issuer_identity: owner.identity_id(),
+                owners: vec![Owner {
+                    identity_id: owner.identity_id(),
+                    root_public_key: root_key.clone(),
+                }],
+                controller_credential_id: owner.credential().id(),
+                witness: Some(pin.clone()),
+            })
+            .unwrap(),
+            owner.signing_key(),
+        )
+        .unwrap();
+        let mut authority = Authority::new(
+            genesis.bytes(),
+            genesis.id().to_string().parse().unwrap(),
+            &root.verifying_key(),
+            owner.credential().clone(),
+            StreamId::from_bytes([7; 16]),
+        )
+        .unwrap();
+        let config = StreamConfig {
+            v: 4,
+            kind: "stream.config".into(),
+            nonce: record::random_hex::<16>().unwrap(),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            sequence: 1,
+            previous_config_id: None,
+            controller_credential_id: owner.credential().id(),
+            members: vec![Member {
+                identity_id: owner.identity_id(),
+                identity_type: "HUMAN".into(),
+                root_public_key: root_key,
+                capabilities: vec![
+                    Capability::Read,
+                    Capability::Post,
+                    Capability::ShareHistory,
+                    Capability::Manage,
+                ],
+                credential_ids: vec![owner.credential().id()],
+                external: false,
+            }],
+            owner_credential_ids: vec![owner.credential().id()],
+            action: ConfigAction {
+                operation: "create".into(),
+                actor_identity: owner.identity_id(),
+                request_record_id: None,
+            },
+            chat_kind: Some(ChatKind::Chat),
+            recovery: None,
+            witness_evidence: None,
+        };
+        authority
+            .apply_config(config.sign(owner.signing_key()).unwrap())
+            .unwrap();
+        let context = json!({"expected_identity":owner.identity_id(), "space":authority.space(),
+            "stream":authority.stream(), "hosting_space_id":authority.space(), "audience":"https://calls.example.test/calls/v1"});
+        let command = elo_core::calls::sign_command(
+            &authority,
+            &owner,
+            authority.space(),
+            "https://calls.example.test/calls/v1",
+            elo_core::calls::Operation::Subscribe,
+            1_800_000_000,
+        )
+        .unwrap();
+        let mut signed = json!({"command":base64::engine::general_purpose::STANDARD.encode(command.bytes()),
+            "proof":authority.call_proof().unwrap(), "trusted_witness":pin});
+        let verified = verified_context(&context, &signed).unwrap();
+        assert_eq!(verified["kind"], "group");
+        assert_eq!(verified["credential"], json!(owner.credential().id()));
+        signed["trusted_witness"]["key_generation"] = json!(2);
+        assert_eq!(verified_context(&context, &signed), Err("unauthorized"));
+        signed["trusted_witness"] = Value::Null;
+        let mut forged_ipc = context;
+        forged_ipc["trusted_witness"] = json!(pin);
+        assert_eq!(verified_context(&forged_ipc, &signed), Err("unauthorized"));
     }
     struct TestDriver {
         locked: bool,

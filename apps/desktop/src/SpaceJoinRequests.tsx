@@ -1,6 +1,6 @@
 import { useDesktopLayout } from "./PageSurface";
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { FloatingSearch, SearchField } from "./Search";
 import { t, locale } from "./i18n";
 import { useToast } from "./Toast";
@@ -170,7 +170,7 @@ export function SpaceJoinRequests({
             </p>
             {entry.note && <p className="space-applicant-note">{entry.note}</p>}
             <div className="space-choice">
-              {[true, false].map((approve) => (
+              {[false, true].map((approve) => (
                 <button
                   key={String(approve)}
                   className={approve ? "" : "secondary"}

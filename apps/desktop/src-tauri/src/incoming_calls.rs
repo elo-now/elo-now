@@ -30,10 +30,17 @@ struct Prepared {
 }
 impl Prepared {
     fn load(binding: CallDelegateBinding, now: u64) -> Result<Self, &'static str> {
-        let authority = binding
-            .proof
-            .verify(binding.scope.space_id, binding.scope.stream_id)
-            .map_err(|_| "unauthorized")?;
+        let authority = match &binding.witness {
+            Some(pin) => {
+                binding
+                    .proof
+                    .verify_witnessed(binding.scope.space_id, binding.scope.stream_id, pin)
+            }
+            None => binding
+                .proof
+                .verify(binding.scope.space_id, binding.scope.stream_id),
+        }
+        .map_err(|_| "unauthorized")?;
         let delegate = CallDelegate::import(
             &binding.delegate,
             &authority,
@@ -312,6 +319,8 @@ impl<'de> Deserialize<'de> for RingRoute {
 mod android;
 #[cfg(all(mobile, feature = "mobile-push"))]
 mod mobile;
+#[cfg(any(test, all(mobile, feature = "mobile-push")))]
+mod presentation;
 #[cfg(any(test, all(mobile, feature = "mobile-push")))]
 mod transport;
 #[cfg(all(mobile, feature = "mobile-push"))]

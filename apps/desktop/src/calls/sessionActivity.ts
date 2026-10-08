@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "../diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 
 const mobile = () =>

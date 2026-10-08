@@ -25,6 +25,8 @@ struct Config {
     admission_url: String,
     admission_key: PathBuf,
     #[serde(default)]
+    witness: Option<elo_core::authority::WitnessPin>,
+    #[serde(default)]
     limits: Limits,
     #[serde(default)]
     media: Option<elo_call_service::media::Config>,
@@ -80,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if database.exists() && !std::fs::symlink_metadata(&database)?.is_file() {
         return Err("Unsafe call database.".into());
     }
-    let engine = Engine::open(&database, config.public_url, config.limits)?;
+    let engine =
+        Engine::open_with_witness(&database, config.public_url, config.limits, config.witness)?;
     let key = Zeroizing::new(String::from_utf8(vault::read_private(
         &config.admission_key,
     )?)?);

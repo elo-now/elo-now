@@ -1,0 +1,9 @@
+{
+  "connection": "connecting",
+  "native_owned": true,
+  "revision": -1,
+  "remote": null,
+  "signals": [],
+  "tracks": [],
+  "call": { "call_id": "session", "key_epoch": 1 }
+}

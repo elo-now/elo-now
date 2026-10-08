@@ -23,14 +23,18 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn new(direct: bool) -> Self {
+        Self::with_witness(direct, None)
+    }
+    pub fn with_witness(direct: bool, witness: Option<elo_core::authority::WitnessPin>) -> Self {
+        let version = if witness.is_some() { 4 } else { 1 };
         let (owner, card) = Session::create().unwrap();
         let (peer, recovery) = Session::create().unwrap();
         let peer_device = Session::recover(&recovery, peer.identity_id()).unwrap();
         let third = Session::create().unwrap().0;
         let root = card.recover_root(owner.identity_id()).unwrap();
         let genesis = SpaceGenesis {
-            witness: None,
-            v: 1,
+            witness,
+            v: version,
             kind: "space.genesis".into(),
             nonce: random_hex::<16>().unwrap(),
             issuer_identity: owner.identity_id(),
@@ -40,7 +44,12 @@ impl Fixture {
             }],
             controller_credential_id: owner.credential().id(),
         };
-        let record = SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), &root).unwrap();
+        let key = if version == 4 {
+            owner.signing_key()
+        } else {
+            &root
+        };
+        let record = SignedRecord::sign(&serde_json::to_vec(&genesis).unwrap(), key).unwrap();
         let mut authority = Authority::new(
             record.bytes(),
             record.id().to_string().parse().unwrap(),
@@ -91,7 +100,7 @@ impl Fixture {
         members.sort_by_key(|person| person.identity_id);
         let config = StreamConfig {
             witness_evidence: None,
-            v: 1,
+            v: version,
             kind: "stream.config".into(),
             nonce: random_hex::<16>().unwrap(),
             space_id: authority.space(),

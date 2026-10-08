@@ -1778,6 +1778,7 @@ dependencies = [
  "arboard",
  "base64 0.23.1",
  "elo-core",
+ "elo-diagnostics-macos",
  "futures-util",
  "getrandom 0.4.3",
  "image",
@@ -1807,6 +1808,13 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "elo-diagnostics-macos"
+version = "1.0.5"
+dependencies = [
+ "swift-rs",
 ]
 
 [[package]]

@@ -132,6 +132,9 @@ fn local_operation(request: &serde_json::Value) -> bool {
         | "delete_chat_local"
         | "set_user_blocked"
         | "invitation_notifications_seen"
+        | "invitation_notification_dismiss"
+        | "space_join_notices_seen"
+        | "space_join_notice_dismiss"
         | "invitation_list"
         | "invitation_activity"
         | "call_encrypt_signal"
@@ -296,6 +299,9 @@ mod tests {
             "remind",
             "set_chat_muted",
             "delete_chat_local",
+            "invitation_notification_dismiss",
+            "space_join_notices_seen",
+            "space_join_notice_dismiss",
         ] {
             assert!(local_operation(&json!({"op":op})), "{op}");
         }

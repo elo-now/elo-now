@@ -7,7 +7,24 @@ import java.nio.file.LinkOption
 
 plugins {
     id("com.android.application")
+    id("com.google.firebase.crashlytics") apply false
+    id("com.google.gms.google-services") apply false
     id("rust")
+}
+
+// Read the existing client configuration directly; never copy credentials into source.
+val firebaseClientPath = providers.environmentVariable("TAURI_ELO_FIREBASE_ANDROID").orNull
+if (firebaseClientPath != null) {
+    apply(plugin = "com.google.gms.google-services")
+    apply(plugin = "com.google.firebase.crashlytics")
+    androidComponents.onVariants { variant ->
+        // Configure after the Google Services plugin has registered its variant
+        // task; configureEach runs before that plugin assigns its default paths.
+        val variantName = variant.name.replaceFirstChar { it.uppercase() }
+        tasks.named<com.google.gms.googleservices.GoogleServicesTask>("process${variantName}GoogleServices") {
+            googleServicesJsonFiles.set(listOf(file(firebaseClientPath)))
+        }
+    }
 }
 
 val tauriProperties = Properties().apply {
@@ -58,6 +75,8 @@ repositories {
 
 android {
     compileSdk { version = release(37) }
+    // Match the native builder; AGP cannot strip with an absent default NDK.
+    ndkVersion = "30.0.16248370"
     namespace = "now.elo"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -80,10 +99,8 @@ android {
             }
             val info = client["client_info"] as Map<*, *>
             val key = (client["api_key"] as List<*>).map { it as Map<*, *> }.first()["current_key"] as String
-            resValue("string", "google_app_id", info["mobilesdk_app_id"] as String)
-            resValue("string", "gcm_defaultSenderId", project["project_number"] as String)
-            resValue("string", "google_api_key", key)
-            resValue("string", "project_id", project["project_id"] as String)
+            require((info["mobilesdk_app_id"] as String).isNotEmpty() && key.isNotEmpty()
+                && (project["project_number"] as String).isNotEmpty()) { "Incomplete Firebase client configuration" }
         }
     }
     signingConfigs {
@@ -103,14 +120,16 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
-                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
-            }
         }
         getByName("release") {
             signingConfig = signingConfigs.findByName("teamRelease")
+            // Keep private symbols separately; never ship them in the APK.
+            ndk.debugSymbolLevel = "FULL"
+            if (firebaseClientPath != null) {
+                configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                    nativeSymbolUploadEnabled = true
+                }
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -128,6 +147,14 @@ android {
         buildConfig = true
         // Firebase client configuration is supplied through generated resources.
         resValues = true
+    }
+}
+
+// The DSL packaging block is global even when written inside a build type.
+// Scope this exception to debug variants so release native libraries are stripped.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.packaging.jniLibs.keepDebugSymbols.add("**/*.so")
     }
 }
 

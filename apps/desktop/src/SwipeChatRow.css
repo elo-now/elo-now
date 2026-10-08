@@ -9,7 +9,8 @@
   right: 0;
   overflow: hidden;
 }
-.channel-list .swipe-chat-delete {
+.channel-list .swipe-chat-delete,
+.member-list .swipe-chat-delete {
   position: absolute;
   top: 50%;
   right: 0;
@@ -26,7 +27,8 @@
   background: #b43b36;
   color: #fff;
 }
-.channel-list .swipe-chat-delete .ui-icon {
+.channel-list .swipe-chat-delete .ui-icon,
+.member-list .swipe-chat-delete .ui-icon {
   width: 22px;
   height: 22px;
 }

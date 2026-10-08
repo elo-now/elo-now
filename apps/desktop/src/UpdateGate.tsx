@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "./i18n";
 import { setUpdateRequired, useUpdateRequired } from "./releasePolicy";

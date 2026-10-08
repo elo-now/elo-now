@@ -3,7 +3,7 @@
 use crate::registry::{ActiveCall, CallError, Event, Limits, Registry, Scope};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use elo_core::{
-    authority::{Authority, CallAuthorityProof},
+    authority::{Authority, CallAuthorityProof, WitnessPin},
     calls::{self, Command},
     ids::{IdentityId, RecordId},
     record::SignedRecord,
@@ -33,6 +33,7 @@ pub struct Preparation {
     scope: Scope,
     audience: String,
     cached: Option<Arc<Authority>>,
+    witness: Option<WitnessPin>,
 }
 impl Preparation {
     pub fn authenticate(&self, now: u64) -> Result<(Command, IdentityId)> {
@@ -72,6 +73,14 @@ impl Preparation {
                         self.scope.conversation.space_id,
                         self.scope.conversation.stream_id,
                     )
+                    .or_else(|error| match &self.witness {
+                        Some(pin) => proof.verify_witnessed(
+                            self.scope.conversation.space_id,
+                            self.scope.conversation.stream_id,
+                            pin,
+                        ),
+                        None => Err(error),
+                    })
                     .map_err(|_| CallError::Unauthorized)?,
             ),
             None => self.cached.ok_or(CallError::Unauthorized)?,
@@ -158,6 +167,7 @@ pub struct Engine {
     _lock: std::fs::File,
     db: Connection,
     audience: String,
+    witness: Option<WitnessPin>,
     fences: BTreeMap<Scope, Fence>,
     pending: Vec<Event>,
     pub registry: Registry,
@@ -174,6 +184,20 @@ impl Engine {
         audience: String,
         limits: Limits,
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_with_witness(path, audience, limits, None)
+    }
+
+    /// The deployment pin is configured by the operator, never taken from a
+    /// caller's proof. Ordinary private chats still use their owner-signed chain.
+    pub fn open_with_witness(
+        path: &Path,
+        audience: String,
+        limits: Limits,
+        witness: Option<WitnessPin>,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(pin) = &witness {
+            pin.validate()?;
+        }
         if path.exists() && std::fs::symlink_metadata(path)?.file_type().is_symlink() {
             return Err("Unsafe call database.".into());
         }
@@ -207,6 +231,7 @@ impl Engine {
             _lock: lock,
             db,
             audience,
+            witness,
             fences,
             pending: vec![],
             registry: Registry::new(limits)?,
@@ -284,6 +309,7 @@ impl Engine {
             scope,
             audience: self.audience.clone(),
             cached: self.fences.get(&scope).and_then(|f| f.authority.clone()),
+            witness: self.witness.clone(),
         })
     }
 

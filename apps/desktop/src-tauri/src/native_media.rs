@@ -762,9 +762,12 @@ pub(crate) async fn native_call_media(
             auth["op"] = "call_authorization".into();
             auth["include_proof"] = true.into();
             auth["operation"] = serde_json::json!({"type":"heartbeat","call_id":active.id});
+            crate::native_session::diagnostic(c"media:before_authorization");
             let signed = client.operate(auth).await.map_err(|_| "unauthorized")?;
+            crate::native_session::diagnostic(c"media:before_verified_context");
             let context = crate::native_session::verified_context(&active.context, &signed)
                 .map_err(str::to_owned)?;
+            crate::native_session::diagnostic(c"media:after_verified_context");
             let mut url = reqwest::Url::parse(context["audience"].as_str().ok_or("invalid")?)
                 .map_err(|_| "invalid")?;
             url.set_scheme("wss").map_err(|_| "invalid")?;
@@ -831,7 +834,10 @@ pub(crate) async fn native_call_media(
                     .collect(),
             };
             let task = tokio::spawn(async move {
-                let _ = crate::native_session::run(&mut driver, &target).await;
+                crate::native_session::diagnostic(c"run:starting");
+                let result = crate::native_session::run(&mut driver, &target).await;
+                eprintln!("[EloSession] run:result:{:?}", result);
+                crate::native_session::diagnostic(c"run:finished");
                 driver.finished().await;
             });
             active.lease = task.abort_handle();
@@ -884,9 +890,7 @@ pub(crate) async fn native_call_media(
                 }
                 if session.group && !session.capture_ready && op != "stop" {
                     return if op == "poll" {
-                        Ok(
-                            serde_json::json!({"connection":"connecting","native_owned":true,"signals":[],"tiles":[],"call":session.call}),
-                        )
+                        Ok(pending_group_snapshot(&session.call))
                     } else {
                         Ok(serde_json::json!({}))
                     };
@@ -930,6 +934,21 @@ pub(crate) async fn native_call_media(
         let _ = (app, state, identity, request);
         Err("unavailable".into())
     }
+}
+
+#[cfg(any(test, all(mobile, feature = "mobile-push")))]
+fn pending_group_snapshot(call: &Value) -> Value {
+    // Use the same snapshot contract as native capture. A negative revision
+    // clears stale tracks during reset and cannot collide with capture revisions.
+    serde_json::json!({
+        "connection": "connecting",
+        "native_owned": true,
+        "revision": -1,
+        "remote": null,
+        "signals": [],
+        "tracks": [],
+        "call": call,
+    })
 }
 
 #[cfg(any(test, all(mobile, feature = "mobile-push")))]
@@ -1086,13 +1105,39 @@ impl crate::native_session::Driver for SessionDriver {
                 request["speaker_muted"] = session.speaker_muted.into();
             }
         }
+        let started_at = std::time::Instant::now();
+        crate::diagnostics::event("event", "media", &op, None);
         let value = tokio::time::timeout(
             std::time::Duration::from_secs(if op == "group_start" { 12 } else { 6 }),
             dispatch(self.app.clone(), request),
         )
         .await
-        .map_err(|_| "unavailable")?
-        .map_err(|_| "unavailable")?;
+        .map_err(|_| {
+            crate::diagnostics::event(
+                "error",
+                "media",
+                "timeout",
+                Some(started_at.elapsed().as_millis() as u64),
+            );
+            "unavailable"
+        })?
+        .map_err(|_| {
+            crate::diagnostics::event(
+                "error",
+                "media",
+                "native_failure",
+                Some(started_at.elapsed().as_millis() as u64),
+            );
+            "unavailable"
+        })?;
+        if value["error"].is_string() {
+            crate::diagnostics::event(
+                "error",
+                "media",
+                &op,
+                Some(started_at.elapsed().as_millis() as u64),
+            );
+        }
         if op == "group_start" {
             let gate = self.app.state::<MediaGate>();
             if let Some(session) = gate
@@ -1187,6 +1232,15 @@ fn bind_signal_participant(
 mod delegated_signal_tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn pending_group_snapshot_matches_the_webview_contract() {
+        let snapshot: Value = serde_json::from_str(include_str!(
+            "../../src/calls/fixtures/native-group-pending.json"
+        ))
+        .unwrap();
+        assert_eq!(pending_group_snapshot(&snapshot["call"]), snapshot);
+    }
+
     #[test]
     fn direct_call_waits_for_remote_transport_while_group_keeps_room_state() {
         assert_eq!(

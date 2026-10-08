@@ -1,7 +1,12 @@
 mod ios_resources;
+mod macos_diagnostics_resources;
 mod service_endpoints;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // Crashlytics NDK matches the installed ELF to its private symbols by ID.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,--build-id=sha1");
+    }
     for name in [
         "ELO_API_URL",
         "TAURI_ELO_API_URL",
@@ -45,6 +50,7 @@ fn main() {
     configure_team_replica();
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "diagnostic_task",
             "profile_environment",
             "profile_task",
             "control_task",
@@ -66,6 +72,7 @@ fn main() {
             "desktop_notification_task",
             "native_call_media",
             "native_call_incoming",
+            "native_call_ringtone",
             "native_call_state",
             "native_call_audio",
             "choose_attachment",
@@ -85,6 +92,7 @@ fn main() {
         ]),
     ))
     .expect("application build configuration");
+    macos_diagnostics_resources::stage().expect("macOS SDK privacy resources");
     ios_resources::stage().expect("iOS SDK privacy resources");
 }
 

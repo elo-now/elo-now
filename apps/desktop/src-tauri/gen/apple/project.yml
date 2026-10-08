@@ -55,6 +55,7 @@ targets:
         FirebaseMessagingAutoInitEnabled: false
         FirebaseMessagingInstallationIdEnabled: true
         FirebaseAnalyticsCollectionEnabled: false
+        FirebaseCrashlyticsCollectionEnabled: false
         UIBackgroundModes: [remote-notification, audio, voip]
         NSFaceIDUsageDescription: Use Face ID to unlock your encrypted elo profile on this device.
         NSPhotoLibraryUsageDescription: Choose photos and videos to share as encrypted attachments, a profile photo or a recovery QR image.

@@ -141,6 +141,10 @@ pub struct CallDelegateBinding {
     pub scope: CallScope,
     pub config_id: RecordId,
     pub proof: crate::authority::CallAuthorityProof,
+    /// Copied from the unlocked client's trusted hosting configuration, never
+    /// learned from an incoming push or a caller-supplied proof.
+    #[serde(default)]
+    pub witness: Option<crate::authority::WitnessPin>,
     pub delegate: Vec<u8>,
 }
 impl Drop for CallDelegateBinding {

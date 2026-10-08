@@ -5,6 +5,7 @@ import plistlib
 from pathlib import Path
 
 SDK_BUNDLES = (
+    "Firebase_FirebaseCrashlytics",
     "Firebase_FirebaseCore", "Firebase_FirebaseCoreInternal",
     "Firebase_FirebaseInstallations", "Firebase_FirebaseMessaging",
     "GoogleDataTransport_GoogleDataTransport",

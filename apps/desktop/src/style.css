@@ -685,58 +685,34 @@ h2 {
   justify-content: flex-end;
   padding: 12px 16px;
 }
-.composer button {
+.composer > .composer-actions > button {
   flex-shrink: 0;
 }
-.composer-expiry {
-  display: flex;
-  flex: 1;
-  min-width: 0;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-right: auto;
-  color: var(--elo-muted);
-  font-size: var(--elo-type-caption);
-}
-.composer-expiry > span {
-  white-space: nowrap;
-}
-.composer-expiry-options {
-  display: flex;
-  gap: 8px;
-}
-.composer .composer-expiry button {
+.composer > .composer-actions > button.composer-expiry-link {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  padding: 4px 12px;
-  min-width: 44px;
+  flex: 0 1 auto;
+  min-width: 0;
   min-height: 32px;
-  line-height: 1.25;
-  border: 1px solid var(--elo-line);
-  border-radius: 999px;
+  padding: 4px 0;
+  margin-right: auto;
+  border: 0;
+  border-radius: 0;
   background: transparent;
+  box-shadow: none;
   color: var(--elo-muted);
   font-size: var(--elo-type-caption);
   font-weight: 400;
+  text-decoration: none;
+  text-align: left;
 }
-.composer-expiry-symbol {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 2em;
-  height: 1.25em;
-}
-.composer .composer-expiry-symbol .ui-icon {
-  width: 1.4em;
-  height: 1.4em;
-  flex: none;
-}
-.composer .composer-expiry button[aria-pressed="true"] {
-  background: var(--elo-button);
-  color: var(--elo-onButton);
-  border-color: var(--elo-button);
+.composer
+  > .composer-actions
+  > button.composer-expiry-link:hover:not(:disabled),
+.composer > .composer-actions > button.composer-expiry-link:focus-visible {
+  color: var(--elo-text);
+  background: transparent;
+  border: 0;
 }
 .composer .composer-attach {
   border: 0;
@@ -843,10 +819,11 @@ h2 {
   text-align: start;
   font-weight: 500;
 }
-@media (min-width: 761px) {
-  .shell[data-mobile="false"] .hide-avatars-toggle {
-    border-bottom: 0;
-  }
+.appearance-page .hide-avatars-toggle {
+  border-bottom: 0;
+}
+.appearance-page .hide-avatars-toggle + .settings-toggle {
+  margin-top: 0;
 }
 .toggle-track {
   display: flex;
@@ -1154,6 +1131,9 @@ h2 {
 .settings-page .appearance button {
   flex: 1;
 }
+.appearance-page {
+  --appearance-tile-size: 64px;
+}
 .scale-slider {
   appearance: none;
   -webkit-appearance: none;
@@ -1166,12 +1146,6 @@ h2 {
   border: 0;
   background: transparent;
   --scale-fill: 50%;
-}
-.scale-slider[data-scale="compact"] {
-  --scale-fill: 0%;
-}
-.scale-slider[data-scale="large"] {
-  --scale-fill: 100%;
 }
 .scale-slider::-webkit-slider-runnable-track {
   height: 4px;
@@ -1210,27 +1184,13 @@ h2 {
   background: var(--elo-surface);
   box-shadow: 0 1px 2px #0002;
 }
-.scale-labels {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  color: var(--elo-muted);
-  font-size: var(--elo-type-caption);
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--elo-line);
-}
-.scale-labels > :nth-child(2) {
-  text-align: center;
-}
-.scale-labels > :last-child {
-  text-align: right;
-}
 .scheme-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 .scheme-grid button {
-  min-height: 64px;
+  min-height: var(--appearance-tile-size, 64px);
   padding: 8px;
   background: var(--elo-surface);
   color: var(--elo-text);
@@ -1600,7 +1560,7 @@ summary {
     align-items: start;
     flex-direction: column;
   }
-  .composer button:not(.attachment-cancel) {
+  .composer > .composer-actions > button:not(.attachment-cancel) {
     align-self: flex-end;
   }
 }

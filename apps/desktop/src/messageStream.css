@@ -14,17 +14,34 @@
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   padding: 4px 8px 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.buzz-filters::-webkit-scrollbar {
+  display: none;
 }
 .buzz-filters button {
-  flex: 1 1 0;
+  flex: 1 0 auto;
   min-height: 40px;
-  min-width: 0;
-  padding: 6px 12px;
+  min-width: max-content;
+  padding: 6px 10px;
+  font-size: var(--elo-type-label);
+  white-space: nowrap;
   color: var(--elo-muted);
   background: transparent;
   border: 1px solid transparent;
+}
+.buzz-filter-label {
+  position: relative;
+}
+.buzz-filter-label .new-indicator {
+  position: absolute;
+  top: -2px;
+  right: -7px;
+  width: 5px;
+  height: 5px;
 }
 .buzz-filters button[aria-pressed="true"] {
   color: var(--elo-text);

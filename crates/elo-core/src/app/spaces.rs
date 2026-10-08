@@ -4,6 +4,7 @@ use super::space_service::{SpaceAddress, SpaceInvitation};
 use super::*;
 
 const MAX_SPACES: usize = 16;
+const MAX_JOIN_NOTICES: usize = 32;
 const VAULT_CACHE: &str = "space-vault-cache.age";
 const DATA_FILES: &[&str] = &[
     "workspace.age",
@@ -63,6 +64,14 @@ struct CreationIntent {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct JoinNotice {
+    id: String,
+    space_id: String,
+    name: String,
+    seen: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Catalog {
     v: u8,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -75,6 +84,8 @@ struct Catalog {
     creation_retry: Option<CreationIntent>,
     #[serde(default)]
     notification_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    join_notices: Vec<JoinNotice>,
     #[serde(default)]
     account_hosts: BTreeSet<String>,
     active: Option<String>,
@@ -459,6 +470,7 @@ impl ClientApp {
                 creation: None,
                 creation_retry: None,
                 notification_generation: 0,
+                join_notices: Vec::new(),
                 account_hosts: BTreeSet::new(),
                 active: Some(id.clone()),
                 entries: vec![Entry {
@@ -1043,6 +1055,7 @@ impl Spaces {
                 .map(|e| e.requests)
                 .sum::<usize>()
         );
+        view["space_join_notices"] = json!(self.catalog.join_notices);
         // Foreground notification detection and explicit reminders must continue
         // across Spaces without exposing foreign rows in Messages or Buzz.
         let mut background = Vec::new();
@@ -1288,6 +1301,7 @@ impl Spaces {
             }
         }
         let old = self.catalog.entries.iter().position(|e| e.id == id);
+        let was_pending = old.is_some_and(|i| self.catalog.entries[i].status == "pending");
         if let Some(previous) = old.and_then(|i| self.catalog.entries[i].address.as_ref())
             && serde_json::to_value(previous)? != serde_json::to_value(&address)?
         {
@@ -1514,6 +1528,20 @@ impl Spaces {
         }
         if status == "approved" && self.catalog.creation.is_none() {
             self.catalog.setup = false;
+        }
+        if status == "approved" && was_pending {
+            self.catalog.join_notices.push(JoinNotice {
+                id: record::random_hex::<16>()?,
+                space_id: id.clone(),
+                name: name.into(),
+                seen: false,
+            });
+            let excess = self
+                .catalog
+                .join_notices
+                .len()
+                .saturating_sub(MAX_JOIN_NOTICES);
+            self.catalog.join_notices.drain(..excess);
         }
         self.save(root)?;
         Ok(id)
@@ -2391,8 +2419,46 @@ impl Spaces {
         match op {
             "space_list" => {}
             "space_refresh" => {
-                self.next_poll = 0;
-                self.poll(root).await?;
+                if let Some(id) = v.get("id") {
+                    let id = id.as_str().ok_or("Invalid Space ID.")?;
+                    let entry = self
+                        .catalog
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .ok_or("Space not found.")?
+                        .clone();
+                    let pending = entry.status == "pending" || entry.status == "checking";
+                    let failed = self.poll_entry(root, entry, PollMode::Regular).await?;
+                    if pending && failed {
+                        return Err("Could not check this Space's approval. Try again.".into());
+                    }
+                    self.save(root)?;
+                } else {
+                    self.next_poll = 0;
+                    self.poll(root).await?;
+                }
+            }
+            "space_join_notices_seen" => {
+                let ids: Vec<String> = serde_json::from_value(v["ids"].clone())?;
+                if ids.len() > MAX_JOIN_NOTICES {
+                    return Err("Too many notifications.".into());
+                }
+                for notice in &mut self.catalog.join_notices {
+                    if ids.contains(&notice.id) {
+                        notice.seen = true;
+                    }
+                }
+                self.save(root)?;
+            }
+            "space_join_notice_dismiss" => {
+                let id = field(&v, "id")?;
+                let before = self.catalog.join_notices.len();
+                self.catalog.join_notices.retain(|notice| notice.id != id);
+                if self.catalog.join_notices.len() == before {
+                    return Err("Notification not found.".into());
+                }
+                self.save(root)?;
             }
             "space_create" => {
                 if let Err(error) = self.create(root, &v).await {
@@ -4937,6 +5003,22 @@ mod tests {
             .await
             .unwrap();
         attach(&mut user, a.address.clone(), approved).await;
+        let view = user.view().await.unwrap();
+        let notices = view["space_join_notices"].as_array().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["space_id"], a_id);
+        assert_eq!(notices[0]["seen"], false);
+        let notice_id = notices[0]["id"].as_str().unwrap().to_owned();
+        user.operate(json!({"op":"space_join_notices_seen","ids":[notice_id]}))
+            .await
+            .unwrap();
+        let view = user.view().await.unwrap();
+        assert_eq!(view["space_join_notices"][0]["seen"], true);
+        user.operate(json!({"op":"space_join_notice_dismiss","id":notice_id}))
+            .await
+            .unwrap();
+        let view = user.view().await.unwrap();
+        assert!(view["space_join_notices"].as_array().unwrap().is_empty());
         let offer_b = command(
             &second,
             b,
@@ -5069,17 +5151,24 @@ mod tests {
                 .to_string(),
             "Space server unreachable."
         );
-        // Restore owns several profile-opening futures. Keep it on the heap
-        // separately from this scenario, including with CI's unified features.
-        let mut restored = Box::pin(ClientApp::restore_profile(
-            temp.path().join("restored"),
-            &backup,
-            PASSWORD.into(),
-            user.identity_id(),
-            "synthetic new spaces password".into(),
-            true,
-        ))
+        // Poll recovery in its own task on the same default-stack runtime.
+        // Boxing alone does not remove this long scenario's unoptimized poll
+        // frame from the stack while recovery refreshes remote membership.
+        let restore_path = temp.path().join("restored");
+        let restore_identity = user.identity_id();
+        let mut restored = tokio::spawn(async move {
+            ClientApp::restore_profile(
+                restore_path,
+                &backup,
+                PASSWORD.into(),
+                restore_identity,
+                "synthetic new spaces password".into(),
+                true,
+            )
+            .await
+        })
         .await
+        .unwrap()
         .unwrap();
         // Restored managed compartments stay hidden until a fresh pinned
         // service answer is applied after the servers become reachable again.

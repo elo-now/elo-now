@@ -20,6 +20,7 @@ import { unreadStreamEntries } from "./streamFeed";
 type Props = {
   view: View;
   calls: Calls;
+  hasActiveCalls?: boolean;
   selected?: string;
   query: string;
   busy: boolean;
@@ -120,6 +121,7 @@ function MenuButton({
 export function DesktopSidebar({
   view,
   calls,
+  hasActiveCalls = false,
   selected,
   query,
   busy,
@@ -392,15 +394,28 @@ export function DesktopSidebar({
             className="desktop-nav-item"
             data-active={current === "stream" || undefined}
             aria-label={
-              unreadMessages > 0
-                ? t("nav.streamNew", { count: unreadMessages })
-                : t("nav.stream")
+              hasActiveCalls
+                ? t(
+                    unreadMessages > 0
+                      ? "nav.streamNewCalls"
+                      : "nav.streamCalls",
+                    {
+                      count: unreadMessages,
+                    },
+                  )
+                : unreadMessages > 0
+                  ? t("nav.streamNew", { count: unreadMessages })
+                  : t("nav.stream")
             }
             onClick={() => navigate(() => onHome("stream"))}
           >
             <Icon name="buzz" attention={unreadMessages > 0} />
             <span className="desktop-nav-label">{t("nav.stream")}</span>
-            {unreadMessages > 0 && <NewIndicator />}
+            {(unreadMessages > 0 || hasActiveCalls) && (
+              <NewIndicator
+                label={hasActiveCalls ? t("calls.activeSessions") : undefined}
+              />
+            )}
           </button>
           <button
             type="button"

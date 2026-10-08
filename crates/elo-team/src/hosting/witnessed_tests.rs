@@ -806,6 +806,24 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
             .unwrap()
             .contains(&guest.credential().id())
     );
+    assert!(
+        space
+            .client
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .space_call_device_allowed(
+                guest.credential().identity(),
+                guest.credential().id(),
+                elo_core::calls::CallScope {
+                    space_id: authority.space(),
+                    stream_id: authority.stream(),
+                },
+                authority.head_id().unwrap(),
+            )
+            .unwrap()
+    );
     advance(&mut authority, &owner, &witness, &guest, false);
     *head.lock().unwrap() = (authority.head_id().unwrap(), 3);
     host.witness.as_ref().unwrap().clear_test_cache();

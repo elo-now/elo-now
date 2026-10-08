@@ -1,3 +1,8 @@
+import {
+  installDiagnostics,
+  setDiagnosticMode,
+  diagnostic,
+} from "./diagnostics";
 import { RefreshButton } from "./RefreshButton";
 import { UpdateGate } from "./UpdateGate";
 import { canReadVisibleMessages } from "./messageReadVisibility";
@@ -11,6 +16,7 @@ import {
   useSessionStarted,
 } from "./calls/CallUI";
 import { activeSessions } from "./calls/sessionPresence";
+import { useActiveCalls } from "./calls/useActiveCalls";
 import { isRingingFor } from "./calls/attention";
 import {
   useActivityNotifications,
@@ -20,7 +26,7 @@ import { leaveBeforeLock } from "./calls/leaveBeforeLock";
 import { t, messageDayKey, formatMessageDay, formatFileSize } from "./i18n";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import {
   recordTimestamp,
@@ -564,8 +570,12 @@ function App() {
   const settingsRef = useRef<HTMLElement>(null);
   const moreRef = useRef<HTMLButtonElement>(null);
   const changeMode = (value: ViewMode) => {
-    saveViewMode(value);
-    setMode(value);
+    void setDiagnosticMode(value === "expert")
+      .then(() => {
+        saveViewMode(value);
+        setMode(value);
+      })
+      .catch(reportError);
   };
   useEffect(() => {
     if (settingsOpen) settingsRef.current?.focus();
@@ -904,6 +914,7 @@ function App() {
       }
     : streamSummary;
   const calls = useCalls(view);
+  const hasActiveCalls = useActiveCalls(calls, view);
   const [callsTabRequest, setCallsTabRequest] = useState(0);
   const personalDM =
     stream?.chat_kind === "direct" && stream.members.length === 2;
@@ -2297,6 +2308,7 @@ function App() {
             onOpen={openStreamMessage}
             calls={calls}
             callsTabRequest={callsTabRequest}
+            hasActiveCalls={hasActiveCalls}
             onSessionOpen={(chat) =>
               void openSessionChat(chat).catch(reportError)
             }
@@ -2535,6 +2547,7 @@ function App() {
             <DesktopSidebar
               view={view}
               calls={calls}
+              hasActiveCalls={hasActiveCalls}
               selected={messagesActive ? stream?.stream : undefined}
               query={chatQuery}
               busy={busy}
@@ -3500,6 +3513,7 @@ function App() {
           <MobileNavigation
             notifications={notificationCount(view) + invitationCount(view)}
             unreadMessages={unreadStreamEntries(view).length}
+            hasActiveCalls={hasActiveCalls}
             active={
               settingsOpen && settingsPage !== "actions" ? "profile" : homeTab
             }
@@ -3807,7 +3821,10 @@ function App() {
     </RealtimeProvider>
   );
 }
-createRoot(document.getElementById("root")!).render(
+installDiagnostics(readViewMode() === "expert");
+createRoot(document.getElementById("root")!, {
+  onUncaughtError: () => diagnostic("error", "runtime", "react_error"),
+}).render(
   <React.StrictMode>
     <ToastProvider>
       <WindowChrome />

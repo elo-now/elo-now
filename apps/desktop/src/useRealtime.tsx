@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { listen } from "@tauri-apps/api/event";
 import { updateRequired, useUpdateRequired } from "./releasePolicy";
 import { formatFileSize, t } from "./i18n";

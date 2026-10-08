@@ -20,6 +20,7 @@ import WebRTC
     private var registry: PKPushRegistry?
     private var channel: Channel?
     private var hints: [UUID: IncomingCallHint] = [:]
+    private var presentationRevision: UInt64 = 0
     private var answers: [UUID: CXAnswerCallAction] = [:]
     private var events: [[String: Any]] = []
     private var authorized = Set<String>()
@@ -28,6 +29,7 @@ import WebRTC
     private var ledger: IncomingCallLedger
     private(set) var audioActivated = false
     var systemAudioOwned: Bool { !authorized.isEmpty || outgoing.call != nil }
+    var hasRingingPresentation: Bool { hints.keys.contains { !connected.contains($0) && answers[$0] == nil } }
 
     private override init() {
         let configuration = CXProviderConfiguration()
@@ -66,7 +68,16 @@ import WebRTC
         ["voipToken": prefs.string(forKey: "elo.calls.voip-token") as Any? ?? NSNull(),
          "apnsSandbox": APNsEnvironment.sandbox,
          "pending": events,
+         "presentationRevision": presentationRevision,
+         "presentationHints": hints.values.map { $0.event("presentation") },
          "presented": hints.values.map { ["callId": $0.callId, "invitationId": $0.invitationId] }]
+    }
+
+    private func presentationChanged() {
+        presentationRevision += 1
+        // A refresh signal only. Rust verifies the current snapshot locally;
+        // this event is neither a call admission nor an authorization to capture.
+        _ = try? channel?.send(["action": "presentation", "eventId": UUID().uuidString])
     }
 
     private func emit(_ event: [String: Any]) {
@@ -96,6 +107,7 @@ import WebRTC
     }
 
     func report(_ data: [AnyHashable: Any], completion: @escaping () -> Void) {
+        ForegroundRingtone.shared.pausePlayback()
         let now = Date().timeIntervalSince1970
         let hint = IncomingCallHint(data, now: now)
         let valid = hint.map {
@@ -114,17 +126,20 @@ import WebRTC
         update.supportsUngrouping = false
         update.supportsDTMF = false
         let duplicate = hints[id] != nil
-        if valid, let hint, !duplicate { hints[id] = hint }
+        if valid, let hint, !duplicate { hints[id] = hint; presentationChanged() }
         provider.reportNewIncomingCall(with: id, update: update) { [weak self] error in
             Task { @MainActor in
                 defer { completion() }
                 guard let self else { return }
                 if duplicate { return }
                 guard valid, let hint, error == nil else {
-                    self.hints.removeValue(forKey: id)
+                    if self.hints.removeValue(forKey: id) != nil { self.presentationChanged() }
                     if error == nil { self.provider.reportCall(with: id, endedAt: Date(), reason: .failed) }
                     return
                 }
+                // The user may have ended the call before CallKit's asynchronous
+                // report completion. A late success must not restart admission.
+                guard self.hints[id] == hint else { return }
                 self.emit(hint.event("incoming"))
                 DispatchQueue.main.asyncAfter(deadline: .now() + max(0, hint.expires - now)) { [weak self] in
                     guard let self, self.hints[id] != nil, !self.connected.contains(id), self.answers[id] == nil else { return }
@@ -269,6 +284,7 @@ import WebRTC
 
     private func finish(_ id: UUID, reason: CXCallEndedReason) {
         guard let hint = hints.removeValue(forKey: id) else { return }
+        presentationChanged()
         forgetMute(id)
         if let capture = captures.removeValue(forKey: id) { NativeMedia.shared.stop(id: capture) }
         answers.removeValue(forKey: id)?.fail()

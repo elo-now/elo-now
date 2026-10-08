@@ -6,11 +6,11 @@ import {
   type PointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
-import { GripVertical } from "lucide-react";
 import { t } from "../i18n";
 import {
   floatingAnchor,
   floatingPosition,
+  floatingReleaseAnchor,
   type FloatingBounds,
   type Point,
 } from "./floatingPosition";
@@ -21,11 +21,13 @@ export function FloatingCall({
   children,
   label,
   hidden = false,
+  aboveCall = false,
 }: {
   title: ReactNode;
   children: ReactNode;
   label: string;
   hidden?: boolean;
+  aboveCall?: boolean;
 }) {
   const [layer] = useState(() => {
     if (typeof document === "undefined") return null;
@@ -35,7 +37,7 @@ export function FloatingCall({
   });
   const widget = useRef<HTMLElement>(null);
   const anchor = useRef<Point>({
-    x: typeof innerWidth === "number" && innerWidth >= 768 ? 1 : 0,
+    x: 0.5,
     y: 1,
   });
   const bounds = useRef<FloatingBounds>({
@@ -44,9 +46,15 @@ export function FloatingCall({
     width: 0,
     height: 0,
   });
-  const drag = useRef<{ id: number; pointer: Point; origin: Point } | null>(
-    null,
-  );
+  const drag = useRef<{
+    id: number;
+    pointer: Point;
+    origin: Point;
+    moved: boolean;
+    capture: Element;
+    samples: (Point & { time: number })[];
+  } | null>(null);
+  const suppressClick = useRef(false);
   const reposition = useRef(() => {});
 
   useLayoutEffect(() => {
@@ -64,7 +72,10 @@ export function FloatingCall({
       const pages = document.querySelectorAll<HTMLDialogElement>(
         "dialog.page-surface[open]",
       );
-      const host = pages[pages.length - 1] ?? document.body;
+      const callDialog = aboveCall
+        ? document.querySelector<HTMLDialogElement>("dialog.call-dialog[open]")
+        : null;
+      const host = callDialog ?? pages[pages.length - 1] ?? document.body;
       if (layer!.parentElement !== host) host.append(layer!);
       const node = widget.current;
       if (!node) return;
@@ -158,7 +169,7 @@ export function FloatingCall({
       window.removeEventListener("resize", schedule);
       layer.remove();
     };
-  }, [layer]);
+  }, [layer, aboveCall]);
 
   useLayoutEffect(() => {
     if (!hidden) reposition.current();
@@ -173,11 +184,34 @@ export function FloatingCall({
     );
     reposition.current();
   };
-  const finishDrag = (event: PointerEvent<HTMLButtonElement>) => {
-    if (drag.current?.id !== event.pointerId) return;
+  const finishDrag = (event: PointerEvent<HTMLElement>) => {
+    const start = drag.current;
+    if (!start || start.id !== event.pointerId) return;
     drag.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
+    const node = widget.current;
+    if (start.moved && node && event.type === "pointerup") {
+      const recent =
+        start.samples.find((sample) => event.timeStamp - sample.time <= 140) ??
+        start.samples[start.samples.length - 1];
+      anchor.current = floatingReleaseAnchor(
+        bounds.current,
+        node.getBoundingClientRect(),
+        {
+          x: start.origin.x + event.clientX - start.pointer.x,
+          y: start.origin.y + event.clientY - start.pointer.y,
+        },
+        {
+          x: event.clientX - recent.x,
+          y: event.clientY - recent.y,
+          duration: event.timeStamp - recent.time,
+        },
+      );
+      node.dataset.settling = "true";
+      reposition.current();
+    }
+    if (node) delete node.dataset.dragging;
+    if (start.capture.hasPointerCapture(event.pointerId))
+      start.capture.releasePointerCapture(event.pointerId);
   };
   return (
     layer &&
@@ -186,63 +220,96 @@ export function FloatingCall({
         ref={widget}
         className="call-widget"
         aria-label={label}
+        aria-description={t("calls.moveControlsHelp")}
+        tabIndex={0}
+        data-no-back-swipe
         hidden={hidden}
+        onPointerDown={(event) => {
+          suppressClick.current = false;
+          if (
+            !event.isPrimary ||
+            event.button !== 0 ||
+            !widget.current ||
+            !(event.target instanceof Element)
+          )
+            return;
+          const control = event.target.closest(
+            "button, a, input, select, textarea, [role='button']",
+          );
+          if (control && !control.matches("[data-call-drag-toggle]")) return;
+          // Keep a title tap targeted at its button. Capturing on the outer
+          // section would retarget the click away from its expand action.
+          const capture = control ?? event.currentTarget;
+          const rect = widget.current.getBoundingClientRect();
+          delete widget.current.dataset.settling;
+          // A new drag can interrupt a docking animation at its visible position.
+          moveTo({ x: rect.left, y: rect.top });
+          drag.current = {
+            id: event.pointerId,
+            pointer: { x: event.clientX, y: event.clientY },
+            origin: { x: rect.left, y: rect.top },
+            moved: false,
+            capture,
+            samples: [
+              { x: event.clientX, y: event.clientY, time: event.timeStamp },
+            ],
+          };
+          capture.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const start = drag.current;
+          if (!start || start.id !== event.pointerId || !widget.current) return;
+          const dx = event.clientX - start.pointer.x;
+          const dy = event.clientY - start.pointer.y;
+          if (!start.moved && Math.hypot(dx, dy) < 6) return;
+          start.moved = true;
+          suppressClick.current = true;
+          widget.current.dataset.dragging = "true";
+          event.preventDefault();
+          start.samples.push({
+            x: event.clientX,
+            y: event.clientY,
+            time: event.timeStamp,
+          });
+          start.samples = start.samples.filter(
+            (sample) => event.timeStamp - sample.time <= 180,
+          );
+          moveTo({ x: start.origin.x + dx, y: start.origin.y + dy });
+        }}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
+        onLostPointerCapture={(event) => {
+          if (event.target !== drag.current?.capture) return;
+          drag.current = null;
+          if (widget.current) delete widget.current.dataset.dragging;
+        }}
+        onClickCapture={(event) => {
+          if (!suppressClick.current || event.detail === 0) return;
+          suppressClick.current = false;
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          const direction: Record<string, Point> = {
+            ArrowLeft: { x: -1, y: 0 },
+            ArrowRight: { x: 1, y: 0 },
+            ArrowUp: { x: 0, y: -1 },
+            ArrowDown: { x: 0, y: 1 },
+          };
+          const delta = direction[event.key];
+          if (!delta || !widget.current) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = widget.current.getBoundingClientRect();
+          const step = event.shiftKey ? 60 : 20;
+          moveTo({
+            x: rect.left + delta.x * step,
+            y: rect.top + delta.y * step,
+          });
+        }}
       >
-        <div className="call-widget-header">
-          <button
-            type="button"
-            className="call-widget-grip"
-            aria-label={t("calls.moveControls")}
-            aria-description={t("calls.moveControlsHelp")}
-            title={t("calls.moveControlsHelp")}
-            onPointerDown={(event) => {
-              if (!event.isPrimary || event.button !== 0 || !widget.current)
-                return;
-              event.preventDefault();
-              const rect = widget.current.getBoundingClientRect();
-              drag.current = {
-                id: event.pointerId,
-                pointer: { x: event.clientX, y: event.clientY },
-                origin: { x: rect.left, y: rect.top },
-              };
-              event.currentTarget.setPointerCapture(event.pointerId);
-            }}
-            onPointerMove={(event) => {
-              const start = drag.current;
-              if (!start || start.id !== event.pointerId) return;
-              moveTo({
-                x: start.origin.x + event.clientX - start.pointer.x,
-                y: start.origin.y + event.clientY - start.pointer.y,
-              });
-            }}
-            onPointerUp={finishDrag}
-            onPointerCancel={finishDrag}
-            onLostPointerCapture={() => {
-              drag.current = null;
-            }}
-            onKeyDown={(event) => {
-              const direction: Record<string, Point> = {
-                ArrowLeft: { x: -1, y: 0 },
-                ArrowRight: { x: 1, y: 0 },
-                ArrowUp: { x: 0, y: -1 },
-                ArrowDown: { x: 0, y: 1 },
-              };
-              const delta = direction[event.key];
-              if (!delta || !widget.current) return;
-              event.preventDefault();
-              event.stopPropagation();
-              const rect = widget.current.getBoundingClientRect();
-              const step = event.shiftKey ? 60 : 20;
-              moveTo({
-                x: rect.left + delta.x * step,
-                y: rect.top + delta.y * step,
-              });
-            }}
-          >
-            <GripVertical size={16} aria-hidden="true" />
-          </button>
-          {title}
-        </div>
+        <div className="call-widget-header">{title}</div>
         <div className="call-widget-controls">{children}</div>
       </section>,
       layer,

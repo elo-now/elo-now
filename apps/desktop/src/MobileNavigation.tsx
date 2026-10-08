@@ -14,11 +14,13 @@ export function MobileNavigation({
   active,
   notifications = 0,
   unreadMessages = 0,
+  hasActiveCalls = false,
   onNavigate,
 }: {
   active: MobileTab;
   notifications?: number;
   unreadMessages?: number;
+  hasActiveCalls?: boolean;
   onNavigate: (tab: MobileTab) => void;
 }) {
   const [hint, setHint] = useState<{
@@ -80,11 +82,20 @@ export function MobileNavigation({
           aria-label={
             tab.id === "profile" && notifications > 0
               ? t("nav.moreNew", { count: notifications })
-              : tab.id === "stream" && unreadMessages > 0
-                ? t("nav.streamNew", { count: unreadMessages })
-                : tab.id === "chats" && unreadMessages > 0
-                  ? t("nav.chatsNew", { count: unreadMessages })
-                  : t(tab.label)
+              : tab.id === "stream" && hasActiveCalls
+                ? t(
+                    unreadMessages > 0
+                      ? "nav.streamNewCalls"
+                      : "nav.streamCalls",
+                    {
+                      count: unreadMessages,
+                    },
+                  )
+                : tab.id === "stream" && unreadMessages > 0
+                  ? t("nav.streamNew", { count: unreadMessages })
+                  : tab.id === "chats" && unreadMessages > 0
+                    ? t("nav.chatsNew", { count: unreadMessages })
+                    : t(tab.label)
           }
           aria-current={active === tab.id ? "page" : undefined}
           onContextMenu={(event) => event.preventDefault()}
@@ -123,8 +134,17 @@ export function MobileNavigation({
               attention={tab.id === "stream" && unreadMessages > 0}
             />
             {((tab.id === "profile" && notifications > 0) ||
+              (tab.id === "stream" && hasActiveCalls) ||
               ((tab.id === "stream" || tab.id === "chats") &&
-                unreadMessages > 0)) && <NewIndicator />}
+                unreadMessages > 0)) && (
+              <NewIndicator
+                label={
+                  tab.id === "stream" && hasActiveCalls
+                    ? t("calls.activeSessions")
+                    : undefined
+                }
+              />
+            )}
           </span>
           {hint?.tab === tab.id && (
             <span

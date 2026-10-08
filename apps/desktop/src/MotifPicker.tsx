@@ -49,7 +49,6 @@ export function MotifPicker({
   const [drawOpen, setDrawOpen] = useState(false);
   return (
     <>
-      <h3 id="appearance-motif-label">{t("motif.label")}</h3>
       <button
         type="button"
         className="motif-selector"
@@ -62,8 +61,9 @@ export function MotifPicker({
         }}
       >
         <MotifPreview motif={value} drawing={drawing} />
-        <span id="appearance-motif-value">{t(`motif.${value}`)}</span>
-        <Icon name="next" />
+        <span id="appearance-motif-value" hidden>
+          {t(`motif.${value}`)}
+        </span>
       </button>
       {anchor && (
         <ActionDialog

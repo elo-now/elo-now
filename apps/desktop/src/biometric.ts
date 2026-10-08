@@ -1,5 +1,5 @@
 import { t } from "./i18n";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import {
   BiometryType,
   checkStatus,

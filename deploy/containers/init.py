@@ -229,7 +229,7 @@ def proxy_config(role, public_origin, storage, wake=False, calls=False):
     return (global_options + public_origin + " {\n" + routes + "}\n").encode()
 
 
-def setup_calls(root, public_origin, public_ip, uids):
+def setup_calls(root, public_origin, public_ip, uids, witness_pin):
     """Share only the individual admission/media secrets needed by each service."""
     data = root / "calls/data"
     admission = secret(root / "calls/config/admission.key", uids["calls"], data, hexadecimal=True)
@@ -240,6 +240,7 @@ def setup_calls(root, public_origin, public_ip, uids):
     config = {"bind": "127.0.0.1:18920", "public_url": public_origin + "/calls/v1",
               "data": "/var/lib/elo-calls", "admission_url": "http://127.0.0.1:18901/internal/calls/admission",
               "admission_key": "/etc/elo/calls/admission.key", "max_connections": 128,
+              "witness": witness_pin,
               "media": {"url": "wss://" + domain + "/media", "api_url": "http://127.0.0.1:7880",
                         "api_key": "elo-private", "api_secret": media_secret, "turn_secret": turn_secret,
                         "turn_urls": ["turn:" + domain + ":3478?transport=udp", "turn:" + domain + ":3478?transport=tcp"]}}
@@ -364,7 +365,7 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
                   "allowed_creators": None if public_hosting else list(creators), "allowed_message_retentions": retentions}
         if call_ip:
             config["call_admission_key"] = "/etc/elo/api/call-admission.key"
-            setup_calls(root, public_origin, call_ip, uids)
+            setup_calls(root, public_origin, call_ip, uids, witness_pin)
         if firebase is not None:
             stable(root / "wake/config/firebase.json", json_bytes(firebase), uids["wake"])
             stable(root / "wake/config/config.json", json_bytes({"public_url": public_origin}), uids["wake"])

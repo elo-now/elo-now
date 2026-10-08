@@ -73,6 +73,12 @@ class MacSigningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Associated Domains"):
             self.validate(webcredentials=True)
 
+    def test_device_bound_macos_profile_can_omit_debugging_entitlement(self):
+        self.profile["Entitlements"].pop("com.apple.security.get-task-allow")
+        entitlements = self.validate()
+        self.assertEqual(entitlements["keychain-access-groups"], [APP_ID])
+        self.assertNotIn("com.apple.security.get-task-allow", entitlements)
+
     def test_overlay_embeds_original_profile_and_protects_output_from_overwrite(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "signing"

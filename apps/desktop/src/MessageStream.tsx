@@ -14,7 +14,7 @@ import { EmptyState } from "./EmptyState";
 import { CallList } from "./calls/ActiveSessions";
 import type { Calls } from "./calls/controller";
 import type { Stream } from "./model";
-import { Icon } from "./Icon";
+import { Icon, NewIndicator } from "./Icon";
 import { ScreenHeader } from "./ScreenHeader";
 import { PullToRefresh } from "./PullToRefresh";
 import { messageDayKey, formatMessageDay, t } from "./i18n";
@@ -81,11 +81,13 @@ export function MessageStream({
   onOpen,
   calls,
   callsTabRequest = 0,
+  hasActiveCalls = false,
   onSessionOpen,
 }: {
   view: View;
   calls?: Calls;
   callsTabRequest?: number;
+  hasActiveCalls?: boolean;
   onSessionOpen?: (chat: Stream) => void;
   active: boolean;
   mobile: boolean;
@@ -382,7 +384,12 @@ export function MessageStream({
               setSlide(null);
             }}
           >
-            {t(`stream.filter.${value}`)}
+            <span className="buzz-filter-label">
+              {t(`stream.filter.${value}`)}
+              {value === "calls" && hasActiveCalls && (
+                <NewIndicator label={t("calls.activeSessions")} />
+              )}
+            </span>
           </button>
         ))}
       </div>

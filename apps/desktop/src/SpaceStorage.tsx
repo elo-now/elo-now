@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { messageLifetimeLabel } from "./Hosting";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { ActionDialog } from "./ActionDialog";
 import { locale, t } from "./i18n";
 import type { SpaceSummary } from "./model";

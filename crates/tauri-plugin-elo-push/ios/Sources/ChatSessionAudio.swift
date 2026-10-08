@@ -8,6 +8,7 @@ import UIKit
     private var sessionId: String?
     private var activation: String?
     private var systemManaged = false
+    var active: Bool { sessionId != nil }
     private var observer: NSObjectProtocol?
     private var changed: (() -> Void)?
     private var systemAction: (([String: Any]) -> Void)?
@@ -30,6 +31,7 @@ import UIKit
         if active {
             guard sessionId == nil || (sessionId == id && self.activation == activation) else { throw NativePeer.MediaError.invalid }
             if sessionId == nil {
+                ForegroundRingtone.shared.stop()
                 guard (UIApplication.shared.applicationState == .active || IncomingCalls.shared.permitsBackgroundAudio(id)),
                     AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
                     throw NativePeer.MediaError.permission

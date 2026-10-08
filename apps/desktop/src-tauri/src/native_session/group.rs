@@ -40,7 +40,9 @@ pub(super) async fn maintain(
     initial: Value,
     state: &mut State,
 ) -> Result<()> {
+    diagnostic(c"group:entered");
     target.validate(&initial)?;
+    diagnostic(c"group:validated");
     let local = target.context["credential"].as_str().ok_or("invalid")?;
     let mut call = initial;
     let mut epoch = 0;
@@ -62,9 +64,12 @@ pub(super) async fn maintain(
         let next_epoch = call["key_epoch"].as_u64().ok_or("invalid")?;
         if epoch != next_epoch {
             target.validate(&call)?;
+            diagnostic(c"group:before_changed");
             driver.changed(&call, false).await?;
             // Revoke the old room/key before admitting new tracks.
+            diagnostic(c"group:before_reset");
             driver.media(json!({"op":"group_reset"})).await?;
+            diagnostic(c"group:after_reset");
             epoch = next_epoch;
             people = participants(&call)?;
             started = false;
@@ -104,12 +109,14 @@ pub(super) async fn maintain(
             }
         }
         if !started && let Some(secret) = state.key.as_ref() {
+            diagnostic(c"group:before_connect_media");
             let result = control
                 .command(
                     driver,
                     json!({"type":"connect_media","call_id":target.call_id}),
                 )
                 .await?;
+            diagnostic(c"group:after_connect_media");
             target.validate(&result["call"])?;
             if result["call"]["key_epoch"] != epoch {
                 call = result["call"].clone();
@@ -124,8 +131,10 @@ pub(super) async fn maintain(
             if access["provider"] != "livekit" || access["epoch"] != epoch {
                 return Err("unauthorized");
             }
+            diagnostic(c"group:before_group_start");
             driver.media(json!({"op":"group_start","url":access["url"],"token":access["token"],"key":**secret,
                 "epoch":epoch,"participants":people,"credential":local})).await?;
+            diagnostic(c"group:after_group_start");
             started = true;
             driver.media(json!({"op":"update","state":call["participants"][target.context["expected_identity"].as_str().ok_or("invalid")?]["media"],"speaker_muted":false})).await?;
         }

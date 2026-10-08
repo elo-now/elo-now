@@ -13,5 +13,6 @@
   "calls.nativeEndAndAnswer": "End & answer",
   "calls.nativeDecline": "Decline",
   "calls.nativeEnd": "End call",
-  "calls.nativeChannelIncoming": "Incoming calls"
+  "calls.nativeChannelIncoming": "Incoming calls",
+  "calls.nativeChannelActive": "Active calls"
 }

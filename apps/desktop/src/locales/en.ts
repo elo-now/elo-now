@@ -18,6 +18,12 @@ export const brandIntroFrames = [
 ] as const;
 
 export const en = {
+  "diagnostics.help":
+    "In this beta build, Debug also sends crash reports, error codes, operation stages, app version and device information to Google Firebase Crashlytics. Messages, passwords, keys and invitation links are excluded from custom reports. Reports are sent on the next launch while Debug is enabled. Turning it off discards pending reports; it does not delete reports already sent.",
+  "diagnostics.supportId": "Diagnostic installation ID: {id}",
+  "diagnostics.test": "Queue test report",
+  "diagnostics.testQueued":
+    "Test report queued. Close and reopen elo with Debug enabled to send it.",
   "error.recoveryClipboard": "Could not copy the recovery code.",
   "control.error.request": "Check the device request and paste it again.",
   "control.error.file":
@@ -162,13 +168,10 @@ export const en = {
   "calls.otherSessions": "{count} other calls",
   "calls.dismissSession": "Dismiss this session",
   "calls.open": "Open call",
-  "calls.moveControls": "Move call controls",
-  "calls.moveControlsHelp": "Drag to move, or use the arrow keys.",
+  "calls.moveControlsHelp":
+    "Drag to move, swipe to dock, or use the arrow keys.",
   "calls.widgetStatus": "{status} · {space}",
   "calls.none": "No active calls.",
-  "calls.invitePeople": "Invite to call",
-  "calls.inviteHelp":
-    "Choose a person to ring. Other members can still join from Calls.",
   "stream.filter.calls": "Calls",
   "calls.join": "Join session",
   "calls.activeSessions": "Active sessions",
@@ -188,6 +191,7 @@ export const en = {
   "calls.reconnecting": "Reconnecting…",
   "calls.leave": "Leave session",
   "calls.collapse": "Collapse session",
+  "calls.hide": "Hide call",
   "calls.mute": "Mute microphone",
   "calls.unmute": "Unmute microphone",
   "calls.muteSpeaker": "Mute session audio",
@@ -566,6 +570,7 @@ export const en = {
     "This invitation is valid for 24 hours. Anyone with its link or QR can join without your approval. Manage invitations and members in Spaces.",
   "spaces.openCreated": "Open Space",
   "spaces.refresh": "Check for approval",
+  "spaces.refreshNamed": "Check for approval for {name}",
   "spaces.membersTitle": "Members ({count})",
   "spaces.rolesHelp":
     "Owners manage invitations and members. Only the primary owner can add or remove owners. Primary ownership cannot be transferred.",
@@ -860,6 +865,8 @@ export const en = {
     "The original message is not on this device yet. Refresh or request its history before replying.",
   "nav.stream": "Buzz",
   "nav.streamNew": "Buzz, {count} unread messages",
+  "nav.streamCalls": "Buzz, active calls",
+  "nav.streamNewCalls": "Buzz, {count} unread messages and active calls",
   "nav.backToStream": "Back to Buzz",
   "stream.empty": "All caught up",
   "stream.filters": "Show unread activity",
@@ -1082,6 +1089,12 @@ export const en = {
   "invite.page.notifications": "Notifications",
   "notifications.count": "Notifications, {count} new items",
   "notifications.empty": "No notifications yet",
+  "notifications.spaceJoined": "Your request to join this Space was approved.",
+  "notifications.deleteNamed": "Delete notification about {name}",
+  "notifications.deleteTitle": "Delete notification?",
+  "notifications.deleteConfirm":
+    "Remove the notification about {name} from this device?",
+  "notifications.delete": "Delete",
   "notifications.loading": "Loading notifications…",
   "notifications.removed": "You were removed from this conversation.",
   "invite.activity.incoming": "To review",
@@ -1457,6 +1470,8 @@ export const en = {
     "Biometric authentication didn’t succeed. Try again.",
   "error.biometricLocked":
     "Biometrics are temporarily locked. Unlock the device, or use your profile password.",
+  "error.biometricBuildUnavailable":
+    "Touch ID is unavailable in this app build. Use your profile password.",
   "error.savedUnlockInvalid":
     "The saved unlock no longer works. Use your profile password, then enable biometrics again.",
   "view.label": "View",
@@ -1525,12 +1540,13 @@ export const en = {
   "file.expired": "Expired",
   "file.removed": "Removed",
   "file.unavailable": "Unavailable",
-  "composer.deleteAfter": "Keep:",
   "composer.expiryHours": "{hours}h",
   "composer.noExpiry": "No expiry",
+  "composer.expireIn": "Expires in {hours}h",
+  "composer.expiryDescription": "Expiry starts when you send.",
   "messageActions.expired": "Message expired",
   "messageActions.expiresAt": "Expires: {date}",
-  "messageActions.deleteAfter": "Keep",
+  "messageActions.expiry": "Expiry",
   "messageActions.noExpiry": "No expiry",
   "messageActions.expiryDescription": "The new time starts when you save.",
   "messageActions.saveExpiry": "Save",

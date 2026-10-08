@@ -150,6 +150,8 @@ struct Invitations {
     own_wake: Option<push::Route>,
     #[serde(default)]
     seen_notices: Vec<String>,
+    #[serde(default)]
+    dismissed_notices: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     session_notices: BTreeMap<String, u64>,
     #[serde(default)]
@@ -376,6 +378,7 @@ impl ClientApp {
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
+            || state.dismissed_notices.len() > MAX_ITEMS
             || state.seen_activity.len() > 3 * MAX_ITEMS
         {
             return Err("Invalid invitation state.".into());
@@ -443,6 +446,7 @@ impl ClientApp {
             || state.wake_routes.len() > MAX_ITEMS
             || state.pending_wake_routes.len() > MAX_PENDING_WAKE_ROUTES
             || state.seen_notices.len() > MAX_ITEMS
+            || state.dismissed_notices.len() > MAX_ITEMS
             || state.seen_activity.len() > 3 * MAX_ITEMS
         {
             return Err("There are too many saved invitations. Remove an old entry first.".into());
@@ -585,6 +589,36 @@ impl ClientApp {
                         response.seen = true;
                     }
                 }
+                self.save_invitations(&state)?;
+            }
+            "invitation_notification_dismiss" => {
+                let id = field(&v, "id")?;
+                if let Some(response) = state.responses.get_mut(id)
+                    && matches!(response.packet, Packet::Declined { .. })
+                {
+                    response.dismissed = true;
+                } else if self
+                    .membership_notices(&state)?
+                    .iter()
+                    .any(|notice| notice["id"] == id)
+                    || self.invitation_activity(&state)?["outgoing"]
+                        .as_array()
+                        .is_some_and(|outgoing| {
+                            outgoing.iter().any(|entry| {
+                                entry["id"] == id
+                                    && matches!(
+                                        entry["status"].as_str(),
+                                        Some("joined" | "expired")
+                                    )
+                            })
+                        })
+                {
+                    state.dismissed_notices.push(id.to_owned());
+                } else {
+                    return Err("Notification not found.".into());
+                }
+                let excess = state.dismissed_notices.len().saturating_sub(MAX_ITEMS);
+                state.dismissed_notices.drain(..excess);
                 self.save_invitations(&state)?;
             }
             "invitation_dismiss" => {

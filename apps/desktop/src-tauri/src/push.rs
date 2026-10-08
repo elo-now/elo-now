@@ -161,6 +161,7 @@ pub async fn changed(app: &tauri::AppHandle, client: &ClientApp) -> bool {
     }
 }
 pub async fn suspend(app: &tauri::AppHandle, client: Option<&ClientApp>) -> Result<(), String> {
+    crate::foreground_ringtone::shutdown(app).await;
     #[cfg(all(mobile, feature = "mobile-push"))]
     crate::incoming_calls::shutdown(app).await;
     let media = crate::native_media::shutdown(app).await;

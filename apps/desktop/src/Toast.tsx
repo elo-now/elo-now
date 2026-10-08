@@ -1,3 +1,4 @@
+import { diagnosticErrorMessage } from "./diagnostics";
 import { Icon } from "./Icon";
 import { createPortal } from "react-dom";
 import {
@@ -96,6 +97,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     detail?: string,
     tone: "error" | "notice" = "error",
   ) => {
+    if (tone === "error" && message) diagnosticErrorMessage(errorText(message));
     if (timer.current !== null) clearTimeout(timer.current);
     setLeaving(false);
     setDetailsOpen(false);

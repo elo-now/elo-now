@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { Phone } from "lucide-react";
+import { EmptyState } from "../EmptyState";
 import { locale, t } from "../i18n";
 import type { Stream, View } from "../model";
 import type { Calls } from "./controller";
@@ -7,7 +8,13 @@ import { activeSessions, type ActiveSession } from "./sessionPresence";
 import { callKey, scopeKey } from "./types";
 import "./calls.css";
 
-function SessionDetails({ session }: { session: ActiveSession }) {
+function SessionDetails({
+  session,
+  showSpace,
+}: {
+  session: ActiveSession;
+  showSpace: boolean;
+}) {
   const names = new Intl.ListFormat(locale, {
     style: "short",
     type: "conjunction",
@@ -15,7 +22,9 @@ function SessionDetails({ session }: { session: ActiveSession }) {
   return (
     <span className="active-session-details">
       <strong>{session.chat.name}</strong>
-      <small>{t("calls.inSpace", { name: session.spaceName })}</small>
+      {showSpace && (
+        <small>{t("calls.inSpace", { name: session.spaceName })}</small>
+      )}
       <small className="active-session-participants">
         {t("calls.sessionParticipants", { names })}
       </small>
@@ -38,8 +47,7 @@ export function CallList({
     calls.getSnapshot,
   );
   const sessions = activeSessions(view, state.available);
-  if (!sessions.length)
-    return <p className="call-list-empty">{t("calls.none")}</p>;
+  if (!sessions.length) return <EmptyState message={t("calls.none")} />;
   return (
     <section className="call-list" aria-label={t("calls.activeSessions")}>
       {sessions.map((session) => {
@@ -59,20 +67,22 @@ export function CallList({
                 onOpen(session.chat);
               }}
             >
-              <Phone size={20} aria-hidden="true" />
-              <SessionDetails session={session} />
+              <SessionDetails
+                session={session}
+                showSpace={
+                  session.call.scope.hosting_space_id !== view.active_space
+                }
+              />
             </button>
             <button
               type="button"
-              className="quiet"
+              className="call-list-open"
               disabled={state.answering}
-              onClick={() =>
-                joined
-                  ? calls.expand()
-                  : calls.requestStart(session.chat, session.call)
-              }
+              aria-label={t(joined ? "calls.open" : "calls.joinSession")}
+              title={t(joined ? "calls.open" : "calls.joinSession")}
+              onClick={() => calls.requestStart(session.chat, session.call)}
             >
-              {t(joined ? "calls.open" : "calls.joinSession")}
+              <Phone size={20} aria-hidden="true" />
             </button>
           </article>
         );

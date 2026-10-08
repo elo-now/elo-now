@@ -317,6 +317,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(command.hosting_space_id, space);
+        assert_eq!(
+            admit(
+                State(host.clone()),
+                headers.clone(),
+                Json(Request {
+                    space_id: space,
+                    identity_id: guest.identity_id(),
+                    device: Some((command.credential_id, command.scope, command.config_id)),
+                }),
+            )
+            .await
+            .unwrap()
+            .0["allowed"],
+            true,
+            "a newly joined member must be admitted to a General call",
+        );
         operation["hosting_space_id"] = json!(SpaceId::from_bytes([8; 32]));
         assert!(guest.operate(operation.clone()).await.is_err());
         operation["hosting_space_id"] = json!(space);

@@ -1,3 +1,5 @@
+# Preserve useful Crashlytics stacks; upload the matching R8 mapping per build.
+-keepattributes SourceFile,LineNumberTable
 # The system certificate verifier is called from Rust through JNI.
 -keep,includedescriptorclasses class org.rustls.platformverifier.** { *; }
 -keepclassmembers class now.elo.MainActivity {

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { t } from "./i18n";
 import { useToast } from "./Toast";
 import type { SpaceSummary, View } from "./model";

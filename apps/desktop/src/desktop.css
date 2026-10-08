@@ -695,10 +695,10 @@ body:has(.shell[data-mobile="false"]) .toast {
   flex-direction: row;
   align-items: center;
   gap: 4px;
-  padding: 0 calc(8px * var(--desktop-density))
+  padding: 0 calc(14px * var(--desktop-density))
     calc(7px * var(--desktop-density));
 }
-.shell[data-mobile="false"] .composer button {
+.shell[data-mobile="false"] .composer > .composer-actions > button {
   align-self: center;
 }
 .shell[data-mobile="false"] .composer > .composer-attachment {

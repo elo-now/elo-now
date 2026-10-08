@@ -241,12 +241,8 @@ export function Icon({
   );
 }
 
-export function NewIndicator() {
-  return (
-    <span
-      className="new-indicator"
-      role="img"
-      aria-label={t("notifications.new")}
-    />
-  );
+export function NewIndicator({
+  label = t("notifications.new"),
+}: { label?: string } = {}) {
+  return <span className="new-indicator" role="img" aria-label={label} />;
 }

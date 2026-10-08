@@ -348,6 +348,11 @@ Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit p
   "data": "/var/lib/elo/call",
   "admission_url": "http://127.0.0.1:18901/internal/calls/admission",
   "admission_key": "/etc/elo/call/admission.key",
+  "witness": {
+    "url": "https://witness.example.org/witness/v1",
+    "public_key": "REPLACE_WITH_THE_SAME_WITNESS_PUBLIC_KEY_AS_THE_API",
+    "key_generation": 1
+  },
   "max_connections": 128,
   "media": {
     "url": "wss://chat.example.org/media/",
@@ -364,6 +369,11 @@ Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit p
 ```
 
 The `admission_key` must have exactly the same 64 characters as the host's `call_admission_key`. The call service reads its JSON with `--config /etc/elo/call/config.json`. Its public WebSocket is only `/calls/v1/connect`; the private admission URL must stay on loopback. Media credentials are issued to clients as short-lived tokens through signed call operations, not baked into an app package.
+
+Copy the API's trusted `witness` pin into the call-service configuration as well.
+General uses a witnessed membership chain; without this explicit pin the call
+service rejects its proof. Private chats continue to use their owner-signed
+chains. Both paths still require the API's current device and membership check.
 
 ## 6. Firebase, APNs and the wake service
 

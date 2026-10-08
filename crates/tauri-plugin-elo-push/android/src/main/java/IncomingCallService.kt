@@ -53,6 +53,7 @@ class IncomingCallService : Service() {
     }
     companion object {
         private const val CHANNEL = "elo_calls_v1"
+        private const val ONGOING_CHANNEL = "elo_calls_active_v1"
         private var silenced: String? = null
         private var instance: IncomingCallService? = null
         fun authorizeCapture(context: Context, mediaId: String, camera: Boolean) {
@@ -75,8 +76,15 @@ class IncomingCallService : Service() {
         internal fun silence(context: Context, offer: IncomingCallState.Offer? = IncomingCalls.active()?.offer) {
             if (offer?.key != IncomingCalls.active()?.offer?.key) return
             silenced = offer?.key
-            context.getSystemService(NotificationManager::class.java).cancel(IncomingCalls.NOTIFICATION_ID)
-            refresh(context)
+            val call = IncomingCalls.active() ?: return
+            val service = instance
+            if (service != null) {
+                val updated = runCatching {
+                    ServiceCompat.startForeground(service, IncomingCalls.NOTIFICATION_ID, notification(context, call),
+                        service.captureTypes or if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL else 0)
+                }.isSuccess
+                if (!updated) refresh(context)
+            } else refresh(context)
         }
         private fun action(context: Context, offer: IncomingCallState.Offer, action: String, activity: Boolean): PendingIntent {
             val intent = Intent(context, if (activity) IncomingCallActivity::class.java else IncomingCallReceiver::class.java).apply {
@@ -100,17 +108,25 @@ class IncomingCallService : Service() {
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             })
             val ringing = call.phase == IncomingCallState.Phase.RINGING
+            if (!ringing) manager.createNotificationChannel(NotificationChannel(ONGOING_CHANNEL,
+                context.getString(R.string.notification_channel_active_calls), NotificationManager.IMPORTANCE_LOW).apply {
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            })
             val person = Person.Builder().setName(context.getString(R.string.notification_incoming_call)).setImportant(true).build()
             val show = action(context, call.offer, IncomingCalls.SHOW, true)
             val decline = action(context, call.offer, IncomingCalls.DECLINE, false)
             val answer = action(context, call.offer, IncomingCalls.ANSWER, true)
             val end = action(context, call.offer, IncomingCalls.END, false)
-            val builder = NotificationCompat.Builder(context, CHANNEL)
+            val builder = NotificationCompat.Builder(context, if (ringing) CHANNEL else ONGOING_CHANNEL)
                 .setSmallIcon(R.drawable.ic_elo_notification).setContentTitle("elo.now")
                 .setContentText(context.getString(if (ringing) R.string.notification_incoming_call else if (call.phase == IncomingCallState.Phase.ANSWERING) R.string.notification_connecting_call else R.string.notification_chat_session))
                 .setContentIntent(show).setCategory(NotificationCompat.CATEGORY_CALL)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC).setOngoing(true).setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_MAX).setSilent(!ringing || silenced == call.offer.key)
+                .setPriority(if (ringing) NotificationCompat.PRIORITY_MAX else NotificationCompat.PRIORITY_LOW)
+                .setSilent(!ringing || silenced == call.offer.key)
                 .setStyle(if (ringing) NotificationCompat.CallStyle.forIncomingCall(person, decline, answer)
                     else NotificationCompat.CallStyle.forOngoingCall(person, end))
             if (call.deadline != Long.MAX_VALUE) builder.setTimeoutAfter(maxOf(1, call.deadline - System.currentTimeMillis()))

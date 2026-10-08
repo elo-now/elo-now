@@ -65,3 +65,5 @@ __pycache__/
 /release/
 /docs/STORE_RELEASE.md
 /docs/VALIDATION.md
+
+/apps/desktop/src-tauri/macos/DiagnosticsResources/

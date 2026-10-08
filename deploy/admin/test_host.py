@@ -241,7 +241,8 @@ def prepare(root, source, bundle, version):
                 "message_lifetimes": retentions, "default_message_lifetime": 86400}
     calls_config = {"bind": "127.0.0.1:19920", "public_url": origin + "/calls/v1",
                     "data": "/var/lib/elo-calls", "admission_url": "http://127.0.0.1:19901/internal/calls/admission",
-                    "admission_key": "/etc/elo/calls/admission.key", "max_connections": 64, "media": media}
+                    "admission_key": "/etc/elo/calls/admission.key", "max_connections": 64,
+                    "witness": witness, "media": media}
     for path, content, uid in (
         (root / "api/config/config.json", api_config, uids["api"]),
         (root / "export/config/manifest-input.json", manifest, uids["export"]),

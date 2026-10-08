@@ -2,7 +2,7 @@ import { UpdateBanner } from "./UpdateGate";
 import { PasswordInput } from "./PasswordInput";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./diagnosticInvoke";
 import { t } from "./i18n";
 import { Icon } from "./Icon";
 import type { Theme } from "./theme";

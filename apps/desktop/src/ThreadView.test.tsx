@@ -98,7 +98,7 @@ describe.each([true, false])(
       }
     });
     it("always offers a reply its own expiry even when the original has a deadline", () => {
-      expect(render(mobile)).toContain('aria-label="Keep:"');
+      expect(render(mobile)).toContain("No expiry");
       const expiring = {
         ...root,
         body: {
@@ -110,7 +110,7 @@ describe.each([true, false])(
         },
       };
       const html = render(mobile, { thread: { ...thread, root: expiring } });
-      expect(html).toContain('aria-label="Keep:"');
+      expect(html).toContain("No expiry");
       expect(html).not.toContain(
         'placeholder="' + t("composer.unavailable") + '"',
       );
@@ -131,7 +131,7 @@ describe.each([true, false])(
       expect(html).not.toContain(
         'placeholder="' + t("composer.unavailable") + '"',
       );
-      expect(html).toContain('aria-label="Keep:"');
+      expect(html).toContain("No expiry");
       expect(html).not.toMatch(/<button[^>]*aria-label="Send"[^>]*disabled=""/);
     });
   },

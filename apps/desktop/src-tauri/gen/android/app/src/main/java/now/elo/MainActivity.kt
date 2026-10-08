@@ -33,7 +33,10 @@ class MainActivity : TauriActivity() {
     // Keep the same mark across the Android starting window and WebView startup.
     // The WebView stays visible underneath so it can prepare its first frame.
     val container = FrameLayout(this)
-    container.addView(view, FrameLayout.LayoutParams(
+    val appContent = FrameLayout(this)
+    appContent.addView(view, FrameLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    container.addView(appContent, FrameLayout.LayoutParams(
       ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     val cover = View(this).apply {
       setBackgroundResource(R.drawable.elo_launch_background)
@@ -44,7 +47,21 @@ class MainActivity : TauriActivity() {
       ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     launchWebView = view
     launchCover = cover
+    // Keep the cover in the same full-window coordinates as windowBackground.
+    // Insetting their shared parent moves the star when the WebView appears.
+    // Only app content avoids system bars, cutouts and the keyboard; the cover
+    // stays centered until the first usable WebView frame replaces it.
+    ViewCompat.setOnApplyWindowInsetsListener(container) { _, windowInsets ->
+      val handled = WindowInsetsCompat.Type.systemBars() or
+        WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime()
+      val safe = windowInsets.getInsets(handled)
+      appContent.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+      WindowInsetsCompat.Builder(windowInsets)
+        .setInsets(handled, Insets.NONE)
+        .build()
+    }
     super.setContentView(container)
+    ViewCompat.requestApplyInsets(container)
   }
 
   override fun onWebViewDestroyed(webView: WebView) {
@@ -180,19 +197,5 @@ class MainActivity : TauriActivity() {
     clearPhotoCaptures()
     clearOldShareFiles()
     super.onCreate(savedInstanceState)
-
-    // Older Android WebViews do not expose system bars or the keyboard to CSS.
-    // Size the native container and zero the handled insets for its WebView.
-    val content = findViewById<View>(android.R.id.content)
-    ViewCompat.setOnApplyWindowInsetsListener(content) { view, windowInsets ->
-      val handled = WindowInsetsCompat.Type.systemBars() or
-        WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime()
-      val safe = windowInsets.getInsets(handled)
-      view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
-      WindowInsetsCompat.Builder(windowInsets)
-        .setInsets(handled, Insets.NONE)
-        .build()
-    }
-    ViewCompat.requestApplyInsets(content)
   }
 }

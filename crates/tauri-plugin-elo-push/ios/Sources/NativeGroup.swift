@@ -1,3 +1,4 @@
+import EloDiagnostics
 import Foundation
 import AVFoundation
 import CryptoKit
@@ -69,6 +70,7 @@ import LiveKit
             }
             subscribeAdmitted()
         } catch {
+            EloDiagnostics.mediaFailure(error, stage: "group_connect_failed")
             await stop().value
             throw error
         }

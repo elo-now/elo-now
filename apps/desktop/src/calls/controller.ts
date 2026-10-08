@@ -1,3 +1,5 @@
+import { diagnostic } from "../diagnostics";
+import { callErrorCopy } from "./errors";
 import { updateRequired, subscribeUpdateRequired } from "../releasePolicy";
 import type { Stream, View } from "../model";
 import {
@@ -140,8 +142,23 @@ export class Calls {
     if (set.size > 2048) set.delete(set.values().next().value!);
   }
   dismissError = () => this.change({ error: undefined });
-  expand = () => this.change({ expanded: true });
+  expand = () => this.change({ expanded: true, minimized: undefined });
   collapse = () => this.change({ expanded: false });
+  minimize = (call = this.snapshot.active) => {
+    const key = call
+      ? sessionKey(call)
+      : this.snapshot.phase === "connecting" && this.snapshot.chat
+        ? `pending:${scopeKey(this.snapshot.chat)}`
+        : undefined;
+    if (key)
+      this.change({
+        minimized: key,
+        expanded:
+          this.snapshot.active && sessionKey(this.snapshot.active) !== key
+            ? this.snapshot.expanded
+            : false,
+      });
+  };
   cancelJoin = () => this.change({ joinRequest: undefined });
   setNativePresented = (presented: Snapshot["nativePresented"]) =>
     this.change({ nativePresented: presented ?? [] });
@@ -243,6 +260,7 @@ export class Calls {
       phase: "connecting",
       error: undefined,
       joinRequest: undefined,
+      minimized: undefined,
       incoming: (this.snapshot.incoming ?? []).filter(
         (call) => sessionKey(call) !== sessionKey(value.call),
       ),
@@ -279,9 +297,17 @@ export class Calls {
   }
   reveal(chat: Stream) {
     if (!this.view) return;
-    const call = this.snapshot.available[scopeKey(chat)];
-    if (!call) return;
+    const call =
+      this.snapshot.active && callKey(this.snapshot.active) === scopeKey(chat)
+        ? this.snapshot.active
+        : this.snapshot.available[scopeKey(chat)];
+    if (!call) {
+      if (this.snapshot.minimized === `pending:${scopeKey(chat)}`)
+        this.change({ minimized: undefined });
+      return;
+    }
     this.change({
+      minimized: undefined,
       dismissed: saveDismissed(
         this.view.identity,
         (this.snapshot.dismissed ?? []).filter(
@@ -302,21 +328,39 @@ export class Calls {
       ),
     });
   }
-  requestStart(chat: Stream, call = this.snapshot.available[scopeKey(chat)]) {
+  requestStart(
+    chat: Stream,
+    call = this.snapshot.active &&
+    callKey(this.snapshot.active) === scopeKey(chat)
+      ? this.snapshot.active
+      : this.snapshot.available[scopeKey(chat)],
+  ) {
+    const restoring = call && this.snapshot.minimized === sessionKey(call);
+    const invitationId =
+      call && this.view && isRingingFor(call, this.view.identity)
+        ? call.invitations?.[this.view.identity]?.invitation_id
+        : undefined;
     this.reveal(chat);
+    if (
+      !this.snapshot.active &&
+      this.snapshot.phase === "connecting" &&
+      this.snapshot.chat &&
+      scopeKey(this.snapshot.chat) === scopeKey(chat)
+    )
+      return;
     if (
       call &&
       this.snapshot.active?.call_id === call.call_id &&
       callKey(this.snapshot.active) === callKey(call)
     ) {
-      this.expand();
+      if (!restoring) this.expand();
       return;
     }
     if (this.snapshot.active || this.snapshot.phase !== "idle") {
-      this.change({ joinRequest: { chat, call } });
+      this.change({ joinRequest: { chat, call, invitation_id: invitationId } });
       return;
     }
-    void this.answer(chat, call);
+    void this.answer(chat, call, false, invitationId);
   }
   async answer(
     chat: Stream,
@@ -350,7 +394,9 @@ export class Calls {
       }
       if (this.snapshot.active || this.snapshot.phase !== "idle") {
         if (!replace) {
-          this.change({ joinRequest: { chat, call } });
+          this.change({
+            joinRequest: { chat, call, invitation_id: invitationId },
+          });
           return;
         }
         await this.leave();
@@ -491,7 +537,29 @@ export class Calls {
     }
   }
   private change(update: Partial<Snapshot>) {
+    if (update.error && update.error !== this.snapshot.error)
+      diagnostic("error", "ui", callErrorCopy(update.error).message);
+    if (update.phase && update.phase !== this.snapshot.phase)
+      diagnostic("event", "call", update.phase);
     this.snapshot = { ...this.snapshot, ...update };
+    const minimized = this.snapshot.minimized;
+    if (
+      minimized &&
+      !(
+        (this.snapshot.active &&
+          sessionKey(this.snapshot.active) === minimized) ||
+        Object.values(this.snapshot.available).some(
+          (call) => sessionKey(call) === minimized,
+        ) ||
+        this.snapshot.incoming?.some(
+          (call) => sessionKey(call) === minimized,
+        ) ||
+        (this.snapshot.phase === "connecting" &&
+          this.snapshot.chat &&
+          `pending:${scopeKey(this.snapshot.chat)}` === minimized)
+      )
+    )
+      this.snapshot.minimized = undefined;
     this.listeners.forEach((fn) => fn());
   }
   update(view: View | null | undefined) {
@@ -519,6 +587,7 @@ export class Calls {
         incoming: [],
         joinRequest: undefined,
         expanded: false,
+        minimized: undefined,
         nativePresented: [],
         dismissed: view ? readDismissed(view.identity) : [],
       });
@@ -1238,6 +1307,7 @@ export class Calls {
       error: undefined,
       phase: "connecting",
       chat,
+      minimized: undefined,
     });
     const generation = ++this.generation;
     this.pendingMediaAdmission = generation;
@@ -1322,6 +1392,10 @@ export class Calls {
       this.change({
         active: result.call,
         chat,
+        minimized:
+          this.snapshot.minimized === `pending:${scopeKey(chat)}`
+            ? sessionKey(result.call)
+            : undefined,
         media: {
           audio_muted: false,
           video_published: false,
@@ -1727,6 +1801,7 @@ export class Calls {
       media: { ...muted },
       tiles: [],
       expanded: false,
+      minimized: undefined,
       changingMedia: false,
     });
   }
@@ -1739,6 +1814,13 @@ export class Calls {
       (reason === "user" || reason === "native_end")
     )
       this.dismiss(active);
+    // Leaving a direct call ends that session on the service. Its delayed
+    // presence must not reappear as Answer/Join while Leave is in flight.
+    if (active?.kind === "direct")
+      this.rememberSession(this.endedSessions, active.call_id);
+    const available = { ...this.snapshot.available };
+    if (active && available[callKey(active)]?.call_id === active.call_id)
+      delete available[callKey(active)];
     if (active || this.sessionWork.size) this.refreshBeforeStart = true;
     ++this.generation;
     clearTimeout(this.notificationRetry);
@@ -1757,10 +1839,15 @@ export class Calls {
     this.nonces.clear();
     this.change({
       active: undefined,
+      available,
+      incoming: (this.snapshot.incoming ?? []).filter(
+        (call) => !active || sessionKey(call) !== sessionKey(active),
+      ),
       chat: undefined,
       phase: "idle",
       changingMedia: false,
       expanded: false,
+      minimized: undefined,
       media: { ...muted },
       tiles: [],
     });

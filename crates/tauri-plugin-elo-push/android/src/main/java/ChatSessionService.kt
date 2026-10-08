@@ -102,7 +102,8 @@ internal object ChatSessions {
         prefs.all.keys.filter { it.startsWith("call-") || it == "call" || it == "calls-enabled" }.forEach { edit.remove(it) }
         edit.apply()
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.notificationChannels.filter { it.id.startsWith("elo_calls_") && it.id != "elo_calls_v1" }.forEach { manager.deleteNotificationChannel(it.id) }
+        manager.notificationChannels.filter { it.id.startsWith("elo_calls_") &&
+            it.id !in setOf("elo_calls_v1", "elo_calls_active_v1") }.forEach { manager.deleteNotificationChannel(it.id) }
         if (state.active() == null) manager.cancel(NOTIFICATION_ID)
     }
 }

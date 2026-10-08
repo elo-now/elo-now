@@ -1,3 +1,4 @@
+import { diagnosticErrorMessage } from "./diagnostics";
 import { errorText, t, type MessageKey } from "./i18n";
 import { en } from "./locales/en";
 
@@ -449,6 +450,7 @@ const patterns: [RegExp, MessageKey][] = [
     "error.biometricFailed",
   ],
   [/biometryLockout/i, "error.biometricLocked"],
+  [/keychainUnavailable/i, "error.biometricBuildUnavailable"],
   [
     /(itemNotFound|keychainError|dataNeedsReenrollment)/i,
     "error.savedUnlockInvalid",
@@ -469,7 +471,10 @@ function reasons(error: unknown): string[] {
         try {
           visit(JSON.parse(text), depth + 1);
         } catch {
-          /* Invalid diagnostics are not UI text. */
+          // Native plugins also return bracketed error codes such as
+          // "[keychainUnavailable] - ...". Only known codes are translated;
+          // the raw diagnostic is never shown to the user.
+          output.push(text);
         }
       } else output.push(text);
     } else if (value && typeof value === "object" && !seen.has(value)) {
@@ -546,7 +551,11 @@ export function presentError(
 ): { message: string; detail?: string } {
   for (const reason of reasons(error)) {
     const message = explanation(reason, passwordBytes);
-    if (message && message !== t("error.generic")) return { message };
+    if (message && message !== t("error.generic")) {
+      diagnosticErrorMessage(message);
+      return { message };
+    }
   }
+  diagnosticErrorMessage(t("error.generic"));
   return { message: t("error.generic") };
 }

@@ -27,34 +27,42 @@
   background-image: none;
 }
 
-.motif-selector {
-  display: flex;
+.motif-settings-row {
+  display: grid;
+  grid-template-columns: var(--appearance-tile-size) minmax(0, 1fr);
   align-items: center;
   gap: 12px;
-  width: 100%;
-  padding: 4px 14px 4px 4px;
-  text-align: left;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--elo-line);
+}
+.motif-selector {
+  display: grid;
+  place-items: center;
+  width: var(--appearance-tile-size);
+  height: var(--appearance-tile-size);
+  padding: 8px;
   color: var(--elo-text);
   background: var(--elo-surface);
   border: 1px solid var(--elo-line);
   border-radius: 12px;
   font-size: var(--elo-type-label);
 }
-.motif-selector > .ui-icon {
-  margin-left: auto;
+.motif-selector .motif-art {
+  width: 100%;
+  height: 100%;
 }
-.appearance-page .motif-opacity-slider {
-  margin-top: 8px;
+.motif-opacity-control {
+  min-width: 0;
 }
 .appearance-page .motif-opacity-label {
+  position: relative;
+  top: -6px;
   display: flex;
   flex-direction: row;
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
   margin: 0;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--elo-line);
   color: var(--elo-muted);
   font-size: var(--elo-type-caption);
   font-weight: 400;

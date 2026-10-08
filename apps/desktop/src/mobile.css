@@ -336,6 +336,7 @@
     color: var(--elo-onButton);
   }
   .composer {
+    --composer-inset: calc(var(--elo-input-inset) * var(--elo-control-density));
     display: flex;
     align-items: flex-end;
     margin: 0 12px 8px;
@@ -357,15 +358,15 @@
       var(--elo-control-height),
       calc(var(--app-viewport-height, 100dvh) / 3)
     );
-    padding: calc(10px * var(--elo-control-density));
+    padding-block: max(
+      calc(10px * var(--elo-control-density)),
+      calc((var(--elo-control-height) - 1.5em) / 2)
+    );
     /* Include the composer's 1px border and 2px padding in the shared inset. */
-    padding-inline: calc(var(--elo-input-inset) - 3px);
+    padding-inline: calc(var(--composer-inset) - 3px);
     resize: none;
     line-height: 1.5;
     border-radius: 10px;
-  }
-  :root[data-ui-scale="compact"] .composer textarea {
-    padding-block: calc(10px * var(--elo-control-density) + 1.5px);
   }
   .composer > div,
   .shell[data-mode="default"] .composer > div {
@@ -383,31 +384,35 @@
   }
   .composer > .composer-attachment-uploading,
   .shell[data-mode="default"] .composer > .composer-attachment-uploading {
-    padding-inline: calc(var(--elo-input-inset) - 3px);
+    padding-inline: calc(var(--composer-inset) - 3px);
   }
   .composer > textarea {
     flex-basis: 100%;
   }
   .shell[data-mode] .composer > .composer-actions {
     flex: 0 0 100%;
-    padding: 4px calc(var(--elo-input-inset) - 3px) 8px;
-    gap: 4px;
+    padding: calc(4px * var(--elo-control-density))
+      calc(var(--composer-inset) - 3px) calc(8px * var(--elo-control-density));
+    gap: calc(4px * var(--elo-control-density));
   }
-  .composer button:not(.attachment-cancel) {
-    width: 44px;
+  .composer > .composer-actions > button:not(.attachment-cancel) {
+    width: var(--elo-control-height);
+    height: var(--elo-control-height);
     min-height: var(--elo-control-height);
-    padding: calc(10px * var(--elo-control-density));
+    padding: 0;
     margin: 0;
     border-radius: 12px;
     display: grid;
     place-items: center;
   }
-  .composer .composer-expiry button {
+  .composer > .composer-actions > button.composer-expiry-link {
     width: auto;
-    min-width: 44px;
-    min-height: 32px;
-    padding: 4px 12px;
-    border-radius: 999px;
+    min-width: 0;
+    min-height: var(--elo-control-height);
+    padding: 4px 0;
+    margin-right: auto;
+    border-radius: 0;
+    display: inline-flex;
   }
   .settings-header {
     display: flex;
