@@ -135,7 +135,7 @@ def compose_configuration(root, certificate_directory, origin, version, uids):
     services = {}
     for role, image, target in (("api", "elo-api", "api"), ("wake", "elo-wake", "wake"), ("calls", "elo-calls", "calls")):
         uid = uids[role]
-        memory = "2g" if role == "api" else "512m"
+        memory = {"api": "2g", "wake": "512m", "calls": "1536m"}[role]
         services[role] = {
             "image": f"{image}:{version}", "pull_policy": "never", "user": f"{uid}:{uid}",
             "network_mode": "host", "read_only": True, "init": True, "restart": "unless-stopped",
@@ -225,6 +225,7 @@ def prepare(root, source, bundle, version):
     # The read-only certificate submount needs an existing mount point beneath /etc/caddy.
     provision.directory(root / "proxy/config/public-tls", uids["proxy"])
     provision.secret(root / "api/config/backup-access.key", uids["api"], root / "api/data", hexadecimal=True)
+    registration_key = provision.secret(root / "api/config/registration-signing-key.bin", uids["api"], root / "api/data")
     admission = provision.secret(root / "calls/config/admission.key", uids["calls"], root / "calls/data", hexadecimal=True)
     provision.stable(root / "api/config/call-admission.key", admission, uids["api"])
     signing_key = provision.secret(root / "export/config/signing-key.bin", uids["export"], root / "api/data")
@@ -232,6 +233,7 @@ def prepare(root, source, bundle, version):
     api_config = {"root": "/var/lib/elo-api", "public_url": origin, "max_spaces_per_identity": 2,
                   "max_spaces": 32, "max_space_creations_per_day": 16, "mailbox_quota_bytes": 150000000,
                   "backup_access_key": "/etc/elo/api/backup-access.key", "witness": witness,
+                  "registration_signing_key": "/etc/elo/api/registration-signing-key.bin",
                   "allowed_creators": [], "allowed_message_retentions": retentions,
                   "call_admission_key": "/etc/elo/api/call-admission.key"}
     manifest = {"v": 1, "kind": "hosting.configuration", "revision": 1, "name": "9bits test",
@@ -242,6 +244,7 @@ def prepare(root, source, bundle, version):
     calls_config = {"bind": "127.0.0.1:19920", "public_url": origin + "/calls/v1",
                     "data": "/var/lib/elo-calls", "admission_url": "http://127.0.0.1:19901/internal/calls/admission",
                     "admission_key": "/etc/elo/calls/admission.key", "max_connections": 64,
+                    "transport_memory_mib": 768,
                     "witness": witness, "media": media}
     for path, content, uid in (
         (root / "api/config/config.json", api_config, uids["api"]),
@@ -252,6 +255,9 @@ def prepare(root, source, bundle, version):
     ):
         provision.stable(path, provision.json_bytes(content), uid)
     provision.stable(root / "public/witness-pin.json", provision.json_bytes(witness), 0, 0o644)
+    provision.stable(root / "public/registration-host.json", provision.json_bytes({
+        "host": origin + "/spaces/v1/create", "public_key": provision.public_key(registration_key),
+    }), 0, 0o644)
     provision.stable(root / "proxy/config/Caddyfile", proxy_configuration(origin, hostname), uids["proxy"])
     provision.stable(root / "compose.api.yaml", provision.json_bytes(compose_configuration(root, certificate_directory, origin, version, uids)), 0)
     provision.stable(root / "compose.env", f"ELO_STATE={root}\nELO_VERSION={version}\n".encode(), 0)

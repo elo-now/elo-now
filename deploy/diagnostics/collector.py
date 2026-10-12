@@ -4,6 +4,7 @@ import argparse
 import collections
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,28 @@ VOCABULARY = {k: set(v) for k, v in json.loads(Path(__file__).with_name('codes.j
 INGEST = '/diagnostics/v1/errors'
 RETENTION = 14 * 86400
 MAX_ROWS = 10000
+MAX_REQUESTS = 600
+REQUESTS_PER_NETWORK = 60
+REPORTS_PER_NETWORK = 20
+SOURCE_HEADER = 'X-Elo-Diagnostics-Source'
+
+
+def source_network(value):
+    if not isinstance(value, str) or '%' in value:
+        raise ValueError('Invalid source address')
+    address = ipaddress.ip_address(value)
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    # Only volatile minute counters use these keys; never persist them with reports.
+    return (address.version, int(address) if address.version == 4 else int(address) >> 64)
+
+
+def proxy_source(peer, headers):
+    values = headers.get_all(SOURCE_HEADER, [])
+    if peer != '127.0.0.1' or len(values) != 1:
+        raise ValueError('Trusted loopback proxy source required')
+    source_network(values[0])
+    return values[0]
 
 
 def exact(value, fields):
@@ -70,6 +93,7 @@ class Store:
         self.path, self.clock, self.max_rows = path, clock, max_rows
         self.lock = threading.RLock()
         self.minute, self.requests, self.accepted = -1, 0, collections.Counter()
+        self.network_requests, self.network_accepted = collections.Counter(), collections.Counter()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA auto_vacuum=FULL')
         self.db.execute('PRAGMA secure_delete=ON')
@@ -83,28 +107,43 @@ class Store:
 
     def prune(self):
         with self.lock, self.db:
+            self.reset_limits()
             self.db.execute('DELETE FROM reports WHERE received <= ?', (int(self.clock()) - RETENTION,))
             self.db.execute('DELETE FROM reports WHERE seq IN (SELECT seq FROM reports ORDER BY seq DESC LIMIT -1 OFFSET ?)', (self.max_rows,))
 
-    def allow_request(self):
-        with self.lock:
-            minute = int(self.clock()) // 60
-            if minute != self.minute:
-                self.minute, self.requests, self.accepted = minute, 0, collections.Counter()
-            self.requests += 1
-            return self.requests <= 600
+    def reset_limits(self):
+        # Call only while holding the store lock. Also cleared by idle maintenance.
+        minute = int(self.clock()) // 60
+        if minute != self.minute:
+            self.minute, self.requests, self.accepted = minute, 0, collections.Counter()
+            self.network_requests, self.network_accepted = collections.Counter(), collections.Counter()
 
-    def ingest(self, value):
+    def allow_request(self, source):
+        network = source_network(source)
+        with self.lock:
+            self.reset_limits()
+            if self.network_requests[network] >= REQUESTS_PER_NETWORK or self.requests >= MAX_REQUESTS:
+                return False
+            # Rejected sources do not consume the shared budget or create map entries.
+            self.requests += 1
+            self.network_requests[network] += 1
+            return True
+
+    def ingest(self, value, source):
+        network = source_network(source)
         now = int(self.clock())
         if not valid(value, now):
             return 400
         r = value['report']
         with self.lock, self.db:
+            self.reset_limits()
             if self.db.execute('SELECT 1 FROM reports WHERE installation=? AND id=?', (value['installation'], r['id'])).fetchone():
                 return 204
-            if self.accepted.total() >= 120 or self.accepted[value['installation']] >= 20:
+            if (self.accepted.total() >= 120 or self.accepted[value['installation']] >= 20
+                    or self.network_accepted[network] >= REPORTS_PER_NETWORK):
                 return 429
             self.accepted[value['installation']] += 1
+            self.network_accepted[network] += 1
             self.db.execute('INSERT INTO reports(received,installation,id,platform,version,build,code,body) VALUES(?,?,?,?,?,?,?,?)',
                             (now, value['installation'], r['id'], value['platform'], value['version'], value['build'], r['event']['code'], json.dumps(value, separators=(',', ':'))))
             self.prune()
@@ -152,7 +191,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != INGEST:
             return self.reply(404)
-        if not self.server.store.allow_request():
+        # Caddy overwrites this header from the actual TCP peer, never X-Forwarded-For.
+        # The collector itself only listens on loopback.
+        try:
+            source = proxy_source(self.client_address[0], self.headers)
+        except ValueError:
+            return self.reply(403)
+        if not self.server.store.allow_request(source):
             return self.reply(429)
         if (self.headers.get_all('Transfer-Encoding') or len(self.headers.get_all('Content-Type', [])) != 1
                 or self.headers.get('Content-Type') not in ('application/json', 'application/json; charset=utf-8')):
@@ -164,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             data = self.rfile.read(int(lengths[0]))
             if len(data) != int(lengths[0]):
                 return self.reply(400)
-            self.reply(self.server.store.ingest(decode(data)))
+            self.reply(self.server.store.ingest(decode(data), source))
         except (ValueError, TypeError, UnicodeError, RecursionError):
             self.reply(400)
         except TimeoutError:

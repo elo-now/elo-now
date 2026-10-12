@@ -1,5 +1,6 @@
 //! Identity-signed, retryable hosted Space creation. No client secret leaves the device.
 use super::*;
+use crate::ids::ObjectId;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -281,6 +282,173 @@ pub(crate) mod tests {
         request.work = request.work.wrapping_add(1);
         assert!(request.verify_work().is_err());
     }
+
+    #[test]
+    fn registration_ticket_must_match_the_selected_host_device_genesis_and_witness() {
+        use crate::witness::registration::RegistrationTicket;
+        let pin = crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(
+                ed25519_dalek::SigningKey::from_bytes(&[91; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            key_generation: 1,
+        };
+        let (owner, command) = owner_creation_with_witness(Some(pin.clone()));
+        let authority =
+            verify_creation_authority_with_witness(&command, owner.credential(), Some(&pin))
+                .unwrap()
+                .unwrap();
+        let ticket = RegistrationTicket {
+            v: 1,
+            kind: "witness.registration_ticket".into(),
+            audience: pin.url.clone(),
+            witness_public_key: pin.public_key.clone(),
+            witness_key_generation: 1,
+            host: command.host.clone(),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            authority_head: authority.head_id().unwrap(),
+            creator_identity: owner.identity_id(),
+            credential_id: owner.credential().id(),
+            issued_at_ms: 10_000,
+            expires_at_ms: 610_000,
+            reservation_id: ObjectId::of_ciphertext(
+                format!("elo.host.v1:{}:{}", owner.identity_id(), command.request_id).as_bytes(),
+            )
+            .to_string(),
+        };
+        let check = |ticket: &RegistrationTicket, at| {
+            let signed = ticket.sign(&[92; 32]).unwrap();
+            verify_registration_ticket_target(
+                &STANDARD.encode(signed.bytes()),
+                &command.host,
+                &authority,
+                owner.credential(),
+                &pin,
+                at,
+            )
+        };
+        check(&ticket, 10_000).unwrap();
+        for field in 0..10 {
+            let mut changed = ticket.clone();
+            match field {
+                0 => changed.host = "https://other.example.test/spaces/v1/create".into(),
+                1 => changed.space_id = SpaceId::from_bytes([1; 32]),
+                2 => changed.stream_id = StreamId::from_bytes([1; 16]),
+                3 => changed.authority_head = RecordId::from_bytes([1; 32]),
+                4 => changed.creator_identity = IdentityId::from_bytes([1; 32]),
+                5 => changed.credential_id = RecordId::from_bytes([1; 32]),
+                6 => changed.audience = "https://other.example.test/witness/v1".into(),
+                7 => {
+                    changed.witness_public_key = record::encode_hex(
+                        ed25519_dalek::SigningKey::from_bytes(&[93; 32])
+                            .verifying_key()
+                            .as_bytes(),
+                    )
+                }
+                8 => changed.witness_key_generation += 1,
+                _ => changed.reservation_id = "01".repeat(32),
+            }
+            assert!(
+                check(&changed, 10_000).is_err(),
+                "mismatched ticket field {field}"
+            );
+        }
+        assert!(check(&ticket, 4_999).is_err());
+        assert!(check(&ticket, 610_000).is_err());
+    }
+
+    #[tokio::test]
+    async fn exhausted_hosting_never_sends_a_registration_to_the_witness() {
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = ProfileDraft::new()
+            .unwrap()
+            .save_named(
+                directory.path().join("profile"),
+                "synthetic registration password".into(),
+                "General",
+                "Owner",
+            )
+            .await
+            .unwrap();
+        app.allow_loopback = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let host = format!("{base}/spaces/v1/create");
+        let pin = crate::authority::WitnessPin {
+            url: "https://witness.example.test/witness/v1".into(),
+            public_key: record::encode_hex(
+                ed25519_dalek::SigningKey::from_bytes(&[94; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            key_generation: 1,
+        };
+        app.configure_witness_pin(Some(pin.clone())).unwrap();
+        app.configure_invitation_host(&host).unwrap();
+        app.witness_test_url = Some(base);
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let witness_steps = steps.clone();
+        let prepare_steps = steps.clone();
+        let create_steps = steps.clone();
+        let expected_host = host.clone();
+        let router = axum::Router::new()
+            .route(
+                "/command",
+                axum::routing::post(
+                    move |axum::Json(request): axum::Json<crate::witness::Request>| {
+                        let command: crate::witness::Command =
+                            decode_record(&request.command).unwrap().decode().unwrap();
+                        assert!(matches!(command.operation, crate::witness::Operation::Read));
+                        witness_steps.lock().unwrap().push("read");
+                        async { axum::http::StatusCode::NOT_FOUND }
+                    },
+                ),
+            )
+            .route(
+                "/spaces/v1/prepare",
+                axum::routing::post(move |axum::Json(request): axum::Json<CreateRequest>| {
+                    verify_create_with_witness(
+                        &request,
+                        &expected_host,
+                        now().unwrap().as_millis() as u64,
+                        Some(&pin),
+                    )
+                    .unwrap();
+                    prepare_steps.lock().unwrap().push("prepare");
+                    async { axum::http::StatusCode::TOO_MANY_REQUESTS }
+                }),
+            )
+            .route(
+                "/spaces/v1/create",
+                axum::routing::post(move || {
+                    create_steps.lock().unwrap().push("create");
+                    async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let error = app
+            .create_hosted(
+                &host,
+                &"ac".repeat(16),
+                "Prepared Space",
+                "owner@example.test",
+                Default::default(),
+                true,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("currently at capacity"));
+        assert_eq!(*steps.lock().unwrap(), vec!["read", "prepare"]);
+        server.abort();
+        app.close().await.unwrap();
+    }
 }
 
 // Paid once per signed creation, never during chat synchronization. Verification
@@ -339,6 +507,49 @@ pub struct CreateCommand {
 #[serde(deny_unknown_fields)]
 pub struct CreateResponse {
     pub ciphertext: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareResponse {
+    pub registration_ticket: String,
+}
+
+fn verify_registration_ticket_target(
+    encoded: &str,
+    host: &str,
+    authority: &Authority,
+    credential: &VerifiedCredential,
+    pin: &crate::authority::WitnessPin,
+    now_ms: u64,
+) -> Result<()> {
+    let (ticket, _) = crate::witness::registration::RegistrationTicket::parse(encoded)?;
+    let reservation = ObjectId::of_ciphertext(
+        format!(
+            "elo.host.v1:{}:{}",
+            credential.identity(),
+            authority.stream()
+        )
+        .as_bytes(),
+    );
+    if ticket.host != host
+        || ticket.space_id != authority.space()
+        || ticket.stream_id != authority.stream()
+        || Some(ticket.authority_head) != authority.head_id()
+        || ticket.creator_identity != credential.identity()
+        || ticket.credential_id != credential.id()
+        || ticket.audience != pin.url
+        || ticket.witness_public_key != pin.public_key
+        || ticket.witness_key_generation != pin.key_generation
+        || ticket.reservation_id != reservation.to_string()
+        || ticket.issued_at_ms > now_ms.saturating_add(5_000)
+        || ticket.expires_at_ms <= now_ms
+    {
+        return Err("Unexpected hosting registration ticket.".into());
+    }
+    // Only the independently pinned witness knows authorized registration keys.
+    // The ticket never establishes a new client trust anchor: registration still
+    // requires its signed receipt and a fresh witness Read of this exact head.
+    Ok(())
 }
 pub fn validate_host(value: &str, allow_loopback: bool) -> Result<()> {
     let url = reqwest::Url::parse(value)?;
@@ -593,29 +804,14 @@ impl ClientApp {
             message_lifetime_seconds,
             require_approval,
         )?;
-        let command: CreateCommand = decode_record(&request.record)?.decode()?;
+        let mut command: CreateCommand = decode_record(&request.record)?.decode()?;
         let authority = verify_creation_authority_with_witness(
             &command,
             self.session.credential(),
             self.witness_pin.as_ref(),
         )?
         .ok_or("Missing owner-managed Space authority.")?;
-        if self.witness_pin.is_some() {
-            self.require_invitation_origin(host)?;
-            // Registration may have succeeded before a previous response was lost.
-            // A full independently fresh Read reconciles that outcome.
-            if self.witness_read_authority(&authority).await.is_err() {
-                let registration = self.witness_register_authority(&authority).await;
-                let observed = self.witness_read_authority(&authority).await;
-                match (registration, observed) {
-                    (_, Ok(current)) if current.head_id() == authority.head_id() => (),
-                    (Err(error), _) => return Err(error),
-                    (_, Err(error)) => return Err(error),
-                    _ => return Err("Space creation authority changed.".into()),
-                }
-            }
-        }
-        let request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
+        let mut request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
             request.solve_work()?;
             Ok(request)
         })
@@ -626,6 +822,80 @@ impl ClientApp {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .build()?;
+        if self.witness_pin.is_some() {
+            self.require_invitation_origin(host)?;
+            // Registration may have succeeded before a previous response was lost.
+            // A full independently fresh Read reconciles that outcome.
+            if self.witness_read_authority(&authority).await.is_err() {
+                let endpoint = host
+                    .strip_suffix("/create")
+                    .ok_or("Invalid hosting address.")?;
+                let mut prepared = client
+                    .post(format!("{endpoint}/prepare"))
+                    .timeout(Duration::from_secs(30))
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(space_service::space_transport_error)?;
+                if prepared.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err("Space hosting is currently at capacity. Try again later or join an existing Space.".into());
+                }
+                if !prepared.status().is_success() {
+                    return Err(space_service::space_status_error(prepared.status()).into());
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = prepared
+                    .chunk()
+                    .await
+                    .map_err(space_service::space_transport_error)?
+                {
+                    if bytes.len() + chunk.len()
+                        > crate::witness::registration::MAX_TICKET_BYTES * 2
+                    {
+                        return Err("Space hosting response is too large.".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let prepared: PrepareResponse = serde_json::from_slice(&bytes)?;
+                verify_registration_ticket_target(
+                    &prepared.registration_ticket,
+                    host,
+                    &authority,
+                    self.session.credential(),
+                    self.trusted_witness(&authority)?,
+                    now()?.as_millis() as u64,
+                )?;
+                let registration = self
+                    .witness_register_authority_with_ticket(
+                        &authority,
+                        Some(prepared.registration_ticket),
+                    )
+                    .await;
+                let observed = self.witness_read_authority(&authority).await;
+                match (registration, observed) {
+                    (_, Ok(current)) if current.head_id() == authority.head_id() => (),
+                    (Err(error), _) => return Err(error),
+                    (_, Err(error)) => return Err(error),
+                    _ => return Err("Space creation authority changed.".into()),
+                }
+            }
+        }
+        // Re-sign only the timestamp/work if preparation and witness traffic
+        // consumed the creation freshness window. Preserve the exact genesis,
+        // initial configuration and durable reservation identity across retries.
+        let current_ms = now()?.as_millis() as u64;
+        if current_ms.abs_diff(command.issued) > 60_000 {
+            command.issued = current_ms;
+            request.record = STANDARD.encode(
+                SignedRecord::sign(&serde_json::to_vec(&command)?, self.session.signing_key())?
+                    .bytes(),
+            );
+            request = tokio::task::spawn_blocking(move || -> Result<CreateRequest> {
+                request.solve_work()?;
+                Ok(request)
+            })
+            .await??;
+        }
         let mut response = client
             .post(host)
             .json(&request)

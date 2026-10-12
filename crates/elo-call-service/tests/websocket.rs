@@ -56,6 +56,269 @@ async fn submit(socket: &mut Socket, request: elo_call_service::engine::Request)
 }
 
 #[tokio::test]
+async fn transport_memory_budget_rejects_new_upgrades_but_preserves_admitted_controls() {
+    let f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let service = Service::with_transport_memory(
+        engine,
+        Arc::new(Gate(AtomicBool::new(true))),
+        128,
+        None,
+        96,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let url = format!("ws://{address}/calls/v1/connect");
+    let (mut owner, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut owner,
+        f.request(&f.owner, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut owner, "result").await;
+    let (mut peer, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut peer,
+        f.request(&f.peer, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut peer, "result").await;
+    // An admitted peer can announce a maximum-sized frame and stop sending.
+    // The transport reserves its declared payload before authentication of that
+    // next command; the lifetime budget must therefore survive the first proof.
+    use tokio::io::AsyncWriteExt;
+    let mut header = vec![0x81, 0xff];
+    header.extend_from_slice(&(elo_call_service::engine::MAX_FRAME as u64).to_be_bytes());
+    header.extend_from_slice(&[1, 2, 3, 4]);
+    match peer.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream.write_all(&header).await.unwrap(),
+        _ => panic!("The fixture must stay on local plain TCP"),
+    }
+    // Neither the per-device, per-identity, configured connection limit nor
+    // anonymous ingress is full. Only the global memory reservation is full.
+    let denied = connect_async(&url).await.unwrap_err();
+    assert!(
+        matches!(denied, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 503)
+    );
+    submit(
+        &mut owner,
+        f.request(&f.owner, Operation::Subscribe, now(), false),
+    )
+    .await;
+    receive(&mut owner, "result").await;
+    let state = reqwest::Client::new()
+        .post(format!("http://{address}/calls/v1/state"))
+        .json(&f.request(&f.peer, Operation::Subscribe, now(), true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(state.status(), reqwest::StatusCode::OK);
+    drop(peer);
+    let (mut replacement, _) = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match connect_async(&url).await {
+                Ok(socket) => break socket,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status() == 503 =>
+                {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("Unexpected reconnect error: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    submit(
+        &mut replacement,
+        f.request(&f.peer, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut replacement, "result").await;
+    owner.close(None).await.unwrap();
+    replacement.close(None).await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn slow_anonymous_state_reads_do_not_block_other_sources_or_websocket_authentication() {
+    use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let service = Service::new(engine, Arc::new(Gate(AtomicBool::new(true))), 8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"POST /calls/v1/state HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: 192.0.2.1\r\nContent-Length: 1000\r\n\r\n").await.unwrap();
+        stalled.push(stream);
+    }
+    let endpoint = format!("http://{address}/calls/v1/state");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // Observe both handlers holding their body slots without relying on sleep.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = client
+                .post(&endpoint)
+                .header("x-real-ip", "192.0.2.1")
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut request = format!("ws://{address}/calls/v1/connect")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("x-real-ip", "198.51.100.1".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    submit(
+        &mut socket,
+        f.request(&f.owner, Operation::Subscribe, now(), true),
+    )
+    .await;
+    assert_eq!(receive(&mut socket, "result").await["type"], "result");
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .header("x-real-ip", "198.51.100.2")
+            .json(&f.request(&f.peer, Operation::Subscribe, now(), true))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    drop(stalled);
+    socket.close(None).await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn device_connection_limit_allows_mobile_overlap_and_denies_excess_before_call_mutation() {
+    let f = Fixture::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.sqlite"),
+        AUDIENCE.into(),
+        Limits::default(),
+    )
+    .unwrap();
+    let service = Service::new(engine, Arc::new(Gate(AtomicBool::new(true))), 16);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
+    let url = format!("ws://{address}/calls/v1/connect");
+    let mut sockets = Vec::new();
+    // Control, native media, incoming watchers and short-lived answer/mute or
+    // reconnect commands may overlap on a phone using the same credential.
+    for _ in 0..6 {
+        let (mut socket, _) = connect_async(&url).await.unwrap();
+        submit(
+            &mut socket,
+            f.request(&f.owner, Operation::Subscribe, now(), true),
+        )
+        .await;
+        receive(&mut socket, "result").await;
+        sockets.push(socket);
+    }
+    let (mut excess, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut excess,
+        f.request(
+            &f.owner,
+            Operation::Start {
+                kind: CallKind::Group,
+                initial_media: InitialMedia::Audio,
+            },
+            now(),
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(receive(&mut excess, "error").await["code"], "unavailable");
+    let response: Value = reqwest::Client::new()
+        .post(format!("http://{address}/calls/v1/state"))
+        .json(&f.request(&f.owner, Operation::Subscribe, now(), true))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        response["call"].is_null(),
+        "an excess socket must not start a call"
+    );
+
+    // Another admitted identity retains access while this device is saturated.
+    let (mut peer, _) = connect_async(&url).await.unwrap();
+    submit(
+        &mut peer,
+        f.request(&f.peer, Operation::Subscribe, now(), true),
+    )
+    .await;
+    receive(&mut peer, "result").await;
+    for mut socket in sockets {
+        socket.close(None).await.unwrap();
+    }
+    peer.close(None).await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
 async fn native_state_read_requires_signed_subscribe_and_current_admission_without_joining() {
     let f = Fixture::new(false);
     let directory = tempfile::tempdir().unwrap();
@@ -97,7 +360,13 @@ async fn native_state_read_requires_signed_subscribe_and_current_admission_witho
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let host = format!("http://{}", listener.local_addr().unwrap());
     let ws = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
-    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
     let client = reqwest::Client::new();
     let endpoint = format!("{host}/calls/v1/state");
     let read = || f.request(&f.peer, Operation::Subscribe, now(), true);
@@ -200,7 +469,13 @@ async fn simultaneous_starts_share_a_room_signals_are_targeted_and_host_revocati
     let service = Service::new(engine, gate.clone(), 8);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
-    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
     let (mut owner, _) = connect_async(&url).await.unwrap();
     owner
         .send(Message::Ping(vec![1, 2, 3].into()))
@@ -288,7 +563,13 @@ async fn signed_stream_membership_does_not_bypass_hosting_denial() {
     let service = Service::new(engine, Arc::new(Gate(AtomicBool::new(false))), 2);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
-    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
     let (mut socket, _) = connect_async(url).await.unwrap();
     submit(
         &mut socket,
@@ -340,7 +621,13 @@ async fn later_subscriptions_receive_calls_but_staggering_never_bypasses_admissi
     let service = Service::new(engine, gate.clone(), 4);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
-    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
     let (mut peer, _) = connect_async(&url).await.unwrap();
     let original = f.authority.clone();
     let root_hex = f.owner.credential().record().body()["root_public_key"]
@@ -455,7 +742,13 @@ async fn direct_ring_answer_and_decline_reach_every_signed_device_subscription()
     let service = Service::new(engine, Arc::new(Gate(AtomicBool::new(true))), 8);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/calls/v1/connect", listener.local_addr().unwrap());
-    let task = tokio::spawn(axum::serve(listener, server::app(service)).into_future());
+    let task = tokio::spawn(
+        axum::serve(
+            listener,
+            server::app(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .into_future(),
+    );
     let (mut owner, _) = connect_async(&url).await.unwrap();
     let (mut peer, _) = connect_async(&url).await.unwrap();
     let (mut sibling, _) = connect_async(&url).await.unwrap();

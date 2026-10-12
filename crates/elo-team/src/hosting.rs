@@ -5,7 +5,7 @@ use crate::attachments::{AttachmentStorage, AttachmentStorageConfig};
 use axum::{
     body::Body,
     extract::{Path, Request},
-    http::{HeaderMap, header},
+    http::{HeaderMap, Method, header},
     response::{Html, IntoResponse},
 };
 use elo_core::{
@@ -13,7 +13,7 @@ use elo_core::{
         space_host::{self, CreateCommand, CreateRequest, CreateResponse},
         space_service::{DeletionReceipt, SpaceAddress},
     },
-    ids::{IdentityId, ObjectId},
+    ids::{IdentityId, MailboxId, ObjectId},
     replica::{MailboxDescriptor, ReplicaStore},
     sync::PeerDescriptor,
 };
@@ -33,6 +33,7 @@ mod calls;
 mod freshness;
 mod invitation_descriptors;
 mod lifecycle;
+mod registration;
 mod service;
 use elo_core::public_space::PublicSpaceService;
 use service::HostedService;
@@ -66,6 +67,9 @@ pub(super) struct HostConfig {
     pub backup_access_key: Option<PathBuf>,
     #[serde(default)]
     pub call_admission_key: Option<PathBuf>,
+    /// Dedicated witness-registration key; separate from the offline profile signer.
+    #[serde(default)]
+    pub registration_signing_key: Option<PathBuf>,
     #[serde(default)]
     pub attachment_storage: Option<AttachmentStorageConfig>,
     /// Only a public recovery recipient belongs on the hosting server.
@@ -121,6 +125,9 @@ struct Reservation {
     // Existing advertised Spaces are never eligible for automatic reclamation.
     #[serde(default)]
     reclaim_if_unclaimed: bool,
+    /// Issuing a ticket may create durable state at the independent witness.
+    #[serde(default)]
+    registration_ticket_issued: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +146,7 @@ struct HostedSpace {
     serving: RwLock<bool>,
     client: Mutex<Option<HostedService>>,
     command_slots: Semaphore,
+    replica_slots: Semaphore,
     config: ServiceConfig,
     mailbox: elo_core::ids::MailboxId,
 }
@@ -147,6 +155,7 @@ struct Host {
     revocations: elo_core::identity::revocations::Revocations,
     call_admission_key: Option<Zeroizing<Vec<u8>>>,
     backup_access_key: Option<Zeroizing<Vec<u8>>>,
+    registration_signing_key: Option<Zeroizing<[u8; 32]>>,
     spaces: RwLock<BTreeMap<String, Arc<HostedSpace>>>,
     // A single admitted creator bounds Argon2 work and makes reservations atomic.
     creation: Mutex<()>,
@@ -281,6 +290,9 @@ impl Host {
             )?,
             call_admission_key: calls::load_key(config.call_admission_key.as_deref())?,
             backup_access_key: backup::load_key(config.backup_access_key.as_deref())?,
+            registration_signing_key: registration::load_key(
+                config.registration_signing_key.as_deref(),
+            )?,
             config,
             spaces: RwLock::new(BTreeMap::new()),
             creation: Mutex::new(()),
@@ -386,6 +398,7 @@ impl Host {
             serving: RwLock::new(true),
             client: Mutex::new(Some(client)),
             command_slots: Semaphore::new(16),
+            replica_slots: Semaphore::new(8),
             mailbox: reservation.mailbox.mailbox_id,
             config,
         }))
@@ -482,18 +495,15 @@ impl Host {
         self.provision_from_network_inner(command, creator, network, None, None)
             .await
     }
-    async fn provision_from_network_inner(
+    // Called while the creation gate is held. Allocation and abuse budgets are
+    // durable before issuing a witness registration ticket or provisioning storage.
+    fn reserve_creation(
         &self,
         command: &CreateCommand,
         creator: IdentityId,
         network: Option<String>,
         creation_evidence: Option<elo_core::public_space::AdminEvidence>,
-        freshness: Option<(
-            &elo_core::authority::Authority,
-            &elo_core::witness::VerifiedFreshness,
-        )>,
     ) -> Result<(String, Reservation)> {
-        // Never allocate a new server-owned profile, including through internal callers.
         require_owner_managed_creation(command)?;
         if self
             .config
@@ -505,27 +515,6 @@ impl Host {
                 "This profile is not allowed to create Spaces on this hosting service.".into(),
             );
         }
-        if let Some((authority, _)) = freshness {
-            let proof = command
-                .authority
-                .as_ref()
-                .ok_or("Missing creation authority.")?;
-            let pin = self
-                .config
-                .witness
-                .as_ref()
-                .ok_or("Missing hosting witness pin.")?;
-            let requested = proof.verify_witnessed(authority.space(), authority.stream(), pin)?;
-            if requested.head_id() != authority.head_id() {
-                return Err("Creation witness lease belongs to another authority.".into());
-            }
-        }
-        let check_freshness = || match (&self.witness, freshness) {
-            (Some(gate), Some((authority, lease))) => gate.check(authority, lease),
-            (None, None) => Ok(()),
-            _ => Err("Missing hosting creation witness lease.".into()),
-        };
-        check_freshness()?;
         let id = reservation_id(creator, &command.request_id);
         let path = self.config.root.join("spaces").join(&id);
         if self
@@ -538,7 +527,7 @@ impl Host {
             return Err("This Space was deleted.".into());
         }
         let reservation_path = path.join("reservation.json");
-        let mut reservation: Reservation = if reservation_path.exists() {
+        let reservation: Reservation = if reservation_path.exists() {
             serde_json::from_slice(&Zeroizing::new(vault::read_private(&reservation_path)?))?
         } else {
             // An operator's current offer only governs new reservations. Existing
@@ -610,7 +599,6 @@ impl Host {
                 *count += 1;
             }
             budget.count += 1;
-            check_freshness()?;
             save(&budget_path, &budget)?;
             let value = Reservation {
                 creator: Some(creator),
@@ -632,6 +620,7 @@ impl Host {
                 reserved_at: current()?,
                 creation_network: network,
                 reclaim_if_unclaimed: true,
+                registration_ticket_issued: false,
             };
             // Stage and rename the reservation directory so a crash cannot leave
             // a counted directory without its durable allocation descriptor.
@@ -661,6 +650,56 @@ impl Host {
         {
             return Err("Creation request cannot be changed.".into());
         }
+        Ok((id, reservation))
+    }
+    async fn provision_from_network_inner(
+        &self,
+        command: &CreateCommand,
+        creator: IdentityId,
+        network: Option<String>,
+        creation_evidence: Option<elo_core::public_space::AdminEvidence>,
+        freshness: Option<(
+            &elo_core::authority::Authority,
+            &elo_core::witness::VerifiedFreshness,
+        )>,
+    ) -> Result<(String, Reservation)> {
+        // Never allocate a new server-owned profile, including through internal callers.
+        require_owner_managed_creation(command)?;
+        if self
+            .config
+            .allowed_creators
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&creator))
+        {
+            return Err(
+                "This profile is not allowed to create Spaces on this hosting service.".into(),
+            );
+        }
+        if let Some((authority, _)) = freshness {
+            let proof = command
+                .authority
+                .as_ref()
+                .ok_or("Missing creation authority.")?;
+            let pin = self
+                .config
+                .witness
+                .as_ref()
+                .ok_or("Missing hosting witness pin.")?;
+            let requested = proof.verify_witnessed(authority.space(), authority.stream(), pin)?;
+            if requested.head_id() != authority.head_id() {
+                return Err("Creation witness lease belongs to another authority.".into());
+            }
+        }
+        let check_freshness = || match (&self.witness, freshness) {
+            (Some(gate), Some((authority, lease))) => gate.check(authority, lease),
+            (None, None) => Ok(()),
+            _ => Err("Missing hosting creation witness lease.".into()),
+        };
+        check_freshness()?;
+        let (id, mut reservation) =
+            self.reserve_creation(command, creator, network, creation_evidence)?;
+        let path = self.config.root.join("spaces").join(&id);
+        let reservation_path = path.join("reservation.json");
         if !self.spaces.read().await.contains_key(&id) {
             let mut prepared = None;
             if !path.join("config.json").exists() {
@@ -1400,6 +1439,37 @@ impl Host {
         Ok(())
     }
 }
+// Match only the transport routes before acquiring hosted authority locks. The
+// inner router remains responsible for signed URI, identity, replay and ACL checks.
+fn replica_mailbox(
+    method: &Method,
+    path: &str,
+) -> std::result::Result<Option<MailboxId>, StatusCode> {
+    let read = method == Method::GET || method == Method::HEAD;
+    let write = method == Method::POST;
+    let parts: Vec<_> = path.split('/').collect();
+    let mailbox = match parts.as_slice() {
+        ["v1", "health"] if read => return Ok(None),
+        ["v1", "mailboxes", mailbox, "inventory"] if read => mailbox,
+        ["v1", "mailboxes", mailbox, "objects", object]
+            if (read || write) && object.parse::<ObjectId>().is_ok() =>
+        {
+            mailbox
+        }
+        [
+            "v1",
+            "mailboxes",
+            mailbox,
+            "messages",
+            object,
+            "request" | "accept",
+        ] if write && object.parse::<ObjectId>().is_ok() => mailbox,
+        ["v1", "mailboxes", mailbox, "children"] if write => mailbox,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    mailbox.parse().map(Some).map_err(|_| StatusCode::NOT_FOUND)
+}
+
 // Route by the stable reservation in the path, never by profile or backend IP.
 async fn replica_request(
     State(host): State<Arc<Host>>,
@@ -1408,7 +1478,7 @@ async fn replica_request(
     let Ok(_accounts) = host.accounts.try_read() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let Some((id, _)) = request
+    let Some((id, route)) = request
         .uri()
         .path()
         .strip_prefix("/spaces/")
@@ -1419,15 +1489,40 @@ async fn replica_request(
     if id.parse::<ObjectId>().is_err() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let mailbox = match replica_mailbox(request.method(), route) {
+        Ok(mailbox) => mailbox,
+        Err(status) => return status.into_response(),
+    };
+    let token = if mailbox.is_some() {
+        let Some(token) = bearer(request.headers()).filter(|token| token.len() == 43) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        Some(token.to_owned())
+    } else {
+        None
+    };
     let space = host.spaces.read().await.get(id).cloned();
     let Some(space) = space else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let serving = space.serving.read().await;
+    let Ok(_permit) = space.replica_slots.try_acquire() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    if let Some(mailbox) = mailbox
+        && let Err(error) = space
+            .replica
+            .authorize(mailbox, token.unwrap(), request.method() == Method::POST)
+            .await
+    {
+        return error.into_response();
+    }
+    let Ok(serving) = space.serving.try_read() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     if !*serving {
         return StatusCode::GONE.into_response();
     }
-    if host.require_current_replica(&space).await.is_err() {
+    if mailbox.is_some() && host.require_current_replica(&space).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     // No prefix rewriting: the inner router checks the complete signed URI.
@@ -1437,17 +1532,27 @@ async fn replica_request(
 impl elo_core::realtime::Resolver for Host {
     fn resolve<'a>(
         &'a self,
-        replica: &'a str,
+        request: &'a elo_core::realtime::SubscriptionRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ReplicaStore>> + Send + 'a>>
     {
         Box::pin(async move {
             let _accounts = self.accounts.try_read().ok()?;
-            let id = replica
+            if request.read_token.len() != 43 {
+                return None;
+            }
+            let id = request
+                .replica
                 .strip_prefix("/spaces/")?
                 .strip_suffix("/replica/")?;
             id.parse::<ObjectId>().ok()?;
             let space = self.spaces.read().await.get(id).cloned()?;
-            let serving = space.serving.read().await;
+            let _permit = space.replica_slots.try_acquire().ok()?;
+            space
+                .replica
+                .authorize(request.mailbox, request.read_token.clone(), false)
+                .await
+                .ok()?;
+            let serving = space.serving.try_read().ok()?;
             if !*serving || self.require_current_replica(&space).await.is_err() {
                 return None;
             }
@@ -1466,6 +1571,7 @@ fn app(host: Arc<Host>) -> Router {
     Router::new()
         .route(elo_core::client_policy::PATH, get(client_policy))
         .route("/spaces/v1/create", post(create))
+        .route("/spaces/v1/prepare", post(registration::prepare))
         .route(
             "/spaces/{id}/invitations/v1",
             post(invitation_descriptors::upload).layer(DefaultBodyLimit::disable()),
@@ -1951,6 +2057,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,
@@ -2087,6 +2194,7 @@ mod tests {
                 operator_snapshot: None,
                 backup_access_key: None,
                 call_admission_key: None,
+                registration_signing_key: None,
                 client_policy: Default::default(),
                 witness: None,
                 attachment_storage: None,
@@ -2552,6 +2660,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: Some(AttachmentStorageConfig::Local {
@@ -3003,6 +3112,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,
@@ -3260,6 +3370,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,
@@ -3396,6 +3507,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,
@@ -3794,11 +3906,19 @@ mod tests {
         assert!(!*deleted_space.serving.read().await);
         assert!(deleted_space.client.lock().await.is_none());
         let closed = reqwest::Client::new()
-            .get(format!("{base}/spaces/{deleted_id}/replica/"))
+            .get(format!("{base}/spaces/{deleted_id}/replica/v1/health"))
             .send()
             .await
             .unwrap();
         assert_eq!(closed.status(), StatusCode::GONE);
+        // Unknown transport paths are rejected before looking up authority,
+        // including when their Space is awaiting deletion cleanup.
+        let unknown = reqwest::Client::new()
+            .get(format!("{base}/spaces/{deleted_id}/replica/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
         let refreshed = tokio::time::timeout(
             Duration::from_secs(3),
             owner.operate(json!({"op":"space_refresh"})),
@@ -3934,6 +4054,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,

@@ -32,9 +32,14 @@ struct Config {
     media: Option<elo_call_service::media::Config>,
     #[serde(default = "default_connections")]
     max_connections: usize,
+    #[serde(default = "default_transport_memory")]
+    transport_memory_mib: usize,
 }
 fn default_connections() -> usize {
     128
+}
+fn default_transport_memory() -> usize {
+    server::DEFAULT_TRANSPORT_MEMORY_MIB
 }
 
 #[tokio::main]
@@ -93,7 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(elo_call_service::media::Provider::new)
         .transpose()?
         .map(Arc::new);
-    let service = Service::with_media(engine, Arc::new(admission), config.max_connections, media);
+    let service = Service::with_transport_memory(
+        engine,
+        Arc::new(admission),
+        config.max_connections,
+        media,
+        config.transport_memory_mib,
+    )?;
     let worker = service.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -104,11 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let result = axum::serve(listener, server::app(service))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await;
+    let result = axum::serve(
+        listener,
+        server::app(service).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
     task.abort();
     let _ = task.await;
     result?;

@@ -333,6 +333,36 @@ closed when admission is unavailable. Credential binding, bounded frames,
 connection/command limits and slow-consumer disconnects constrain the transport.
 After an idle proof is evicted, a client must supply a fresh proof to subscribe.
 
+### Call-control memory bounds
+
+The service reserves 48 MiB per WebSocket before accepting its upgrade and retains
+the reservation through authentication and socket closure. Changing devices,
+profiles or source addresses cannot bypass this deployment-wide budget. The
+default `transport_memory_mib=768` admits at most 16 sockets, even when
+`max_connections` is higher. Exhaustion refuses new upgrades with HTTP 503;
+already admitted controls and the separately bounded HTTP state route remain
+available. Closing a socket releases its reservation.
+
+The 9 MiB wire-message and frame limits remain unchanged. The reservation allows
+up to roughly 18 MiB of fragmented-message allocation plus 18 MiB of frame-buffer
+capacity after allocator growth. The remainder allows the bounded typed request,
+an 8 KiB read buffer, a 256 KiB write buffer and per-socket bookkeeping.
+Completed raw JSON is released immediately after parsing, before remote admission.
+Only two CPU verification jobs run at a time. Credential/config proof arrays stop
+at their existing 8192/4096 protocol counts during parsing, preventing a small-string
+array from allocating millions of vector elements before validation. Decoding and
+verification still need process-memory headroom beyond the transport reservation.
+
+Queued and currently delivered events share a separate 64 MiB budget, charged for
+owned strings, maps and conservative node overhead. Fanout shares each event across
+subscribers; it does not clone a complete participant roster into every queue. The
+existing 64-event queue length bound still applies. Exhaustion disconnects affected
+subscriptions, which must obtain a fresh authenticated snapshot; unrelated queues
+are not cleared. The encoded-proof cache has its own 64 MiB limit, and its decoded
+structures consume additional memory. These are enforced admission/allocation
+bounds, not a guarantee that the process RSS equals their sum. The default deployment
+allows 1536 MiB RSS; configure and validate more RAM before raising socket capacity.
+
 ## App and service integration
 
 The app obtains call control from the trusted joined hosting profile's pinned

@@ -291,6 +291,9 @@ pub(super) async fn request(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if command.action == Action::Submit && result.status == Status::Ready {
+        host.erase_unprovisioned_account_reservations(credential.identity())
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let spaces = host
             .account_scopes(credential.identity())
             .await
@@ -368,6 +371,7 @@ mod tests {
             operator_snapshot: None,
             backup_access_key: None,
             call_admission_key: None,
+            registration_signing_key: None,
             client_policy: Default::default(),
             witness: None,
             attachment_storage: None,

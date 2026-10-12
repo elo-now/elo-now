@@ -107,9 +107,13 @@ sudo docker compose --env-file /srv/elo-witness/compose.env \
   -f deploy/containers/compose.witness.yaml config --quiet
 sudo docker compose --env-file /srv/elo-witness/compose.env \
   -f deploy/containers/compose.witness.yaml pull proxy
-sudo docker compose --env-file /srv/elo-witness/compose.env \
-  -f deploy/containers/compose.witness.yaml up -d
 ```
+
+Before the first start, initialize the API using the public witness pin, then
+install its separate registration public key as described under
+[Authorize hosting registration](#authorize-hosting-registration). The initial
+empty registration allowlist intentionally denies new Spaces. This allowlist
+names hosting services; it does not impose a user allowlist on public hosting.
 
 Omit `--with-storage` to omit the broker and its public proxy routes. Keep
 `--env-file` on every subsequent Compose command; it also selects the storage
@@ -141,6 +145,8 @@ reboot. Compose health uses `/livez`; a healthy container can still be sealed.
 Read its current startup document locally:
 
 ```sh
+sudo docker compose --env-file /srv/elo-witness/compose.env \
+  -f deploy/containers/compose.witness.yaml up -d
 sudo docker compose --env-file /srv/elo-witness/compose.env \
   -f deploy/containers/compose.witness.yaml exec -T witness \
   cat /run/elo-witness/startup.json
@@ -239,6 +245,40 @@ QR service or CDN. If distributing the page separately, keep its HTML and SVG
 beside each other.
 Keep all other state directories private. The signature proves consistent
 contents; clients still need the user's approval of the operator and pins.
+
+### Authorize hosting registration
+
+API initialization generates a separate raw 32-byte
+`api/config/registration-signing-key.bin`, owned by the API service with mode
+0600. The API uses it only for short-lived allocation tickets. It does not receive
+the profile-export or witness signing keys. The public counterpart is
+`public/registration-host.json`, containing the exact creation URL and public key.
+
+Transfer that public document through a trusted operator channel and verify both
+fields independently. On the witness host, before its first start:
+
+```sh
+sudo python3 deploy/containers/authorize_host.py --state /srv/elo-witness \
+  --host https://api.example.org/spaces/v1/create \
+  --public-key REPLACE_WITH_VERIFIED_REGISTRATION_PUBLIC_KEY
+```
+
+The helper pins one of at most 16 hosting services, rejects conflicting keys and
+requires the witness container to be stopped. It does not start services, unseal
+the witness, alter the journal or create a backup. When adding a hosting service
+to an existing installation, first stop mutations and retain the latest independent
+journal anchor; then perform the controlled stop and activation procedure above.
+For an existing API deployment, provision a new dedicated registration key with
+the same ownership, add `registration_signing_key` to its configuration, and pin
+the public counterpart on witness. Do not regenerate existing service keys.
+
+Matching clients call `/spaces/v1/prepare` before witness registration and final
+`/spaces/v1/create`. The API verifies the same signed creation request, proof of
+work and creator/capacity policy before issuing a ticket. The proxy's existing
+API route forwards both endpoints; their request bodies are bounded by the API.
+Missing pins or tickets deny new registration, with no permissive compatibility
+fallback. Existing Spaces and their membership checks remain independent of this
+hosting registration allowlist. See [witness capacity limits](../witness/README.md#registration-and-durable-capacity).
 
 The S3 broker remains disabled for each Space until its owner configures it.
 Use a dedicated bucket/prefix and least-privilege HTTPS S3 credentials with the
@@ -395,6 +435,17 @@ public profile. Each component runs under its own UID with read-only private
 configuration. HTTP administration for LiveKit remains loopback-only; Caddy
 explicitly refuses `/media/twirp` and its descendants. WebSocket signalling
 uses `/calls/v1/connect` and `/media/`; no proxy reaches API port 18901.
+
+The generated call configuration sets `transport_memory_mib` to 768. A 48 MiB
+reservation per accepted socket limits this to 16 sockets, independently of the
+larger `max_connections` ceiling. The calls container defaults to a 1536 MiB process
+limit through `ELO_CALL_MEMORY_LIMIT`; its additional headroom is for proofs,
+queued events, SQLite and runtime allocations. To allow 21 sockets, set the
+private call configuration's transport budget to 1024 and
+`ELO_CALL_MEMORY_LIMIT=2g` before recreating the calls container. Mobile control
+transports can use several sockets per participant. Plan and test capacity using
+the [call memory bounds](../../docs/CALLS.md#call-control-memory-bounds), rather
+than treating the configured connection ceiling as a supported participant count.
 
 Call networking also needs inbound TCP 7881, UDP 7882, TCP/UDP 3478 and UDP
 49160–49200 on the API host and provider firewall. Set `--call-ip` to an IPv4

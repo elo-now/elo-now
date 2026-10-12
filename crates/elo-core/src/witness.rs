@@ -1,5 +1,6 @@
 //! Public, signed requests and nonce-bound freshness for independent authorization.
 pub mod link;
+pub mod registration;
 
 use crate::{
     authority::{
@@ -20,6 +21,8 @@ pub struct Request {
     pub proof: Option<CallAuthorityProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_work: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_ticket: Option<String>,
 }
 
 impl Request {
@@ -143,6 +146,8 @@ pub struct HeadRequest {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
+    /// A signed journal Receipt, or a NoopAcknowledgement for an unchanged
+    /// invitation operation. Only the former advances the journal position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +177,25 @@ pub struct Receipt {
     pub state_digest: String,
     pub accepted_at_ms: u64,
     pub event: String,
+    pub witness_key_generation: u64,
+}
+
+/// A nonce-bound acknowledgement of an already applied invitation operation.
+/// Its signature is not a new journal record; position retains the actual tip.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoopAcknowledgement {
+    pub v: u8,
+    pub kind: String,
+    pub audience: String,
+    pub request_id: RecordId,
+    pub space_id: SpaceId,
+    pub stream_id: StreamId,
+    pub authority_head: RecordId,
+    pub event: String,
+    pub position: Position,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
     pub witness_key_generation: u64,
 }
 

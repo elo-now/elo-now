@@ -46,9 +46,16 @@ managed separately. These limits do not apply to Firebase retention.
 - Ingestion is anonymous. A secret bundled in a public app would not prove its
   identity. Reports and installation IDs are untrusted diagnostics, never
   authorization or billing evidence. Schema validation, an eight-request
-  concurrency limit, request timeouts, global/per-installation rate limits and
-  bounded disk storage limit abuse. A hostile sender can still exhaust the
-  shared diagnostic budget; chat services are separate.
+  concurrency limit, request timeouts and bounded disk storage limit abuse.
+  Minute limits admit at most 600 requests and 120 reports globally, 60 requests
+  and 20 reports per source network, and 20 reports per installation. IPv4-mapped
+  addresses share the IPv4 limit; IPv6 addresses share their /64 network limit.
+  Network counters are held only in memory and cleared each minute. Caddy must
+  overwrite `X-Elo-Diagnostics-Source` with its actual peer's `{remote_host}`;
+  client-supplied forwarding headers are not trusted. Update the proxy and
+  collector together: ingestion without this source header is rejected.
+  Multiple hostile source networks can still exhaust the shared diagnostic
+  budget; reports remain untrusted and chat services are separate.
 
 ## Install on an existing native admin/API host
 

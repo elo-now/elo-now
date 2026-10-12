@@ -303,6 +303,7 @@ async fn creation_rechecks_the_lease_after_waiting_before_publication() {
         operator_snapshot: None,
         backup_access_key: None,
         call_admission_key: None,
+        registration_signing_key: None,
         attachment_storage: None,
         recovery_recipient: None,
         client_policy: Default::default(),

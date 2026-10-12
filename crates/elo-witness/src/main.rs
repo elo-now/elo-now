@@ -25,6 +25,8 @@ struct Config {
     activation_file: PathBuf,
     #[serde(default)]
     trusted_loopback_proxy: bool,
+    #[serde(default)]
+    registration_hosts: Vec<elo_core::witness::registration::RegistrationHost>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -40,12 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         return Err("Invalid witness service configuration.".into());
     }
-    let journal = Journal::open(
+    let mut journal = Journal::open(
         &config.data,
         &config.signing_key,
         config.pin,
         elo_witness::now_ms()?,
     )?;
+    journal.set_registration_hosts(config.registration_hosts)?;
     // Stale activations from previous processes are never accepted.
     if config.activation_file.exists() {
         std::fs::remove_file(&config.activation_file)?;

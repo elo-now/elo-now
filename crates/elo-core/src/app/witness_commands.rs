@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     authority::{CallAuthorityProof, WitnessPin},
     identity::VerifiedCredential,
-    witness::{Command, Operation, Position, Receipt, Request, Response},
+    witness::{Command, NoopAcknowledgement, Operation, Position, Receipt, Request, Response},
 };
 use std::time::{Duration, Instant};
 
@@ -85,15 +85,25 @@ fn verify_returned_proof(
 
 impl ClientApp {
     pub async fn witness_register_authority(&self, authority: &Authority) -> Result<Receipt> {
+        self.witness_register_authority_with_ticket(authority, None)
+            .await
+    }
+
+    pub async fn witness_register_authority_with_ticket(
+        &self,
+        authority: &Authority,
+        ticket: Option<String>,
+    ) -> Result<Receipt> {
         if authority.head()?.sequence != 1
             || authority.genesis().body()["nonce"] != authority.stream().to_string()
         {
             return Err(ERROR.into());
         }
-        self.send_witness_command(
+        self.send_witness_command_with_ticket(
             authority,
             Operation::Register,
             Some(authority.call_proof()?),
+            ticket,
         )
         .await?
         .receipt
@@ -104,7 +114,7 @@ impl ClientApp {
         &self,
         authority: &Authority,
         policy: &SignedRecord,
-    ) -> Result<Receipt> {
+    ) -> Result<()> {
         let body = authority.verify_witness_invitation(policy, now()?.as_millis() as u64)?;
         if body.issuer_credential_id != self.session.credential().id() {
             return Err(ERROR.into());
@@ -116,20 +126,18 @@ impl ClientApp {
             },
             None,
         )
-        .await?
-        .receipt
-        .ok_or_else(|| ERROR.into())
+        .await?;
+        Ok(())
     }
 
     pub async fn witness_revoke_invitation(
         &self,
         authority: &Authority,
         policy_id: RecordId,
-    ) -> Result<Receipt> {
+    ) -> Result<()> {
         self.send_witness_command(authority, Operation::RevokeInvitation { policy_id }, None)
-            .await?
-            .receipt
-            .ok_or_else(|| ERROR.into())
+            .await?;
+        Ok(())
     }
 
     /// Read and import the witnessed configuration separately after this ack.
@@ -187,6 +195,17 @@ impl ClientApp {
         operation: Operation,
         proof: Option<CallAuthorityProof>,
     ) -> Result<VerifiedResponse> {
+        self.send_witness_command_with_ticket(authority, operation, proof, None)
+            .await
+    }
+
+    async fn send_witness_command_with_ticket(
+        &self,
+        authority: &Authority,
+        operation: Operation,
+        proof: Option<CallAuthorityProof>,
+        registration_ticket: Option<String>,
+    ) -> Result<VerifiedResponse> {
         let pin = self.trusted_witness(authority)?;
         let read = matches!(operation, Operation::Read);
         let register = matches!(operation, Operation::Register);
@@ -229,6 +248,7 @@ impl ClientApp {
             invitation_signature: None,
             proof,
             registration_work: None,
+            registration_ticket,
         };
         if register {
             request = tokio::task::spawn_blocking(move || {
@@ -305,6 +325,25 @@ impl ClientApp {
                 authority: Some(returned),
             });
         }
+        let encoded_receipt = response.receipt.as_deref().ok_or(ERROR)?;
+        if decode_record(encoded_receipt)?.body()["kind"] == "witness.noop" {
+            if returned.is_some() {
+                return Err(ERROR.into());
+            }
+            let position = verify_noop(
+                pin,
+                &signed,
+                &command,
+                encoded_receipt,
+                now()?.as_millis() as u64,
+                floor.as_ref(),
+            )?;
+            self.record_witness_position(pin, position)?;
+            return Ok(VerifiedResponse {
+                receipt: None,
+                authority: None,
+            });
+        }
         let (receipt, position) = verify_receipt(
             pin,
             &signed,
@@ -325,6 +364,52 @@ impl ClientApp {
             authority: returned,
         })
     }
+}
+
+fn verify_noop(
+    pin: &WitnessPin,
+    request: &SignedRecord,
+    command: &Command,
+    encoded: &str,
+    now_ms: u64,
+    floor: Option<&Position>,
+) -> Result<Position> {
+    if encoded.len() > 16_384 {
+        return Err(ERROR.into());
+    }
+    let event = match command.operation {
+        Operation::RegisterInvitation { .. } => "invitation.registered",
+        Operation::RevokeInvitation { .. } => "invitation.revoked",
+        _ => return Err(ERROR.into()),
+    };
+    let signed = decode_record(encoded)?;
+    signed.verify_signature(&pin.key()?)?;
+    let ack: NoopAcknowledgement = signed.decode()?;
+    if ack.v != 1
+        || ack.kind != "witness.noop"
+        || ack.audience != pin.url
+        || ack.witness_key_generation != pin.key_generation
+        || ack.request_id != request.id()
+        || ack.space_id != command.space_id
+        || ack.stream_id != command.stream_id
+        || ack.authority_head != command.authority_head
+        || ack.event != event
+        || ack.position.sequence == 0
+        || ack.position.record_id.is_none()
+        || ack.issued_at_ms < command.issued_at_ms.saturating_sub(5_000)
+        || ack.issued_at_ms > now_ms.saturating_add(5_000)
+        || ack.expires_at_ms != command.expires_at_ms
+        || ack.issued_at_ms >= ack.expires_at_ms
+        || now_ms >= ack.expires_at_ms
+        || floor.is_some_and(|floor| {
+            ack.position.sequence < floor.sequence
+                || (ack.position.sequence == floor.sequence
+                    && ack.position.record_id != floor.record_id)
+        })
+    {
+        return Err(ERROR.into());
+    }
+    Ok(ack.position)
 }
 
 #[cfg(test)]

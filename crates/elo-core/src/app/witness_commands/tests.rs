@@ -90,6 +90,77 @@ fn receipt_requires_the_exact_signed_request_scope_event_and_witness() {
 }
 
 #[test]
+fn noop_acknowledgement_binds_request_and_retains_the_real_journal_position() {
+    let key = SigningKey::from_bytes(&[8; 32]);
+    let pin = pin(&key);
+    let command = command(
+        &pin,
+        Operation::RevokeInvitation {
+            policy_id: RecordId::from_bytes([9; 32]),
+        },
+    );
+    let request = signed(&command, &SigningKey::from_bytes(&[10; 32]));
+    let position = Position {
+        sequence: 5,
+        record_id: Some(RecordId::from_bytes([11; 32])),
+    };
+    let ack = NoopAcknowledgement {
+        v: 1,
+        kind: "witness.noop".into(),
+        audience: pin.url.clone(),
+        request_id: request.id(),
+        space_id: command.space_id,
+        stream_id: command.stream_id,
+        authority_head: command.authority_head,
+        event: "invitation.revoked".into(),
+        position: position.clone(),
+        issued_at_ms: 10_000,
+        expires_at_ms: 70_000,
+        witness_key_generation: pin.key_generation,
+    };
+    let encoded = STANDARD.encode(signed(&ack, &key).bytes());
+    assert_eq!(
+        verify_noop(&pin, &request, &command, &encoded, 10_000, Some(&position)).unwrap(),
+        position
+    );
+    // The signed acknowledgement itself must never become a fictitious tip.
+    assert_ne!(
+        decode_record(&encoded).unwrap().id(),
+        position.record_id.unwrap()
+    );
+    let value = serde_json::to_value(&ack).unwrap();
+    for (field, wrong) in [
+        ("request_id", json!(RecordId::from_bytes([12; 32]))),
+        ("space_id", json!(SpaceId::from_bytes([13; 32]))),
+        ("stream_id", json!(StreamId::from_bytes([14; 16]))),
+        ("authority_head", json!(RecordId::from_bytes([15; 32]))),
+        ("event", json!("invitation.registered")),
+        ("audience", json!("https://wrong.test/witness/v1")),
+        ("witness_key_generation", json!(2)),
+        ("expires_at_ms", json!(80_000)),
+        (
+            "position",
+            json!({"sequence":4,"record_id":position.record_id}),
+        ),
+        (
+            "position",
+            json!({"sequence":5,"record_id":RecordId::from_bytes([16;32])}),
+        ),
+    ] {
+        let mut changed = value.clone();
+        changed[field] = wrong;
+        let changed = STANDARD.encode(signed(&changed, &key).bytes());
+        assert!(
+            verify_noop(&pin, &request, &command, &changed, 10_000, Some(&position)).is_err(),
+            "{field}"
+        );
+    }
+    let wrong = STANDARD.encode(signed(&ack, &SigningKey::from_bytes(&[17; 32])).bytes());
+    assert!(verify_noop(&pin, &request, &command, &wrong, 10_000, Some(&position)).is_err());
+    assert!(verify_noop(&pin, &request, &command, &encoded, 70_000, None).is_err());
+}
+
+#[test]
 fn receipts_cannot_replay_across_nonces_or_roll_back_the_journal_position() {
     let key = SigningKey::from_bytes(&[8; 32]);
     let owner = SigningKey::from_bytes(&[10; 32]);

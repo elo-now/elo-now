@@ -32,6 +32,7 @@ def proxy_config(previous):
 \t\t\t\tmax_size 16384
 \t\t\t}
 \t\t\treverse_proxy 127.0.0.1:17930 {
+\t\t\t\theader_up X-Elo-Diagnostics-Source {remote_host}
 \t\t\t\theader_up -Authorization
 \t\t\t\theader_up -Cookie
 \t\t\t\theader_up -X-Elo-Admin-Proxy-Key

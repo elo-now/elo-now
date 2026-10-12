@@ -12,6 +12,8 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
+#[path = "engine/request_limits.rs"]
+mod request_limits;
 
 type Result<T> = std::result::Result<T, CallError>;
 const MAX_SCOPES: usize = 4096;
@@ -22,6 +24,7 @@ pub const MAX_FRAME: usize = 9 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub command: String,
+    #[serde(default, deserialize_with = "request_limits::proof")]
     pub proof: Option<CallAuthorityProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<String>,

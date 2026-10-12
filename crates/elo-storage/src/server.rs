@@ -24,12 +24,75 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::Semaphore;
+
+const COMMANDS_PER_SOURCE: usize = 2;
+const MAX_COMMAND_SOURCES: usize = 4096;
+
+fn source_network(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => {
+                let segments = ip.segments();
+                IpAddr::V6(Ipv6Addr::new(
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+            }
+        },
+    }
+}
+
+#[derive(Default)]
+struct CommandSources(Mutex<BTreeMap<IpAddr, usize>>);
+
+struct SourcePermit {
+    sources: Arc<CommandSources>,
+    network: IpAddr,
+}
+
+impl CommandSources {
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Result<SourcePermit> {
+        let network = source_network(ip);
+        let mut active = self.0.lock().map_err(|_| Error::Unavailable)?;
+        if active.get(&network).copied().unwrap_or(0) >= COMMANDS_PER_SOURCE
+            || (active.len() >= MAX_COMMAND_SOURCES && !active.contains_key(&network))
+        {
+            return Err(Error::Limit);
+        }
+        *active.entry(network).or_default() += 1;
+        Ok(SourcePermit {
+            sources: self.clone(),
+            network,
+        })
+    }
+}
+
+impl Drop for SourcePermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.sources.0.lock()
+            && let Some(count) = active.get_mut(&self.network)
+        {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.network);
+            }
+        }
+    }
+}
 
 /// Optional operator-owned storage. Access is separately allowlisted on the
 /// broker: possession of the public hosting QR never grants provider access.
@@ -63,6 +126,7 @@ pub struct Service {
     trusted_loopback_proxy: bool,
     configs: Arc<Semaphore>,
     proofs: Arc<Semaphore>,
+    command_sources: Arc<CommandSources>,
     transfers: Arc<Semaphore>,
     rate: Arc<Mutex<BTreeMap<IpAddr, (u64, u32)>>>,
     witness: Option<Arc<WitnessGate>>,
@@ -87,6 +151,7 @@ impl Service {
             trusted_loopback_proxy: false,
             configs: Arc::new(Semaphore::new(1)),
             proofs: Arc::new(Semaphore::new(4)),
+            command_sources: Arc::new(CommandSources::default()),
             transfers: Arc::new(Semaphore::new(8)),
             rate: Arc::new(Mutex::new(BTreeMap::new())),
             witness,
@@ -174,6 +239,7 @@ impl Service {
         engine.claim(object, token, action, now())
     }
     fn rate(&self, ip: IpAddr) -> Result<()> {
+        let ip = source_network(ip);
         let now = now();
         let mut rates = self.rate.lock().map_err(|_| Error::Unavailable)?;
         rates.retain(|_, (start, _)| now.saturating_sub(*start) < 60);
@@ -281,6 +347,10 @@ async fn command(
 ) -> Result<axum::Json<broker::Response>> {
     let ip = service.source_ip(peer, request.headers())?;
     service.rate(ip)?;
+    // Incomplete unauthenticated bodies must not reserve every proof worker
+    // for one source. Keep this permit through verification and release it on
+    // every error, timeout or cancellation, without queueing waiting requests.
+    let source_slot = service.command_sources.acquire(ip)?;
     let slot = service
         .proofs
         .clone()
@@ -296,7 +366,7 @@ async fn command(
     let input: Request = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
     let audience = service.audience.clone();
     let pin = service.witness.as_ref().map(|gate| gate.pin.clone());
-    let (verified, _slot) = tokio::task::spawn_blocking(move || {
+    let (verified, _slot, _source_slot) = tokio::task::spawn_blocking(move || {
         let verified = match pin {
             Some(pin) => Verified::new(input, &audience, now(), &pin),
             #[cfg(test)]
@@ -304,7 +374,7 @@ async fn command(
             #[cfg(not(test))]
             None => Err(Error::Unavailable),
         }?;
-        Ok::<_, Error>((verified, slot))
+        Ok::<_, Error>((verified, slot, source_slot))
     })
     .await
     .map_err(|_| Error::Unavailable)??;

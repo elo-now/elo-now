@@ -10,6 +10,7 @@ const sourceMessageKeys = new Map<string, MessageKey>(
 );
 
 const known: Record<string, MessageKey> = {
+  backup_space_access_required: "recover.error.backupAccess",
   chat_deleted_locally: "error.chatDeletedLocally",
   "This conversation cannot be removed from this device.":
     "error.chatDeleteUnavailable",

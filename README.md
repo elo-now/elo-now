@@ -110,6 +110,9 @@ A recovery code restores identity, not all chat history. A separate encrypted
 backup restores supported profile and conversation data, without attachment
 bytes. Its 64 MiB budget is measured before compression and encryption; older
 message groups may be omitted to fit. Keep backups independently of your device.
+Recovery on a new device creates new device keys. Restored Spaces retain their
+saved chats but may require a new invitation before this device can access them.
+Restoring a backup does not bypass current membership or restore owner powers.
 
 ## How data moves
 

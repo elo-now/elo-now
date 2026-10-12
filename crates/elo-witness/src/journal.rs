@@ -23,6 +23,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const MAX_EVENTS: u64 = 1_000_000;
+pub(crate) mod capacity;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +47,7 @@ pub struct Journal {
     pub(crate) db: Connection,
     pub(crate) key: SigningKey,
     pub(crate) pin: WitnessPin,
+    pub(crate) registration_hosts: Vec<elo_core::witness::registration::RegistrationHost>,
     _lock: File,
     startup_nonce: String,
     active: bool,
@@ -154,6 +156,7 @@ impl Journal {
             db,
             key,
             pin,
+            registration_hosts: Vec::new(),
             _lock: lock,
             startup_nonce: record::random_hex::<32>()?,
             active: false,
@@ -162,6 +165,26 @@ impl Journal {
             anchor_wall: now,
             monotonic: Instant::now(),
         })
+    }
+
+    /// Operator configuration only. Neither a client QR nor a supplied ticket
+    /// can add a hosting key to this independent provisioning trust boundary.
+    pub fn set_registration_hosts(
+        &mut self,
+        hosts: Vec<elo_core::witness::registration::RegistrationHost>,
+    ) -> Result<()> {
+        if hosts.len() > 16 {
+            return Err(Error::Invalid);
+        }
+        let mut origins = std::collections::BTreeSet::new();
+        for host in &hosts {
+            host.validate()?;
+            if !origins.insert(&host.host) {
+                return Err(Error::Invalid);
+            }
+        }
+        self.registration_hosts = hosts;
+        Ok(())
     }
 
     pub fn startup(&self) -> Result<Startup> {
@@ -358,12 +381,24 @@ pub(crate) struct Event<'a> {
     pub now: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn append(
     tx: &Transaction<'_>,
     key: &SigningKey,
     pin: &WitnessPin,
     event: Event<'_>,
+    response: Response,
+) -> Result<Response> {
+    append_with_budget(tx, key, pin, event, response, false)
+}
+
+pub(crate) fn append_with_budget(
+    tx: &Transaction<'_>,
+    key: &SigningKey,
+    pin: &WitnessPin,
+    event: Event<'_>,
     mut response: Response,
+    security_reduction: bool,
 ) -> Result<Response> {
     let tip = position(tx)?;
     if tip.sequence >= MAX_EVENTS {
@@ -388,6 +423,7 @@ pub(crate) fn append(
     response.receipt = Some(encoded.clone());
     tx.execute("INSERT INTO events(sequence,record_id,receipt,request_id,response,space) VALUES(?1,?2,?3,?4,?5,?6)",
         params![body.sequence as i64,record.id().to_string(),encoded,event.request.to_string(),serde_json::to_string(&response).map_err(|_| Error::Invalid)?,event.space.to_string()])?;
+    capacity::enforce(tx, event.space, security_reduction)?;
     Ok(response)
 }
 

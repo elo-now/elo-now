@@ -325,6 +325,7 @@ export const en = {
     "Removing another owner requires their confirmation or the primary owner's approval. Once confirmed, they lose Space access and their local Space data is cleared when their apps reconnect. Saved exports cannot be erased remotely.",
   "spaces.memberRemovalRequest":
     "{requester} wants to remove {target} from {space}. Confirm removal from the Space?",
+  "spaces.rejoin": "Join again with a new invitation to restore access on this device. Your saved chats are retained.",
   "spaces.checking": "Checking access — connect to restore this Space",
   "brand.pronunciation.play": "Hear how to say elo",
   "brand.pronunciation.spelling": "EH-loh",
@@ -897,6 +898,8 @@ export const en = {
     "This recovery QR is incomplete or damaged. Scan it again.",
   "recover.error.qrPasswordLength":
     "Use at least 12 characters for the QR password.",
+  "recover.error.backupAccess":
+    "Restore access to your Spaces before creating a new backup. Spaces marked for rejoining need a new invitation.",
   "recover.error.backupInvalid":
     "This backup is incomplete or damaged. Choose another copy.",
   "recover.error.backupPassword":
@@ -1005,7 +1008,7 @@ export const en = {
   "recover.useDevice": "Use another device",
   "recover.preserve": "Profiles already on this device will stay.",
   "recover.backupHelp":
-    "Saved chats are restored after checking your current Space access. Data from Spaces you were removed from is skipped. Offline Spaces wait for a connection. Managing chat membership remains on the original device.",
+    "Saved chats are retained while your Space access is checked. On a new device, you may need a new invitation to join your Spaces again. Offline Spaces wait for a connection. Managing chat membership remains on the original device.",
   "recover.newPassword": "New password",
   "recover.useQr": "Recovery QR",
   "recover.protectQr": "Protect QR code",
@@ -1567,8 +1570,6 @@ export const en = {
   "onboarding.passwordMismatch": "The passwords do not match.",
   "profile.savedNumber": "Profile {number}",
   "profile.currentLocal": "Current",
-  "sync.shortSummary":
-    "Sync finished. Stored: {stored}. Retry pending: {retry}. Missing copies: {repair_pending}.",
   "profile.local": "On this device",
   "settings.title": "Settings",
   "settings.heading": "Settings",
@@ -1898,8 +1899,6 @@ export const en = {
   "messageStatus.recipients": "Recipient delivery",
   "messageStatus.read": "Read receipts",
   "messageStatus.notTracked": "Not tracked",
-  "sync.summary":
-    "Downloaded: {downloaded}. Verified: {accepted}. Stored by Replica: {stored}. Retry pending: {retry}. Copies restored: {repaired}. Missing copies: {repair_pending}. Waiting for proof: {waiting_for_proof}. Quarantined: {quarantined}.",
   "preview.recipient": "Recipient: {recipient}",
   "file.downloadLabel": "Download {filename} · {size}",
   "warning.history":

@@ -1,4 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <!-- Android receives shared screens but does not publish screen capture. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" tools:node="remove" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -13,6 +15,7 @@
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <application>
+        <service android:name="io.livekit.android.room.track.screencapture.ScreenCaptureService" tools:node="remove" />
         <meta-data android:name="firebase_crashlytics_collection_enabled" android:value="false" />
         <activity android:name="now.elo.push.IncomingCallActivity" android:exported="false" android:excludeFromRecents="true" android:launchMode="singleTop" android:showWhenLocked="true" android:turnScreenOn="true" android:theme="@android:style/Theme.Material.NoActionBar" />
         <receiver android:name="now.elo.push.IncomingCallReceiver" android:exported="false" />

@@ -766,7 +766,7 @@ async fn run(
                     // A crash after the commit but before updating profiles.json.
                     ClientApp::open(path.clone(), password, false).await?
                 } else {
-                    profile_backup::restore(
+                    profile_backup::restore_configured(
                         profile_backup::RestoreRequest {
                             directory: path.clone(),
                             bytes,
@@ -778,6 +778,12 @@ async fn run(
                             paged: true,
                         },
                         &job.progress,
+                        |client| {
+                            crate::team_replica::configure(client)?;
+                            crate::push::configure_client(client)?;
+                            crate::witness::configure_client(client)?;
+                            Ok(())
+                        },
                     )
                     .await?
                 }

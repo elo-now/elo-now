@@ -579,6 +579,7 @@ impl ClientApp {
                     invitation_signature: None,
                     proof: None,
                     registration_work: None,
+                    registration_ticket: None,
                 },
             )
             .await?;
@@ -709,6 +710,7 @@ impl ClientApp {
                     invitation_signature: Some(STANDARD.encode(possession.bytes())),
                     proof: None,
                     registration_work: None,
+                    registration_ticket: None,
                 },
             )
             .await?
@@ -810,6 +812,7 @@ impl ClientApp {
                     invitation_signature: None,
                     proof: None,
                     registration_work: None,
+                    registration_ticket: None,
                 },
             )
             .await?

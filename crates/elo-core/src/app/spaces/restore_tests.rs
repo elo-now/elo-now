@@ -60,8 +60,20 @@ async fn witnessed_restore_fixture(
     Authority,
     Value,
     ed25519_dalek::SigningKey,
+    String,
 ) {
-    let mut user = profile(base, "restore source").await;
+    let draft = ProfileDraft::new().unwrap();
+    let phrase = draft.card().phrase.clone();
+    let mut user = draft
+        .save_named(
+            base.join("restore source"),
+            PASSWORD.into(),
+            "General",
+            "restore source",
+        )
+        .await
+        .unwrap();
+    user.allow_loopback = true;
     user.enable_spaces().await.unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[102; 32]);
     let mut hosting = hosting_services::test_profile(101);
@@ -128,7 +140,7 @@ async fn witnessed_restore_fixture(
     let child = &user.spaces.as_ref().unwrap().children[&address.scope.space.to_string()];
     assert_eq!(child.identity_id(), user.identity_id());
     assert_eq!(child.authorities.0[0].head_id(), authority.head_id());
-    (user, address, authority, approved, key)
+    (user, address, authority, approved, key, phrase)
 }
 
 async fn assert_witnessed_restore_quarantined(user: &mut ClientApp, address: &SpaceAddress) {
@@ -160,7 +172,7 @@ async fn offline_private_non_root_backup_restore_reaches_ready_without_cached_pr
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("https://{}", listener.local_addr().unwrap());
     drop(listener);
-    let (source, address, _, _, _) = witnessed_restore_fixture(temp.path(), &origin, true).await;
+    let (source, address, _, _, _, _) = witnessed_restore_fixture(temp.path(), &origin, true).await;
     let expected = source.identity_id();
     let hosting = source.spaces.as_ref().unwrap().catalog.hosting_bindings
         [&address.scope.space.to_string()]
@@ -203,6 +215,25 @@ async fn offline_private_non_root_backup_restore_reaches_ready_without_cached_pr
 
 #[tokio::test]
 async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usable() {
+    fresh_authority_before_use(false, false, false).await;
+}
+
+#[tokio::test]
+async fn call_start_and_join_refresh_stale_membership_before_signing() {
+    fresh_authority_before_use(true, false, false).await;
+}
+
+#[tokio::test]
+async fn call_start_refuses_membership_revoked_since_opening_the_chat() {
+    fresh_authority_before_use(true, true, false).await;
+}
+
+#[tokio::test]
+async fn call_membership_refresh_times_out_before_ui_without_signing_stale_permissions() {
+    fresh_authority_before_use(true, false, true).await;
+}
+
+async fn fresh_authority_before_use(for_call: bool, revoked: bool, slow_network: bool) {
     use crate::witness::{Command, Freshness, HeadRequest, Operation, Position, Request, Response};
     use std::sync::{
         Arc,
@@ -211,13 +242,48 @@ async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usab
     let temp = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let (source, address, authority, approved, key) =
+    let (source, address, mut authority, mut approved, key, _) =
         witnessed_restore_fixture(temp.path(), &origin, false).await;
+    let stale_authority = authority.clone();
+    if for_call {
+        let companion = source.session.linked_companion().unwrap();
+        authority.add_credential(companion.credential().clone());
+        let mut next = authority.head().unwrap().clone();
+        next.sequence += 1;
+        next.previous_config_id = authority.head_id();
+        next.nonce = record::random_hex::<16>().unwrap();
+        next.witness_evidence = None;
+        next.members[0]
+            .credential_ids
+            .push(companion.credential().id());
+        if revoked {
+            next.members[0]
+                .credential_ids
+                .retain(|id| *id != source.session.credential().id());
+        }
+        next.members[0].credential_ids.sort();
+        next.owner_credential_ids = next.members[0].credential_ids.clone();
+        next.action.operation = "device.updated".into();
+        next.action.request_record_id = None;
+        let signed = authority
+            .prepare_witness_owner_config(&next.sign(source.session.signing_key()).unwrap(), &key)
+            .unwrap();
+        authority.apply_config(signed).unwrap();
+        approved["general_head"] = json!(authority.head_id());
+        approved["enrollment"]["packet"] = json!(
+            STANDARD.encode(
+                serde_json::to_vec(&json!({"proof":authority.call_proof().unwrap(),"contacts":[]}))
+                    .unwrap()
+            )
+        );
+    }
     let path = source.directory.clone();
     let credential = STANDARD.encode(source.session.credential().record().bytes());
     let host_key = source.session.signing_key().clone();
     let pin = authority.witness_pin().unwrap().clone();
-    source.quarantine_restored_spaces().unwrap();
+    if !for_call {
+        source.quarantine_restored_spaces().unwrap();
+    }
     source.close().await.unwrap();
     let mut reopened = ClientApp::open(path, PASSWORD.into(), true).await.unwrap();
     reopened.configure_witness_pin(Some(pin.clone())).unwrap();
@@ -226,8 +292,14 @@ async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usab
         .unwrap();
     reopened.witness_test_url = Some(origin);
     reopened.enable_spaces().await.unwrap();
-    assert_witnessed_restore_quarantined(&mut reopened, &address).await;
-    let mode = Arc::new(AtomicUsize::new(0)); // 0 unavailable, 1 wrong signer, 2 valid.
+    if !for_call {
+        assert_witnessed_restore_quarantined(&mut reopened, &address).await;
+    }
+    let call_request = json!({"op":"call_authorization", "target_space":address.scope.space,
+        "hosting_space_id":address.scope.space, "space":address.scope.space, "stream":address.scope.stream,
+        "expected_identity":reopened.identity_id(), "audience":"https://calls.example.test/calls/v1",
+        "include_proof":true, "operation":{"type":"start", "kind":"group", "initial_media":"audio"}});
+    let mode = Arc::new(AtomicUsize::new(0)); // 0 unavailable, 1 wrong signer, 2 valid, 3 slow.
     let commands = mode.clone();
     let heads = mode.clone();
     let reads = Arc::new(AtomicUsize::new(0));
@@ -242,9 +314,15 @@ async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usab
             let command:Command = decode_record(&request.command).unwrap().decode().unwrap();
             assert!(matches!(command.operation, Operation::Read));
             read_count.fetch_add(1, Ordering::SeqCst);
-            let status = if commands.load(Ordering::SeqCst) == 0 { axum::http::StatusCode::SERVICE_UNAVAILABLE } else { axum::http::StatusCode::OK };
+            let state = commands.load(Ordering::SeqCst);
+            let status = if state == 0 { axum::http::StatusCode::SERVICE_UNAVAILABLE } else { axum::http::StatusCode::OK };
             let response = Response { receipt:None, proof:Some(proof.clone()), challenge:None };
-            async move { (status, axum::Json(response)) }
+            async move {
+                if state == 3 {
+                    tokio::time::sleep(CALL_REFRESH_TIMEOUT + std::time::Duration::from_secs(1)).await;
+                }
+                (status, axum::Json(response))
+            }
         }))
         .route("/head", axum::routing::post(move |axum::Json(request):axum::Json<HeadRequest>| {
             let time = now().unwrap().as_millis() as u64;
@@ -274,29 +352,89 @@ async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usab
         mode.store(state, Ordering::SeqCst);
         let mut spaces = reopened.spaces.take().unwrap();
         let entry = spaces.catalog.entries[0].clone();
-        let result = spaces
-            .poll_entry(&mut reopened, entry, PollMode::Regular)
-            .await;
+        let result = if for_call {
+            spaces
+                .operate_selected(&mut reopened, call_request.clone())
+                .await
+                .map(|_| false)
+        } else {
+            spaces
+                .poll_entry(&mut reopened, entry, PollMode::Regular)
+                .await
+        };
         reopened.spaces = Some(spaces);
         assert_eq!(
             result.is_err(),
-            should_error,
+            should_error || for_call,
             "only transport unavailability may be deferred"
         );
-        assert_witnessed_restore_quarantined(&mut reopened, &address).await;
+        if !for_call {
+            assert_witnessed_restore_quarantined(&mut reopened, &address).await;
+        }
         assert_eq!(
             syncs.load(Ordering::SeqCst),
             0,
             "unverified witness answers must not reach the host"
         );
     }
+    if slow_network {
+        mode.store(3, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let error = reopened.operate(call_request.clone()).await.unwrap_err();
+        assert!(error.is::<super::super::witness_client::WitnessUnavailable>());
+        assert!(started.elapsed() >= CALL_REFRESH_TIMEOUT);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(12),
+            "native refresh must release the profile before the UI signing deadline"
+        );
+        assert_eq!(syncs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reopened.selected_space_client().unwrap().authorities.0[0].head_id(),
+            stale_authority.head_id(),
+            "a timed-out request must not import a head or sign stale permissions"
+        );
+    }
+    // A bounded failure leaves the profile immediately usable for another try.
     mode.store(2, Ordering::SeqCst);
     let mut spaces = reopened.spaces.take().unwrap();
     let entry = spaces.catalog.entries[0].clone();
-    spaces
-        .poll_entry(&mut reopened, entry, PollMode::Regular)
-        .await
-        .unwrap();
+    if revoked {
+        assert!(
+            spaces
+                .operate_selected(&mut reopened, call_request)
+                .await
+                .is_err()
+        );
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        reopened.spaces = Some(spaces);
+        reopened.close().await.unwrap();
+        server.abort();
+        return;
+    }
+    if for_call {
+        for operation in [
+            call_request["operation"].clone(),
+            json!({"type":"join","call_id":"a1".repeat(16)}),
+        ] {
+            let mut request = call_request.clone();
+            request["operation"] = operation;
+            let signed = spaces
+                .operate_selected(&mut reopened, request)
+                .await
+                .unwrap();
+            let command: crate::calls::Command = decode_record(signed["command"].as_str().unwrap())
+                .unwrap()
+                .decode()
+                .unwrap();
+            assert_eq!(command.config_id, head);
+            assert_ne!(command.config_id, stale_authority.head_id().unwrap());
+        }
+    } else {
+        spaces
+            .poll_entry(&mut reopened, entry, PollMode::Regular)
+            .await
+            .unwrap();
+    }
     assert_eq!(spaces.catalog.entries[0].status, "joined");
     assert!(!spaces.catalog.entries[0].root);
     assert_eq!(
@@ -310,8 +448,11 @@ async fn restored_witnessed_child_requires_valid_fresh_head_before_becoming_usab
     );
     reopened.spaces = Some(spaces);
     assert!(reopened.selected_space_client().is_ok());
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
-    assert_eq!(syncs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        (if for_call { 4 } else { 3 }) + usize::from(slow_network)
+    );
+    assert_eq!(syncs.load(Ordering::SeqCst), if for_call { 2 } else { 1 });
     reopened.close().await.unwrap();
     server.abort();
 }
@@ -335,7 +476,7 @@ async fn deferred_owner_grant(case: DeferredOwnerCase) {
     let temp = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let (mut source, address, mut authority, mut approved, key) =
+    let (mut source, address, mut authority, mut approved, key, _) =
         witnessed_restore_fixture(temp.path(), &origin, false).await;
     let path = source.directory.clone();
     let space = address.scope.space;
@@ -538,4 +679,106 @@ async fn deferred_live_pairing_owner_grants_cannot_restore_a_revoked_device() {
 #[tokio::test]
 async fn deferred_live_pairing_owner_grants_do_not_reactivate_a_retired_compartment() {
     deferred_owner_grant(DeferredOwnerCase::Retired).await;
+}
+
+#[tokio::test]
+async fn fresh_device_backup_finishes_and_keeps_spaces_for_readmission() {
+    use super::super::profile_backup::{RestoreProgress, RestoreRequest, restore_configured};
+    for bound in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = "https://127.0.0.1:9";
+        let (source, address, authority, mut approved, key, phrase) =
+            witnessed_restore_fixture(temp.path(), origin, bound).await;
+        let expected = source.identity_id();
+        let old_credential = source.session.credential().id();
+        let backup = source.export_profile(phrase.clone().into()).await.unwrap();
+        let path = temp.path().join("fresh recovery");
+        let pin = authority.witness_pin().unwrap().clone();
+        let restored = restore_configured(
+            RestoreRequest {
+                directory: path.clone(),
+                bytes: &backup,
+                secret: phrase.into(),
+                expected,
+                password: PASSWORD.into(),
+                allow_loopback: true,
+                resume: true,
+                paged: true,
+            },
+            &RestoreProgress::default(),
+            |client| {
+                client.configure_witness_pin(Some(pin.clone()))?;
+                client.configure_invitation_host(&format!("{origin}/spaces/v1/create"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(restored.session.credential().id(), old_credential);
+        assert!(!path.join(".initializing").exists());
+        let view = restored.view().await.unwrap();
+        assert_eq!(view["spaces"][0]["status"], "rejoin");
+        assert_eq!(view["spaces"][0]["owner"], false);
+        assert_eq!(view["streams"], json!([]));
+        assert!(restored.selected_space_client().is_err());
+        assert!(restored.export_profile(PASSWORD.into()).await.is_err());
+        let child = child_path(&restored, &address.scope.space.to_string()).unwrap();
+        assert!(child.join("client.sqlite").is_file());
+        restored.close().await.unwrap();
+        let mut restored = ClientApp::open(path, PASSWORD.into(), true).await.unwrap();
+        restored.configure_witness_pin(Some(pin)).unwrap();
+        restored
+            .configure_invitation_host(&format!("{origin}/spaces/v1/create"))
+            .unwrap();
+        restored.enable_spaces().await.unwrap();
+        // A readmission requirement is stable, not an endless failed network poll.
+        restored
+            .operate(json!({"op":"space_refresh"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.view().await.unwrap()["spaces"][0]["status"],
+            "rejoin"
+        );
+
+        // A freshly signed admission can reopen the preserved compartment.
+        let mut admitted = authority.clone();
+        admitted.add_credential(restored.session.credential().clone());
+        let mut next = admitted.head().unwrap().clone();
+        next.sequence += 1;
+        next.previous_config_id = admitted.head_id();
+        next.nonce = record::random_hex::<16>().unwrap();
+        next.witness_evidence = None;
+        next.members[0]
+            .credential_ids
+            .push(restored.session.credential().id());
+        next.members[0].credential_ids.sort();
+        next.owner_credential_ids = next.members[0].credential_ids.clone();
+        next.action.operation = "device.updated".into();
+        next.action.request_record_id = None;
+        let signed = admitted
+            .prepare_witness_owner_config(&next.sign(source.session.signing_key()).unwrap(), &key)
+            .unwrap();
+        admitted.apply_config(signed).unwrap();
+        approved["owner"] = json!(false);
+        approved["general_head"] = json!(admitted.head_id());
+        approved["enrollment"]["packet"] = json!(
+            STANDARD.encode(
+                serde_json::to_vec(&json!({"proof":admitted.call_proof().unwrap(),"contacts":[]}))
+                    .unwrap()
+            )
+        );
+        let mut spaces = restored.spaces.take().unwrap();
+        spaces
+            .add_joined(&mut restored, address, approved)
+            .await
+            .unwrap();
+        restored.spaces = Some(spaces);
+        assert!(restored.selected_space_client().is_ok());
+        assert_eq!(
+            restored.view().await.unwrap()["spaces"][0]["status"],
+            "joined"
+        );
+        restored.close().await.unwrap();
+        source.close().await.unwrap();
+    }
 }

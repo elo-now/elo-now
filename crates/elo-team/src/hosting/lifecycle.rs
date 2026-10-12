@@ -37,10 +37,11 @@ impl Host {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error.into()),
             };
-            if ((reservation.invitation.is_some()
-                || configured
-                || reservation.invitation_issued != 0)
-                && !reservation.reclaim_if_unclaimed)
+            if reservation.registration_ticket_issued
+                || ((reservation.invitation.is_some()
+                    || configured
+                    || reservation.invitation_issued != 0)
+                    && !reservation.reclaim_if_unclaimed)
                 || reservation.reserved_at == 0
                 || now.saturating_sub(reservation.reserved_at) < 86_400_000
             {
@@ -242,6 +243,7 @@ mod tests {
                     reserved_at: time,
                     creation_network: None,
                     reclaim_if_unclaimed: index == 5,
+                    registration_ticket_issued: false,
                 },
             )
             .unwrap();
@@ -405,6 +407,7 @@ mod reservation_limits_tests {
                     reserved_at: current().unwrap(),
                     creation_network: Some(network.clone()),
                     reclaim_if_unclaimed: true,
+                    registration_ticket_issued: false,
                 },
             )
             .unwrap();

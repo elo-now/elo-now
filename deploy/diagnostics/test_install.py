@@ -12,6 +12,8 @@ class ProxyTests(unittest.TestCase):
         self.assertNotIn('/reports', updated)
         self.assertNotIn('/admin', updated)
         self.assertIn('header_up -Authorization', updated)
+        self.assertIn('header_up X-Elo-Diagnostics-Source {remote_host}', updated)
+        self.assertNotIn('{header.X-Forwarded-For}', updated)
         self.assertIn('reverse_proxy 127.0.0.1:18900', updated)
 
     def test_damaged_proxy_marker_fails_closed(self):

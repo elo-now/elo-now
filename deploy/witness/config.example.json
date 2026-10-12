@@ -9,5 +9,11 @@
   "signing_key": "/etc/elo/witness/signing-key.bin",
   "startup_file": "/run/elo-witness/startup.json",
   "activation_file": "/run/elo-witness/activation.json",
-  "trusted_loopback_proxy": true
+  "trusted_loopback_proxy": true,
+  "registration_hosts": [
+    {
+      "host": "https://api.example.invalid/spaces/v1/create",
+      "public_key": "REPLACE_WITH_HOST_REGISTRATION_PUBLIC_KEY"
+    }
+  ]
 }

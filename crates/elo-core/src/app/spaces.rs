@@ -99,7 +99,11 @@ enum PollMode {
     Regular,
     Foreground,
     Notification,
+    Call,
 }
+// Leave time for durable enrollment and signing before the UI's 12-second IPC
+// deadline. Only network reads are cancellable; local commits must finish.
+const CALL_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 pub(super) struct Spaces {
     catalog: Catalog,
     children: BTreeMap<String, ClientApp>,
@@ -543,7 +547,8 @@ impl ClientApp {
         for entry in &catalog.entries {
             safe_id(&entry.id)?;
             if !unique.insert(&entry.id)
-                || !["pending", "joined", "declined", "checking"].contains(&entry.status.as_str())
+                || !["pending", "joined", "declined", "checking", "rejoin"]
+                    .contains(&entry.status.as_str())
                 || !record::valid_display_name(&entry.name)
             {
                 return Err("Invalid Space catalog.".into());
@@ -927,7 +932,10 @@ impl Spaces {
         Ok(())
     }
     pub(super) fn awaiting_verification(&self) -> bool {
-        self.catalog.entries.iter().any(|e| e.status == "checking")
+        self.catalog
+            .entries
+            .iter()
+            .any(|e| matches!(e.status.as_str(), "checking" | "rejoin"))
     }
     pub(super) fn children(&self) -> &BTreeMap<String, ClientApp> {
         &self.children
@@ -1942,6 +1950,9 @@ impl Spaces {
         entry: Entry,
         mode: PollMode,
     ) -> Result<bool> {
+        if entry.status == "rejoin" {
+            return Ok(false);
+        }
         let context = self.context_for(root, Some(&entry.id))?;
         let mut scope = hosting_services::Scope::new(root, context);
         Box::pin(self.poll_entry_scoped(&mut scope, entry, mode)).await
@@ -1960,18 +1971,20 @@ impl Spaces {
                 return Box::pin(self.verify_restored_witnessed(root, entry, address, mode)).await;
             }
             let origin = root.invitation_origin()?.to_owned();
-            if let Some((pending, authority)) = root
-                .witness_reconcile_pending_scope(&address.scope, &origin)
-                .await?
+            if mode != PollMode::Call
+                && let Some((pending, authority)) = root
+                    .witness_reconcile_pending_scope(&address.scope, &origin)
+                    .await?
             {
                 self.complete_witnessed_join(root, &pending, &authority)
                     .await?;
                 return Ok(false);
             }
-            if let Some(pending) = root
-                .witness_durable_admissions()?
-                .into_iter()
-                .find(|p| p.address.scope.space == address.scope.space)
+            if mode != PollMode::Call
+                && let Some(pending) = root
+                    .witness_durable_admissions()?
+                    .into_iter()
+                    .find(|p| p.address.scope.space == address.scope.space)
             {
                 // An earlier Admit may already have committed. Reconcile its
                 // durable witness state before consulting a relay that can still
@@ -2034,8 +2047,19 @@ impl Spaces {
                 .find(|a| a.space() == address.scope.space && a.stream() == address.scope.stream)
                 .ok_or("General unavailable.")?
                 .clone();
-            let current = root.witness_read_authority(&known).await?;
-            let response = root.sync_witnessed_host(&address, &current).await?;
+            let refresh = async {
+                let current = root.witness_read_authority(&known).await?;
+                root.sync_witnessed_host(&address, &current).await
+            };
+            let response = if mode == PollMode::Call {
+                // Calls already require joined membership. Do not reconcile
+                // pending admissions or apply enrollment inside this timeout.
+                tokio::time::timeout(CALL_REFRESH_TIMEOUT, refresh)
+                    .await
+                    .map_err(|_| super::witness_client::WitnessUnavailable)??
+            } else {
+                refresh.await?
+            };
             self.add_joined(root, address, response).await?;
             return Ok(false);
         }
@@ -2054,7 +2078,11 @@ impl Spaces {
         // Only the read-only network request is cancellable. Verified
         // enrollment, revocation and local journal commits finish normally.
         let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(if foreground { 2 } else { 24 });
+            + if mode == PollMode::Call {
+                CALL_REFRESH_TIMEOUT
+            } else {
+                std::time::Duration::from_secs(if foreground { 2 } else { 24 })
+            };
         let enrollment = root.team_enrollment_request(&address.scope)?;
         let client = if entry.root {
             Some(&*root)
@@ -2155,6 +2183,27 @@ impl Spaces {
             child.close().await?;
             known?
         };
+        // Recovery creates a fresh device credential. The old signed membership
+        // is history, not authorization for this device. Keep the isolated data
+        // until a new invitation grants access; do not fail the whole import.
+        if !known.head()?.members.iter().any(|member| {
+            member
+                .credential_ids
+                .contains(&root.session.credential().id())
+                && member.capabilities.contains(&Capability::Read)
+        }) {
+            let restored = self
+                .catalog
+                .entries
+                .iter_mut()
+                .find(|e| e.id == entry.id)
+                .ok_or("Space not found.")?;
+            restored.status = "rejoin".into();
+            restored.owner = false;
+            restored.requests = 0;
+            restored.role_requests.clear();
+            return Ok(false);
+        }
         let refresh = async {
             let current = root.witness_read_authority(&known).await?;
             root.sync_witnessed_host(&address, &current).await
@@ -3137,9 +3186,37 @@ impl Spaces {
         } else {
             None
         };
-        let id = target
+        let selected = target
             .or(self.catalog.active.as_deref())
-            .ok_or("Join a Space first.")?;
+            .ok_or("Join a Space first.")?
+            .to_owned();
+        let id = selected.as_str();
+        if op == "call_authorization"
+            && matches!(v["operation"]["type"].as_str(), Some("start" | "join"))
+        {
+            if v.get("expected_identity")
+                .is_some_and(|identity| identity != &json!(root.identity_id()))
+            {
+                return Err("The open profile has changed".into());
+            }
+            let entry = self
+                .catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id == id && entry.status == "joined")
+                .cloned()
+                .ok_or("Space not found.")?;
+            if entry.address.is_none() || v["hosting_space_id"].as_str() != Some(id) {
+                return Err("Call Space authorization mismatch.".into());
+            }
+            // Membership can change between opening a chat and starting a call.
+            // Refresh the targeted Space before signing, without retrying a
+            // mutating call command or changing the selected Space.
+            if self.poll_entry(root, entry, PollMode::Call).await? {
+                return Err("Call authorization is no longer current.".into());
+            }
+            self.save(root)?;
+        }
         let entry = self
             .catalog
             .entries

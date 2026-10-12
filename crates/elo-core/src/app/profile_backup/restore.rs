@@ -177,6 +177,15 @@ fn matches_file(path: &Path, expected: &[u8]) -> Result<bool> {
 }
 
 pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) -> Result<ClientApp> {
+    restore_configured(request, progress, |_| Ok(())).await
+}
+
+/// Install trusted runtime configuration before checking restored Space access.
+pub async fn restore_configured(
+    request: RestoreRequest<'_>,
+    progress: &RestoreProgress,
+    configure: impl FnOnce(&mut ClientApp) -> Result<()>,
+) -> Result<ClientApp> {
     let RestoreRequest {
         directory,
         bytes,
@@ -417,6 +426,7 @@ pub async fn restore(request: RestoreRequest<'_>, progress: &RestoreProgress) ->
             app.enable_paged_views();
         }
         let verified: Result<()> = async {
+            configure(&mut app)?;
             if app.has_spaces_catalog() {
                 app.quarantine_restored_spaces()?;
                 app.enable_spaces().await?;

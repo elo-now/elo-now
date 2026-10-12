@@ -41,7 +41,7 @@ export type SpaceSummary = {
   contact_email?: string | null;
   id: string;
   name: string;
-  status: "joined" | "pending" | "declined" | "checking";
+  status: "joined" | "pending" | "declined" | "checking" | "rejoin";
   pending_reason?: "approval" | "owner_sync" | null;
   owner: boolean;
   requests: number;
@@ -57,6 +57,8 @@ export function spaceStatusText(
   space: Pick<SpaceSummary, "status" | "pending_reason">,
 ): string {
   switch (space.status) {
+    case "rejoin":
+      return t("spaces.rejoin");
     case "checking":
       return t("spaces.checking");
     case "pending":

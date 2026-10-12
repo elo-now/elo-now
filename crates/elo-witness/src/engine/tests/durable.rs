@@ -360,14 +360,18 @@ fn durable_pending_request_does_not_bypass_policy_revocation_or_fresh_possession
     ))
     .unwrap();
     // Re-registering identical bytes must not reset the durable revoke flag.
-    f.apply(command(
-        &f.authority,
-        &f.owner,
-        Operation::RegisterInvitation {
-            policy: encoded(&policy),
-        },
-    ))
-    .unwrap();
+    let position = journal::position(&f.engine.journal.db).unwrap();
+    assert!(matches!(
+        f.apply(command(
+            &f.authority,
+            &f.owner,
+            Operation::RegisterInvitation {
+                policy: encoded(&policy),
+            },
+        )),
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(journal::position(&f.engine.journal.db).unwrap(), position);
     let admit = f.durable_admit(evidence, NOW);
     assert!(f.apply(admit).is_err());
     let challenge = f.challenge_request(request, NOW);

@@ -1,4 +1,6 @@
 use super::*;
+
+mod head_performance;
 use axum::body::Body;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use elo_core::{
@@ -40,9 +42,14 @@ async fn global_ingest_and_source_rate_reject_before_json_and_release_capacity()
     let service = Service::new(engine, directory.path().join("activation"), false);
     let peer = "127.0.0.1:4444".parse().unwrap();
     let mut permits = Vec::new();
-    for _ in 0..INGEST_SLOTS {
+    for index in 0..INGEST_SLOTS {
+        let source = if index < NETWORK_INGEST_SLOTS {
+            peer
+        } else {
+            "127.0.0.2:4444".parse().unwrap()
+        };
         let (_, _, permit) = service
-            .receive(peer, incoming("not JSON"), false)
+            .receive(source, incoming("not JSON"), false)
             .await
             .unwrap();
         permits.push(permit);
@@ -52,7 +59,7 @@ async fn global_ingest_and_source_rate_reject_before_json_and_release_capacity()
     assert!(matches!(
         service
             .receive(
-                "127.0.0.2:4444".parse().unwrap(),
+                "127.0.0.3:4444".parse().unwrap(),
                 incoming("not JSON"),
                 false
             )
@@ -60,7 +67,12 @@ async fn global_ingest_and_source_rate_reject_before_json_and_release_capacity()
         Err(Error::Limit)
     ));
     drop(permits.pop());
-    assert!(service.receive(peer, incoming("{}"), false).await.is_ok());
+    assert!(
+        service
+            .receive("127.0.0.2:4444".parse().unwrap(), incoming("{}"), false)
+            .await
+            .is_ok()
+    );
     drop(permits);
     service
         .rates
@@ -72,6 +84,151 @@ async fn global_ingest_and_source_rate_reject_before_json_and_release_capacity()
         Err(Error::Limit)
     ));
     assert_eq!(service.ingest.available_permits(), INGEST_SLOTS);
+    assert!(service.network_ingest.lock().unwrap().is_empty());
+}
+
+#[test]
+fn network_admission_groups_ipv6_and_only_trusts_the_configured_loopback_proxy() {
+    assert_eq!(
+        network("2001:db8:1:2::1".parse().unwrap()),
+        network("2001:db8:1:2::ffff".parse().unwrap())
+    );
+    assert_ne!(
+        network("2001:db8:1:2::1".parse().unwrap()),
+        network("2001:db8:1:3::1".parse().unwrap())
+    );
+    assert_eq!(
+        network("192.0.2.1".parse().unwrap()),
+        network("::ffff:192.0.2.1".parse().unwrap())
+    );
+    let (directory, engine) = engine();
+    let mut service = Service::new(engine, directory.path().join("activation"), false);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-real-ip", "192.0.2.2".parse().unwrap());
+    let external: SocketAddr = "192.0.2.1:4444".parse().unwrap();
+    assert_eq!(service.ip(external, &headers).unwrap(), external.ip());
+    service.proxy = true;
+    assert!(matches!(
+        service.ip(external, &headers),
+        Err(Error::Unauthorized)
+    ));
+    let loopback = "127.0.0.1:4444".parse().unwrap();
+    assert_eq!(
+        service.ip(loopback, &headers).unwrap(),
+        "192.0.2.2".parse::<IpAddr>().unwrap()
+    );
+    assert!(service.ip(loopback, &HeaderMap::new()).is_err());
+}
+
+#[tokio::test]
+async fn source_quota_cannot_be_bypassed_by_rotating_ipv6_addresses() {
+    let (directory, engine) = engine();
+    let service = Service::new(engine, directory.path().join("activation"), false);
+    let mut permits = Vec::new();
+    for index in 0..NETWORK_INGEST_SLOTS {
+        let source = format!("[2001:db8:1:2::{index}]:4444").parse().unwrap();
+        permits.push(
+            service
+                .receive(source, incoming("{}"), false)
+                .await
+                .unwrap()
+                .2,
+        );
+    }
+    assert!(matches!(
+        service
+            .receive(
+                "[2001:db8:1:2::ffff]:4444".parse().unwrap(),
+                incoming("{}"),
+                false
+            )
+            .await,
+        Err(Error::Limit)
+    ));
+    assert!(
+        service
+            .receive(
+                "[2001:db8:1:3::1]:4444".parse().unwrap(),
+                incoming("{}"),
+                false
+            )
+            .await
+            .is_ok()
+    );
+    drop(permits);
+    let source: SocketAddr = "[2001:db8:1:2::1]:4444".parse().unwrap();
+    service
+        .rates
+        .lock()
+        .unwrap()
+        .insert(network(source.ip()), (Instant::now(), 120));
+    assert!(matches!(
+        service
+            .receive(
+                "[2001:db8:1:2::ffff]:4444".parse().unwrap(),
+                incoming("{}"),
+                false
+            )
+            .await,
+        Err(Error::Limit)
+    ));
+    assert!(service.network_ingest.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn slow_command_bodies_leave_capacity_for_other_sources_and_head_requests() {
+    use std::io::Write;
+    let (directory, engine) = engine();
+    let service = Service::new(engine, directory.path().join("activation"), false);
+    let running = service.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(running).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let stalled = tokio::task::spawn_blocking(move || {
+        (0..NETWORK_INGEST_SLOTS).map(|_| {
+            let mut connection = std::net::TcpStream::connect(address).unwrap();
+            connection.write_all(b"POST /witness/v1/command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{").unwrap();
+            connection
+        }).collect::<Vec<_>>()
+    }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.ingest.available_permits() != INGEST_SLOTS - NETWORK_INGEST_SLOTS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let source = "127.0.0.1:4444".parse().unwrap();
+    assert!(matches!(
+        service.receive(source, incoming("{}"), false).await,
+        Err(Error::Limit)
+    ));
+    assert!(service.receive(source, incoming("{}"), true).await.is_ok());
+    assert!(
+        service
+            .receive("127.0.0.2:4444".parse().unwrap(), incoming("{}"), false)
+            .await
+            .is_ok()
+    );
+    drop(stalled);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !service.network_ingest.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(service.ingest.available_permits(), INGEST_SLOTS);
+    assert_eq!(service.head_ingest.available_permits(), HEAD_INGEST_SLOTS);
+    assert!(service.receive(source, incoming("{}"), false).await.is_ok());
+    server.abort();
 }
 
 #[tokio::test]
@@ -116,6 +273,8 @@ async fn head_has_small_body_limit_and_global_budget_before_parsing() {
         Err(Error::Limit)
     ));
     assert_eq!(service.ingest.available_permits(), INGEST_SLOTS);
+    assert_eq!(service.head_ingest.available_permits(), HEAD_INGEST_SLOTS);
+    assert!(service.network_ingest.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -144,6 +303,11 @@ async fn incomplete_head_body_times_out_and_releases_ingest_slot() {
     }).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 400"));
     assert_eq!(inspection.ingest.available_permits(), INGEST_SLOTS);
+    assert_eq!(
+        inspection.head_ingest.available_permits(),
+        HEAD_INGEST_SLOTS
+    );
+    assert!(inspection.network_ingest.lock().unwrap().is_empty());
     server.abort();
 }
 

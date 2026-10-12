@@ -13,6 +13,39 @@ use tempfile::TempDir;
 
 const NOW: u64 = 1_800_000_000_000;
 const URL: &str = "https://witness.example.test/witness/v1";
+const HOST: &str = "https://hosting.example.test/spaces/v1/create";
+
+fn registration_host() -> elo_core::witness::registration::RegistrationHost {
+    elo_core::witness::registration::RegistrationHost {
+        host: HOST.into(),
+        public_key: record::encode_hex(
+            SigningKey::from_bytes(&[51; 32]).verifying_key().as_bytes(),
+        ),
+    }
+}
+
+fn ticket(authority: &Authority, owner: &Device, pin: &WitnessPin) -> String {
+    encoded(
+        &elo_core::witness::registration::RegistrationTicket {
+            v: 1,
+            kind: "witness.registration_ticket".into(),
+            audience: pin.url.clone(),
+            witness_public_key: pin.public_key.clone(),
+            witness_key_generation: pin.key_generation,
+            host: HOST.into(),
+            space_id: authority.space(),
+            stream_id: authority.stream(),
+            authority_head: authority.head_id().unwrap(),
+            creator_identity: owner.credential.identity(),
+            credential_id: owner.credential.id(),
+            issued_at_ms: NOW,
+            expires_at_ms: NOW + 60_000,
+            reservation_id: "41".repeat(32),
+        }
+        .sign(&[51; 32])
+        .unwrap(),
+    )
+}
 
 struct Device {
     root: SigningKey,
@@ -56,6 +89,7 @@ fn command(authority: &Authority, actor: &Device, operation: Operation) -> Reque
         invitation_signature: None,
         proof: None,
         registration_work: None,
+        registration_ticket: None,
     }
 }
 struct Fixture {
@@ -87,6 +121,114 @@ fn registration_work_cannot_be_reused_with_a_changed_command_or_proof() {
 }
 
 #[test]
+fn new_registration_requires_the_exact_operator_authorized_allocation() {
+    let fixture = Fixture::new();
+    let mut journal = Journal::open(
+        &fixture.directory.path().join("empty-data"),
+        &fixture.directory.path().join("key"),
+        fixture.pin.clone(),
+        NOW,
+    )
+    .unwrap();
+    activate(
+        &mut journal,
+        Position {
+            sequence: 0,
+            record_id: None,
+        },
+    );
+    let mut engine = Engine { journal };
+    let request = || serde_json::from_slice::<Request>(&fixture.registration).unwrap();
+    // An advertised host key inside a ticket is never an independent trust pin.
+    assert!(matches!(
+        engine.apply(request(), "127.0.0.1".parse().unwrap(), NOW),
+        Err(Error::Unauthorized)
+    ));
+    engine
+        .journal
+        .set_registration_hosts(vec![registration_host()])
+        .unwrap();
+    let mut missing = request();
+    missing.registration_ticket = None;
+    assert!(matches!(
+        engine.apply(missing, "127.0.0.1".parse().unwrap(), NOW),
+        Err(Error::Unauthorized)
+    ));
+    let (original, _) = elo_core::witness::registration::RegistrationTicket::parse(
+        request().registration_ticket.as_deref().unwrap(),
+    )
+    .unwrap();
+    let value = serde_json::to_value(original).unwrap();
+    for (field, wrong) in [
+        (
+            "audience",
+            serde_json::json!("https://other.example.test/witness/v1"),
+        ),
+        ("witness_public_key", serde_json::json!("61".repeat(32))),
+        ("witness_key_generation", serde_json::json!(2)),
+        (
+            "host",
+            serde_json::json!("https://other.example.test/spaces/v1/create"),
+        ),
+        ("space_id", serde_json::json!(SpaceId::from_bytes([61; 32]))),
+        (
+            "stream_id",
+            serde_json::json!(StreamId::from_bytes([62; 16])),
+        ),
+        (
+            "authority_head",
+            serde_json::json!(RecordId::from_bytes([63; 32])),
+        ),
+        (
+            "creator_identity",
+            serde_json::json!(fixture.guest.credential.identity()),
+        ),
+        (
+            "credential_id",
+            serde_json::json!(fixture.guest.credential.id()),
+        ),
+        ("expires_at_ms", serde_json::json!(NOW)),
+        ("issued_at_ms", serde_json::json!(NOW + 6_000)),
+    ] {
+        let mut changed = value.clone();
+        changed[field] = wrong;
+        let mut altered = request();
+        altered.registration_ticket = Some(encoded(&signed(
+            &changed,
+            &SigningKey::from_bytes(&[51; 32]),
+        )));
+        assert!(
+            engine
+                .apply(altered, "127.0.0.1".parse().unwrap(), NOW)
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(journal::position(&engine.journal.db).unwrap().sequence, 0);
+    }
+    let mut wrong_key = request();
+    wrong_key.registration_ticket =
+        Some(encoded(&signed(&value, &SigningKey::from_bytes(&[52; 32]))));
+    assert!(
+        engine
+            .apply(wrong_key, "127.0.0.1".parse().unwrap(), NOW)
+            .is_err()
+    );
+    engine
+        .apply(request(), "127.0.0.1".parse().unwrap(), NOW)
+        .unwrap();
+    let registered = journal::position(&engine.journal.db).unwrap();
+    assert_eq!(registered.sequence, 1);
+    engine.journal.set_registration_hosts(vec![]).unwrap();
+    // Closing new provisioning does not invalidate existing registration replay.
+    let mut replay = request();
+    replay.registration_ticket = None;
+    engine
+        .apply(replay, "127.0.0.1".parse().unwrap(), NOW)
+        .unwrap();
+    assert_eq!(journal::position(&engine.journal.db).unwrap(), registered);
+}
+
+#[test]
 fn registration_budget_groups_ipv6_networks_and_normalizes_mapped_ipv4() {
     let key = |ip: &str, day| registration_network(ip.parse().unwrap(), day);
     assert_eq!(key("2001:db8:1:2::1", 1), key("2001:db8:1:2::ffff", 1));
@@ -94,6 +236,88 @@ fn registration_budget_groups_ipv6_networks_and_normalizes_mapped_ipv4() {
     assert_eq!(key("192.0.2.1", 1), key("::ffff:192.0.2.1", 1));
     assert_ne!(key("192.0.2.1", 1), key("192.0.2.1", 2));
     assert_eq!(key("192.0.2.1", 1).len(), 64);
+}
+
+#[test]
+fn repeated_invitation_operations_are_signed_noops_without_journal_growth() {
+    let mut fixture = Fixture::new();
+    let policy = fixture.policy(false, 5);
+    let before = journal::position(&fixture.engine.journal.db).unwrap();
+    for _ in 0..5 {
+        let request = command(
+            &fixture.authority,
+            &fixture.owner,
+            Operation::RegisterInvitation {
+                policy: encoded(&policy),
+            },
+        );
+        let id = decode(&request.command).unwrap().id();
+        let response = fixture.apply(request).unwrap();
+        let signed = decode(response.receipt.as_ref().unwrap()).unwrap();
+        signed
+            .verify_signature(&fixture.pin.key().unwrap())
+            .unwrap();
+        let ack: NoopAcknowledgement = signed.decode().unwrap();
+        assert_eq!(ack.request_id, id);
+        assert_eq!(ack.position, before);
+        assert_eq!(ack.event, "invitation.registered");
+    }
+    assert_eq!(
+        journal::position(&fixture.engine.journal.db).unwrap(),
+        before
+    );
+    fixture
+        .apply(command(
+            &fixture.authority,
+            &fixture.owner,
+            Operation::RevokeInvitation {
+                policy_id: policy.id(),
+            },
+        ))
+        .unwrap();
+    let revoked = journal::position(&fixture.engine.journal.db).unwrap();
+    assert_eq!(revoked.sequence, before.sequence + 1);
+    for _ in 0..5 {
+        let response = fixture
+            .apply(command(
+                &fixture.authority,
+                &fixture.owner,
+                Operation::RevokeInvitation {
+                    policy_id: policy.id(),
+                },
+            ))
+            .unwrap();
+        let ack: NoopAcknowledgement = decode(response.receipt.as_ref().unwrap())
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!(ack.event, "invitation.revoked");
+        assert_eq!(ack.position, revoked);
+    }
+    assert_eq!(
+        journal::position(&fixture.engine.journal.db).unwrap(),
+        revoked
+    );
+    assert!(matches!(
+        fixture.apply(command(
+            &fixture.authority,
+            &fixture.owner,
+            Operation::RegisterInvitation {
+                policy: encoded(&policy)
+            }
+        )),
+        Err(Error::Unauthorized)
+    ));
+    assert!(matches!(
+        fixture.apply(command(
+            &fixture.authority,
+            &fixture.guest,
+            Operation::RevokeInvitation {
+                policy_id: policy.id()
+            }
+        )),
+        Err(Error::Unauthorized)
+    ));
 }
 impl Fixture {
     fn new() -> Self {
@@ -170,8 +394,12 @@ impl Fixture {
         elo_core::vault::write_private(&keypath, &witness.to_bytes(), false).unwrap();
         let mut journal =
             Journal::open(&directory.path().join("data"), &keypath, pin.clone(), NOW).unwrap();
+        journal
+            .set_registration_hosts(vec![registration_host()])
+            .unwrap();
         let mut request = command(&authority, &owner, Operation::Register);
         request.proof = Some(authority.call_proof().unwrap());
+        request.registration_ticket = Some(ticket(&authority, &owner, &pin));
         assert!(request.verify_registration_work().is_err());
         request.solve_registration_work().unwrap();
         let registration = serde_json::to_vec(&request).unwrap();

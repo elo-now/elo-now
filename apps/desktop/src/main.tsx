@@ -647,7 +647,6 @@ function App() {
   const [storedView, storeView] = useState<View | null>(null),
     [selected, setSelected] = useState(""),
     [busy, setBusy] = useState(false),
-    [syncSummary, setSyncSummary] = useState(""),
     [action, setAction] = useState<Action | null>(null),
     [values, setValues] = useState<Record<string, string | boolean>>({});
   const [deleteChat, setDeleteChat] = useState<{
@@ -958,7 +957,6 @@ function App() {
   const perform = async (fn: () => Promise<void>) => {
     setBusy(true);
     setError("");
-    setSyncSummary("");
     try {
       await fn();
     } catch (e) {
@@ -1302,7 +1300,6 @@ function App() {
     const transferId = crypto.randomUUID();
     setBusy(true);
     setError("");
-    setSyncSummary("");
     void (async () => {
       const output = await invoke<string>("prepare_export", {
         kind: "file_download",
@@ -1375,11 +1372,8 @@ function App() {
       retryConversationDrafts();
       // Keep a manual refresh bounded; the foreground worker drains the rest.
       try {
-        const result = await call({ op: "sync_live" });
+        await call({ op: "sync_live" });
         requestSync(true);
-        setSyncSummary(
-          t("sync.summary", result.result as Record<string, number>),
-        );
       } finally {
         // A no-change or failed network pass must not leave already saved
         // messages hidden behind an older local page.
@@ -2704,11 +2698,6 @@ function App() {
               }
             />
             {stream?.forked && <p className="error">{t("warning.forked")}</p>}
-            {mode === "expert" && syncSummary && (
-              <p className="notice" role="status">
-                {syncSummary}
-              </p>
-            )}
             <div
               className="searchable-list"
               ref={threadActive ? undefined : messageEntrance.list}

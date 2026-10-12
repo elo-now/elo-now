@@ -240,7 +240,7 @@ impl Server {
         tokio::time::timeout(Duration::from_secs(3), async {
             let store = self
                 .resolver
-                .resolve(&subscription.request.replica)
+                .resolve(&subscription.request)
                 .await
                 .ok_or(ReplicaError::Unauthorized)?;
             if store.key() != subscription.store.key() {
@@ -275,7 +275,7 @@ impl Server {
         }
         let store = self
             .resolver
-            .resolve(&request.replica)
+            .resolve(request)
             .await
             .ok_or(ReplicaError::Unauthorized)?;
         // Reject invalid mailbox tokens before doing public-key proof work.

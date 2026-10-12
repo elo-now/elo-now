@@ -26,6 +26,7 @@ def load(name):
 
 provision, activation, source_bundle, locked = (load(name) for name in ("init", "activate", "bundle", "verify_lock"))
 profile_export = load("export")
+registration_trust = load("authorize_host")
 runtime_smoke = load("smoke")
 
 
@@ -113,11 +114,39 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(config["witness"], pin)
         backup = (self.root / "api/config/backup-access.key").read_bytes()
         signer = (self.root / "export/config/signing-key.bin").read_bytes()
+        registration_key = (self.root / "api/config/registration-signing-key.bin").read_bytes()
         self.assertEqual(len(backup), 64)
         self.assertNotEqual(bytes.fromhex(backup.decode()), signer)
+        self.assertNotEqual(registration_key, signer)
+        self.assertEqual(config["registration_signing_key"], "/etc/elo/api/registration-signing-key.bin")
+        registration = json.loads((self.root / "public/registration-host.json").read_text())
+        self.assertEqual(registration, {"host": "https://api.example.test/spaces/v1/create",
+                                        "public_key": provision.public_key(registration_key)})
+        self.assertEqual(stat.S_IMODE((self.root / "api/config/registration-signing-key.bin").stat().st_mode), 0o600)
         self.assertEqual(body["signing_public_key"], provision.public_key(signer))
         self.assertEqual(body["storage"]["url"], "https://witness.example.test/storage/v1")
         self.assertEqual(body["name"], "Private elo")
+
+    def test_witness_registration_pins_reject_conflicts_and_keep_other_configuration(self):
+        self.prepare()
+        config = json.loads((self.root / "witness/config/config.json").read_text())
+        self.assertEqual(config["registration_hosts"], [])
+        entry = registration_trust.registration("https://api.example.test/spaces/v1/create", "a" * 64)
+        trusted = registration_trust.updated(config, entry)
+        self.assertEqual(registration_trust.updated(trusted, entry), trusted)
+        self.assertEqual(trusted["pin"], config["pin"])
+        self.assertEqual(trusted["signing_key"], config["signing_key"])
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            registration_trust.updated(trusted, dict(entry, public_key="b" * 64))
+        for host in ["http://api.example.test/spaces/v1/create", "https://api.example.test:65536/spaces/v1/create",
+                     "https://user@api.example.test/spaces/v1/create", "https://api.example.test/spaces/v1/create?x=1",
+                     "https://api.example.test/spaces/v1/create/", "https://127.0.0.1/spaces/v1/create"]:
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                registration_trust.registration(host, "a" * 64)
+        self.assertEqual(registration_trust.registration("https://api.example.test:9443/spaces/v1/create", "a" * 64)["public_key"], "a" * 64)
+        with mock.patch.object(registration_trust.subprocess, "check_output", return_value="container-id\n"):
+            with self.assertRaisesRegex(ValueError, "Stop witness"):
+                registration_trust.require_stopped()
 
     def test_managed_s3_credentials_stay_on_the_storage_service(self):
         managed = {"provider": {"provider": "s3_compatible", "endpoint": "https://s3.example.test",

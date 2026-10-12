@@ -146,6 +146,7 @@ fn create(root: &Path) -> Result<()> {
             invitation_signature: None,
             proof: None,
             registration_work: None,
+            registration_ticket: None,
         })
     };
     let key = root.join("synthetic-key.bin");
@@ -153,6 +154,12 @@ fn create(root: &Path) -> Result<()> {
     private_json(&root.join("pin.json"), &pin)?;
     let now = elo_witness::now_ms()?;
     let mut journal = Journal::open(&root.join("data"), &key, pin.clone(), now)?;
+    let host = "https://hosting.example.test/spaces/v1/create";
+    let host_key = SigningKey::from_bytes(&[51; 32]);
+    journal.set_registration_hosts(vec![elo_core::witness::registration::RegistrationHost {
+        host: host.into(),
+        public_key: record::encode_hex(host_key.verifying_key().as_bytes()),
+    }])?;
     if journal.ready(now) {
         return Err("A new journal was unexpectedly active".into());
     }
@@ -174,6 +181,28 @@ fn create(root: &Path) -> Result<()> {
     let mut engine = Engine { journal };
     let mut registration = request(Operation::Register)?;
     registration.proof = Some(authority.call_proof()?);
+    registration.registration_ticket = Some(
+        STANDARD.encode(
+            elo_core::witness::registration::RegistrationTicket {
+                v: 1,
+                kind: "witness.registration_ticket".into(),
+                audience: pin.url.clone(),
+                witness_public_key: pin.public_key.clone(),
+                witness_key_generation: pin.key_generation,
+                host: host.into(),
+                space_id: authority.space(),
+                stream_id: stream,
+                authority_head: authority.head_id().ok_or("Missing head")?,
+                creator_identity: credential.identity(),
+                credential_id: credential.id(),
+                issued_at_ms: now,
+                expires_at_ms: now + 60_000,
+                reservation_id: "41".repeat(32),
+            }
+            .sign(&host_key.to_bytes())?
+            .bytes(),
+        ),
+    );
     registration.solve_registration_work()?;
     engine.apply(registration, "127.0.0.1".parse()?, elo_witness::now_ms()?)?;
     // Keep a correctly signed older snapshot for the independent-anchor test.

@@ -22,7 +22,7 @@ fn signed<T: Serialize>(body: &T, session: &Session) -> SignedRecord {
 fn encoded(signed: &SignedRecord) -> String {
     STANDARD.encode(signed.bytes())
 }
-fn solve_creation_work(creation: &mut CreateRequest) {
+pub(super) fn solve_creation_work(creation: &mut CreateRequest) {
     let mut prefix = Sha256::new();
     prefix.update(b"elo.space.create.work.v1\0");
     prefix.update(Sha256::digest(creation.record.as_bytes()));
@@ -245,7 +245,7 @@ async fn witnessed_creation_accepts_paired_owner_and_rejects_revoked_parent() {
     super::tests::close_host(host).await;
     witness_task.abort();
 }
-fn fixture() -> (Session, Session, WitnessPin, Authority) {
+pub(super) fn fixture() -> (Session, Session, WitnessPin, Authority) {
     let (signer, _) = Session::create().unwrap();
     let pin = WitnessPin {
         url: "https://witness.example.test/witness/v1".into(),
@@ -364,7 +364,11 @@ fn request(session: &Session, authority: &Authority, action: &str, body: Value) 
         ))),
     }
 }
-async fn post(router: &Router, path: &str, body: &impl Serialize) -> (StatusCode, Value) {
+pub(super) async fn post(
+    router: &Router,
+    path: &str,
+    body: &impl Serialize,
+) -> (StatusCode, Value) {
     let response = router
         .clone()
         .oneshot(
@@ -507,6 +511,7 @@ fn advance(
 
 #[tokio::test]
 async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_membership() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let directory = tempfile::tempdir().unwrap();
     let (owner, witness, pin, mut authority) = fixture();
     let witness = Arc::new(witness);
@@ -516,7 +521,10 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
     let server_head = head.clone();
     let server_witness = witness.clone();
     let server_pin = pin.clone();
+    let witness_requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = witness_requests.clone();
     let witness_task = tokio::spawn(axum::serve(listener,Router::new().route("/head",axum::routing::post(move |Json(request):Json<HeadRequest>| {
+        server_requests.fetch_add(1, Ordering::SeqCst);
         let head = server_head.clone(); let signer=server_witness.clone(); let pin=server_pin.clone(); async move {
             let (head,sequence)=*head.lock().unwrap();let now=current().unwrap();
             Json(json!({"freshness":encoded(&signed(&Freshness {v:1,kind:"witness.freshness".into(),audience:pin.url,nonce:request.nonce,space_id:request.space_id,stream_id:request.stream_id,authority_head:head,position:Position {sequence,record_id:Some(RecordId::from_bytes([sequence as u8;32]))},issued_at_ms:now,expires_at_ms:now+30_000,witness_key_generation:1},&signer))}))
@@ -535,6 +543,7 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
         operator_snapshot: None,
         backup_access_key: None,
         call_admission_key: None,
+        registration_signing_key: None,
         attachment_storage: None,
         recovery_recipient: None,
         client_policy: Default::default(),
@@ -595,6 +604,127 @@ async fn witnessed_routes_create_import_relay_ciphertext_restart_and_deny_stale_
     let (status, reply) = post(&router, &path, &sync).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(plaintext(reply, &owner)["status"], "approved");
+    {
+        let space = host.spaces.read().await.get(&id).unwrap().clone();
+        let client = space.client.lock().await;
+        host.witness.as_ref().unwrap().clear_test_cache();
+        let before = witness_requests.load(Ordering::SeqCst);
+        let inventory = format!(
+            "/spaces/{id}/replica/v1/mailboxes/{}/inventory",
+            space.mailbox
+        );
+        let token = space.config.peer.read_token.as_deref().unwrap();
+        let invalid_token = MailboxDescriptor::random().unwrap().read_token;
+        for (method, route, bearer_token, expected) in [
+            ("GET", inventory.clone(), None, StatusCode::FORBIDDEN),
+            (
+                "GET",
+                inventory.clone(),
+                Some(invalid_token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "DELETE",
+                inventory.clone(),
+                Some(token),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                format!("/spaces/{id}/replica/not-a-route"),
+                Some(token),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                format!(
+                    "/spaces/{id}/replica/v1/mailboxes/{}/objects/invalid",
+                    space.mailbox
+                ),
+                Some(token),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                format!("/spaces/{id}/replica/v1/health"),
+                None,
+                StatusCode::OK,
+            ),
+        ] {
+            let mut request = Request::builder().method(method).uri(route);
+            if let Some(token) = bearer_token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = tokio::time::timeout(
+                Duration::from_millis(500),
+                router.clone().oneshot(request.body(Body::empty()).unwrap()),
+            )
+            .await
+            .expect("anonymous requests must not wait for the Space client lock")
+            .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let mut realtime = elo_core::realtime::SubscriptionRequest {
+            id: "bounded-test".into(),
+            replica: format!("/spaces/{id}/replica/"),
+            mailbox: space.mailbox,
+            read_token: invalid_token,
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                elo_core::realtime::Resolver::resolve(host.as_ref(), &realtime),
+            )
+            .await
+            .expect("invalid realtime bearer must not wait for the Space client lock")
+            .is_none()
+        );
+        realtime.read_token = token.into();
+        let permits = space.replica_slots.acquire_many(8).await.unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&inventory)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            elo_core::realtime::Resolver::resolve(host.as_ref(), &realtime)
+                .await
+                .is_none()
+        );
+        drop(permits);
+        assert_eq!(witness_requests.load(Ordering::SeqCst), before);
+        assert!(
+            space.serving.try_write().is_ok(),
+            "rejected requests cannot hold the serving gate"
+        );
+        drop(client);
+        assert!(
+            elo_core::realtime::Resolver::resolve(host.as_ref(), &realtime)
+                .await
+                .is_some()
+        );
+        // Possessing the mailbox bearer still does not bypass the signed identity check.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(inventory)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(witness_requests.load(Ordering::SeqCst), before + 1);
+    }
     assert_eq!(
         post(
             &router,

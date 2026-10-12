@@ -157,6 +157,84 @@ fn digest_is_signed_with_the_transaction_and_rollback_keeps_the_old_snapshot() {
 }
 
 #[test]
+fn capacity_failure_rolls_back_authority_and_receipt_without_breaking_activation() {
+    let mut fixture = Fixture::new();
+    let prior = position(&fixture.journal.db).unwrap();
+    let prior_digest = state_digest(&fixture.journal.db, fixture.space).unwrap();
+    {
+        let tx = fixture.journal.db.transaction().unwrap();
+        tx.execute("UPDATE spaces SET proof=?1", ["x".repeat(3 * 1024 * 1024)])
+            .unwrap();
+        let result = append(
+            &tx,
+            &fixture.journal.key,
+            &fixture.journal.pin,
+            Event {
+                request: RecordId::from_bytes([10; 32]),
+                space: fixture.space,
+                head: fixture.head,
+                name: "authority.updated",
+                now: NOW,
+            },
+            Response {
+                receipt: None,
+                proof: None,
+                challenge: None,
+            },
+        );
+        assert!(matches!(result, Err(Error::Limit)));
+    }
+    assert_eq!(position(&fixture.journal.db).unwrap(), prior);
+    assert_eq!(
+        state_digest(&fixture.journal.db, fixture.space).unwrap(),
+        prior_digest
+    );
+    verify_materialized(&fixture.journal.db, &fixture.journal.pin).unwrap();
+    fixture.journal.activate(fixture.activation(), NOW).unwrap();
+}
+
+#[test]
+fn security_reserve_commits_a_signed_snapshot_after_the_normal_budget_is_full() {
+    let mut fixture = Fixture::new();
+    let tx = fixture.journal.db.transaction().unwrap();
+    // This journal-layer fixture represents authority already verified by Engine.
+    tx.execute("UPDATE spaces SET proof=?1", ["x".repeat(3 * 1024 * 1024)])
+        .unwrap();
+    append_with_budget(
+        &tx,
+        &fixture.journal.key,
+        &fixture.journal.pin,
+        Event {
+            request: RecordId::from_bytes([10; 32]),
+            space: fixture.space,
+            head: fixture.head,
+            name: "invitation.revoked",
+            now: NOW,
+        },
+        Response {
+            receipt: None,
+            proof: None,
+            challenge: None,
+        },
+        true,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(
+        capacity::enforce(&fixture.journal.db, fixture.space, false),
+        Err(Error::Limit)
+    ));
+    capacity::enforce(&fixture.journal.db, fixture.space, true).unwrap();
+    verify_materialized(&fixture.journal.db, &fixture.journal.pin).unwrap();
+    let prior = position(&fixture.journal.db).unwrap();
+    let path = fixture.directory.path().to_path_buf();
+    let pin = fixture.journal.pin.clone();
+    drop(fixture.journal);
+    let reopened = Journal::open(&path.join("data"), &path.join("key"), pin, NOW).unwrap();
+    assert_eq!(position(&reopened.db).unwrap(), prior);
+}
+
+#[test]
 fn canonical_digest_ignores_row_insertion_order_but_preserves_types_and_boundaries() {
     let mut fixture = Fixture::new();
     let space = fixture.space.to_string();

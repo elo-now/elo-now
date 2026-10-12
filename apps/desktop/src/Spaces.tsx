@@ -176,7 +176,7 @@ export function SpaceSetup({
                   <p className="muted">{spaceStatusText(space)}</p>
                 </div>
               ))}
-            {!!view.spaces?.length && (
+            {hasPending && (
               <button
                 className="secondary"
                 disabled={busy}

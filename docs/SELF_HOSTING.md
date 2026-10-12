@@ -225,7 +225,7 @@ Save the following as `/etc/elo/host/config.json` (mode `0600`, owned by `elo-ho
 }
 ```
 
-`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB. The deployment-wide limits also count new identities: at most 128 allocated Spaces and 32 new reservations per UTC day by default. Lower these values to fit the disk budget; 128 fully used Spaces require at least 25.6 GB before overhead. Retries of an existing reservation do not spend another daily slot. These caps bound resource consumption; they do not prove that two profiles belong to different people.
+`public_url` must be the final HTTPS origin **without a trailing slash**. The host builds signed, Space-specific `/spaces/{id}/replica/` and enrollment endpoints under that origin. A client keeps the signed endpoint and signing-key pin after joining. Do not round-robin the host over independent databases. This example allows two Spaces per creator, with 150,000,000 encrypted-message bytes and a separate 50,000,000-byte encrypted-attachment quota per Space. Each plaintext file is limited to 5 MiB. The deployment-wide limits also count new identities: at most 128 allocated Spaces and 32 new reservations per UTC day by default. Lower these values to fit the disk budget; 128 fully used Spaces require at least 25.6 GB before overhead. Retries of an existing reservation do not spend another daily slot. Witness preparation also keeps an identity-free, monotonic counter in `registration-budget.json`, capped at the lower of `max_spaces` and 128. It is committed before issuing any registration ticket and is not reset by Space/account deletion. On the first upgrade, existing allocations and deletion tombstones count conservatively. Account deletion removes unfinished private setup data while preserving this aggregate counter. Keep the counter with the hosting state; never clear or reduce it to bypass a full, append-only witness. A full counter refuses only new tickets; existing Spaces and retries of already issued tickets remain available. These caps bound resource consumption; they do not prove that two profiles belong to different people.
 
 The next-release baseline also requires a 20-bit SHA-256 proof of work tied to
 each signed Space-creation request. The client computes it locally on a worker;
@@ -354,6 +354,7 @@ Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit p
     "key_generation": 1
   },
   "max_connections": 128,
+  "transport_memory_mib": 768,
   "media": {
     "url": "wss://chat.example.org/media/",
     "api_url": "http://127.0.0.1:7880",
@@ -369,6 +370,22 @@ Save `/etc/elo/call/config.json` (private to `elo-call`) with the same LiveKit p
 ```
 
 The `admission_key` must have exactly the same 64 characters as the host's `call_admission_key`. The call service reads its JSON with `--config /etc/elo/call/config.json`. Its public WebSocket is only `/calls/v1/connect`; the private admission URL must stay on loopback. Media credentials are issued to clients as short-lived tokens through signed call operations, not baked into an app package.
+
+Call control reserves **48 MiB of transport capacity per socket before upgrade**.
+The effective socket limit is the smaller of `max_connections` and
+`floor(transport_memory_mib / 48)`: the default 768 MiB budget admits 16 sockets,
+including idle subscriptions and native mobile control sockets. These are sockets,
+not simultaneous participants. A phone can use several while answering or switching
+calls. The per-device limit remains six and the per-profile limit 24.
+
+The example systemd unit allows 1536 MiB of process memory; the container uses
+`ELO_CALL_MEMORY_LIMIT=1536m` by default. For 21 sockets, set
+`transport_memory_mib` to 1024 and the process limit to at least 2 GiB. Change both
+together and measure your own roster sizes and call workload before increasing
+capacity. The transport reservation covers buffering; it is not a hard RSS bound
+or a throughput promise. Proof verification, the authority cache, pending events,
+SQLite and runtime allocations need the remaining memory. See the
+[call memory bounds](CALLS.md#call-control-memory-bounds).
 
 Copy the API's trusted `witness` pin into the call-service configuration as well.
 General uses a witnessed membership chain; without this explicit pin the call
@@ -567,7 +584,7 @@ the owner's control. An already authorized linked owner device can manage Genera
 after another owner device is revoked. Losing every authorized owner device
 still requires the explicit management-recovery process.
 
-The host shares four SQLite worker slots across profiles. The notification relay uses a dedicated SQLite worker with at most 64 queued operations; overload returns HTTP 503. SQLite never runs on the relay's network executor, and provider requests remain outside the database worker. Recipient policy changes and delivery retain their original ordering. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. HTTP deletion and subsequent requests return the durable signed receipt without contacting attachment storage or acquiring the creation lock. Access closes immediately; physical cleanup retries only in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. New reservations can be reclaimed after 24 hours only if all invitations have expired and no authenticated use or join request was ever accepted. The claim marker is permanent, including after a pending request expires or a member leaves. Previously existing advertised Spaces and damaged/unavailable state are never inferred to be unused. This is not inactivity-based deletion. Eight existing Spaces per network supplement the daily limits, but an attacker using many independent networks can still exhaust anonymous capacity. `/stats` reports allocated, remaining and near-full capacity (80% threshold); outbound alerts require separate operator configuration.
+The host shares four SQLite worker slots across profiles. The notification relay uses a dedicated SQLite worker with at most 64 queued operations; overload returns HTTP 503. SQLite never runs on the relay's network executor, and provider requests remain outside the database worker. Recipient policy changes and delivery retain their original ordering. A corrupt Space stays unavailable and consumes its allocation, while healthy Spaces continue serving. Deletion tombstones remain permanent; completed cleanup is recorded so a restart does not contact attachment storage for it. HTTP deletion and subsequent requests return the durable signed receipt without contacting attachment storage or acquiring the creation lock. Access closes immediately; physical cleanup retries only in the background. The defaults admit 128 Spaces, 32 creations per deployment/day and four per IPv4 address or IPv6 /64/day, alongside the two-Space identity limit. These are capacity/abuse budgets, not proof of a unique human. Reservations can be reclaimed after 24 hours only if no witness registration ticket was issued, all invitations have expired, and no authenticated use or join request was ever accepted. A ticket may already have registered its genesis at the independent witness even when API creation was abandoned, so ticket-issued reservations are not automatically reclaimed. The claim marker is permanent, including after a pending request expires or a member leaves. Previously existing advertised Spaces and damaged/unavailable state are never inferred to be unused. This is not inactivity-based deletion. Eight existing Spaces per network supplement the daily limits, but an attacker using many independent networks can still exhaust anonymous capacity. `/stats` reports allocated, remaining and near-full capacity (80% threshold); outbound alerts require separate operator configuration.
 
 ### Isolate the local attachment bridge
 

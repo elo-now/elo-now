@@ -11,6 +11,132 @@ use elo_core::{
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[test]
+fn command_source_limits_normalize_addresses_and_release_on_drop() {
+    let sources = Arc::new(CommandSources::default());
+    let first = sources.acquire("192.0.2.1".parse().unwrap()).unwrap();
+    let second = sources
+        .acquire("::ffff:192.0.2.1".parse().unwrap())
+        .unwrap();
+    assert!(matches!(
+        sources.acquire("192.0.2.1".parse().unwrap()),
+        Err(Error::Limit)
+    ));
+    drop(first);
+    drop(second);
+    assert!(sources.0.lock().unwrap().is_empty());
+
+    let first = sources.acquire("2001:db8:1:2::1".parse().unwrap()).unwrap();
+    let second = sources.acquire("2001:db8:1:2::2".parse().unwrap()).unwrap();
+    assert!(matches!(
+        sources.acquire("2001:db8:1:2:ffff::3".parse().unwrap()),
+        Err(Error::Limit)
+    ));
+    let other = sources.acquire("2001:db8:1:3::1".parse().unwrap()).unwrap();
+    drop((first, second, other));
+    assert!(sources.0.lock().unwrap().is_empty());
+
+    let permits: Vec<_> = (0..MAX_COMMAND_SOURCES)
+        .map(|n| sources.acquire(IpAddr::V4((n as u32).into())).unwrap())
+        .collect();
+    assert!(matches!(
+        sources.acquire("192.0.2.2".parse().unwrap()),
+        Err(Error::Limit)
+    ));
+    drop(permits);
+    assert!(sources.0.lock().unwrap().is_empty());
+}
+
+fn slow_command_request(source: &str) -> axum::extract::Request {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/storage/v1/command")
+        .header("x-real-ip", source)
+        .header(header::CONTENT_LENGTH, "32")
+        .body(Body::from_stream(futures_util::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn incomplete_commands_leave_capacity_for_another_source_and_cancel_cleanly() {
+    let (_dir, engine, _owner, _authority) = configured_with_pin(None);
+    let service = Service::new_test(engine, AUDIENCE.into()).trust_loopback_proxy(true);
+    let peer = "127.0.0.1:1234".parse().unwrap();
+    let mut first = Box::pin(command(
+        State(service.clone()),
+        ConnectInfo(peer),
+        slow_command_request("2001:db8:1:2::1"),
+    ));
+    let mut second = Box::pin(command(
+        State(service.clone()),
+        ConnectInfo(peer),
+        slow_command_request("2001:db8:1:2::2"),
+    ));
+    assert!(futures_util::poll!(&mut first).is_pending());
+    assert!(futures_util::poll!(&mut second).is_pending());
+    assert_eq!(service.proofs.available_permits(), 2);
+    assert!(matches!(
+        command(
+            State(service.clone()),
+            ConnectInfo(peer),
+            slow_command_request("2001:db8:1:2::3"),
+        )
+        .await,
+        Err(Error::Limit)
+    ));
+    let other = axum::http::Request::builder()
+        .header("x-real-ip", "2001:db8:1:3::1")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert!(matches!(
+        command(State(service.clone()), ConnectInfo(peer), other).await,
+        Err(Error::Invalid)
+    ));
+    assert_eq!(service.proofs.available_permits(), 2);
+    drop(first);
+    drop(second);
+    assert!(service.command_sources.0.lock().unwrap().is_empty());
+    assert_eq!(service.proofs.available_permits(), 4);
+
+    let mut retry = Box::pin(command(
+        State(service.clone()),
+        ConnectInfo(peer),
+        slow_command_request("2001:db8:1:2::1"),
+    ));
+    assert!(futures_util::poll!(&mut retry).is_pending());
+    drop(retry);
+    assert!(service.command_sources.0.lock().unwrap().is_empty());
+    assert_eq!(service.proofs.available_permits(), 4);
+
+    // A direct caller cannot bypass the network limit by supplying proxy headers.
+    let direct = service.clone().trust_loopback_proxy(false);
+    let headers = slow_command_request("203.0.113.8").headers().clone();
+    assert_eq!(direct.source_ip(peer, &headers).unwrap(), peer.ip());
+    let remote = "192.0.2.8:1234".parse().unwrap();
+    assert_eq!(service.source_ip(remote, &headers).unwrap(), remote.ip());
+}
+
+#[tokio::test]
+async fn incomplete_command_body_timeout_releases_source_and_global_capacity() {
+    let (_dir, engine, _owner, _authority) = configured_with_pin(None);
+    let service = Service::new_test(engine, AUDIENCE.into());
+    let result = tokio::time::timeout(
+        Duration::from_secs(25),
+        command(
+            State(service.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            slow_command_request("192.0.2.1"),
+        ),
+    )
+    .await
+    .expect("The command body read must have its own bounded deadline");
+    assert!(matches!(result, Err(Error::Invalid)));
+    assert!(service.command_sources.0.lock().unwrap().is_empty());
+    assert_eq!(service.proofs.available_permits(), 4);
+}
+
+#[test]
 fn operator_storage_requires_a_separate_owner_allowlist() {
     let (_dir, _engine, owner, authority) = configured_with_pin(None);
     let operation = Operation::ConfigureManaged {

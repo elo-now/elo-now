@@ -240,6 +240,7 @@ def setup_calls(root, public_origin, public_ip, uids, witness_pin):
     config = {"bind": "127.0.0.1:18920", "public_url": public_origin + "/calls/v1",
               "data": "/var/lib/elo-calls", "admission_url": "http://127.0.0.1:18901/internal/calls/admission",
               "admission_key": "/etc/elo/calls/admission.key", "max_connections": 128,
+              "transport_memory_mib": 768,
               "witness": witness_pin,
               "media": {"url": "wss://" + domain + "/media", "api_url": "http://127.0.0.1:7880",
                         "api_key": "elo-private", "api_secret": media_secret, "turn_secret": turn_secret,
@@ -355,13 +356,16 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
         witness_pin = {"url": public_origin + "/witness/v1", "public_key": public_key(key), "key_generation": 1}
         config = {"bind": "127.0.0.1:17845", "pin": witness_pin, "data": "/var/lib/elo-witness",
                   "signing_key": "/etc/elo/witness/signing-key.bin", "startup_file": "/run/elo-witness/startup.json",
-                  "activation_file": "/run/elo-witness/activation.json", "trusted_loopback_proxy": True}
+                  "activation_file": "/run/elo-witness/activation.json", "trusted_loopback_proxy": True,
+                  "registration_hosts": []}
     else:
         secret(service / "config/backup-access.key", uids[role], service / "data", hexadecimal=True)
+        registration_key = secret(service / "config/registration-signing-key.bin", uids[role], service / "data")
         retentions = [21600, 43200, 86400] if public_hosting else [86400, 172800, "no_expiry"]
         config = {"root": "/var/lib/elo-api", "public_url": public_origin, "max_spaces_per_identity": 2,
                   "max_spaces": 128, "max_space_creations_per_day": 32, "mailbox_quota_bytes": 150000000,
                   "backup_access_key": "/etc/elo/api/backup-access.key", "witness": witness_pin,
+                  "registration_signing_key": "/etc/elo/api/registration-signing-key.bin",
                   "allowed_creators": None if public_hosting else list(creators), "allowed_message_retentions": retentions}
         if call_ip:
             config["call_admission_key"] = "/etc/elo/api/call-admission.key"
@@ -370,6 +374,10 @@ def prepare(root, role, public_origin, version, witness_pin=None, storage=False,
             stable(root / "wake/config/firebase.json", json_bytes(firebase), uids["wake"])
             stable(root / "wake/config/config.json", json_bytes({"public_url": public_origin}), uids["wake"])
         signing_key = secret(root / "export/config/signing-key.bin", uids["export"], root / "api/data")
+        # Registration does not give the API process the profile-signing key.
+        stable(root / "public/registration-host.json", json_bytes({
+            "host": public_origin + "/spaces/v1/create", "public_key": public_key(registration_key),
+        }), owner, 0o644)
         body = {"v": 1, "kind": "hosting.configuration", "revision": 1, "name": name,
                 "signing_public_key": public_key(signing_key), "create_url": public_origin + "/spaces/v1/create",
                 "witness": witness_pin, "storage": {"url": storage_url, "managed":

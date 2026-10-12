@@ -249,6 +249,7 @@ mod tests {
             reserved_at: 1,
             creation_network: None,
             reclaim_if_unclaimed: true,
+            registration_ticket_issued: false,
         };
         save(&directory.join("reservation.json"), &reservation).unwrap();
         host.allocations.lock().unwrap().insert(id, None);

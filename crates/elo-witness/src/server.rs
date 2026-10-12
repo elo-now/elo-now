@@ -29,6 +29,48 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const COMMAND_BYTES: usize = 9 * 1024 * 1024;
 const HEAD_BYTES: usize = 1024;
 const INGEST_SLOTS: usize = 4;
+const HEAD_INGEST_SLOTS: usize = 4;
+const NETWORK_INGEST_SLOTS: usize = 2;
+
+fn network(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => {
+                let mut prefix = ip.octets();
+                prefix[8..].fill(0);
+                IpAddr::V6(prefix.into())
+            }
+        },
+    }
+}
+
+type NetworkIngest = Arc<Mutex<BTreeMap<IpAddr, [usize; 2]>>>;
+
+struct NetworkPermit {
+    active: NetworkIngest,
+    network: IpAddr,
+    class: usize,
+}
+
+impl Drop for NetworkPermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock()
+            && let Some(counts) = active.get_mut(&self.network)
+        {
+            counts[self.class] -= 1;
+            if *counts == [0, 0] {
+                active.remove(&self.network);
+            }
+        }
+    }
+}
+
+struct IngestPermit {
+    _global: OwnedSemaphorePermit,
+    _network: NetworkPermit,
+}
 
 struct Budget {
     start: Instant,
@@ -152,6 +194,8 @@ pub struct Service {
     engine: Arc<Mutex<Engine>>,
     workers: Arc<Semaphore>,
     ingest: Arc<Semaphore>,
+    head_ingest: Arc<Semaphore>,
+    network_ingest: NetworkIngest,
     rates: Arc<Mutex<BTreeMap<IpAddr, (Instant, u32)>>>,
     head_budget: Arc<Mutex<Budget>>,
     heads: Arc<Mutex<HeadCache>>,
@@ -164,6 +208,8 @@ impl Service {
             engine: Arc::new(Mutex::new(engine)),
             workers: Arc::new(Semaphore::new(4)),
             ingest: Arc::new(Semaphore::new(INGEST_SLOTS)),
+            head_ingest: Arc::new(Semaphore::new(HEAD_INGEST_SLOTS)),
+            network_ingest: Arc::new(Mutex::new(BTreeMap::new())),
             rates: Arc::new(Mutex::new(BTreeMap::new())),
             head_budget: Arc::new(Mutex::new(Budget::new())),
             heads: Arc::new(Mutex::new(HeadCache::new())),
@@ -186,6 +232,7 @@ impl Service {
         }
     }
     fn rate(&self, ip: IpAddr) -> Result<()> {
+        let ip = network(ip);
         let mut rates = self.rates.lock().map_err(|_| Error::Unavailable)?;
         rates.retain(|_, (time, _)| time.elapsed() < Duration::from_secs(60));
         if rates.len() >= 4096 && !rates.contains_key(&ip) {
@@ -198,12 +245,45 @@ impl Service {
         *count += 1;
         Ok(())
     }
+
+    fn admit_ingest(&self, ip: IpAddr, head: bool) -> Result<IngestPermit> {
+        let network = network(ip);
+        let class = usize::from(head);
+        let mut active = self.network_ingest.lock().map_err(|_| Error::Unavailable)?;
+        if active
+            .get(&network)
+            .is_some_and(|counts| counts[class] >= NETWORK_INGEST_SLOTS)
+        {
+            return Err(Error::Limit);
+        }
+        // Independent head capacity keeps slow command bodies from preventing
+        // API services from refreshing their authorization. One source cannot
+        // occupy an entire class; the global semaphores also bound this map.
+        let global = if head {
+            &self.head_ingest
+        } else {
+            &self.ingest
+        }
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Limit)?;
+        active.entry(network).or_default()[class] += 1;
+        Ok(IngestPermit {
+            _global: global,
+            _network: NetworkPermit {
+                active: self.network_ingest.clone(),
+                network,
+                class,
+            },
+        })
+    }
+
     async fn receive(
         &self,
         peer: SocketAddr,
         request: HttpRequest,
         head: bool,
-    ) -> Result<(IpAddr, axum::body::Bytes, OwnedSemaphorePermit)> {
+    ) -> Result<(IpAddr, axum::body::Bytes, IngestPermit)> {
         let ip = self.ip(peer, request.headers())?;
         self.rate(ip)?;
         if head {
@@ -214,11 +294,7 @@ impl Service {
         }
         // Admission precedes polling the body or parsing JSON. Keep this permit
         // through signature verification so queued decoded bodies stay bounded.
-        let permit = self
-            .ingest
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Limit)?;
+        let permit = self.admit_ingest(ip, head)?;
         let limit = if head { HEAD_BYTES } else { COMMAND_BYTES };
         if request
             .headers()

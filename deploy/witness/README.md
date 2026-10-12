@@ -42,6 +42,56 @@ Expose only `/witness/v1/command` and `/witness/v1/head` through the HTTPS proxy
 
 The unit's memory and task limits are initial operating limits, not load-test results. An unexpected process restart will require a new operator activation.
 
+## Registration and durable capacity
+
+New Spaces require a short-lived, signed allocation ticket from an independently
+configured hosting service. The client first reserves hosting through
+`/spaces/v1/prepare`, then presents that ticket together with its own signed genesis,
+initial configuration and proof of work to the witness. Final hosting creation
+still requires fresh witness confirmation. The ticket binds the exact creation
+endpoint, Space, stream, initial head, creator identity and device, witness pin,
+reservation and expiry. It cannot grant membership or change an existing Space.
+
+Configure `registration_hosts` on the witness with each reviewed hosting creation
+URL and its dedicated registration public key. Provision the corresponding private
+key only on that hosting service; do not reuse its hosting-profile export key or
+the witness key. An absent or empty list closes **new** registrations while leaving
+existing Spaces and registration replay available. Client-supplied keys, QR codes
+and ticket contents cannot extend this list. Deploy matching client, hosting and
+witness versions; there is no fallback accepting un-ticketed new registrations.
+
+Each Space has a durable normal budget of 3,072 journal events and 3 MiB of charged
+storage. The charge includes receipts, replay responses, authority proof,
+invitation policies, challenges, tombstones and conservative row/index overhead.
+Real invitation revocation and owner updates that strictly reduce permissions may
+use the reserved remainder, up to 4,096 events and 4 MiB. A transaction crossing
+either limit is rolled back in full. Reads, signed freshness and exact-request
+replay do not consume these budgets. Re-registering an unchanged active invitation
+or revoking one already revoked returns a signed, request-bound no-op acknowledgement
+at the existing journal position, without appending a fictitious journal record.
+
+At most 128 Spaces reserve these independent budgets (512 MiB charged storage and
+524,288 events in total), below the existing 1 GiB SQLite page ceiling and one
+million-event journal ceiling. Registration also counts any older oversized Space
+at its actual usage before accepting a new reservation. Older signed data remains
+readable and startup/activation still verify it; installing these limits does not
+rewrite, prune or reset history. An already oversized Space may require operator
+capacity work before further mutations. Reaching creation capacity does not
+disable reads or available reserved mutations in other Spaces.
+
+Before upgrading an existing deployment, inspect every Space's charged usage
+and event count with the same accounting as `journal/capacity.rs`. Do not enable
+these limits on a Space already above the normal budget without a separately
+reviewed, durable operating allocation that leaves revocation headroom. Never
+derive a new baseline on every restart: that would reset the growth budget.
+
+These are finite operational allocations, not unlimited anonymous-service or
+Sybil-resistance guarantees. Monitor remaining capacity and stop issuing new
+allocations before exhaustion. Preserve independent journal anchors during any
+capacity change; deleting acknowledged events, old policies or tombstones is not
+a supported way to reclaim room. Head integrity checks scan one Space's materialized
+state, not all Spaces; startup verifies journal rows and Space snapshots sequentially.
+
 ## Sealed startup and operator activation
 
 Every process starts sealed. It writes `/run/elo-witness/startup.json` with a fresh `startup_nonce`, its observed journal position, public key, and key generation. `/livez` reports process liveness; `/readyz` stays unavailable while sealed. Mutations and signed freshness replies are denied. Stale activation files from a previous process are removed.

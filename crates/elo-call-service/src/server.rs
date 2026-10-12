@@ -7,10 +7,10 @@ use crate::{
 use axum::{
     Router,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -25,7 +25,10 @@ use std::{
 };
 use tokio::sync::{Mutex, Semaphore};
 mod events;
+mod ingress;
+mod memory;
 mod subscriptions;
+pub use memory::DEFAULT_TRANSPORT_MEMORY_MIB;
 use zeroize::Zeroizing;
 
 pub type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, CallError>> + Send + 'a>>;
@@ -166,6 +169,10 @@ pub struct Service {
     events: Arc<events::Events>,
     connections: Arc<Semaphore>,
     verification: Arc<Semaphore>,
+    ingress: Arc<ingress::Ingress>,
+    websocket_ingress: Arc<ingress::Ingress>,
+    member_connections: Arc<ingress::Connections>,
+    transport_memory: memory::Budget,
 }
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -183,15 +190,35 @@ impl Service {
         max_connections: usize,
         media: Option<Arc<crate::media::Provider>>,
     ) -> Arc<Self> {
+        Self::with_transport_memory(
+            engine,
+            admission,
+            max_connections,
+            media,
+            DEFAULT_TRANSPORT_MEMORY_MIB,
+        )
+        .expect("The default transport memory budget is valid")
+    }
+    pub fn with_transport_memory(
+        engine: Engine,
+        admission: Arc<dyn Admission>,
+        max_connections: usize,
+        media: Option<Arc<crate::media::Provider>>,
+        transport_memory_mib: usize,
+    ) -> Result<Arc<Self>, &'static str> {
         let events = Arc::new(events::Events::default());
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             engine: Mutex::new(engine),
             admission,
             media,
             events,
             connections: Arc::new(Semaphore::new(max_connections.clamp(1, 4096))),
             verification: Arc::new(Semaphore::new(2)),
-        })
+            ingress: ingress::Ingress::new(),
+            websocket_ingress: ingress::Ingress::websocket(),
+            member_connections: Arc::new(ingress::Connections::default()),
+            transport_memory: memory::Budget::new(transport_memory_mib)?,
+        }))
     }
     fn publish(&self, events: Vec<Event>) {
         for event in events {
@@ -232,13 +259,12 @@ pub fn app(service: Arc<Service>) -> Router {
 /// start, join, renew or publish media for a participant.
 async fn current_state(
     State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     request: axum::extract::Request,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
-    let permit = service
-        .verification
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let _ingress = service
+        .ingress
+        .acquire(ingress::source(peer, request.headers())?)?;
     let body = tokio::time::timeout(
         Duration::from_secs(5),
         axum::body::to_bytes(request.into_body(), MAX_FRAME),
@@ -246,16 +272,24 @@ async fn current_state(
     .await
     .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
     .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    // Slow bodies never occupy workers shared with WebSocket call commands.
+    let permit = service
+        .verification
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let request: Request = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    drop(body);
     let job = service
         .engine
         .lock()
         .await
         .preparation(request, None)
         .map_err(|_| StatusCode::FORBIDDEN)?;
-    let (job, (command, identity), permit) = tokio::task::spawn_blocking(move || {
+    let (job, (command, identity)) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let authenticated = job.authenticate(now());
-        authenticated.map(|value| (job, value, permit))
+        authenticated.map(|value| (job, value))
     })
     .await
     .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -278,11 +312,19 @@ async fn current_state(
     ) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let (prepared, _permit) =
-        tokio::task::spawn_blocking(move || job.verify(now()).map(|prepared| (prepared, permit)))
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .map_err(|_| StatusCode::FORBIDDEN)?;
+    // Remote hosting checks do not reserve a CPU verification worker.
+    let permit = service
+        .verification
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job.verify(now())
+    })
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    .map_err(|_| StatusCode::FORBIDDEN)?;
     let mut engine = service.engine.lock().await;
     let expired = engine.registry.tick(now());
     let applied = engine.execute(prepared, now());
@@ -296,16 +338,32 @@ async fn current_state(
     let applied = applied.map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(axum::Json(json!({"call":applied.call})))
 }
-async fn upgrade(State(service): State<Arc<Service>>, ws: WebSocketUpgrade) -> impl IntoResponse {
+async fn upgrade(
+    State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let admission = match ingress::source(peer, &headers)
+        .and_then(|source| service.websocket_ingress.acquire(source))
+    {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
     let Ok(permit) = service.connections.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(memory) = service.transport_memory.acquire() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .max_write_buffer_size(256 * 1024)
+        .read_buffer_size(memory::READ_BUFFER)
+        .max_write_buffer_size(memory::WRITE_BUFFER)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            connected(service, socket).await;
+            let _memory = memory;
+            connected(service, socket, admission).await;
         })
         .into_response()
 }
@@ -319,7 +377,10 @@ async fn send(socket: &mut WebSocket, value: serde_json::Value) -> bool {
         Ok(Ok(()))
     )
 }
-async fn connected(service: Arc<Service>, mut socket: WebSocket) {
+async fn connected(service: Arc<Service>, mut socket: WebSocket, admission: ingress::Permit) {
+    // Retain a bounded memory slot through the first authenticated frame.
+    let mut anonymous = Some(admission);
+    let mut _member_connection: Option<ingress::ConnectionPermit> = None;
     let mut receiver = service.events.subscribe();
     let mut device: Option<RecordId> = None;
     let mut identity: Option<IdentityId> = None;
@@ -355,6 +416,9 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                     Ok(request) => request,
                     Err(_) => { let _ = send(&mut socket, json!({"type":"error","code":CallError::Invalid})).await; break; }
                 };
+                // Keep only the bounded typed proof across remote admission;
+                // the raw frame can otherwise remain live for this whole branch.
+                drop(text);
                 let job = service.engine.lock().await.preparation(request, device);
                 let authenticated = match job {
                     Ok(job) => tokio::task::spawn_blocking(move || {
@@ -396,6 +460,18 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 let delegated_lease = prepared.delegation_lease;
                 let bound_device = prepared.command.credential_id;
                 let bound_identity = prepared.identity;
+                // Acquire before executing an operation so an excess socket
+                // cannot start or mutate a call before being refused. A failed
+                // operation releases this temporary reservation immediately.
+                let new_connection = if device.is_none() {
+                    match service.member_connections.acquire(bound_identity, bound_device) {
+                        Ok(permit) => Some(permit),
+                        Err(code) => {
+                            let _ = send(&mut socket,json!({"type":"error","request_id":request_id,"code":code})).await;
+                            break;
+                        }
+                    }
+                } else { None };
                 let mut engine = service.engine.lock().await;
                 let applied = engine.execute(prepared, now());
                 let authority_events = engine.take_events();
@@ -403,7 +479,9 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 if service.publish_media(authority_events).await.is_err() { break; }
                 match applied {
                     Ok(result) => {
+                        if let Some(permit) = new_connection { _member_connection = Some(permit); }
                         device = Some(bound_device); identity = Some(bound_identity); scopes.insert(scope);
+                        drop(anonymous.take());
                         delegations.update(scope, delegated_lease);
                         receiver.update(bound_device, &scopes);
                         if service.publish_media(result.events).await.is_err() {
@@ -425,15 +503,15 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
             }
             event = receiver.recv(), if device.is_some() => {
                 let Some(event) = event else { break; }; // A slow consumer reconnects for a fresh snapshot.
-                let scope = match &event {
+                let scope = match &**event {
                     Event::Presence { call } => call.scope,
                     Event::Ended { scope, .. } | Event::Signal { scope, .. } => *scope,
                 };
                 let credential = device.unwrap();
-                if !scopes.contains(&scope) || matches!(&event, Event::Signal { to, .. } if *to != credential) { continue; }
+                if !scopes.contains(&scope) || matches!(&**event, Event::Signal { to, .. } if *to != credential) { continue; }
                 // A Leave/Join cycle keeps the session ID but replaces its media
                 // generation. Never forward a queued negotiation from the old peer.
-                if let Event::Signal { call_id, epoch, from, to, .. } = &event {
+                if let Event::Signal { call_id, epoch, from, to, .. } = &**event {
                     let engine = service.engine.lock().await;
                     let current = engine.registry.presence(&scope).is_some_and(|call| {
                         call.call_id == *call_id && call.key_epoch == *epoch
@@ -462,7 +540,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                 // Idle checks are staggered; never forward fresh presence or
                 // media signals on an expired hosting admission. A terminal
                 // event still clears an already known call after revocation.
-                if !matches!(&event, Event::Ended { .. }) {
+                if !matches!(&**event, Event::Ended { .. }) {
                     let head = service.engine.lock().await.authorized_head(scope, credential, now());
                     let allowed = if let Some(head) = head {
                         subscriptions::admitted(&service, &mut grants, scope, identity.unwrap(), credential, head, false).await
@@ -477,7 +555,7 @@ async fn connected(service: Arc<Service>, mut socket: WebSocket) {
                         continue;
                     }
                 }
-                if !send(&mut socket, serde_json::to_value(&event).unwrap()).await { break; }
+                if !send(&mut socket, serde_json::to_value(&**event).unwrap()).await { break; }
             }
             _ = admission_tick.tick(), if device.is_some() => {
                 let expired = {

@@ -86,7 +86,7 @@ impl Engine {
         let registering = matches!(command.operation, Operation::Register);
         if registering {
             request.verify_registration_work()?;
-        } else if request.registration_work.is_some() {
+        } else if request.registration_work.is_some() || request.registration_ticket.is_some() {
             return Err(Error::Invalid);
         }
         let registered = self
@@ -175,6 +175,19 @@ impl Engine {
                 challenge: None,
             });
         }
+        if registering && !registered {
+            verify_registration_ticket(
+                request
+                    .registration_ticket
+                    .as_deref()
+                    .ok_or(Error::Unauthorized)?,
+                &self.journal.registration_hosts,
+                &self.journal.pin,
+                &command,
+                signer.identity(),
+                now,
+            )?;
+        }
         // No receipt is returned before checking the current signer permissions.
         if let Some(response) = journal::replay(&self.journal.db, signed.id())? {
             if matches!(
@@ -223,6 +236,7 @@ impl Engine {
             proof: None,
             challenge: None,
         };
+        let mut security_reduction = false;
         let event = match &command.operation {
             Operation::Register => {
                 if tx.query_row(
@@ -233,9 +247,7 @@ impl Engine {
                 {
                     return Err(Error::Conflict);
                 }
-                if tx.query_row("SELECT count(*) FROM spaces", [], |r| r.get::<_, i64>(0))? >= 128 {
-                    return Err(Error::Limit);
-                }
+                journal::capacity::reserve_space(&tx)?;
                 let day = (now / 86_400_000) as i64;
                 let network = registration_network(ip, day);
                 let count = tx
@@ -265,6 +277,27 @@ impl Engine {
                 if body.issuer_credential_id != command.credential_id {
                     return Err(Error::Unauthorized);
                 }
+                if let Some((existing, revoked)) = tx
+                    .query_row(
+                        "SELECT record,revoked FROM policies WHERE space=?1 AND id=?2",
+                        params![command.space_id.to_string(), record.id().to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+                    )
+                    .optional()?
+                {
+                    if existing != *policy || revoked {
+                        return Err(Error::Unauthorized);
+                    }
+                    return noop(
+                        &tx,
+                        &self.journal.key,
+                        &self.journal.pin,
+                        &signed,
+                        &command,
+                        "invitation.registered",
+                        now,
+                    );
+                }
                 if tx.query_row(
                     "SELECT count(*) FROM policies WHERE space=?1",
                     [command.space_id.to_string()],
@@ -285,6 +318,25 @@ impl Engine {
                 "invitation.registered"
             }
             Operation::RevokeInvitation { policy_id } => {
+                let revoked = tx
+                    .query_row(
+                        "SELECT revoked FROM policies WHERE space=?1 AND id=?2",
+                        params![command.space_id.to_string(), policy_id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .ok_or(Error::Missing)?;
+                if revoked {
+                    return noop(
+                        &tx,
+                        &self.journal.key,
+                        &self.journal.pin,
+                        &signed,
+                        &command,
+                        "invitation.revoked",
+                        now,
+                    );
+                }
                 if tx.execute(
                     "UPDATE policies SET revoked=1 WHERE space=?1 AND id=?2",
                     params![command.space_id.to_string(), policy_id.to_string()],
@@ -292,6 +344,7 @@ impl Engine {
                 {
                     return Err(Error::Missing);
                 }
+                security_reduction = true;
                 "invitation.revoked"
             }
             Operation::Challenge {
@@ -515,6 +568,13 @@ impl Engine {
                     return Err(Error::Limit);
                 }
                 let before = members(&authority)?;
+                let before_grants = grants(&authority)?;
+                let before_owners: BTreeSet<_> = authority
+                    .head()?
+                    .owner_credential_ids
+                    .iter()
+                    .copied()
+                    .collect();
                 for credential in credentials {
                     authority.add_credential(verify_credential(credential)?);
                 }
@@ -523,6 +583,16 @@ impl Engine {
                     authority.prepare_witness_owner_config(&proposal, &self.journal.key)?;
                 authority.apply_config(config)?;
                 let after = members(&authority)?;
+                let after_grants = grants(&authority)?;
+                let after_owners: BTreeSet<_> = authority
+                    .head()?
+                    .owner_credential_ids
+                    .iter()
+                    .copied()
+                    .collect();
+                security_reduction = after_grants.is_subset(&before_grants)
+                    && after_owners.is_subset(&before_owners)
+                    && (after_grants != before_grants || after_owners != before_owners);
                 for (credential, identity) in before.difference(&after) {
                     tx.execute("INSERT OR IGNORE INTO tombstones(space,credential,identity) VALUES(?1,?2,?3)",
                         params![command.space_id.to_string(),credential,identity])?;
@@ -541,7 +611,7 @@ impl Engine {
                 command.expires_at_ms as i64
             ],
         )?;
-        let response = journal::append(
+        let response = journal::append_with_budget(
             &tx,
             &self.journal.key,
             &self.journal.pin,
@@ -553,10 +623,79 @@ impl Engine {
                 now,
             },
             response,
+            security_reduction,
         )?;
         tx.commit()?;
         Ok(response)
     }
+}
+
+fn verify_registration_ticket(
+    encoded: &str,
+    hosts: &[elo_core::witness::registration::RegistrationHost],
+    pin: &elo_core::authority::WitnessPin,
+    command: &Command,
+    creator: elo_core::ids::IdentityId,
+    now: u64,
+) -> Result<()> {
+    use elo_core::witness::registration::RegistrationTicket;
+    let (ticket, signed) = RegistrationTicket::parse(encoded)?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host == ticket.host)
+        .ok_or(Error::Unauthorized)?;
+    signed.verify_signature(
+        &VerifyingKey::from_bytes(&hex32(&host.public_key)?).map_err(|_| Error::Invalid)?,
+    )?;
+    if ticket.audience != pin.url
+        || ticket.witness_public_key != pin.public_key
+        || ticket.witness_key_generation != pin.key_generation
+        || ticket.space_id != command.space_id
+        || ticket.stream_id != command.stream_id
+        || ticket.authority_head != command.authority_head
+        || ticket.creator_identity != creator
+        || ticket.credential_id != command.credential_id
+        || ticket.issued_at_ms > now.saturating_add(5_000)
+        || ticket.expires_at_ms <= now
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+fn noop(
+    db: &Connection,
+    key: &ed25519_dalek::SigningKey,
+    pin: &elo_core::authority::WitnessPin,
+    signed: &SignedRecord,
+    command: &Command,
+    event: &str,
+    now: u64,
+) -> Result<Response> {
+    let ack = NoopAcknowledgement {
+        v: 1,
+        kind: "witness.noop".into(),
+        audience: pin.url.clone(),
+        request_id: signed.id(),
+        space_id: command.space_id,
+        stream_id: command.stream_id,
+        authority_head: command.authority_head,
+        event: event.into(),
+        position: journal::position(db)?,
+        issued_at_ms: now,
+        expires_at_ms: command.expires_at_ms,
+        witness_key_generation: pin.key_generation,
+    };
+    Ok(Response {
+        receipt: Some(
+            STANDARD.encode(
+                SignedRecord::sign(&serde_json::to_vec(&ack).map_err(|_| Error::Invalid)?, key)?
+                    .bytes(),
+            ),
+        ),
+        proof: None,
+        challenge: None,
+    })
 }
 
 fn load(
@@ -608,6 +747,24 @@ fn members(authority: &Authority) -> Result<BTreeSet<(String, String)>> {
             m.credential_ids
                 .iter()
                 .map(|id| (id.to_string(), m.identity_id.to_string()))
+        })
+        .collect())
+}
+fn grants(authority: &Authority) -> Result<BTreeSet<(String, String, Capability)>> {
+    Ok(authority
+        .head()?
+        .members
+        .iter()
+        .flat_map(|member| {
+            member.credential_ids.iter().flat_map(move |credential| {
+                member.capabilities.iter().map(move |capability| {
+                    (
+                        member.identity_id.to_string(),
+                        credential.to_string(),
+                        *capability,
+                    )
+                })
+            })
         })
         .collect())
 }

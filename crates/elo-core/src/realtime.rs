@@ -70,10 +70,11 @@ pub enum ServerFrame {
 }
 
 /// Resolves a local replica namespace; implementations must never fetch a client URL.
+/// Hosted resolvers must check the mailbox bearer before refreshing authority.
 pub trait Resolver: Send + Sync {
     fn resolve<'a>(
         &'a self,
-        replica: &'a str,
+        request: &'a SubscriptionRequest,
     ) -> Pin<Box<dyn Future<Output = Option<ReplicaStore>> + Send + 'a>>;
 }
 
@@ -85,9 +86,9 @@ struct Standalone(ReplicaStore);
 impl Resolver for Standalone {
     fn resolve<'a>(
         &'a self,
-        replica: &'a str,
+        request: &'a SubscriptionRequest,
     ) -> Pin<Box<dyn Future<Output = Option<ReplicaStore>> + Send + 'a>> {
-        Box::pin(async move { (replica == "/").then(|| self.0.clone()) })
+        Box::pin(async move { (request.replica == "/").then(|| self.0.clone()) })
     }
 }
 

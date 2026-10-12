@@ -2,7 +2,7 @@
 use super::*;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 mod restore;
-pub use restore::{RestoreProgress, RestoreRequest, RestoreStage, restore};
+pub use restore::{RestoreProgress, RestoreRequest, RestoreStage, restore, restore_configured};
 
 pub const MAX_BACKUP: usize = 96 * 1024 * 1024;
 const MAX_FILES: usize = 64 * 1024 * 1024;
@@ -240,9 +240,7 @@ impl ClientApp {
             .as_ref()
             .is_some_and(|spaces| spaces.awaiting_verification())
         {
-            return Err(
-                "Connect to verify your restored Spaces before creating a new backup.".into(),
-            );
+            return Err("backup_space_access_required".into());
         }
         let mut profiles = vec![(String::new(), self)];
         if let Some(spaces) = &self.spaces {
