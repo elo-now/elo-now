@@ -26,10 +26,6 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 
 COPY . /src
 WORKDIR /src
-RUN python3 -m venv /opt/elo-test-env \
-    && /opt/elo-test-env/bin/pip install --no-cache-dir -r tools/requirements-test.txt
-ENV PATH="/opt/elo-test-env/bin:${PATH}"
-
 RUN rustup component add rustfmt clippy \
     && cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" \
     && npm --prefix apps/desktop ci --ignore-scripts \
