@@ -1,0 +1,54 @@
+name: OSS Scanner environment
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.oss-scanner/**'
+      - '.github/workflows/oss-scanner.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Reserve disk for the scanner image
+        run: |
+          # These are unused preinstalled toolchains on this disposable runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+      - name: Prepare the official scanner validator
+        env:
+          SCANNER_REVISION: d23e90891aa8aa22dc9c74298073d14be9ce78d4
+        run: |
+          git clone --filter=blob:none https://github.com/anthropics/oss-scanner.git "$RUNNER_TEMP/oss-scanner"
+          git -C "$RUNNER_TEMP/oss-scanner" checkout --detach "$SCANNER_REVISION"
+          python3 -m venv "$RUNNER_TEMP/scanner-env"
+          "$RUNNER_TEMP/scanner-env/bin/pip" install PyYAML==6.0.3
+          mkdir -p "$RUNNER_TEMP/elo-now"
+          cp .oss-scanner/project.yaml "$RUNNER_TEMP/elo-now/project.yaml"
+          "$RUNNER_TEMP/scanner-env/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+          path = Path(os.environ["RUNNER_TEMP"]) / "elo-now/project.yaml"
+          config = yaml.safe_load(path.read_text())
+          config["repo"] = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}#{os.environ["GITHUB_REF_NAME"]}'
+          path.write_text(yaml.safe_dump(config, sort_keys=False))
+          PY
+      - name: Build through the official scanner harness
+        run: |
+          "$RUNNER_TEMP/scanner-env/bin/python" "$RUNNER_TEMP/oss-scanner/tools/check" \
+            "$RUNNER_TEMP/elo-now" --no-shell --dir "$RUNNER_TEMP/scanner-build"
+      - name: Test the exact commit with external networking disabled
+        run: |
+          docker run --rm --init --network none --cpus 2 --memory 7g \
+            -e EXPECTED_REVISION="$GITHUB_SHA" \
+            oss-scanner-check/built:elo-now \
+            bash -euc 'test "$(git -C /src rev-parse HEAD)" = "$EXPECTED_REVISION"; sh /src/.oss-scanner/check.sh'
