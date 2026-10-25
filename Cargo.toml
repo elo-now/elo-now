@@ -22,7 +22,10 @@ tempfile = "3"
 
 serde = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["alloc", "zeroize"] }
-age = { version = "=0.12.1", default-features = false }
+# elo uses X25519 and scrypt, both supported by the patched 0.11 branch.
+# age 0.12 adds unused tag recipients through vulnerable crypto-bigint 0.5
+# (RUSTSEC-2026-0387). Revisit when a fixed upstream release is available.
+age = { version = "=0.11.5", default-features = false }
 getrandom = "0.4"
 
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "original-uri"] }

@@ -5,6 +5,38 @@ use elo_core::{
     record::SignedRecord,
 };
 const FIXTURE: &[u8] = include_bytes!("../../../protocol/fixtures/chat-message-v1.record.bin");
+
+#[test]
+fn age_0_12_ciphertexts_remain_readable() {
+    #[derive(serde::Deserialize)]
+    struct CompatibilityFixture {
+        identity: String,
+        record_ciphertext: Vec<u8>,
+        scrypt_passphrase: String,
+        scrypt_plaintext: String,
+        scrypt_ciphertext: Vec<u8>,
+    }
+
+    // Generated with unmodified age 0.12.1 before switching to 0.11.5.
+    // These synthetic keys and passphrases are public test data.
+    let fixture: CompatibilityFixture =
+        serde_json::from_str(include_str!("fixtures/age-0.12.1.json")).unwrap();
+    let identity: age::x25519::Identity = fixture.identity.parse().unwrap();
+    assert_eq!(
+        open_record(&fixture.record_ciphertext, &identity)
+            .unwrap()
+            .bytes(),
+        FIXTURE
+    );
+    let password_identity = age::scrypt::Identity::new(fixture.scrypt_passphrase.into());
+    assert_eq!(
+        age::decrypt(&password_identity, &fixture.scrypt_ciphertext).unwrap(),
+        fixture.scrypt_plaintext.as_bytes()
+    );
+    let wrong_password = age::scrypt::Identity::new("Different public test passphrase".into());
+    assert!(age::decrypt(&wrong_password, &fixture.scrypt_ciphertext).is_err());
+}
+
 #[test]
 fn multiple_readers_self_copy_and_outsider() {
     let alice = age::x25519::Identity::generate();

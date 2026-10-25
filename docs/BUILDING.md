@@ -13,6 +13,19 @@ Install frontend dependencies from `apps/desktop`:
 npm ci
 ```
 
+## Encryption dependency pin
+
+The current age pin is 0.11.5, which includes the same July 2026 parsing fixes
+as 0.12.1. elo uses X25519 and scrypt; it does not use the tag recipient types
+added in 0.12. That release pulls in crypto-bigint 0.5 through P-256/HPKE,
+affected by [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
+Using the unmodified 0.11.5 release removes that unused dependency chain without
+an advisory exception or a custom cryptographic patch. Revisit this pin when a
+fixed upstream release is available. A synthetic age 0.12.1 ciphertext fixture
+in `crates/elo-core/tests/fixtures/age-0.12.1.json` checks compatibility with
+existing X25519 records and passphrase-encrypted objects; its keys are public
+test data. This library choice does not change the age v1 wire format.
+
 ## Desktop development
 
 From `apps/desktop`:
