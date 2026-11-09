@@ -68,7 +68,7 @@ def exact(sock, size):
 
 
 def execute(path, command):
-    # MEGAcmd 2.6 POSIX IPC: native int result, partial output is size_t framed.
+    # MEGAcmd 2.6 and 2.7 POSIX IPC: native int result, size_t-framed output.
     # Command comes exclusively from fixed templates with validated arguments.
     with socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(75)
