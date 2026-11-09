@@ -459,7 +459,7 @@ still uses its encrypted transport with UDP/TCP TURN. No extra plaintext media
 path is enabled.
 
 On the witness host, `--with-storage --with-mega` selects `elo-storage-mega`.
-The helper runs MEGAcmd 2.6.0 with a separate per-operation HOME and private Unix
+The helper runs MEGAcmd 2.7.0 with a separate per-operation HOME and private Unix
 socket on `/run/elo-storage` tmpfs. It has no FUSE device, privileged capability,
 public WebDAV server, account login or persistent provider session. Root can
 still read the broker's limited folder credentials. For an optional managed
@@ -484,10 +484,11 @@ A dedicated folder, compatible MEGA plan and bounded folder write authorization
 must be prepared separately by the account owner. Test real provider upload,
 download and deletion with this broker before offering attachments.
 
-Versions checked against upstream on 2026-10-06:
-[LiveKit 1.13.7](https://github.com/livekit/livekit/releases/tag/v1.13.7),
-[coturn 4.18.0-r0](https://github.com/coturn/coturn/releases/tag/docker%2F4.18.0-r0),
-and [MEGAcmd 2.6.0 Debian 13 packages](https://mega.nz/linux/repo/Debian_13/Packages).
+LiveKit and coturn versions checked against upstream on 2026-10-06:
+[LiveKit 1.13.7](https://github.com/livekit/livekit/releases/tag/v1.13.7) and
+[coturn 4.18.0-r0](https://github.com/coturn/coturn/releases/tag/docker%2F4.18.0-r0).
+[MEGAcmd 2.7.0 Debian 13 packages](https://mega.nz/linux/repo/Debian_13/Packages)
+were checked on 2026-11-09.
 The MEGA installer pins separate amd64/arm64 package hashes. LiveKit and coturn
 use versioned upstream images; record reviewed image digests when releasing.
 The storage image without MEGA remains available for S3-only installations.
