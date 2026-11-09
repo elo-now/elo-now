@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies]
 elo-core = { path = "crates/elo-core" }
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "serialize"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "serialize"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "net", "signal"] }
 sha2 = "0.11"
 thiserror = "2"
