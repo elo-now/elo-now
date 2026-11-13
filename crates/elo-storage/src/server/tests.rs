@@ -164,6 +164,10 @@ fn operator_storage_requires_a_separate_owner_allowlist() {
     assert!(managed.for_command(&verified).is_ok());
 }
 
+// Allow signature verification and scheduling on a busy CI runner. Expiry
+// checks below deliberately wait past this deadline rather than racing setup.
+const WITNESS_LEASE_MS: u64 = 5_000;
+
 struct WitnessFixture {
     key: SigningKey,
     pin: WitnessPin,
@@ -219,10 +223,14 @@ async fn witness_reply(
             record_id: Some(RecordId::from_bytes([sequence as u8; 32])),
         },
         issued_at_ms: now,
-        expires_at_ms: now + 150,
+        expires_at_ms: now + WITNESS_LEASE_MS,
         witness_key_generation: 1,
     };
     let signed = SignedRecord::sign(&serde_json::to_vec(&body).unwrap(), &state.key).unwrap();
+    if state.mode.load(Ordering::SeqCst) == 5 {
+        // Exercise delivery taking longer than the former 150 ms fixture lease.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     axum::Json(serde_json::json!({"freshness": STANDARD.encode(signed.bytes())})).into_response()
 }
 
@@ -317,6 +325,7 @@ async fn removed_member_cannot_reuse_old_proof_or_upload_and_download_grants_aft
         authority.head_id().unwrap(),
     )
     .await;
+    fixture.mode.store(5, Ordering::SeqCst);
     let storage = crate::storage::LocalStorage::open(&dir.path().join("objects"))
         .await
         .unwrap();
@@ -362,6 +371,7 @@ async fn removed_member_cannot_reuse_old_proof_or_upload_and_download_grants_aft
         };
         grants.push((object_id, token));
     }
+    fixture.mode.store(0, Ordering::SeqCst);
     let completed_url = format!("{url}/storage/v1/objects/{}", grants[0].0);
     assert_eq!(
         client
@@ -409,11 +419,21 @@ async fn removed_member_cannot_reuse_old_proof_or_upload_and_download_grants_aft
     else {
         panic!("download grant")
     };
+    let old_lease = inspection
+        .fresh(
+            authority.space(),
+            authority.stream(),
+            authority.head_id().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     let former = authority.clone();
     change_members(&mut authority, &owner, &witness_key, &guest, false);
     *fixture.head.lock().unwrap() = authority.head_id().unwrap();
     fixture.sequence.store(2, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    tokio::time::sleep(Duration::from_millis(WITNESS_LEASE_MS + 50)).await;
+    assert!(!old_lease.is_valid(now_ms()));
     // A modified client bypassing its UI still signs a fresh request with a valid
     // old membership proof. The independent head comparison must reject it.
     assert_eq!(
@@ -537,7 +557,8 @@ async fn witness_transport_rejects_nonce_replay_oversize_redirect_and_unavailabi
         .unwrap();
     assert!(Arc::ptr_eq(&first, &cached));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 5);
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    tokio::time::sleep(Duration::from_millis(WITNESS_LEASE_MS + 50)).await;
+    assert!(!first.is_valid(now_ms()));
     fixture.mode.store(4, Ordering::SeqCst);
     assert!(
         gate.require(
