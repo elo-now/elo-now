@@ -54,7 +54,7 @@ rustls-platform-verifier = "=0.7.1"
 tauri-plugin-elo-privacy = { path = "../../../crates/tauri-plugin-elo-privacy" }
 [target.'cfg(target_os = "macos")'.dependencies]
 elo-diagnostics-macos = { path = "../../../crates/elo-diagnostics-macos", optional = true }
-rustix = { version = "=1.1.5", features = ["fs"] }
+rustix = { version = "=1.1.6", features = ["fs"] }
 mac-usernotifications = { version = "=0.3.1", default-features = false }
 
 [dev-dependencies]
