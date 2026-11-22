@@ -2,8 +2,8 @@
 # Official Debian 13 packages, pinned to reviewed bytes from MEGA's repository.
 set -eu
 case "$(dpkg --print-architecture)" in
-  amd64) package=amd64/megacmd_2.7.0-1.1_amd64.deb; digest=d8c3c77d0417cba498fa6d4b3804fb657721afed072d6472c10e6b0b1b02dab9;;
-  arm64) package=arm64/megacmd_2.7.0-1.1_arm64.deb; digest=6d032193817581984a698f641a2f35703a677d5697923df9fda43f7a317d528b;;
+  amd64) package=amd64/megacmd_2.7.1-1.1_amd64.deb; digest=c5eac2e35031701bee220d0d95e9be87cef15d86fd525e0fadb668e11e3162bc;;
+  arm64) package=arm64/megacmd_2.7.1-1.1_arm64.deb; digest=ee32a39b0e790f91de63e06ea6d7a19a415bce349c88ff6228909cc463ef9f02;;
   *) printf '%s\n' 'MEGAcmd container supports amd64 and arm64 only.' >&2; exit 1;;
 esac
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
